@@ -1,15 +1,9 @@
-[package]
-name = "ncrsDesktop"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [
+  "lib",
+  "ncrs-gui/src-tauri"
+]
+resolver = "2"
 
-[dependencies]
-fuser = "0.11"
-libc = "0.2"
-log = "0.4"
-env_logger = "0.9"
-clap = { version = "3.1", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json"] }
-webdav-handler = "0.2"
-chrono = "0.4"
+[workspace-dependencies]
+clap = "4.5.40"
