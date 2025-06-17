@@ -1,6 +1,19 @@
 Dependencies:
+```
 	sudo apt-get install fuse3 libfuse3-dev libxdo-dev
 	rustup
+```
+# ncRS Desktop client
+Sure, here's the table you provided in Markdown format:
+
+## Feature Goals:
+| Feature                   | Nextcloud Desktop | GNOME Integration/GVfs | ncRS |
+| :------------------------ | :---------------- | :--------------------- | :--- |
+| Virtual Files             | ❌ (Experimental, bad approach which doesn't work with shell/file pickers etc)                | ✅ (remote only)                     | ✅   |
+| Instant local access      | ✅                | ❌                     | ✅   |
+| Dynamically cache files/keep part locally | ❌                | ❌ (Limited caching, generally on-demand access) | ✅   |
+| Full Shell integration    | ✅                | ✅                     | ✅   |
+| HPB Support/Speed         | ❓ (Not explicitly stated, generally good sync performance) | ❌ | ✅ |
 
 ### TODO (minimal):
 + [x] base tauri tray icons https://github.com/tauri-apps/tray-icon
@@ -32,7 +45,7 @@ Dependencies:
 + [ ] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
 
 + [ ] Actual tauri menu UI:
-	+ [ ] View user login info/status
+	+ [ ] View user login info/status: HPB Connection, DAV Connection. Turn orange if HPB NOK.
 	+ [ ] Access mounted folder
 	+ [ ] main Settings:
 		+ [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
@@ -51,7 +64,9 @@ Dependencies:
 
 ### Functionality
 + [x] Tray icon
-+ [ ] VFS File handling
++ [ ] VFS File handling https://github.com/nextcloud/desktop/issues/3668
+> FUSE is not a good solution when network is involved because the normal file API you end up using to access FUSE filesystems is not able to cope with network errors. (?)
+> https://github.com/nextcloud/desktop/issues/3668#issuecomment-905330846
 + [ ] VFS Webdav mount
 	+ [ ] Proper VFS with files openable through terminal
 
@@ -60,9 +75,20 @@ Dependencies:
 	+ [ ] simple, modular RPC api for multiple file browsers: fetch 'recency' of files given path or dir
 	+ [ ] Basic PY implementation https://linuxconfig.org/how-to-write-nautilus-extensions-with-nautilus-python
 	https://gnome.pages.gitlab.gnome.org/nautilus-python/nautilus-python-migrating-to-4.html
+	see: https://github.com/nextcloud/desktop/blob/master/shell_integration/nautilus/syncstate.py
 
 + [ ] Implement files HPB push API (native Nextcloud Desktop API). Would be faster than rclone NC/WebDav [source](https://www.reddit.com/r/NextCloud/comments/ueby94/rclone_as_desktop_sync_client_replacement/)
 	+ [ ] support multiple backends: webdav, HPB...
+	HPB appears to use csync https://docs.nextcloud.com/desktop/3.4/architecture.html
+	'csync (this project) is a client-only file synchronizer for users using existing protocols like smb or sftp'
+	-> probably smart to use remotefs-webdav and remotefs-rs, for the inbuilt SFTP support
+
+	+ [ ] HPB here: https://github.com/nextcloud/notify_push/
+	It runs a websockets server on cloud.your.domain/push/ws
+	There's an existing test client in rust! https://github.com/nextcloud/notify_push/blob/main/test_client/src/main.rs
+
++ Can we implement webdav and HPB?
+
 + [ ] mass deployment / cli setup ensure working. Warn only apppassword https://docs.nextcloud.com/desktop/3.9/advancedusage.html#mass-deployment-and-account-creation
 
 + [ ] local cache implementation
