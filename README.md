@@ -64,7 +64,14 @@ Sure, here's the table you provided in Markdown format:
 		+ config exists? -> load: ok|err ->
 		+ ask for login flow in browser: https://github.com/traxys/nextcloud-passwords-client
 		+ save as yaml, lock yaml file permissions
+	----
+	WEB API:
+	+ [ ] fetch notifications
+	+ [ ] edit configuration/save yaml
+	+ [ ] open local folder
+
 + [ ] network error handling: EAGAIN|ETIMEDOUT https://pubs.opengroup.org/onlinepubs/009695399/functions/read.html
++ [ ] Systemd service
 
 ### Functionality
 + [x] Tray icon
@@ -91,11 +98,30 @@ Sure, here's the table you provided in Markdown format:
 	It runs a websockets server on cloud.your.domain/push/ws
 	There's an existing test client in rust! https://github.com/nextcloud/notify_push/blob/main/test_client/src/main.rs
 
-+ Can we implement webdav and HPB?
++ Can we implement webdav and HPB? -> yes it does seem like it!
 
 + [ ] mass deployment / cli setup ensure working. Warn only apppassword https://docs.nextcloud.com/desktop/3.9/advancedusage.html#mass-deployment-and-account-creation
 
-+ [ ] local cache implementation
++ [ ] local cache implementation:
+> + fetch file request: get etag/modification date. Do this first by folder (test!)
+> + if etag changed, fetch to nc-raw
+> + ln -s from fuse to /mount/nc-raw/
+> + save etags in DB 
+> + save file structure in db. React file structure using notify_sync (fast traversal)
+> + query db to perform cache logic and prune next file request asynchronously (prioritize latency!)
+
+	with tokio_uring! https://gist.github.com/munro/14219f9a671484a8fe820eb35d26bb80
+	+ https://github.com/foyer-rs/foyer
+	+ https://docs.rs/freqfs/0.4.3/freqfs/
+	+ https://github.com/pedrocr/syncer
+	+ https://forum.autonomi.community/t/syncer-a-caching-fuse-based-filesystem-in-rust/32018
+	+ https://github.com/kahing/catfs
+	TDD this!
+Choose DB:
+https://github.com/cberner/redb
+https://github.com/rusqlite/rusqlite
+Turso Limbo
+
 + [ ] E2E Encryption
 + [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
 > This vs GVfs
