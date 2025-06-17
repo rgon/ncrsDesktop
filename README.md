@@ -25,28 +25,37 @@ Dependencies:
 + [x] basic fuse mount
 
 + [x] send notifications multi-platform
-+ [ ] yaml config reader `yaml-rust2 = "0.9.0"`. Overridable with
++ [x] yaml config reader `yaml-rust2 = "0.9.0"`. Overridable with
 + [ ] play notification sound
 
 + [ ] Webdav implementation
-+ [ ] webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
-+ [ ] Actual tauri menu UI
-+ [ ] Setup flow:
-	+ config exists? -> load: ok|err ->
-	+ ask for login flow in browser: https://github.com/traxys/nextcloud-passwords-client
-	+ save as yaml, lock yaml file permissions
++ [ ] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
 
-+ [ ] other config:
-	+ [ ] play notification sound
-	+ [ ] show sync notifications
-	+ [ ] ?
++ [ ] Actual tauri menu UI:
+	+ [ ] View user login info/status
+	+ [ ] Access mounted folder
+	+ [ ] main Settings:
+		+ [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
+		-- cache
+		+ [ ] cache options: max size, algorithm: FIFO/LIFO
+		+ [ ] option to pre-fetch folders up to certain size or not
+	+ [ ] other config:
+		+ [ ] play notification sound
+		+ [ ] show sync notifications
+		+ [ ] ?
+	+ [ ] Setup flow:
+		+ config exists? -> load: ok|err ->
+		+ ask for login flow in browser: https://github.com/traxys/nextcloud-passwords-client
+		+ save as yaml, lock yaml file permissions
++ [ ] network error handling: EAGAIN|ETIMEDOUT https://pubs.opengroup.org/onlinepubs/009695399/functions/read.html
 
 ### Functionality
 + [x] Tray icon
 + [ ] VFS File handling
 + [ ] VFS Webdav mount
 	+ [ ] Proper VFS with files openable through terminal
-+ [ ] Nextcloud notifications
+
++ [ ] Nextcloud notifications API
 + [ ] nautilus-nextcloud icon support
 	+ [ ] simple, modular RPC api for multiple file browsers: fetch 'recency' of files given path or dir
 	+ [ ] Basic PY implementation https://linuxconfig.org/how-to-write-nautilus-extensions-with-nautilus-python
