@@ -9,11 +9,13 @@ Sure, here's the table you provided in Markdown format:
 ## Feature Goals:
 | Feature                   | Nextcloud Desktop | GNOME Integration/GVfs | ncRS |
 | :------------------------ | :---------------- | :--------------------- | :--- |
-| Virtual Files             | ❌ (Experimental, bad approach which doesn't work with shell/file pickers etc)                | ✅ (remote only)                     | ✅   |
+| Nextcloud Notifications         | ✅ | ❌ | ✅ |
+| Full Shell integration    | ✅                | N/A since it's only online                    | ✅   |
 | Instant local access      | ✅                | ❌                     | ✅   |
+| Virtual Files             | ❌ (Experimental, bad approach which doesn't work with shell/file pickers etc)                | ✅ (remote only)                     | ✅   |
 | Dynamically cache files/keep part locally | ❌                | ❌ (Limited caching, generally on-demand access) | ✅   |
-| Full Shell integration    | ✅                | ✅                     | ✅   |
 | HPB Support/Speed         | ❓ (Not explicitly stated, generally good sync performance) | ❌ | ✅ |
+
 
 ### TODO (minimal):
 + [x] base tauri tray icons https://github.com/tauri-apps/tray-icon
@@ -39,7 +41,7 @@ Sure, here's the table you provided in Markdown format:
 
 + [x] send notifications multi-platform
 + [x] yaml config reader `yaml-rust2 = "0.9.0"`. Overridable with
-+ [-] play notification sound
++ [-] play notification sound: requires rodio in separate thread https://github.com/RustAudio/rodio/blob/f1eaaa4a6346933fc8a58d5fd1ace170946b3a94/examples/music_ogg.rs
 
 + [ ] Webdav implementation
 + [ ] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
