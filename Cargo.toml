@@ -1,6 +1,6 @@
 [workspace]
 members = [
-  "lib",
+  "ncrs_core",
   "ncrs-gui/src-tauri"
 ]
 resolver = "2"

@@ -1,5 +1,5 @@
 [package]
-name = "ncrs_lib"
+name = "ncrs_core"
 version = "0.1.0"
 edition = "2021"
 

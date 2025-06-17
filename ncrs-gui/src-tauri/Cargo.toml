@@ -19,7 +19,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tokio = { version = "1.45.1", features = [] }
-ncrs_lib = { path = "../../lib" }
+ncrs_core = { path = "../../ncrs_core" }
 log = "0.4"
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"

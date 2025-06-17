@@ -2237,7 +2237,7 @@ name = "ncrs-gui"
 version = "0.1.0"
 dependencies = [
  "log",
- "ncrs_lib",
+ "ncrs_core",
  "serde",
  "serde_json",
  "tauri",
@@ -2249,7 +2249,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ncrs_lib"
+name = "ncrs_core"
 version = "0.1.0"
 dependencies = [
  "chrono",

@@ -10,7 +10,7 @@ use tokio::time::{sleep, Duration};
 use std::thread;
 use std::sync::{Arc, Mutex};
 
-use ncrs_lib::{
+use ncrs_core::{
     mount_webdav,
     MountOptions,
     SyncState
