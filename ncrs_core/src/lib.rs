@@ -44,7 +44,7 @@ pub struct MountStats {
     pub mount_status: String,
 }
 
-pub struct WebdavFs {
+pub struct NextCloudFs {
     webdav_client: Arc<Mutex<WebdavClient>>,
     inodes: Arc<Mutex<HashMap<u64, PathBuf>>>,
     paths: Arc<Mutex<HashMap<PathBuf, u64>>>,
@@ -182,7 +182,7 @@ fn parse_webdav_response(base_path: &Path) -> Result<Vec<DavEntry>, Box<dyn std:
     Ok(entries)
 }
 
-impl WebdavFs {
+impl NextCloudFs {
     pub fn new(options: MountOptions) -> Self {
         let mut inodes = HashMap::new();
         let mut paths = HashMap::new();
@@ -197,7 +197,7 @@ impl WebdavFs {
             ..Default::default()
         };
         
-        WebdavFs {
+        NextCloudFs {
             webdav_client: Arc::new(Mutex::new(WebdavClient::new(
                 options.url, 
                 options.username, 
@@ -293,7 +293,7 @@ impl WebdavFs {
     }
 }
 
-impl Filesystem for WebdavFs {
+impl Filesystem for NextCloudFs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let parent_path = match self.get_path(parent) {
             Some(path) => path,
@@ -475,8 +475,8 @@ impl Filesystem for WebdavFs {
 }
 
 // Function to mount the filesystem
-pub fn mount_webdav(options: MountOptions) -> Result<(), Box<dyn std::error::Error>> {
-    let filesystem = WebdavFs::new(options.clone());
+pub fn mount_ncfs(options: MountOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let filesystem = NextCloudFs::new(options.clone());
     
     let fuse_options = vec![
         MountOption::RO,

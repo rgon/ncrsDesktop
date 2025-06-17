@@ -11,7 +11,7 @@ use std::thread;
 use std::sync::{Arc, Mutex};
 
 use ncrs_core::{
-    mount_webdav,
+    mount_ncfs,
     MountOptions,
     SyncState
 };
@@ -73,7 +73,7 @@ pub fn run() {
         // move sync_state to the app state
         .setup(move |app| {
             // Spawn setup as a non-blocking task
-            spawn(setup(app.handle().clone()));
+            spawn(run_ncfs_client(app.handle().clone()));
 
             let menu: Menu<tauri_runtime_wry::Wry<EventLoopMessage>> = rerender_tray_menu(app.handle().clone(), sync_state_pointer_clone.lock().unwrap().clone())?;
             let icon = load_icon(
@@ -176,7 +176,7 @@ fn load_icon(path:&'static str) -> Image<'static> {
 }
 
 // An async function that does some heavy setup task
-async fn setup(_app: AppHandle) -> Result<(), ()> {
+async fn run_ncfs_client(_app: AppHandle) -> Result<(), ()> {
     // Fake performing some heavy action for 3 seconds
     println!("Performing really heavy backend setup task...");
     sleep(Duration::from_secs(3)).await;
@@ -188,7 +188,7 @@ async fn setup(_app: AppHandle) -> Result<(), ()> {
     let user = "testlocaluser".to_string();
 
     thread::spawn(|| {
-        mount_webdav(MountOptions {
+        mount_ncfs(MountOptions {
             url: "http://example.com/webdav".to_string(),
             username: Some("testuser".to_string()), password: Some("pass".to_string()),
             mount_point: PathBuf::from("/media/rgon/ncrsDesktop/".to_string()),
