@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
 
+use yaml_rust2::{YamlLoader};
+
 // File attributes 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 // const DIRECTORY_TTL: Duration = Duration::from_secs(60); // 1 minute
@@ -495,4 +497,20 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), Box<dyn std::error::Error
     fuser::mount2(filesystem, &options.mount_point, &fuse_options)?;
     
     Ok(())
+}
+
+pub fn configuration_parser(yaml_conf:&String) -> MountOptions {
+    let docs = YamlLoader::load_from_str(yaml_conf).unwrap();
+
+    // Multi document support, doc is a yaml::Yaml
+    let doc = &docs[0];
+
+    return MountOptions {
+        // raise expect("No server URL specified")
+        url: doc["url"].as_str().unwrap().to_string(),
+        username: doc["username"].as_str().map(|s| s.to_string()),
+        password: doc["password"].as_str().map(|s| s.to_string()),
+        mount_point: PathBuf::from(doc["mount_point"].as_str().unwrap_or("/media/ncrs_mount")),
+        log_user: doc["user"].as_str().unwrap_or("default_user").to_string(),
+    };
 }

@@ -24,14 +24,22 @@ Dependencies:
 + [x] fix tokio error
 + [x] basic fuse mount
 
-+ [ ] send notifications multi-platform
-
-+ [ ] yaml config reader `yaml-rust2 = "0.9.0"`. Overridable with 
++ [x] send notifications multi-platform
++ [ ] yaml config reader `yaml-rust2 = "0.9.0"`. Overridable with
++ [ ] play notification sound
 
 + [ ] Webdav implementation
 + [ ] webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
-+ [ ] Proper login flow as here: https://github.com/traxys/nextcloud-passwords-client
-+ [ ] Actual tauri UI
++ [ ] Actual tauri menu UI
++ [ ] Setup flow:
+	+ config exists? -> load: ok|err ->
+	+ ask for login flow in browser: https://github.com/traxys/nextcloud-passwords-client
+	+ save as yaml, lock yaml file permissions
+
++ [ ] other config:
+	+ [ ] play notification sound
+	+ [ ] show sync notifications
+	+ [ ] ?
 
 ### Functionality
 + [x] Tray icon
