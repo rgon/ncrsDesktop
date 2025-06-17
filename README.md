@@ -9,7 +9,7 @@ Dependencies:
 	+ [x] load js file, interactable (back!)
 	+ [x] show icon and window separately
 	+ [x] tokio setup function
-	+ [ ] window interactions:
+	+ [x] window interactions:
 		+ [x] disable close, maximize
 		+ [x] hide window on close. FIX: minimize event not firing
 	+ [x] app icon: gnome only loads icons from .desktop files in which case tauri dev won't be able to display the icon
@@ -23,6 +23,8 @@ Dependencies:
 + [x] import fuse mount
 + [x] fix tokio error
 + [x] basic fuse mount
+
++ [ ] send notifications multi-platform
 
 + [ ] yaml config reader `yaml-rust2 = "0.9.0"`. Overridable with 
 

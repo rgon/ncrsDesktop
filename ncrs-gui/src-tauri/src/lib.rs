@@ -1,20 +1,20 @@
 use std::path::PathBuf;
 
 use tauri::{
-    image::Image, menu::{Menu, MenuBuilder, MenuItem}, tray::TrayIconBuilder, AppHandle, EventLoopMessage, Manager, WindowEvent,
-    tray::TrayIconId
+    image::Image,
+    menu::{Menu, MenuBuilder, MenuItem},
+    tray::TrayIconBuilder,
+    tray::TrayIconId,
+    AppHandle, EventLoopMessage, Manager, WindowEvent,
 };
+use tauri_plugin_notification::NotificationExt;
 
+use std::sync::{Arc, Mutex};
+use std::thread;
 use tauri::async_runtime::spawn;
 use tokio::time::{sleep, Duration};
-use std::thread;
-use std::sync::{Arc, Mutex};
 
-use ncrs_core::{
-    mount_ncfs,
-    MountOptions,
-    SyncState
-};
+use ncrs_core::{mount_ncfs, MountOptions, SyncState};
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -22,9 +22,12 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
-fn rerender_tray_menu(app: AppHandle, sync_state: SyncState) -> Result<tauri::menu::Menu<tauri_runtime_wry::Wry<EventLoopMessage>>, tauri::Error> {
+fn rerender_tray_menu(
+    app: AppHandle,
+    sync_state: SyncState,
+) -> Result<tauri::menu::Menu<tauri_runtime_wry::Wry<EventLoopMessage>>, tauri::Error> {
     // let tray = app.tray_by_id("main-tray").unwrap();
-    
+
     // let menu_handle = app.menu().unwrap();
     // let pause_handle = menu_handle.get("pause").unwrap();
     // let pause_item = pause_handle.as_menuitem().unwrap();
@@ -62,36 +65,40 @@ pub fn run() {
     let sync_state_pointer_clone = sync_state_pointer.clone();
     let sync_state_pointer_clone2 = sync_state_pointer.clone();
 
-    let tray_icon_id:Arc<Mutex<Option<TrayIconId>>> = Arc::new(Mutex::new(None));
+    let tray_icon_id: Arc<Mutex<Option<TrayIconId>>> = Arc::new(Mutex::new(None));
     let tray_icon_id_clone = tray_icon_id.clone();
     let tray_icon_id_clone2 = tray_icon_id.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_positioner::init())
         .invoke_handler(tauri::generate_handler![greet])
         // move sync_state to the app state
         .setup(move |app| {
             // Spawn setup as a non-blocking task
             spawn(run_ncfs_client(app.handle().clone()));
 
-            let menu: Menu<tauri_runtime_wry::Wry<EventLoopMessage>> = rerender_tray_menu(app.handle().clone(), sync_state_pointer_clone.lock().unwrap().clone())?;
-            let icon = load_icon(
-                concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png")
-            );
+            let menu: Menu<tauri_runtime_wry::Wry<EventLoopMessage>> = rerender_tray_menu(
+                app.handle().clone(),
+                sync_state_pointer_clone.lock().unwrap().clone(),
+            )?;
+            let icon = load_icon(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/icons/tray_icon.idle.png"
+            ));
 
             let tray_icon = TrayIconBuilder::new()
                 .menu(&menu)
                 .icon(icon)
                 .show_menu_on_left_click(true)
-                .on_tray_icon_event(|app, event| {
-                    tauri_plugin_positioner::on_tray_event(app.app_handle(), &event);
-                })
                 .build(app)
                 .unwrap();
 
             // Set the tray icon id to the app state
-            tray_icon_id_clone.lock().unwrap().replace(tray_icon.id().clone());
+            tray_icon_id_clone
+                .lock()
+                .unwrap()
+                .replace(tray_icon.id().clone());
 
             Ok(())
         })
@@ -103,7 +110,7 @@ pub fn run() {
 
                 println!("Window close requested");
                 api.prevent_close(); // Prevent the window from closing
-                // app.exit(0);
+                                     // app.exit(0);
             }
             WindowEvent::Destroyed => {
                 // Handle window destruction
@@ -113,42 +120,63 @@ pub fn run() {
             _ => {}
         })
         .on_menu_event(move |app, event| match event.id.as_ref() {
-            "about" => {                
+            "about" => {
                 let main_window = app.get_webview_window("main").unwrap();
                 main_window.show().unwrap();
             }
             "pause" => {
-                let tray = app.tray_by_id(tray_icon_id_clone2.lock().unwrap().as_ref().unwrap()).unwrap();
+                let tray = app
+                    .tray_by_id(tray_icon_id_clone2.lock().unwrap().as_ref().unwrap())
+                    .unwrap();
 
                 // Toggle state
                 if *sync_state_pointer_clone2.lock().unwrap() == SyncState::Paused {
                     // Set sync state to Idle
                     *sync_state_pointer_clone2.lock().unwrap() = SyncState::Idle;
-                } else {    
+                } else {
                     // Set sync state to Paused
                     *sync_state_pointer_clone2.lock().unwrap() = SyncState::Paused;
                 }
 
-                let new_icon:Option<Image> = match *sync_state_pointer_clone2.lock().unwrap() {
-                    SyncState::Idle => Some(load_icon(
-                        concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png")
-                    )),
-                    SyncState::Paused => Some(load_icon(
-                        concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png")
-                    )),
-                    SyncState::Syncing => Some(load_icon(
-                        concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.syncing.png")
-                    )),
-                    SyncState::Error(_) => Some(load_icon(
-                        concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.error.png")
-                    )),
+                let new_icon: Option<Image> = match *sync_state_pointer_clone2.lock().unwrap() {
+                    SyncState::Idle => Some(load_icon(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/icons/tray_icon.idle.png"
+                    ))),
+                    SyncState::Paused => Some(load_icon(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/icons/tray_icon.paused.png"
+                    ))),
+                    SyncState::Syncing => Some(load_icon(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/icons/tray_icon.syncing.png"
+                    ))),
+                    SyncState::Error(_) => Some(load_icon(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/icons/tray_icon.error.png"
+                    ))),
                 };
+
+                app.notification()
+                    .builder()
+                    .title("NCRS Sync Status")
+                    .body(if  *sync_state_pointer_clone2.lock().unwrap() == SyncState::Paused {
+                        "Sync paused"
+                    } else {
+                        "Sync resumed"
+                    })
+                    .show()
+                    .unwrap();
 
                 // Set icon
                 tray.set_icon(new_icon).unwrap();
 
                 // Refresh menu
-                let menu: Menu<tauri_runtime_wry::Wry<EventLoopMessage>> = rerender_tray_menu(app.app_handle().clone(), sync_state_pointer_clone2.lock().unwrap().clone()).unwrap();
+                let menu: Menu<tauri_runtime_wry::Wry<EventLoopMessage>> = rerender_tray_menu(
+                    app.app_handle().clone(),
+                    sync_state_pointer_clone2.lock().unwrap().clone(),
+                )
+                .unwrap();
                 tray.set_menu(Some(menu)).unwrap();
             }
             "settings" => {
@@ -170,9 +198,8 @@ pub fn run() {
         .expect("error while running tauri application")
 }
 
-fn load_icon(path:&'static str) -> Image<'static> {
-    Image::from_path(std::path::Path::new(path))
-        .expect("Failed to load icon image")
+fn load_icon(path: &'static str) -> Image<'static> {
+    Image::from_path(std::path::Path::new(path)).expect("Failed to load icon image")
 }
 
 // An async function that does some heavy setup task
@@ -190,14 +217,18 @@ async fn run_ncfs_client(_app: AppHandle) -> Result<(), ()> {
     thread::spawn(|| {
         mount_ncfs(MountOptions {
             url: "http://example.com/webdav".to_string(),
-            username: Some("testuser".to_string()), password: Some("pass".to_string()),
+            username: Some("testuser".to_string()),
+            password: Some("pass".to_string()),
             mount_point: PathBuf::from("/media/rgon/ncrsDesktop/".to_string()),
-            log_user: user
-        }).unwrap();
-    
+            log_user: user,
+        })
+        .unwrap();
+
         println!("Mounted");
-    }).join().unwrap();
-    
+    })
+    .join()
+    .unwrap();
+
     println!("Exited");
 
     // set_complete(
