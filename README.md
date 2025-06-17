@@ -31,7 +31,7 @@ Sure, here's the table you provided in Markdown format:
 	+ [x] save state machine
 	+ [x] multiple icons given sync machine
 	+ [x] pause & edit state menu
-	+ [ ] open in top position
+	+ [-] open in top position: cannot get this to work in Gnome
 
 + [x] import fuse mount
 + [x] fix tokio error
@@ -39,12 +39,14 @@ Sure, here's the table you provided in Markdown format:
 
 + [x] send notifications multi-platform
 + [x] yaml config reader `yaml-rust2 = "0.9.0"`. Overridable with
-+ [ ] play notification sound
++ [-] play notification sound
 
 + [ ] Webdav implementation
 + [ ] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
 
 + [ ] Actual tauri menu UI:
+	+ [ ] get avatar: https://github.com/nextcloud/desktop/blob/cd44540a5a30c1e639edc8082228d211a3d9a34b/src/libsync/networkjobs.cpp#L787C1-L787C148
+		yourcloud.domain/remote.php/dav/avatars/userID/256.png
 	+ [ ] View user login info/status: HPB Connection, DAV Connection. Turn orange if HPB NOK.
 	+ [ ] Access mounted folder
 	+ [ ] main Settings:
@@ -100,3 +102,8 @@ Sure, here's the table you provided in Markdown format:
 
 ### Known bugs
 + [ ] fix `fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf` without setting it
+
+
+## Future
++ [ ] Clean branding images/icons etc. Ask NC team
++ [ ] Add project to remotefs-rs/remotefs-rs list of used projects

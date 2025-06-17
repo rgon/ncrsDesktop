@@ -165,6 +165,8 @@ pub fn run() {
                     } else {
                         "Sync resumed"
                     })
+                    // * The sound resource name. Only available on mobile.
+                    // .sound("default")
                     .show()
                     .unwrap();
 
