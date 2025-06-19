@@ -4,7 +4,8 @@ Dependencies:
 	rustup
 ```
 # ncRS Desktop client
-Sure, here's the table you provided in Markdown format:
+
+![Main dialog](docs/screenshot.png)
 
 ## Feature Goals:
 | Feature                   | Nextcloud Desktop | GNOME Integration/GVfs | ncRS |
