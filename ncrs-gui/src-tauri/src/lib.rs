@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use tauri::{
     image::Image,
     menu::{Menu, MenuBuilder, MenuItem},
-    tray::TrayIconBuilder,
-    tray::TrayIconId,
-    AppHandle, EventLoopMessage, Manager, WindowEvent,
+    tray::{TrayIconBuilder, TrayIconId},
+    AppHandle, EventLoopMessage, Manager, WindowEvent, 
+    PhysicalSize
 };
 use tauri_plugin_notification::NotificationExt;
 
@@ -20,6 +20,15 @@ use ncrs_core::{mount_ncfs, MountOptions, SyncState};
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[tauri::command]
+fn close_window(app: AppHandle) {
+    // Get the main window by its label
+    let main_window = app.get_webview_window("main").unwrap();
+    // Hide the main window instead of closing it
+    main_window.hide().unwrap();
+    println!("Main window closed");
 }
 
 fn rerender_tray_menu(
@@ -58,6 +67,50 @@ fn rerender_tray_menu(
         .build();
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum AppEntrypoint {
+    Main,
+    Settings,
+}
+
+fn open_main_window(app: &AppHandle, entrypoint:AppEntrypoint) {
+    println!("Opening main window... Entry point: {:?}", entrypoint);
+
+    // Open the main window
+    let main_window = app.get_webview_window("main").unwrap();
+
+    // Get monitor size
+    let monitor = main_window.primary_monitor().unwrap();
+
+    let size = if monitor.is_some() {
+        monitor.unwrap().size().clone()
+    } else {
+        PhysicalSize::new(1860u32, 1000u32) // Default
+    };
+
+    println!("Monitor size: {:?}", size);
+
+    // Set the size of the main window
+    main_window.set_size(size).unwrap();
+
+    // Also, tauri's implementation does not allow getting tray click events on wayland
+
+    // Set the position to the top right corner of the screen
+    // main_window.set_position(PhysicalPosition { 
+    //     x: 1500,
+    //     y: 20
+    // }).unwrap();
+
+    // Wayland does not support explicitly setting the window position, so we need to build a transparent, decorationless window
+    // and position the 'virtual' window in the top right corner of the screen.
+
+    // Show window
+    main_window.show().unwrap();
+
+    // Optionally, you can also focus the window
+    main_window.set_focus().unwrap();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let sync_state = SyncState::Idle;
@@ -72,7 +125,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            close_window
+        ])
         // move sync_state to the app state
         .setup(move |app| {
             // Spawn setup as a non-blocking task
@@ -121,8 +177,9 @@ pub fn run() {
         })
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "about" => {
-                let main_window = app.get_webview_window("main").unwrap();
-                main_window.show().unwrap();
+                // let main_window = app.get_webview_window("main").unwrap();
+                // main_window.show().unwrap();
+                open_main_window(app, AppEntrypoint::Main);
             }
             "pause" => {
                 let tray = app
@@ -183,10 +240,8 @@ pub fn run() {
             }
             "settings" => {
                 println!("settings menu item was clicked");
-                // Open main window, but go to url /settings
-                let main_window = app.get_webview_window("main").unwrap();
-                main_window.show().unwrap();
-                // main_window.eval("window.location.href = '/settings';").unwrap();
+                // Open settings window or dialog
+                open_main_window(app, AppEntrypoint::Settings);
             }
             "quit" => {
                 println!("quit menu item was clicked");

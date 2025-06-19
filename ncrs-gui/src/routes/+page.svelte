@@ -1,156 +1,205 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+    import '../app.css';
 
-  let name = $state("");
-  let greetMsg = $state("");
+    import Icon from '../components/Icon.svelte';
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
-  }
+    import { invoke } from "@tauri-apps/api/core";
+
+    import { mdiAlertCircleOutline, mdiInformationVariantCircleOutline,
+        mdiMagnify, mdiFolder, mdiAppsBox,
+        mdiPlus, mdiAccountCog,
+        mdiMessageText,
+        mdiChevronDown, mdiClose,
+    } from '@mdi/js';
+
+    import { onMount } from 'svelte';
+
+    import SetStatusView from './SetStatusView.svelte';
+    import SyncProgressView from './SyncProgressView.svelte';
+    
+    let userName = $state("Your Name");
+    let greetMsg = $state("");
+    
+    let notifications = $state([
+        { id: 1, message: "New file uploaded!", description: "File 'report.pdf' has been successfully uploaded.", type: "info", icon: mdiInformationVariantCircleOutline},
+        { id: 2, message: "Important system updates are available.", description: "Please update your system to the latest version.", type: "info", icon: mdiAlertCircleOutline, action: () => {}, cta: "View"},
+        { id: 3, message: "Test user sent a message to ABCD", description: "Hello team! What are we working on today?", type: "info", icon: mdiMessageText, avatar: "https://avatars.githubusercontent.com/u/5474117?v=4"},
+        { id: 4, message: "Important system updates are available.", description: "Please update your system to the latest version.", type: "info", icon: mdiAlertCircleOutline, action: () => {}, cta: "View"},
+        { id: 5, message: "New file uploaded!", description: "File 'image.png' has been successfully uploaded.", type: "info", icon: mdiInformationVariantCircleOutline}
+    ]);
+    
+    async function greet(event: Event) {
+      event.preventDefault();
+      // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+      greetMsg = await invoke("greet", { userName });
+    }
+    
+    async function close() {
+      // Close the Tauri window
+      await invoke("close_window");
+    }
+    
+    onMount(() => {
+      // Detect click outside the main container to close the window
+      const clickOutListener = (event:MouseEvent) => {
+        const container = document.querySelector(".container");
+        if (container && !container.contains(event.target as Node)) {
+          close();
+        }
+      }
+      
+      document.addEventListener("click", clickOutListener);
+      // Detect Escape key to close the window
+      const escKeyListener = (event:KeyboardEvent) => {
+        if (event.key === "Escape") {
+          close();
+        }
+      }
+      document.addEventListener("keydown", escKeyListener);
+      
+      return () => {
+        document.removeEventListener("click", clickOutListener);
+        document.removeEventListener("keydown", escKeyListener);
+      };
+    })
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<!-- Root is the entire computer window, window is the 'virtual' window we style to bypass wayland positioning limitations -->
+<main class="window select-none">
+    <div class="grid grid-rows-[6rem_auto] h-full w-full">
+        <!-- Header -->
+        <div class="grid grid-rows-2 grid-cols-[auto_auto] items-center justify-between p-4 bg-base-300 rounded-t-lg">
+            
+            <div class="flex items-center row-span-2">
+                <div class="dropdown dropdown-hover dropdown-center cursor-pointer" title="Set status">
+                    <div tabindex="0" role="button" class="avatar">
+                        <div class="w-12 rounded-full">
+                            <img src="https://avatars.githubusercontent.com/u/5474117?v=4" alt="Avatar" />
+                        </div>
+                        <!-- Overlay status circle bottom right -->
+                        <div class="absolute bottom-0 right-0 w-4 h-4 bg-green-500 border-2 border-white rounded-full"></div>
+                    </div>
+                    
+                    <!-- Set account status -->
+                    <SetStatusView class="dropdown-content z-[1] menu shadow bg-base-100 rounded-box" />
+                </div>
 
-  <div class="row">
-    <a href="https://vitejs.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://kit.svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+                <div class="dropdown dropdown-start">
+                    <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
+                    <h1 tabindex="0" role="button" class="ml-2 font-bold cursor-pointer">{userName} <Icon class="w-4 h-4 inline-block" path={mdiChevronDown} />
+                    </h1>
+            
+                    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                    <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box z-1 w-52 p-2 shadow-sm">
+                        <li><button onclick={() => false}>
+                            <Icon class="w-4 h-4 inline-block mr-2 align-baseline" path={mdiAccountCog} /> {userName}
+                        </button></li>
+                        <li><button onclick={() => false}>
+                            <Icon class="w-4 h-4 inline-block mr-2 align-baseline" path={mdiPlus} /> Add account
+                        </button></li>
+                    </ul>
+                </div>
+                
+                <!-- <span class="text-gray-300">Status: connected</span> -->
+            </div>
+            
+            <!-- Close button -->
+            <button class="place-self-end self-start -mt-4 -mr-4 w-8 h-8 px-1 rounded-tr-[16px] rounded-bl-xl cursor-pointer bg-primary-content" onclick={close} aria-label="Close">
+                <Icon class="w-6 h-6" path={mdiClose} />
+            </button>
+            
+            <!-- Toolbar -->
+            <div>
+                <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Search">
+                    <Icon class="w-6 h-6" path={mdiMagnify} />
+                </button>
+                <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Open Containing Folder">
+                    <Icon class="w-6 h-6" path={mdiFolder} />
+                </button>
+                <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Notifications">
+                    <Icon class="w-6 h-6" path={mdiAppsBox} />
+                </button>
+            </div>
+        </div>
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
+        <!-- Sync status -->
+        <SyncProgressView />
+    
+        <!-- Notifications -->
+        <div class="overflow-y-auto p-2 flex-grow">
+            {#each notifications as notification (notification.id) }
+            <div class="alert shadow-none rounded-none border-0 [:not(:last-child)]:border-b [:not(:last-child)]:mb-2 pb-4 border-gray-200 relative">
+                <div class="flex items-center gap-1 justify-start">
+                    {#if notification.avatar}
+                    <div tabindex="0" role="button" class="avatar">
+                        <div class="w-8 rounded-full">
+                            <img src="https://avatars.githubusercontent.com/u/5474117?v=4" alt="Avatar" />
+                        </div>
+
+                        <!-- Overlay status circle bottom right -->
+                        <!-- <div class="absolute bottom-0 right-0 w-4 h-4 bg-green-500 border-2 border-white rounded-full"></div> -->
+                        <Icon class="absolute bottom-0 right-0 w-4 h-4 border-2 border-white bg-white" path={notification.icon} />
+                    </div>
+                    {:else}
+                    <Icon class="inline-block w-8 h-8 mr-2" path={notification.icon} />
+                    {/if}
+                    <div>
+                        <h3 class="font-bold">{notification.message}</h3>
+                        <p>{notification.description}</p>
+                    </div>
+                </div>
+
+                <div class="flex-none self-end justify-self-end">
+                    <time class="text-xs text-gray-400 absolute top-2 right-4">1m ago</time>
+                    {#if notification.action || notification.cta}
+                    <button class="btn btn-sm" onclick={notification.action ?? (() => undefined)}>{notification.cta ?? "Open"}</button>
+                    {/if}
+                </div>
+            </div>
+            {/each}
+        </div>
+    </div>
 </main>
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
 :root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
+    font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 24px;
+    font-weight: 400;
+    
+    color: #0f0f0f;
+    /* background-color: #f6f6f6; */
+    background-color: transparent;
+    
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    -webkit-text-size-adjust: 100%;
 }
 
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
+.window {
+    margin: 0;
+    
+    background-color: #f6f6f6;
+    position: absolute;
+    right: 20px;
+    top: 20px;
+    width: min(400px, 40vw);
+    height: min(700px, 60vh);
+    
+    /* Round like a nice UX window, add border/shadow */
+    border-radius: 16px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    border: 1px solid #eaeaea;
 }
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
+/* 
 @media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
+.window {
+color: #f6f6f6;
+background-color: #2f2f2f;
 }
+} */
 
 </style>

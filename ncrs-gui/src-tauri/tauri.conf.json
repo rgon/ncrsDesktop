@@ -14,14 +14,16 @@
       {
         "title": "ncrs-gui",
         "label": "main",
-        "width": 400,
-        "height": 800,
+        "width": 1860,
+        "height": 1000,
         "resizable": false,
         "minimizable": false,
         "maximizable": false,
         "closable": true,
         "fullscreen": false,
-        "visible": false
+        "visible": false,
+        "decorations": false,
+        "transparent": true
       }
     ],
     "security": {

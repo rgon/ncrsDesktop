@@ -64,6 +64,7 @@ Sure, here's the table you provided in Markdown format:
 		+ config exists? -> load: ok|err ->
 		+ ask for login flow in browser: https://github.com/traxys/nextcloud-passwords-client
 		+ save as yaml, lock yaml file permissions
+	+ [ ] Set status! Online/offline etc
 	----
 	WEB API:
 	+ [ ] fetch notifications
