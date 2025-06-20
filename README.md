@@ -1,8 +1,3 @@
-Dependencies:
-```
-	sudo apt-get install fuse3 libfuse3-dev libxdo-dev
-	rustup
-```
 # ncRS Desktop client
 
 ![Main dialog](docs/screenshot.png)
@@ -17,8 +12,18 @@ Dependencies:
 | Dynamically cache files/keep part locally | ❌                | ❌ (Limited caching, generally on-demand access) | ✅   |
 | HPB Support/Speed         | ❓ (Not explicitly stated, generally good sync performance) | ❌ | ✅ |
 
+## Usage
 
-### TODO (minimal):
+Dependencies:
++ `$: sudo apt-get install fuse3 libfuse3-dev libxdo-dev`
++ https://rustup.rs/
+
+Usage:
+> This project is a WIP, so no binary release yet.
+> 
++ `./runui.sh`
+
+## TODO (development progress tracker):
 + [x] base tauri tray icons https://github.com/tauri-apps/tray-icon
 + [x] HTML tauri settings ui with tray icon support
 	+ [x] open window only when clicking about
@@ -34,7 +39,7 @@ Dependencies:
 	+ [x] save state machine
 	+ [x] multiple icons given sync machine
 	+ [x] pause & edit state menu
-	+ [-] open in top position: cannot get this to work in Gnome
+	+ [ ] open in top position: cannot get this to work in Gnome. WORKED AROUND given all my target users have a single OS! -> review multi-platform support
 
 + [x] import fuse mount
 + [x] fix tokio error
@@ -43,11 +48,12 @@ Dependencies:
 + [x] send notifications multi-platform
 + [x] yaml config reader `yaml-rust2 = "0.9.0"`. Overridable with
 + [-] play notification sound: requires rodio in separate thread https://github.com/RustAudio/rodio/blob/f1eaaa4a6346933fc8a58d5fd1ace170946b3a94/examples/music_ogg.rs
++ [x] non-functional primimtive Svelte/tailwindcss UI 
 
 + [ ] Webdav implementation
 + [ ] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
 
-+ [ ] Actual tauri menu UI:
++ [ ] Functional tauri menu UI:
 	+ [ ] get avatar: https://github.com/nextcloud/desktop/blob/cd44540a5a30c1e639edc8082228d211a3d9a34b/src/libsync/networkjobs.cpp#L787C1-L787C148
 		yourcloud.domain/remote.php/dav/avatars/userID/256.png
 	+ [ ] View user login info/status: HPB Connection, DAV Connection. Turn orange if HPB NOK.
@@ -74,8 +80,12 @@ Dependencies:
 
 + [ ] network error handling: EAGAIN|ETIMEDOUT https://pubs.opengroup.org/onlinepubs/009695399/functions/read.html
 + [ ] Systemd service
++ [ ] systemd service installer
++ [ ] release: snap/appimage/flatpak/what? but only in Github Actions
++ [ ] Icon mode: sync status || avatar and user status, errors
++ [ ] Nextcloud integration with clock-in clock-out!! (DUMB spanish regulation) -> separate app? Same app that fetches conn info? Generate png icon with status?
 
-### Functionality
+### Functionality/Service TODO
 + [x] Tray icon
 + [ ] VFS File handling https://github.com/nextcloud/desktop/issues/3668
 > FUSE is not a good solution when network is involved because the normal file API you end up using to access FUSE filesystems is not able to cope with network errors. (?)
