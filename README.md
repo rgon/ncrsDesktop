@@ -9,7 +9,7 @@
 | Full Shell integration    | ✅                | N/A since it's only online                    | ✅   |
 | Instant local access      | ✅                | ❌                     | ✅   |
 | Virtual Files             | ❌ (Experimental, bad approach which doesn't work with shell/file pickers etc)                | ✅ (remote only)                     | ✅   |
-| Dynamically cache files/keep part locally | ❌                | ❌ (Limited caching, generally on-demand access) | ✅   |
+| Dynamically cache files/keep part locally | ❌                | ❌ (No internet = no files) | ✅   |
 | HPB Support/Speed         | ❓ (Not explicitly stated, generally good sync performance) | ❌ | ✅ |
 
 ## Usage
