@@ -14,14 +14,81 @@
 
 ## Usage
 
-Dependencies:
-+ `$: sudo apt-get install fuse3 libfuse3-dev libxdo-dev`
-+ https://rustup.rs/
+### Dependencies
 
-Usage:
-> This project is a WIP, so no binary release yet.
-> 
-+ `./runui.sh`
+```sh
+sudo apt-get install fuse3 libfuse3-dev libxdo-dev
+```
+Rust: https://rustup.rs/
+
+For the Nautilus extension (optional):
+```sh
+sudo apt-get install python3-nautilus
+```
+
+### First-time setup
+
+**1. Create the mount point** — any empty directory works:
+```sh
+mkdir -p ~/ncrs
+```
+
+**2. Create the config file** — run the daemon once to generate the skeleton, then fill it in:
+```sh
+cargo run -p ncrs_core        # exits immediately, writes ~/.config/ncrs/config.yaml
+$EDITOR ~/.config/ncrs/config.yaml
+```
+
+The file looks like this; use an [app password](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) rather than your main password:
+```yaml
+url: https://cloud.example.com/remote.php/dav/files/YOUR_USERNAME/
+username: youruser
+password: xxxx-xxxx-xxxx-xxxx   # app password
+mount_point: /home/you/ncrs
+user: youruser
+```
+
+### Running
+
+**GUI + daemon** (the normal way):
+```sh
+./runui.sh
+```
+This starts the Tauri tray app; the daemon mounts WebDAV at your configured `mount_point` automatically. Downloaded files are cached in `~/.cache/ncrs/`.
+
+**Daemon only** (headless / for systemd):
+```sh
+RUST_LOG=info cargo run -p ncrs_core
+```
+
+### Nautilus integration
+
+Install the shell extension to show sync-state emblems (cloud = remote-only, tick = local) on files in the mount:
+```sh
+./shell_integration/nautilus/install.sh
+nautilus -q   # restart Nautilus
+```
+
+Uninstall:
+```sh
+rm ~/.local/share/nautilus-python/extensions/syncstate.py
+nautilus -q
+```
+
+### Running tests
+
+Unit + integration tests (no server needed — integration tests skip gracefully):
+```sh
+cargo test
+python3 -m unittest shell_integration.nautilus.test_syncstate -v
+```
+
+End-to-end tests against a real WebDAV server (requires Docker):
+```sh
+docker compose -f docker/docker-compose.yml up -d
+WEBDAV_TEST_URL=http://localhost:8888 cargo test -p ncrs_core --test integration_test
+docker compose -f docker/docker-compose.yml down
+```
 
 ## TODO (development progress tracker):
 + [x] base tauri tray icons https://github.com/tauri-apps/tray-icon
