@@ -11,10 +11,16 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use yaml_rust2::YamlLoader;
 
 const TTL: Duration = Duration::from_secs(1);
+const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
+
+struct DirCacheEntry {
+    files: Vec<remotefs::fs::File>,
+    at: Instant,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MountOptions {
@@ -39,6 +45,7 @@ pub struct NextCloudFs {
     paths: HashMap<PathBuf, u64>,
     next_inode: u64,
     log_user: String,
+    dir_cache: HashMap<PathBuf, DirCacheEntry>,
 }
 
 impl NextCloudFs {
@@ -62,6 +69,7 @@ impl NextCloudFs {
             paths,
             next_inode: 2,
             log_user: options.log_user,
+            dir_cache: HashMap::new(),
         })
     }
 
@@ -82,6 +90,26 @@ impl NextCloudFs {
         self.paths.insert(path.clone(), inode);
         self.inodes.insert(inode, path);
         inode
+    }
+
+    fn list_dir_cached(
+        &mut self,
+        path: &Path,
+    ) -> Result<Vec<remotefs::fs::File>, remotefs::RemoteError> {
+        if let Some(entry) = self.dir_cache.get(path) {
+            if entry.at.elapsed() < DIR_CACHE_TTL {
+                return Ok(entry.files.clone());
+            }
+        }
+        let files = self.fs.list_dir(path)?;
+        self.dir_cache.insert(
+            path.to_path_buf(),
+            DirCacheEntry {
+                files: files.clone(),
+                at: Instant::now(),
+            },
+        );
+        Ok(files)
     }
 
     fn make_file_attr(inode: u64, metadata: &remotefs::fs::Metadata) -> FileAttr {
@@ -150,7 +178,7 @@ impl Filesystem for NextCloudFs {
 
         log::debug!("[{}] LOOKUP {}/{}", self.log_user, parent_path.display(), name_str);
 
-        match self.fs.list_dir(&parent_path) {
+        match self.list_dir_cached(&parent_path) {
             Ok(entries) => {
                 for entry in &entries {
                     let entry_name = entry
@@ -198,7 +226,7 @@ impl Filesystem for NextCloudFs {
             .unwrap_or("")
             .to_string();
 
-        match self.fs.list_dir(&parent) {
+        match self.list_dir_cached(&parent) {
             Ok(entries) => {
                 for entry in &entries {
                     let entry_name = entry
@@ -307,7 +335,7 @@ impl Filesystem for NextCloudFs {
             }
         }
 
-        let entries = match self.fs.list_dir(&path) {
+        let entries = match self.list_dir_cached(&path) {
             Ok(e) => e,
             Err(e) => {
                 log::error!("list_dir {}: {}", path.display(), e);
