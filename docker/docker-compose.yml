@@ -1,0 +1,15 @@
+services:
+  webdav:
+    image: bytemark/webdav
+    ports:
+      - "8888:80"
+    environment:
+      AUTH_TYPE: Basic
+      USERNAME: testuser
+      PASSWORD: testpass
+    # Files uploaded/created during testing land here.
+    volumes:
+      - webdav-data:/var/lib/dav
+
+volumes:
+  webdav-data:

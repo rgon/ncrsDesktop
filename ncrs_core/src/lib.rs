@@ -9,7 +9,6 @@ use remotefs_webdav::WebDAVFs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use yaml_rust2::YamlLoader;
@@ -132,13 +131,11 @@ impl NextCloudFs {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
 
-        let mut reader = self
-            .fs
-            .open(remote_path)
-            .map_err(|e| format!("open {}: {}", remote_path.display(), e))?;
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data).map_err(|e| e.to_string())?;
-        std::fs::write(&local_path, &data).map_err(|e| e.to_string())?;
+        let file = std::fs::File::create(&local_path)
+            .map_err(|e| format!("create cache file: {}", e))?;
+        self.fs
+            .open_file(remote_path, Box::new(file))
+            .map_err(|e| format!("open_file {}: {}", remote_path.display(), e))?;
 
         self.file_cache.insert(
             remote_path.to_path_buf(),
