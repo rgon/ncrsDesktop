@@ -2373,6 +2373,7 @@ dependencies = [
  "log",
  "remotefs",
  "remotefs-webdav",
+ "reqwest 0.11.27",
  "serde",
  "yaml-rust2",
 ]
