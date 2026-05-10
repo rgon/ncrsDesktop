@@ -2,21 +2,19 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,
 };
-use libc::ENOENT;
-// use log::info;
+use libc::{EIO, ENOENT};
+use remotefs::fs::FileType as RemoteFileType;
+use remotefs::RemoteFs;
+use remotefs_webdav::WebDAVFs;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
-use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
+use std::time::{Duration, UNIX_EPOCH};
+use yaml_rust2::YamlLoader;
 
-use yaml_rust2::{YamlLoader};
-
-// File attributes 
-const TTL: Duration = Duration::from_secs(1); // 1 second
-// const DIRECTORY_TTL: Duration = Duration::from_secs(60); // 1 minute
+const TTL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MountOptions {
@@ -35,226 +33,75 @@ pub enum SyncState {
     Error(String),
 }
 
-// Stats structure for monitoring
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct MountStats {
-    pub ls_operations: usize,
-    pub lookup_operations: usize,
-    pub read_operations: usize,
-    pub bytes_read: usize,
-    pub start_time: String,
-    pub mount_status: String,
-}
-
 pub struct NextCloudFs {
-    webdav_client: Arc<Mutex<WebdavClient>>,
-    inodes: Arc<Mutex<HashMap<u64, PathBuf>>>,
-    paths: Arc<Mutex<HashMap<PathBuf, u64>>>,
-    next_inode: Arc<Mutex<u64>>,
+    fs: WebDAVFs,
+    inodes: HashMap<u64, PathBuf>,
+    paths: HashMap<PathBuf, u64>,
+    next_inode: u64,
     log_user: String,
-    stats: Arc<Mutex<MountStats>>,
-}
-
-struct WebdavClient {
-    url: String,
-    username: Option<String>,
-    password: Option<String>,
-    client: reqwest::Client,
-}
-
-pub fn get_formatted_time() -> String {
-    let now = SystemTime::now();
-    let datetime: DateTime<Utc> = now.into();
-    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-impl WebdavClient {
-    fn new(url: String, username: Option<String>, password: Option<String>) -> Self {
-        WebdavClient {
-            url,
-            username,
-            password,
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-        }
-    }
-
-    async fn list_directory(&self, path: &Path) -> Result<Vec<DavEntry>, Box<dyn std::error::Error>> {
-        let full_url = format!("{}{}", self.url, path.display());
-        
-        // Create a custom PROPFIND request
-        let mut req = self.client
-            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &full_url);
-        
-        // Add authentication if provided
-        if let (Some(username), Some(password)) = (&self.username, &self.password) {
-            req = req.basic_auth(username, Some(password));
-        }
-        
-        // WebDAV PROPFIND request
-        req = req.header("Depth", "1");
-        req = req.header("Content-Type", "application/xml");
-        req = req.body(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-               <propfind xmlns="DAV:">
-                 <prop>
-                   <resourcetype/>
-                   <getcontentlength/>
-                   <getlastmodified/>
-                   <creationdate/>
-                   <displayname/>
-                 </prop>
-               </propfind>"#
-            .to_string(),
-        );
-
-        let response = req.send().await?;
-        
-        if !response.status().is_success() {
-            return Err(format!("Failed to list directory: {}", response.status()).into());
-        }
-        
-        let _xml = response.text().await?;
-        
-        // Parse XML response to extract directory entries
-        // This is simplified for the example
-        // In a real implementation, you would properly parse the XML
-        let entries = parse_webdav_response(path)?;
-        
-        Ok(entries)
-    }
-
-    async fn get_file(&self, path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let full_url = format!("{}{}", self.url, path.display());
-        let mut req = self.client.get(&full_url);
-        
-        // Add authentication if provided
-        if let (Some(username), Some(password)) = (&self.username, &self.password) {
-            req = req.basic_auth(username, Some(password));
-        }
-        
-        let response = req.send().await?;
-        
-        if !response.status().is_success() {
-            return Err(format!("Failed to get file: {}", response.status()).into());
-        }
-        
-        let bytes = response.bytes().await?;
-        Ok(bytes.to_vec())
-    }
-}
-
-struct DavEntry {
-    name: String,
-    is_dir: bool,
-    size: u64,
-    modified: SystemTime,
-}
-
-fn parse_webdav_response(base_path: &Path) -> Result<Vec<DavEntry>, Box<dyn std::error::Error>> {
-    // In a real implementation, you would use an XML parser here
-    // This is just a placeholder for the example
-    let mut entries = Vec::new();
-    
-    // Add a dummy entry for testing
-    if base_path == Path::new("/") {
-        entries.push(DavEntry {
-            name: "example_dir".to_string(),
-            is_dir: true,
-            size: 0,
-            modified: SystemTime::now(),
-        });
-        entries.push(DavEntry {
-            name: "example_file.txt".to_string(),
-            is_dir: false,
-            size: 1024,
-            modified: SystemTime::now(),
-        });
-    } else if base_path == Path::new("/example_dir") {
-        entries.push(DavEntry {
-            name: "nested_file.txt".to_string(),
-            is_dir: false,
-            size: 2048,
-            modified: SystemTime::now(),
-        });
-    }
-    
-    Ok(entries)
 }
 
 impl NextCloudFs {
-    pub fn new(options: MountOptions) -> Self {
+    pub fn new(options: MountOptions) -> Result<Self, String> {
+        let username = options.username.unwrap_or_default();
+        let password = options.password.unwrap_or_default();
+
+        let mut webdav_fs = WebDAVFs::new(&username, &password, &options.url);
+        webdav_fs
+            .connect()
+            .map_err(|e| format!("WebDAV connect failed: {}", e))?;
+
         let mut inodes = HashMap::new();
         let mut paths = HashMap::new();
-        
-        // Initialize root directory
         inodes.insert(1, PathBuf::from("/"));
         paths.insert(PathBuf::from("/"), 1);
-        
-        let stats = MountStats {
-            start_time: get_formatted_time(),
-            mount_status: "Connected".to_string(),
-            ..Default::default()
-        };
-        
-        NextCloudFs {
-            webdav_client: Arc::new(Mutex::new(WebdavClient::new(
-                options.url, 
-                options.username, 
-                options.password
-            ))),
-            inodes: Arc::new(Mutex::new(inodes)),
-            paths: Arc::new(Mutex::new(paths)),
-            next_inode: Arc::new(Mutex::new(2)),
+
+        Ok(NextCloudFs {
+            fs: webdav_fs,
+            inodes,
+            paths,
+            next_inode: 2,
             log_user: options.log_user,
-            stats: Arc::new(Mutex::new(stats)),
-        }
+        })
     }
-    
-    pub fn get_stats(&self) -> MountStats {
-        self.stats.lock().unwrap().clone()
-    }
-    
+
     fn get_inode(&self, path: &Path) -> Option<u64> {
-        self.paths.lock().unwrap().get(path).copied()
+        self.paths.get(path).copied()
     }
-    
-    fn get_path(&self, inode: u64) -> Option<PathBuf> {
-        self.inodes.lock().unwrap().get(&inode).cloned()
+
+    fn get_path(&self, inode: u64) -> Option<&PathBuf> {
+        self.inodes.get(&inode)
     }
-    
-    fn allocate_inode(&self, path: PathBuf) -> u64 {
-        let mut next_inode = self.next_inode.lock().unwrap();
-        let mut paths = self.paths.lock().unwrap();
-        let mut inodes = self.inodes.lock().unwrap();
-        
-        if let Some(inode) = paths.get(&path) {
+
+    fn allocate_inode(&mut self, path: PathBuf) -> u64 {
+        if let Some(inode) = self.paths.get(&path) {
             return *inode;
         }
-        
-        let inode = *next_inode;
-        *next_inode += 1;
-        
-        paths.insert(path.clone(), inode);
-        inodes.insert(inode, path);
-        
+        let inode = self.next_inode;
+        self.next_inode += 1;
+        self.paths.insert(path.clone(), inode);
+        self.inodes.insert(inode, path);
         inode
     }
-    
-    fn create_file_attr(&self, inode: u64, size: u64, is_dir: bool, modified: SystemTime) -> FileAttr {
+
+    fn make_file_attr(inode: u64, metadata: &remotefs::fs::Metadata) -> FileAttr {
+        let modified = metadata.modified.unwrap_or(UNIX_EPOCH);
+        let is_dir = metadata.file_type == RemoteFileType::Directory;
         FileAttr {
             ino: inode,
-            size,
-            blocks: (size + 511) / 512,
+            size: metadata.size,
+            blocks: (metadata.size + 511) / 512,
             atime: modified,
             mtime: modified,
             ctime: modified,
             crtime: modified,
-            kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
+            kind: if is_dir {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            },
             perm: if is_dir { 0o755 } else { 0o644 },
-            nlink: 1,
+            nlink: if is_dir { 2 } else { 1 },
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             rdev: 0,
@@ -263,254 +110,287 @@ impl NextCloudFs {
         }
     }
 
-    fn log_operation(&self, operation: &str, path: &Path) {
-        let mut stats = self.stats.lock().unwrap();
-        
-        match operation {
-            "LS" => stats.ls_operations += 1,
-            "LOOKUP" => stats.lookup_operations += 1,
-            "READ" => stats.read_operations += 1,
-            _ => {}
+    fn root_attr() -> FileAttr {
+        FileAttr {
+            ino: 1,
+            size: 0,
+            blocks: 0,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
+            kind: FileType::Directory,
+            perm: 0o755,
+            nlink: 2,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: 0,
+            flags: 0,
+            blksize: 512,
         }
-        
-        println!("[{}] User: {} | Operation: {} | Path: {}", 
-            get_formatted_time(), 
-            self.log_user, 
-            operation, 
-            path.display()
-        );
-    }
-    
-    fn log_read(&self, path: &Path, offset: i64, size: u32) {
-        let mut stats = self.stats.lock().unwrap();
-        stats.bytes_read += size as usize;
-        
-        println!("[{}] User: {} | File Access: {} | Offset: {} | Size: {} bytes", 
-            get_formatted_time(), 
-            self.log_user, 
-            path.display(),
-            offset,
-            size
-        );
     }
 }
 
 impl Filesystem for NextCloudFs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let parent_path = match self.get_path(parent) {
-            Some(path) => path,
+        let parent_path = match self.get_path(parent).cloned() {
+            Some(p) => p,
             None => {
                 reply.error(ENOENT);
                 return;
             }
         };
-        
-        let file_name = match name.to_str() {
-            Some(name) => name,
+        let name_str = match name.to_str() {
+            Some(s) => s.to_string(),
             None => {
                 reply.error(ENOENT);
                 return;
             }
         };
-        
-        let mut path = parent_path.clone();
-        path.push(file_name);
-        
-        self.log_operation("LOOKUP", &path);
-        
-        // For simplicity in this example, we're using a blocking runtime
-        // In a real implementation, you'd want to properly handle async
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        
-        rt.block_on(async {
-            let client = self.webdav_client.lock().unwrap();
-            match client.list_directory(&parent_path).await {
-                Ok(entries) => {
-                    for entry in entries {
-                        if entry.name == file_name {
-                            let inode = self.allocate_inode(path);
-                            let attr = self.create_file_attr(inode, entry.size, entry.is_dir, entry.modified);
-                            reply.entry(&TTL, &attr, 0);
-                            return;
-                        }
+
+        log::debug!("[{}] LOOKUP {}/{}", self.log_user, parent_path.display(), name_str);
+
+        match self.fs.list_dir(&parent_path) {
+            Ok(entries) => {
+                for entry in &entries {
+                    let entry_name = entry
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    if entry_name == name_str {
+                        let target_path = parent_path.join(&name_str);
+                        let inode = self.allocate_inode(target_path);
+                        let attr = Self::make_file_attr(inode, &entry.metadata);
+                        reply.entry(&TTL, &attr, 0);
+                        return;
                     }
-                    reply.error(ENOENT);
-                },
-                Err(_) => {
-                    reply.error(ENOENT);
                 }
+                reply.error(ENOENT);
             }
-        });
+            Err(e) => {
+                log::error!("list_dir {}: {}", parent_path.display(), e);
+                reply.error(EIO);
+            }
+        }
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         if ino == 1 {
-            // Root directory
-            let attr = self.create_file_attr(1, 0, true, SystemTime::now());
-            self.log_operation("GETATTR", Path::new("/"));
-            reply.attr(&TTL, &attr);
+            reply.attr(&TTL, &Self::root_attr());
             return;
         }
-        
-        let path = match self.get_path(ino) {
-            Some(path) => path,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        
-        self.log_operation("GETATTR", &path);
-        
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        
-        rt.block_on(async {
-            let client = self.webdav_client.lock().unwrap();
-            let parent_path = path.parent().unwrap_or(Path::new("/"));
-            
-            match client.list_directory(parent_path).await {
-                Ok(entries) => {
-                    if let Some(filename) = path.file_name() {
-                        if let Some(filename_str) = filename.to_str() {
-                            for entry in entries {
-                                if entry.name == filename_str {
-                                    let attr = self.create_file_attr(ino, entry.size, entry.is_dir, entry.modified);
-                                    reply.attr(&TTL, &attr);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    reply.error(ENOENT);
-                },
-                Err(_) => {
-                    reply.error(ENOENT);
-                }
-            }
-        });
-    }
 
-    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
-        let path = match self.get_path(ino) {
-            Some(path) => path,
+        let path = match self.get_path(ino).cloned() {
+            Some(p) => p,
             None => {
                 reply.error(ENOENT);
                 return;
             }
         };
-        
-        self.log_operation("READ", &path);
-        self.log_read(&path, offset, size);
-        
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        
-        rt.block_on(async {
-            let client = self.webdav_client.lock().unwrap();
-            
-            match client.get_file(&path).await {
-                Ok(data) => {
-                    let offset = offset as usize;
-                    let size = size as usize;
-                    
-                    if offset >= data.len() {
-                        reply.data(&[]);
-                    } else {
-                        let end = std::cmp::min(offset + size, data.len());
-                        reply.data(&data[offset..end]);
-                    }
-                },
-                Err(_) => {
-                    reply.error(ENOENT);
-                }
-            }
-        });
-    }
 
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        let path = match self.get_path(ino) {
-            Some(path) => path,
-            None => {
+        log::debug!("[{}] GETATTR {}", self.log_user, path.display());
+
+        let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        match self.fs.list_dir(&parent) {
+            Ok(entries) => {
+                for entry in &entries {
+                    let entry_name = entry
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    if entry_name == file_name {
+                        let attr = Self::make_file_attr(ino, &entry.metadata);
+                        reply.attr(&TTL, &attr);
+                        return;
+                    }
+                }
                 reply.error(ENOENT);
-                return;
             }
-        };
-        
-        self.log_operation("LS", &path);
-        
-        // Add the standard entries
-        if offset == 0 {
-            let _ = reply.add(ino, 0, FileType::Directory, ".");
-            
-            if let Some(parent_ino) = if ino == 1 { Some(1) } else { self.get_inode(path.parent().unwrap_or(Path::new("/"))) } {
-                let _ = reply.add(parent_ino, 1, FileType::Directory, "..");
-            } else {
-                let _ = reply.add(1, 1, FileType::Directory, "..");
+            Err(e) => {
+                log::error!("list_dir {} (for getattr): {}", parent.display(), e);
+                reply.error(EIO);
             }
         }
-        
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        
-        rt.block_on(async {
-            let client = self.webdav_client.lock().unwrap();
-            
-            match client.list_directory(&path).await {
-                Ok(entries) => {
-                    for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                        let mut entry_path = path.clone();
-                        entry_path.push(&entry.name);
-                        
-                        let entry_ino = self.allocate_inode(entry_path);
-                        let file_type = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                        
-                        if reply.add(entry_ino, (i + 2 + offset as usize) as i64, file_type, entry.name) {
-                            break;
-                        }
-                    }
-                    reply.ok();
-                },
-                Err(_) => {
-                    reply.error(ENOENT);
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock: Option<u64>,
+        reply: ReplyData,
+    ) {
+        let path = match self.get_path(ino).cloned() {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        log::debug!(
+            "[{}] READ {} offset={} size={}",
+            self.log_user,
+            path.display(),
+            offset,
+            size
+        );
+
+        match self.fs.open(&path) {
+            Ok(mut stream) => {
+                let mut data = Vec::new();
+                if let Err(e) = stream.read_to_end(&mut data) {
+                    log::error!("read {}: {}", path.display(), e);
+                    reply.error(EIO);
+                    return;
+                }
+                let off = offset as usize;
+                if off >= data.len() {
+                    reply.data(&[]);
+                } else {
+                    let end = std::cmp::min(off + size as usize, data.len());
+                    reply.data(&data[off..end]);
                 }
             }
-        });
+            Err(e) => {
+                log::error!("open {}: {}", path.display(), e);
+                reply.error(EIO);
+            }
+        }
+    }
+
+    fn readdir(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        let path = match self.get_path(ino).cloned() {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        log::debug!("[{}] READDIR {}", self.log_user, path.display());
+
+        // Emit . and .. before the requested offset
+        if offset == 0 {
+            if reply.add(ino, 1, FileType::Directory, ".") {
+                reply.ok();
+                return;
+            }
+            let parent_ino = if ino == 1 {
+                1
+            } else {
+                let parent = path.parent().unwrap_or(Path::new("/"));
+                self.get_inode(parent).unwrap_or(1)
+            };
+            if reply.add(parent_ino, 2, FileType::Directory, "..") {
+                reply.ok();
+                return;
+            }
+        }
+
+        let entries = match self.fs.list_dir(&path) {
+            Ok(e) => e,
+            Err(e) => {
+                log::error!("list_dir {}: {}", path.display(), e);
+                reply.error(EIO);
+                return;
+            }
+        };
+
+        let skip = if offset > 2 { (offset - 2) as usize } else { 0 };
+
+        for (i, entry) in entries.iter().enumerate().skip(skip) {
+            let name = match entry.path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let entry_path = path.join(&name);
+            let entry_ino = self.allocate_inode(entry_path);
+            let is_dir = entry.metadata.file_type == RemoteFileType::Directory;
+            let kind = if is_dir {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            // offset is 1-based: . = 1, .. = 2, entries start at 3
+            if reply.add(entry_ino, (i + 3) as i64, kind, &name) {
+                break;
+            }
+        }
+
+        reply.ok();
     }
 }
 
-// Function to mount the filesystem
-pub fn mount_ncfs(options: MountOptions) -> Result<(), Box<dyn std::error::Error>> {
-    let filesystem = NextCloudFs::new(options.clone());
-    
+pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
+    let filesystem = NextCloudFs::new(options.clone())?;
+
     let fuse_options = vec![
         MountOption::RO,
-        MountOption::FSName("webdav-fs".to_string()),
+        MountOption::FSName("ncrs".to_string()),
         MountOption::AutoUnmount,
-        MountOption::AllowOther,
     ];
-    
-    println!("[{}] User: {} | WebDAV FUSE mount starting at {}", 
-        get_formatted_time(), 
-        options.log_user, 
+
+    log::info!(
+        "Mounting WebDAV {} at {}",
+        options.url,
         options.mount_point.display()
     );
-    
-    // This will block until the filesystem is unmounted
-    fuser::mount2(filesystem, &options.mount_point, &fuse_options)?;
-    
-    Ok(())
+
+    fuser::mount2(filesystem, &options.mount_point, &fuse_options)
+        .map_err(|e| format!("FUSE mount failed: {}", e))
 }
 
-pub fn configuration_parser(yaml_conf:&String) -> MountOptions {
-    let docs = YamlLoader::load_from_str(yaml_conf).unwrap();
+pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
+    let docs =
+        YamlLoader::load_from_str(yaml_conf).map_err(|e| format!("YAML parse error: {}", e))?;
 
-    // Multi document support, doc is a yaml::Yaml
+    if docs.is_empty() {
+        return Err("Empty config file".to_string());
+    }
+
     let doc = &docs[0];
 
-    return MountOptions {
-        // raise expect("No server URL specified")
-        url: doc["url"].as_str().unwrap().to_string(),
-        username: doc["username"].as_str().map(|s| s.to_string()),
-        password: doc["password"].as_str().map(|s| s.to_string()),
-        mount_point: PathBuf::from(doc["mount_point"].as_str().unwrap_or("/media/ncrs_mount")),
-        log_user: doc["user"].as_str().unwrap_or("default_user").to_string(),
-    };
+    let url = doc["url"]
+        .as_str()
+        .ok_or("Missing 'url' in config")?
+        .to_string();
+    let username = doc["username"].as_str().map(str::to_string);
+    let password = doc["password"].as_str().map(str::to_string);
+    let mount_point = PathBuf::from(
+        doc["mount_point"]
+            .as_str()
+            .unwrap_or("/media/ncrs_mount"),
+    );
+    let log_user = doc["user"]
+        .as_str()
+        .unwrap_or("default_user")
+        .to_string();
+
+    Ok(MountOptions {
+        url,
+        username,
+        password,
+        mount_point,
+        log_user,
+    })
 }

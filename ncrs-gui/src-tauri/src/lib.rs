@@ -272,16 +272,16 @@ async fn run_ncfs_client(_app: AppHandle) -> Result<(), ()> {
     let user = "testlocaluser".to_string();
 
     thread::spawn(|| {
-        mount_ncfs(MountOptions {
+        match mount_ncfs(MountOptions {
             url: "http://example.com/webdav".to_string(),
             username: Some("testuser".to_string()),
             password: Some("pass".to_string()),
             mount_point: PathBuf::from("/media/rgon/ncrsDesktop/".to_string()),
             log_user: user,
-        })
-        .unwrap();
-
-        println!("Mounted");
+        }) {
+            Ok(()) => println!("FUSE unmounted cleanly"),
+            Err(e) => eprintln!("FUSE error: {}", e),
+        }
     })
     .join()
     .unwrap();
