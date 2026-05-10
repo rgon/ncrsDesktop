@@ -131,6 +131,7 @@ fn open_main_window(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    env_logger::init();
     let app_state = Arc::new(AppState::default());
     let app_state_setup = app_state.clone();
     let app_state_menu = app_state.clone();
