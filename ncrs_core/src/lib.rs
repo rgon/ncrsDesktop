@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use yaml_rust2::YamlLoader;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -20,6 +20,12 @@ const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
 struct DirCacheEntry {
     files: Vec<remotefs::fs::File>,
     at: Instant,
+}
+
+struct FileCacheEntry {
+    local_path: PathBuf,
+    /// `modified` of the remote file at download time; used for invalidation.
+    remote_modified: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,6 +52,8 @@ pub struct NextCloudFs {
     next_inode: u64,
     log_user: String,
     dir_cache: HashMap<PathBuf, DirCacheEntry>,
+    file_cache: HashMap<PathBuf, FileCacheEntry>,
+    cache_dir: PathBuf,
 }
 
 impl NextCloudFs {
@@ -57,6 +65,13 @@ impl NextCloudFs {
         webdav_fs
             .connect()
             .map_err(|e| format!("WebDAV connect failed: {}", e))?;
+
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("ncrs")
+            .join(url_to_dir_name(&options.url));
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|e| format!("Cannot create cache dir: {}", e))?;
 
         let mut inodes = HashMap::new();
         let mut paths = HashMap::new();
@@ -70,6 +85,8 @@ impl NextCloudFs {
             next_inode: 2,
             log_user: options.log_user,
             dir_cache: HashMap::new(),
+            file_cache: HashMap::new(),
+            cache_dir,
         })
     }
 
@@ -90,6 +107,61 @@ impl NextCloudFs {
         self.paths.insert(path.clone(), inode);
         self.inodes.insert(inode, path);
         inode
+    }
+
+    /// Returns the local cached path for `remote_path`, downloading if stale/absent.
+    fn ensure_file_cached(&mut self, remote_path: &Path) -> Result<PathBuf, String> {
+        // Snapshot cache state without holding a reference into self.
+        let (maybe_local, cached_modified) = match self.file_cache.get(remote_path) {
+            Some(e) if e.local_path.exists() => (Some(e.local_path.clone()), e.remote_modified),
+            _ => (None, None),
+        };
+
+        let current_modified = self.remote_modified_for(remote_path);
+
+        if let Some(local) = maybe_local {
+            if cached_modified == current_modified {
+                return Ok(local);
+            }
+        }
+
+        // Download to cache.
+        let rel = remote_path.strip_prefix("/").unwrap_or(remote_path);
+        let local_path = self.cache_dir.join(rel);
+        if let Some(parent) = local_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+
+        let mut reader = self
+            .fs
+            .open(remote_path)
+            .map_err(|e| format!("open {}: {}", remote_path.display(), e))?;
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).map_err(|e| e.to_string())?;
+        std::fs::write(&local_path, &data).map_err(|e| e.to_string())?;
+
+        self.file_cache.insert(
+            remote_path.to_path_buf(),
+            FileCacheEntry {
+                local_path: local_path.clone(),
+                remote_modified: current_modified,
+            },
+        );
+        Ok(local_path)
+    }
+
+    /// Look up the remote `modified` time via the dir listing cache (no extra network call).
+    fn remote_modified_for(&mut self, path: &Path) -> Option<SystemTime> {
+        let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let name = path.file_name()?.to_str()?.to_string();
+        let entries = self.list_dir_cached(&parent).ok()?;
+        entries.iter().find(|e| {
+            e.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                == name
+        }).and_then(|e| e.metadata.modified)
     }
 
     fn list_dir_cached(
@@ -276,14 +348,17 @@ impl Filesystem for NextCloudFs {
             size
         );
 
-        match self.fs.open(&path) {
-            Ok(mut stream) => {
-                let mut data = Vec::new();
-                if let Err(e) = stream.read_to_end(&mut data) {
-                    log::error!("read {}: {}", path.display(), e);
-                    reply.error(EIO);
-                    return;
-                }
+        let local = match self.ensure_file_cached(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("cache {}: {}", path.display(), e);
+                reply.error(EIO);
+                return;
+            }
+        };
+
+        match std::fs::read(&local) {
+            Ok(data) => {
                 let off = offset as usize;
                 if off >= data.len() {
                     reply.data(&[]);
@@ -293,7 +368,7 @@ impl Filesystem for NextCloudFs {
                 }
             }
             Err(e) => {
-                log::error!("open {}: {}", path.display(), e);
+                log::error!("read cache file {}: {}", local.display(), e);
                 reply.error(EIO);
             }
         }
@@ -386,6 +461,13 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
 
     fuser::mount2(filesystem, &options.mount_point, &fuse_options)
         .map_err(|e| format!("FUSE mount failed: {}", e))
+}
+
+/// Converts a URL into a safe directory name for use in the cache path.
+fn url_to_dir_name(url: &str) -> String {
+    url.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect()
 }
 
 pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {

@@ -11,3 +11,4 @@ serde = { version = "1.0", features = ["derive"] }
 yaml-rust2 = "0.10.3"
 remotefs = "0.3"
 remotefs-webdav = "0.2"
+dirs = "6.0.0"
