@@ -13,13 +13,14 @@ use tauri::async_runtime::spawn;
 use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration};
 
-use ncrs_core::{mount_ncfs, MountOptions, SyncState};
+use ncrs_core::{mount_ncfs, notifications::NcNotification, MountOptions, SyncState};
 
 // ── Shared app state ─────────────────────────────────────────────────────────
 
 pub struct AppState {
     pub sync_state: Mutex<SyncState>,
     pub mount_options: Mutex<Option<MountOptions>>,
+    pub notifications: Mutex<Vec<NcNotification>>,
 }
 
 impl Default for AppState {
@@ -27,6 +28,7 @@ impl Default for AppState {
         AppState {
             sync_state: Mutex::new(SyncState::Idle),
             mount_options: Mutex::new(None),
+            notifications: Mutex::new(Vec::new()),
         }
     }
 }
@@ -55,15 +57,21 @@ pub struct UserInfo {
     pub username: String,
     pub server_url: String,
     pub mount_point: String,
+    pub avatar_url: String,
 }
 
 #[tauri::command]
 fn get_user_info(state: State<Arc<AppState>>) -> Option<UserInfo> {
     let opts = state.mount_options.lock().unwrap();
-    opts.as_ref().map(|o| UserInfo {
-        username: o.username.clone().unwrap_or_else(|| o.log_user.clone()),
-        server_url: o.url.clone(),
-        mount_point: o.mount_point.to_string_lossy().into_owned(),
+    opts.as_ref().map(|o| {
+        let username = o.username.clone().unwrap_or_else(|| o.log_user.clone());
+        let base = ncrs_core::notifications::base_url(&o.url);
+        UserInfo {
+            avatar_url: format!("{}/index.php/avatar/{}/64", base, username),
+            username,
+            server_url: o.url.clone(),
+            mount_point: o.mount_point.to_string_lossy().into_owned(),
+        }
     })
 }
 
@@ -78,6 +86,37 @@ fn open_mount_folder(state: State<Arc<AppState>>, app: AppHandle) {
             .open_path(path.to_string_lossy().as_ref(), None::<&str>)
             .ok();
     }
+}
+
+#[tauri::command]
+fn get_notifications(state: State<Arc<AppState>>) -> Vec<NcNotification> {
+    state.notifications.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn dismiss_notification(state: State<Arc<AppState>>, id: u64) {
+    let opts = {
+        let g = state.mount_options.lock().unwrap();
+        g.clone()
+    };
+    if let Some(opts) = opts {
+        state.notifications.lock().unwrap().retain(|n| n.notification_id != id);
+        let base = ncrs_core::notifications::base_url(&opts.url);
+        let user = opts.username.unwrap_or_default();
+        let pass = opts.password.unwrap_or_default();
+        thread::spawn(move || {
+            if let Err(e) =
+                ncrs_core::notifications::dismiss_notification(&base, &user, &pass, id)
+            {
+                log::warn!("dismiss notification {}: {}", id, e);
+            }
+        });
+    }
+}
+
+#[tauri::command]
+fn open_link(url: String, app: AppHandle) {
+    app.opener().open_url(&url, None::<&str>).ok();
 }
 
 // ── Tray helpers ──────────────────────────────────────────────────────────────
@@ -149,6 +188,9 @@ pub fn run() {
             get_sync_state,
             get_user_info,
             open_mount_folder,
+            get_notifications,
+            dismiss_notification,
+            open_link,
         ])
         .setup(move |app| {
             spawn(start_ncfs_daemon(app.handle().clone(), app_state_setup));
@@ -215,7 +257,6 @@ pub fn run() {
                     let _ = tray.set_menu(Some(menu));
                 }
 
-                // Notify frontend of state change.
                 app.emit("sync-state-changed", new_state.to_string()).ok();
             }
             "settings" => open_main_window(app),
@@ -227,7 +268,6 @@ pub fn run() {
 }
 
 async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), ()> {
-    // Small delay so the UI can appear first.
     sleep(Duration::from_millis(500)).await;
 
     let opts = match ncrs_core::config::load_config() {
@@ -246,11 +286,32 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
 
     *state.mount_options.lock().unwrap() = Some(opts.clone());
 
-    thread::spawn(move || match mount_ncfs(opts) {
-        Ok(()) => println!("FUSE unmounted cleanly"),
-        Err(e) => eprintln!("FUSE error: {}", e),
+    // FUSE mount thread
+    let fuse_opts = opts.clone();
+    thread::spawn(move || match mount_ncfs(fuse_opts) {
+        Ok(()) => log::info!("FUSE unmounted cleanly"),
+        Err(e) => log::error!("FUSE error: {}", e),
+    });
+
+    // Notification polling thread
+    let poll_state = state.clone();
+    let poll_app = app.clone();
+    let poll_url = opts.url.clone();
+    let poll_user = opts.username.clone().unwrap_or_default();
+    let poll_pass = opts.password.clone().unwrap_or_default();
+    thread::spawn(move || {
+        let base = ncrs_core::notifications::base_url(&poll_url);
+        loop {
+            match ncrs_core::notifications::fetch_notifications(&base, &poll_user, &poll_pass) {
+                Ok(notifs) => {
+                    *poll_state.notifications.lock().unwrap() = notifs.clone();
+                    poll_app.emit("notifications-updated", notifs).ok();
+                }
+                Err(e) => log::warn!("fetch notifications: {}", e),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
     });
 
     Ok(())
 }
-
