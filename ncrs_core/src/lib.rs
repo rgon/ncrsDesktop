@@ -1,3 +1,5 @@
+pub mod ipc;
+
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,
@@ -6,8 +8,10 @@ use libc::{EIO, ENOENT};
 use remotefs::fs::FileType as RemoteFileType;
 use remotefs::RemoteFs;
 use remotefs_webdav::WebDAVFs;
+use ipc::{FileStatus, StatusMap};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,9 +57,15 @@ pub struct NextCloudFs {
     dir_cache: HashMap<PathBuf, DirCacheEntry>,
     file_cache: HashMap<PathBuf, FileCacheEntry>,
     cache_dir: PathBuf,
+    /// Shared status map exposed via the IPC socket.
+    status_map: StatusMap,
 }
 
 impl NextCloudFs {
+    pub fn status_map(&self) -> StatusMap {
+        self.status_map.clone()
+    }
+
     pub fn new(options: MountOptions) -> Result<Self, String> {
         let username = options.username.unwrap_or_default();
         let password = options.password.unwrap_or_default();
@@ -77,6 +87,8 @@ impl NextCloudFs {
         inodes.insert(1, PathBuf::from("/"));
         paths.insert(PathBuf::from("/"), 1);
 
+        let status_map: StatusMap = Arc::new(Mutex::new(HashMap::new()));
+
         Ok(NextCloudFs {
             fs: webdav_fs,
             inodes,
@@ -86,6 +98,7 @@ impl NextCloudFs {
             dir_cache: HashMap::new(),
             file_cache: HashMap::new(),
             cache_dir,
+            status_map,
         })
     }
 
@@ -144,6 +157,10 @@ impl NextCloudFs {
                 remote_modified: current_modified,
             },
         );
+        self.status_map
+            .lock()
+            .unwrap()
+            .insert(remote_path.to_path_buf(), FileStatus::Local);
         Ok(local_path)
     }
 
@@ -424,8 +441,16 @@ impl Filesystem for NextCloudFs {
                 None => continue,
             };
             let entry_path = path.join(&name);
-            let entry_ino = self.allocate_inode(entry_path);
+            let entry_ino = self.allocate_inode(entry_path.clone());
             let is_dir = entry.metadata.file_type == RemoteFileType::Directory;
+            // Mark as Remote unless already promoted to Local by a prior read.
+            if !is_dir {
+                self.status_map
+                    .lock()
+                    .unwrap()
+                    .entry(entry_path)
+                    .or_insert(FileStatus::Remote);
+            }
             let kind = if is_dir {
                 FileType::Directory
             } else {
@@ -443,6 +468,8 @@ impl Filesystem for NextCloudFs {
 
 pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
     let filesystem = NextCloudFs::new(options.clone())?;
+
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map());
 
     let fuse_options = vec![
         MountOption::RO,
