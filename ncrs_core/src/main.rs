@@ -1,9 +1,7 @@
-mod config;
-
 fn main() {
     env_logger::init();
 
-    let opts = match config::load_config() {
+    let opts = match ncrs_core::config::load_config() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("ncrs: {}", e);

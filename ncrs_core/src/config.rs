@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use ncrs_core::{configuration_parser, MountOptions};
+use crate::{configuration_parser, MountOptions};
 
 const DEFAULT_CONFIG: &str = r#"# ncRS Desktop configuration
 # Generated on first run — fill in your Nextcloud credentials.

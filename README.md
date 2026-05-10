@@ -50,6 +50,25 @@ Usage:
 + [-] play notification sound: requires rodio in separate thread https://github.com/RustAudio/rodio/blob/f1eaaa4a6346933fc8a58d5fd1ace170946b3a94/examples/music_ogg.rs
 + [x] non-functional primimtive Svelte/tailwindcss UI 
 
+----
+
++ [ ] rust fuse mvp?
+	fuser = { version = "0.13.0", features = ["serializable"] }
+	https://github.com/cberner/fuser
+	or:
+	https://github.com/ubnt-intrepid/polyfuse
+	
+	STEPS:
+	+ [ ] create fuse with 4 folders that say /fuse/burns/pyro/spark
+	+ [ ] login via webdav
+	+ [ ] file directory map with fuse
+	+ [ ] fetch files with fuse
+	+ [ ] when fetching, check version number some way
+	+ [ ] simple login ui with tauri, 2 crates/modules
+	----- LEAVE HERE
++ [ ]https://xethub.com/blog/nfs-fuse-why-we-built-nfs-server-rust 
+----
+
 + [ ] Webdav implementation
 + [ ] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
 

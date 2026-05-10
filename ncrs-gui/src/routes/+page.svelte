@@ -4,6 +4,7 @@
     import Icon from '../components/Icon.svelte';
 
     import { invoke } from "@tauri-apps/api/core";
+    import { listen } from "@tauri-apps/api/event";
 
     import { mdiAlertCircleOutline, mdiInformationVariantCircleOutline,
         mdiMagnify, mdiFolder, mdiAppsBox,
@@ -16,52 +17,63 @@
 
     import SetStatusView from './SetStatusView.svelte';
     import SyncProgressView from './SyncProgressView.svelte';
-    
-    let userName = $state("Your Name");
-    let greetMsg = $state("");
-    
+
+    interface UserInfo {
+        username: string;
+        server_url: string;
+        mount_point: string;
+    }
+
+    let userInfo = $state<UserInfo | null>(null);
+    let syncState = $state<string>("idle");
+
+    // Placeholder notifications — will be replaced by NC Notifications API in a future step.
     let notifications = $state([
         { id: 1, message: "New file uploaded!", description: "File 'report.pdf' has been successfully uploaded.", type: "info", icon: mdiInformationVariantCircleOutline},
         { id: 2, message: "Important system updates are available.", description: "Please update your system to the latest version.", type: "info", icon: mdiAlertCircleOutline, action: () => {}, cta: "View"},
         { id: 3, message: "Test user sent a message to ABCD", description: "Hello team! What are we working on today?", type: "info", icon: mdiMessageText, avatar: "https://avatars.githubusercontent.com/u/5474117?v=4"},
-        { id: 4, message: "Important system updates are available.", description: "Please update your system to the latest version.", type: "info", icon: mdiAlertCircleOutline, action: () => {}, cta: "View"},
-        { id: 5, message: "New file uploaded!", description: "File 'image.png' has been successfully uploaded.", type: "info", icon: mdiInformationVariantCircleOutline}
     ]);
-    
-    async function greet(event: Event) {
-      event.preventDefault();
-      // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-      greetMsg = await invoke("greet", { userName });
-    }
-    
+
     async function close() {
-      // Close the Tauri window
-      await invoke("close_window");
+        await invoke("close_window");
     }
-    
+
+    async function openFolder() {
+        await invoke("open_mount_folder");
+    }
+
+    async function loadInfo() {
+        userInfo = await invoke<UserInfo | null>("get_user_info");
+        syncState = await invoke<string>("get_sync_state");
+    }
+
     onMount(() => {
-      // Detect click outside the main container to close the window
-      const clickOutListener = (event:MouseEvent) => {
-        const container = document.querySelector(".container");
-        if (container && !container.contains(event.target as Node)) {
-          close();
-        }
-      }
-      
-      document.addEventListener("click", clickOutListener);
-      // Detect Escape key to close the window
-      const escKeyListener = (event:KeyboardEvent) => {
-        if (event.key === "Escape") {
-          close();
-        }
-      }
-      document.addEventListener("keydown", escKeyListener);
-      
-      return () => {
-        document.removeEventListener("click", clickOutListener);
-        document.removeEventListener("keydown", escKeyListener);
-      };
-    })
+        loadInfo();
+
+        // React to state changes pushed from the tray menu.
+        const unlisten = listen<string>("sync-state-changed", (e) => {
+            syncState = e.payload;
+        });
+
+        const clickOutListener = (event: MouseEvent) => {
+            const container = document.querySelector(".container");
+            if (container && !container.contains(event.target as Node)) {
+                close();
+            }
+        };
+        document.addEventListener("click", clickOutListener);
+
+        const escKeyListener = (event: KeyboardEvent) => {
+            if (event.key === "Escape") close();
+        };
+        document.addEventListener("keydown", escKeyListener);
+
+        return () => {
+            unlisten.then(f => f());
+            document.removeEventListener("click", clickOutListener);
+            document.removeEventListener("keydown", escKeyListener);
+        };
+    });
 </script>
 
 <!-- Root is the entire computer window, window is the 'virtual' window we style to bypass wayland positioning limitations -->
@@ -86,14 +98,16 @@
 
                 <div class="dropdown dropdown-start">
                     <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
-                    <h1 tabindex="0" role="button" class="ml-2 font-bold cursor-pointer">{userName} <Icon class="w-4 h-4 inline-block" path={mdiChevronDown} />
+                    <h1 tabindex="0" role="button" class="ml-2 font-bold cursor-pointer">
+                        {userInfo?.username ?? "…"} <Icon class="w-4 h-4 inline-block" path={mdiChevronDown} />
                     </h1>
-            
+
                     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
                     <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box z-1 w-52 p-2 shadow-sm">
                         <li><button onclick={() => false}>
-                            <Icon class="w-4 h-4 inline-block mr-2 align-baseline" path={mdiAccountCog} /> {userName}
+                            <Icon class="w-4 h-4 inline-block mr-2 align-baseline" path={mdiAccountCog} /> {userInfo?.username ?? "—"}
                         </button></li>
+                        <li class="text-xs text-gray-400 px-2 py-1 truncate">{userInfo?.server_url ?? ""}</li>
                         <li><button onclick={() => false}>
                             <Icon class="w-4 h-4 inline-block mr-2 align-baseline" path={mdiPlus} /> Add account
                         </button></li>
@@ -113,7 +127,7 @@
                 <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Search">
                     <Icon class="w-6 h-6" path={mdiMagnify} />
                 </button>
-                <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Open Containing Folder">
+                <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Open Containing Folder" onclick={openFolder}>
                     <Icon class="w-6 h-6" path={mdiFolder} />
                 </button>
                 <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Notifications">
@@ -123,7 +137,7 @@
         </div>
 
         <!-- Sync status -->
-        <SyncProgressView />
+        <SyncProgressView {syncState} />
     
         <!-- Notifications -->
         <div class="overflow-y-auto p-2 flex-grow">

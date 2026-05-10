@@ -1,3 +1,4 @@
+pub mod config;
 pub mod ipc;
 
 use fuser::{
@@ -46,6 +47,17 @@ pub enum SyncState {
     Syncing,
     Paused,
     Error(String),
+}
+
+impl std::fmt::Display for SyncState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncState::Idle => write!(f, "idle"),
+            SyncState::Syncing => write!(f, "syncing"),
+            SyncState::Paused => write!(f, "paused"),
+            SyncState::Error(e) => write!(f, "error:{}", e),
+        }
+    }
 }
 
 pub struct NextCloudFs {
