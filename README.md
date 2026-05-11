@@ -1,7 +1,5 @@
 # ncRS Desktop client
 
-![Main dialog](docs/screenshot.png)
-
 ## Feature Goals:
 | Feature                   | Nextcloud Desktop | GNOME Integration/GVfs | ncRS |
 | :------------------------ | :---------------- | :--------------------- | :--- |
