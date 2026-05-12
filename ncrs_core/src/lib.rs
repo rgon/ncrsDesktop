@@ -2,6 +2,7 @@ pub mod config;
 pub mod ipc;
 pub mod notifications;
 pub mod preview;
+pub mod propfind;
 pub mod search;
 
 use std::collections::HashMap;
@@ -16,11 +17,11 @@ use fuser::{
     ReplyEntry, ReplyOpen, Request,
 };
 use libc::{EIO, ENOENT};
-use remotefs::fs::FileType as RemoteFileType;
 use remotefs::RemoteFs;
 use remotefs_webdav::WebDAVFs;
 use ipc::{FileStatus, StatusMap};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use propfind::DavEntry;
 use serde::{Deserialize, Serialize};
 use yaml_rust2::YamlLoader;
 
@@ -49,7 +50,8 @@ const PATH_ENCODE: &AsciiSet = &CONTROLS
 // ── Cache data types ──────────────────────────────────────────────────────────
 
 struct DirCacheEntry {
-    files: Vec<remotefs::fs::File>,
+    files: Vec<DavEntry>,
+    etag: Option<String>,
     at: Instant,
     refreshing: bool,
 }
@@ -129,25 +131,19 @@ impl FsNetwork {
     }
 }
 
-fn list_dir_timeout(
-    net: &Arc<FsNetwork>,
+fn list_dir_propfind(
+    conn: &Arc<ConnInfo>,
     path: PathBuf,
-) -> Result<Vec<remotefs::fs::File>, String> {
+) -> Result<(Option<String>, Vec<DavEntry>), String> {
     log::debug!("LIST {}", path.display());
     let (tx, rx) = mpsc::channel();
-    let n = net.clone();
+    let c = conn.clone();
     thread::spawn(move || {
-        let result = match n.checkout() {
-            Ok(mut conn) => {
-                let r = conn.list_dir(&path).map_err(|e| e.to_string());
-                n.checkin(conn);
-                r
-            }
-            Err(e) => Err(e),
-        };
-        let _ = tx.send(result);
+        let _ = tx.send(propfind::propfind_list(
+            &c.http, &c.webdav_url, &c.username, &c.password, &path, PROPFIND_TIMEOUT,
+        ));
     });
-    rx.recv_timeout(PROPFIND_TIMEOUT)
+    rx.recv_timeout(PROPFIND_TIMEOUT + Duration::from_secs(1))
         .unwrap_or_else(|_| Err("WebDAV PROPFIND timeout".into()))
 }
 
@@ -208,7 +204,7 @@ impl FsCache {
         ino
     }
 
-    fn get_cached_dir(&mut self, path: &Path) -> Option<(Vec<remotefs::fs::File>, bool)> {
+    fn get_cached_dir(&mut self, path: &Path) -> Option<(Vec<DavEntry>, bool)> {
         let entry = self.dir_cache.get_mut(path)?;
         let stale = entry.at.elapsed() >= DIR_CACHE_TTL;
         let needs_refresh = stale && !entry.refreshing;
@@ -218,8 +214,19 @@ impl FsCache {
         Some((entry.files.clone(), needs_refresh))
     }
 
-    fn put_dir_cache(&mut self, path: PathBuf, files: Vec<remotefs::fs::File>) {
-        self.dir_cache.insert(path, DirCacheEntry { files, at: Instant::now(), refreshing: false });
+    fn cached_dir_etag(&self, path: &Path) -> Option<String> {
+        self.dir_cache.get(path)?.etag.clone()
+    }
+
+    fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, files: Vec<DavEntry>) {
+        self.dir_cache.insert(path, DirCacheEntry { files, etag, at: Instant::now(), refreshing: false });
+    }
+
+    fn touch_dir_cache(&mut self, path: &Path) {
+        if let Some(entry) = self.dir_cache.get_mut(path) {
+            entry.at = Instant::now();
+            entry.refreshing = false;
+        }
     }
 
     fn clear_refreshing(&mut self, path: &Path) {
@@ -233,8 +240,7 @@ impl FsCache {
         let name = path.file_name()?.to_str()?;
         let dc = self.dir_cache.get(parent)?;
         Some(dc.files.iter().any(|f| {
-            f.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == name
-                && f.metadata.file_type == RemoteFileType::Directory
+            f.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == name && f.is_dir
         }))
     }
 
@@ -252,7 +258,7 @@ impl FsCache {
                     .unwrap_or("")
                     == name
             })
-            .and_then(|e| e.metadata.modified)
+            .and_then(|e| e.modified)
     }
 }
 
@@ -270,32 +276,36 @@ fn is_streaming(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn decode_remote_path(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    let decoded = percent_encoding::percent_decode_str(&s)
-        .decode_utf8_lossy()
-        .into_owned();
-    PathBuf::from(decoded)
-}
 
 fn get_or_list_dir(
-    net: &Arc<FsNetwork>,
+    conn: &Arc<ConnInfo>,
     cache: &Arc<Mutex<FsCache>>,
     path: PathBuf,
-) -> Result<Vec<remotefs::fs::File>, String> {
+) -> Result<Vec<DavEntry>, String> {
     if let Some((files, needs_refresh)) = cache.lock().unwrap().get_cached_dir(&path) {
         log::debug!("LIST_CACHED {} ({} entries, refresh={})", path.display(), files.len(), needs_refresh);
         if needs_refresh {
-            let net = net.clone();
+            let conn = conn.clone();
             let cache = cache.clone();
             let path = path.clone();
             std::thread::spawn(move || {
-                match list_dir_timeout(&net, path.clone()) {
-                    Ok(mut fresh) => {
-                        for f in &mut fresh {
-                            f.path = decode_remote_path(&f.path);
+                let old_etag = cache.lock().unwrap().cached_dir_etag(&path);
+                if let Some(ref old) = old_etag {
+                    match propfind::propfind_etag(&conn.http, &conn.webdav_url, &conn.username, &conn.password, &path, PROPFIND_TIMEOUT) {
+                        Ok(Some(ref new_etag)) if new_etag == old => {
+                            log::debug!("ETAG_MATCH {} — skipping full re-list", path.display());
+                            cache.lock().unwrap().touch_dir_cache(&path);
+                            return;
                         }
-                        cache.lock().unwrap().put_dir_cache(path, fresh);
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::debug!("etag check {}: {}", path.display(), e);
+                        }
+                    }
+                }
+                match list_dir_propfind(&conn, path.clone()) {
+                    Ok((etag, fresh)) => {
+                        cache.lock().unwrap().put_dir_cache(path, etag, fresh);
                     }
                     Err(e) => {
                         log::debug!("background refresh {}: {}", path.display(), e);
@@ -306,11 +316,8 @@ fn get_or_list_dir(
         }
         return Ok(files);
     }
-    let mut files = list_dir_timeout(net, path.clone())?;
-    for f in &mut files {
-        f.path = decode_remote_path(&f.path);
-    }
-    cache.lock().unwrap().put_dir_cache(path, files.clone());
+    let (etag, files) = list_dir_propfind(conn, path.clone())?;
+    cache.lock().unwrap().put_dir_cache(path, etag, files.clone());
     Ok(files)
 }
 
@@ -364,6 +371,7 @@ fn ensure_file_cached(
 }
 
 fn keep_locally_recursive(
+    conn: &Arc<ConnInfo>,
     net: &Arc<FsNetwork>,
     cache: &Arc<Mutex<FsCache>>,
     status: &StatusMap,
@@ -380,7 +388,7 @@ fn keep_locally_recursive(
         return;
     }
 
-    let entries = match get_or_list_dir(net, cache, remote_path.clone()) {
+    let entries = match get_or_list_dir(conn, cache, remote_path.clone()) {
         Ok(e) => e,
         Err(e) => {
             if known_dir.is_none() {
@@ -402,7 +410,7 @@ fn keep_locally_recursive(
             None => continue,
         };
         let child = remote_path.join(&name);
-        if entry.metadata.file_type == RemoteFileType::Directory {
+        if entry.is_dir {
             dirs.push(child);
         } else {
             files.push(child);
@@ -422,49 +430,38 @@ fn keep_locally_recursive(
     }
 
     for dir in dirs {
-        keep_locally_recursive(net, cache, status, dir);
+        keep_locally_recursive(conn, net, cache, status, dir);
     }
 }
 
-fn prefetch_list_dir(net: &FsNetwork, cache: &Mutex<FsCache>, path: &Path) {
+fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
     if cache.lock().unwrap().get_cached_dir(path).is_some() {
         return;
     }
     log::debug!("PREFETCH_LIST {}", path.display());
-    match net.checkout() {
-        Ok(mut conn) => {
-            let r = conn.list_dir(path).map_err(|e| e.to_string());
-            net.checkin(conn);
-            match r {
-                Ok(mut files) => {
-                    for f in &mut files {
-                        f.path = decode_remote_path(&f.path);
-                    }
-                    cache.lock().unwrap().put_dir_cache(path.to_path_buf(), files);
-                }
-                Err(e) => log::debug!("prefetch {}: {}", path.display(), e),
-            }
+    match propfind::propfind_list(&conn.http, &conn.webdav_url, &conn.username, &conn.password, path, PROPFIND_TIMEOUT) {
+        Ok((etag, files)) => {
+            cache.lock().unwrap().put_dir_cache(path.to_path_buf(), etag, files);
         }
-        Err(e) => log::debug!("prefetch checkout: {}", e),
+        Err(e) => log::debug!("prefetch {}: {}", path.display(), e),
     }
 }
 
 // ── FileAttr helpers ──────────────────────────────────────────────────────────
 
-fn make_file_attr(inode: u64, metadata: &remotefs::fs::Metadata) -> FileAttr {
-    let modified = metadata.modified.unwrap_or(UNIX_EPOCH);
-    let is_dir = metadata.file_type == RemoteFileType::Directory;
+fn make_file_attr(inode: u64, entry: &DavEntry) -> FileAttr {
+    let modified = entry.modified.unwrap_or(UNIX_EPOCH);
     FileAttr {
         ino: inode,
-        size: metadata.size,
-        blocks: (metadata.size + 511) / 512,
+        size: entry.size,
+        blocks: (entry.size + 511) / 512,
         atime: modified,
         mtime: modified,
         ctime: modified,
         crtime: modified,
-        kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
-        perm: if is_dir { 0o755 } else { 0o644 },
-        nlink: if is_dir { 2 } else { 1 },
+        kind: if entry.is_dir { FileType::Directory } else { FileType::RegularFile },
+        perm: if entry.is_dir { 0o755 } else { 0o644 },
+        nlink: if entry.is_dir { 2 } else { 1 },
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
         rdev: 0,
@@ -577,11 +574,12 @@ impl NextCloudFs {
     }
 
     pub fn keep_callback(&self) -> ipc::KeepCallback {
+        let conn = self.conn.clone();
         let net = self.net.clone();
         let cache = self.cache.clone();
         let status = self.status.clone();
         Arc::new(move |remote_path| {
-            keep_locally_recursive(&net, &cache, &status, remote_path);
+            keep_locally_recursive(&conn, &net, &cache, &status, remote_path);
         })
     }
 }
@@ -601,12 +599,12 @@ impl Filesystem for NextCloudFs {
 
         log::debug!("[{}] LOOKUP {}/{}", self.log_user, parent_path.display(), name_str);
 
-        let net = self.net.clone();
+        let conn = self.conn.clone();
         let cache = self.cache.clone();
         let status = self.status.clone();
 
         thread::spawn(move || {
-            match get_or_list_dir(&net, &cache, parent_path.clone()) {
+            match get_or_list_dir(&conn, &cache, parent_path.clone()) {
                 Ok(entries) => {
                     for entry in &entries {
                         let entry_name =
@@ -614,8 +612,8 @@ impl Filesystem for NextCloudFs {
                         if entry_name == name_str {
                             let target_path = parent_path.join(&name_str);
                             let ino = cache.lock().unwrap().allocate_inode(target_path.clone());
-                            let attr = make_file_attr(ino, &entry.metadata);
-                            if entry.metadata.file_type != RemoteFileType::Directory {
+                            let attr = make_file_attr(ino, entry);
+                            if !entry.is_dir {
                                 status
                                     .lock()
                                     .unwrap()
@@ -656,11 +654,11 @@ impl Filesystem for NextCloudFs {
         let file_name =
             path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
 
-        let net = self.net.clone();
+        let conn = self.conn.clone();
         let cache = self.cache.clone();
 
         thread::spawn(move || {
-            match get_or_list_dir(&net, &cache, parent.clone()) {
+            match get_or_list_dir(&conn, &cache, parent.clone()) {
                 Ok(entries) => {
                     for entry in &entries {
                         if entry
@@ -670,7 +668,7 @@ impl Filesystem for NextCloudFs {
                             .unwrap_or("")
                             == file_name
                         {
-                            reply.attr(&TTL, &make_file_attr(ino, &entry.metadata));
+                            reply.attr(&TTL, &make_file_attr(ino, entry));
                             return;
                         }
                     }
@@ -877,7 +875,6 @@ impl Filesystem for NextCloudFs {
 
         log::debug!("[{}] READDIR {}", self.log_user, path.display());
 
-        let net = self.net.clone();
         let cache = self.cache.clone();
         let status = self.status.clone();
         let conn = self.conn.clone();
@@ -894,29 +891,28 @@ impl Filesystem for NextCloudFs {
                 }
             }
 
-            match get_or_list_dir(&net, &cache, path.clone()) {
+            match get_or_list_dir(&conn, &cache, path.clone()) {
                 Ok(entries) => {
                     let skip = if offset > 2 { (offset - 2) as usize } else { 0 };
-                    let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
+                    let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool)> = Vec::new();
                     for (i, entry) in entries.iter().enumerate().skip(skip) {
                         let name = match entry.path.file_name().and_then(|n| n.to_str()) {
                             Some(n) => n.to_string(),
                             None => continue,
                         };
                         let entry_path = path.join(&name);
-                        let is_dir = entry.metadata.file_type == RemoteFileType::Directory;
                         let entry_ino =
                             cache.lock().unwrap().allocate_inode(entry_path.clone());
-                        if !is_dir {
+                        if !entry.is_dir {
                             status
                                 .lock()
                                 .unwrap()
                                 .entry(entry_path.clone())
                                 .or_insert(FileStatus::Remote);
-                            thumb_candidates.push((entry_path, entry.metadata.modified));
+                            thumb_candidates.push((entry_path, entry.modified, entry.has_preview));
                         }
                         let kind =
-                            if is_dir { FileType::Directory } else { FileType::RegularFile };
+                            if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
                         if reply.add(entry_ino, (i + 3) as i64, kind, &name) {
                             break;
                         }
@@ -924,20 +920,21 @@ impl Filesystem for NextCloudFs {
                     reply.ok();
 
                     if !thumb_candidates.is_empty() {
+                        let conn2 = conn.clone();
                         thread::spawn(move || {
                             preview::prefetch_directory_thumbnails(
-                                &conn.http,
-                                &conn.base_url,
-                                &conn.username,
-                                &conn.password,
-                                &conn.mount_point,
+                                &conn2.http,
+                                &conn2.base_url,
+                                &conn2.username,
+                                &conn2.password,
+                                &conn2.mount_point,
                                 &thumb_candidates,
                             );
                         });
                     }
 
                     let subdirs: Vec<PathBuf> = entries.iter()
-                        .filter(|e| e.metadata.file_type == RemoteFileType::Directory)
+                        .filter(|e| e.is_dir)
                         .take(PREFETCH_SUBDIRS)
                         .filter_map(|e| e.path.file_name().map(|n| path.join(n.to_string_lossy().as_ref())))
                         .collect();
@@ -947,7 +944,7 @@ impl Filesystem for NextCloudFs {
                             for chunk in subdirs.chunks(PREFETCH_BATCH) {
                                 std::thread::scope(|s| {
                                     for dir in chunk {
-                                        s.spawn(|| prefetch_list_dir(&net, &cache, dir));
+                                        s.spawn(|| prefetch_list_dir(&conn, &cache, dir));
                                     }
                                 });
                             }

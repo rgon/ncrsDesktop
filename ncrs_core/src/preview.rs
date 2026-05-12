@@ -151,15 +151,15 @@ pub fn prefetch_directory_thumbnails(
     username: &str,
     password: &str,
     mount_point: &Path,
-    entries: &[(PathBuf, Option<SystemTime>)],
+    entries: &[(PathBuf, Option<SystemTime>, bool)],
 ) {
     let previewable: Vec<_> = entries.iter()
-        .filter(|(p, _)| is_previewable(p))
+        .filter(|(_, _, has_preview)| *has_preview)
         .collect();
 
     for chunk in previewable.chunks(THUMB_BATCH) {
         std::thread::scope(|s| {
-            for (path, mtime) in chunk {
+            for (path, mtime, _) in chunk {
                 s.spawn(|| {
                     prefetch_thumbnail(client, base, username, password, mount_point, path, *mtime);
                 });
