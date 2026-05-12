@@ -34,7 +34,7 @@ _EMBLEM_LOCAL  = "emblem-default"       # green tick
 _EMBLEM_REMOTE = "emblem-downloads"     # cloud / down-arrow
 _EMBLEM_SYNCED = "emblem-synchronizing" # circular arrows
 
-SOCKET_TIMEOUT = 0.5  # seconds; keep short to avoid stalling Nautilus
+SOCKET_TIMEOUT = 0.15  # seconds; daemon replies instantly (HashMap lookup)
 
 # One shared pool so we don't spawn unbounded threads for large directories.
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
@@ -43,6 +43,24 @@ _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
 def _sock_path() -> str:
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     return os.path.join(runtime, "ncrs.sock")
+
+
+def _load_mount_point(config_path: str | None = None) -> str | None:
+    """Read mount_point from the ncRS config YAML (simple line parse)."""
+    if config_path is None:
+        config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        config_path = os.path.join(config_home, "ncrs", "config.yaml")
+    try:
+        with open(config_path) as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("mount_point:"):
+                    val = stripped[len("mount_point:"):].strip().strip('"').strip("'")
+                    if val:
+                        return val.rstrip("/")
+    except OSError:
+        pass
+    return None
 
 
 def query_status(path: str, sock_path: str | None = None) -> str:
@@ -79,6 +97,7 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         super().__init__()
         self._cancelled: set[int] = set()
         self._lock = threading.Lock()
+        self._mount = _load_mount_point()
 
     # Synchronous fast path: called for items already in cache.
     # We return COMPLETE immediately without doing any I/O; the async full
@@ -96,6 +115,11 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
 
         path = file_info.get_location().get_path()
         if path is None:
+            Nautilus.info_provider_update_complete_invoke(
+                closure, provider, handle, Nautilus.OperationResult.COMPLETE)
+            return Nautilus.OperationResult.IN_PROGRESS
+
+        if self._mount and not (path == self._mount or path.startswith(self._mount + "/")):
             Nautilus.info_provider_update_complete_invoke(
                 closure, provider, handle, Nautilus.OperationResult.COMPLETE)
             return Nautilus.OperationResult.IN_PROGRESS

@@ -173,5 +173,42 @@ class TestQueryStatus(unittest.TestCase):
         self.assertEqual(status, "unknown")
 
 
+class TestLoadMountPoint(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="ncrs_test_cfg_")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_parses_mount_point(self):
+        cfg = os.path.join(self.tmpdir, "config.yaml")
+        with open(cfg, "w") as f:
+            f.write('url: "https://cloud.example.com"\nmount_point: "/home/user/ncrs"\n')
+        self.assertEqual(syncstate._load_mount_point(cfg), "/home/user/ncrs")
+
+    def test_strips_trailing_slash(self):
+        cfg = os.path.join(self.tmpdir, "config.yaml")
+        with open(cfg, "w") as f:
+            f.write('mount_point: "/home/user/ncrs/"\n')
+        self.assertEqual(syncstate._load_mount_point(cfg), "/home/user/ncrs")
+
+    def test_quoted_value(self):
+        cfg = os.path.join(self.tmpdir, "config.yaml")
+        with open(cfg, "w") as f:
+            f.write('mount_point: "/home/user/my cloud"\n')
+        self.assertEqual(syncstate._load_mount_point(cfg), "/home/user/my cloud")
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(syncstate._load_mount_point("/nonexistent/config.yaml"))
+
+    def test_empty_value_returns_none(self):
+        cfg = os.path.join(self.tmpdir, "config.yaml")
+        with open(cfg, "w") as f:
+            f.write('mount_point: ""\n')
+        self.assertIsNone(syncstate._load_mount_point(cfg))
+
+
 if __name__ == "__main__":
     unittest.main()
