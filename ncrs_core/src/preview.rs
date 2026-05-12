@@ -46,14 +46,19 @@ fn fetch_preview_bytes(
     username: &str,
     password: &str,
     remote_path: &str,
+    fileid: Option<u64>,
 ) -> Result<Vec<u8>, String> {
     log::debug!("GET_THUMB {}", remote_path);
-    let url = format!("{}/index.php/core/preview.png", base);
+    let url = format!("{}/core/preview", base);
     let size = PREVIEW_SIZE.to_string();
-    let resp = client
-        .get(&url)
-        .timeout(API_TIMEOUT)
-        .query(&[("file", remote_path), ("x", &size), ("y", &size), ("a", "1")])
+    let req = client.get(&url).timeout(API_TIMEOUT);
+    let req = if let Some(fid) = fileid {
+        let fid_str = fid.to_string();
+        req.query(&[("fileId", &fid_str), ("x", &size), ("y", &size), ("mimeFallback", &"true".to_string()), ("a", &"0".to_string())])
+    } else {
+        req.query(&[("file", &remote_path.to_string()), ("x", &size), ("y", &size), ("a", &"1".to_string())])
+    };
+    let resp = req
         .basic_auth(username, Some(password))
         .send()
         .map_err(|e| e.to_string())?;
@@ -109,6 +114,7 @@ pub fn prefetch_thumbnail(
     mount_point: &Path,
     remote_path: &Path,
     mtime: Option<SystemTime>,
+    fileid: Option<u64>,
 ) {
     let uri = file_uri(mount_point, remote_path);
     let thumb = xdg_thumb_path(&uri);
@@ -116,7 +122,7 @@ pub fn prefetch_thumbnail(
         return;
     }
 
-    let png = match fetch_preview_bytes(client, base, username, password, &remote_path.to_string_lossy()) {
+    let png = match fetch_preview_bytes(client, base, username, password, &remote_path.to_string_lossy(), fileid) {
         Ok(d) => d,
         Err(e) => {
             log::debug!("thumbnail {}: {}", remote_path.display(), e);
@@ -151,17 +157,17 @@ pub fn prefetch_directory_thumbnails(
     username: &str,
     password: &str,
     mount_point: &Path,
-    entries: &[(PathBuf, Option<SystemTime>, bool)],
+    entries: &[(PathBuf, Option<SystemTime>, bool, Option<u64>)],
 ) {
     let previewable: Vec<_> = entries.iter()
-        .filter(|(_, _, has_preview)| *has_preview)
+        .filter(|(_, _, has_preview, _)| *has_preview)
         .collect();
 
     for chunk in previewable.chunks(THUMB_BATCH) {
         std::thread::scope(|s| {
-            for (path, mtime, _) in chunk {
+            for (path, mtime, _, fileid) in chunk {
                 s.spawn(|| {
-                    prefetch_thumbnail(client, base, username, password, mount_point, path, *mtime);
+                    prefetch_thumbnail(client, base, username, password, mount_point, path, *mtime, *fileid);
                 });
             }
         });

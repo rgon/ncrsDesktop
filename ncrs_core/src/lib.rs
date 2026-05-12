@@ -336,19 +336,6 @@ impl FsCache {
 
 // ── Shared operation helpers ──────────────────────────────────────────────────
 
-const STREAMING_EXTS: &[&str] = &[
-    "mp3", "flac", "ogg", "m4a", "wav", "opus", "aac", "wma",
-    "mp4", "mkv", "avi", "mov", "webm", "m4v", "wmv", "flv",
-];
-
-fn is_streaming(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| STREAMING_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
-}
-
-
 fn get_or_list_dir(
     conn: &Arc<ConnInfo>,
     cache: &Arc<Mutex<FsCache>>,
@@ -857,29 +844,10 @@ impl Filesystem for NextCloudFs {
             fh
         };
 
-        let start_bg = local.is_none() && !is_streaming(&path);
         self.open_files
-            .lock()
-            .unwrap()
+            .safe_lock()
             .insert(fh, OpenFile { remote_path: path.clone(), local, buf: None });
         reply.opened(fh, 0);
-
-        if start_bg {
-            let net = self.net.clone();
-            let cache = self.cache.clone();
-            let status = self.status.clone();
-            let open_files = self.open_files.clone();
-            thread::spawn(move || {
-                match ensure_file_cached(&net, &cache, &status, path.clone()) {
-                    Ok(local_path) => {
-                        open_files.safe_lock().entry(fh).and_modify(|of| {
-                            of.local = Some(local_path);
-                        });
-                    }
-                    Err(e) => log::debug!("background cache {}: {}", path.display(), e),
-                }
-            });
-        }
     }
 
     fn read(
@@ -1046,7 +1014,7 @@ impl Filesystem for NextCloudFs {
             match get_or_list_dir(&conn, &cache, path.clone()) {
                 Ok(entries) => {
                     let skip = if offset > 2 { (offset - 2) as usize } else { 0 };
-                    let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool)> = Vec::new();
+                    let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
                     for (i, entry) in entries.iter().enumerate().skip(skip) {
                         let name = match entry.path.file_name().and_then(|n| n.to_str()) {
                             Some(n) => n.to_string(),
@@ -1067,7 +1035,7 @@ impl Filesystem for NextCloudFs {
                                 .unwrap()
                                 .entry(entry_path.clone())
                                 .or_insert(FileStatus::Remote);
-                            thumb_candidates.push((entry_path, entry.modified, entry.has_preview));
+                            thumb_candidates.push((entry_path, entry.modified, entry.has_preview, entry.fileid));
                         }
                         let kind =
                             if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
