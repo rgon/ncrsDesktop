@@ -218,6 +218,16 @@ impl FsCache {
         self.dir_cache.insert(path, DirCacheEntry { files, at: Instant::now() });
     }
 
+    fn is_known_directory(&self, path: &Path) -> Option<bool> {
+        let parent = path.parent()?;
+        let name = path.file_name()?.to_str()?;
+        let dc = self.dir_cache.get(parent)?;
+        Some(dc.files.iter().any(|f| {
+            f.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == name
+                && f.metadata.file_type == RemoteFileType::Directory
+        }))
+    }
+
     fn remote_modified_for(&self, path: &Path) -> Option<SystemTime> {
         let parent = path.parent().unwrap_or(Path::new("/"));
         let name = path.file_name()?.to_str()?.to_string();
@@ -331,11 +341,25 @@ fn keep_locally_recursive(
     remote_path: PathBuf,
 ) {
     log::info!("KEEP {}", remote_path.display());
+
+    let known_dir = cache.lock().unwrap().is_known_directory(&remote_path);
+
+    if known_dir == Some(false) {
+        if let Err(e) = ensure_file_cached(net, cache, status, remote_path.clone()) {
+            log::warn!("keep failed {}: {}", remote_path.display(), e);
+        }
+        return;
+    }
+
     let entries = match get_or_list_dir(net, cache, remote_path.clone()) {
         Ok(e) => e,
-        Err(_) => {
-            if let Err(e) = ensure_file_cached(net, cache, status, remote_path.clone()) {
-                log::warn!("keep failed {}: {}", remote_path.display(), e);
+        Err(e) => {
+            if known_dir.is_none() {
+                if let Err(e2) = ensure_file_cached(net, cache, status, remote_path.clone()) {
+                    log::warn!("keep failed {}: {} / {}", remote_path.display(), e, e2);
+                }
+            } else {
+                log::warn!("keep dir failed {}: {}", remote_path.display(), e);
             }
             return;
         }
