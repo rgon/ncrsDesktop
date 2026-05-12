@@ -108,21 +108,15 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
     # Async path: Nautilus calls this and expects IN_PROGRESS while we work,
     # then update_complete_invoke when we're done.
     def update_file_info_full(self, provider, handle, closure, file_info):
+        if not self._mount:
+            return Nautilus.OperationResult.COMPLETE
+
         if file_info.get_uri_scheme() != "file":
-            Nautilus.info_provider_update_complete_invoke(
-                closure, provider, handle, Nautilus.OperationResult.COMPLETE)
-            return Nautilus.OperationResult.IN_PROGRESS
+            return Nautilus.OperationResult.COMPLETE
 
         path = file_info.get_location().get_path()
-        if path is None:
-            Nautilus.info_provider_update_complete_invoke(
-                closure, provider, handle, Nautilus.OperationResult.COMPLETE)
-            return Nautilus.OperationResult.IN_PROGRESS
-
-        if self._mount and not (path == self._mount or path.startswith(self._mount + "/")):
-            Nautilus.info_provider_update_complete_invoke(
-                closure, provider, handle, Nautilus.OperationResult.COMPLETE)
-            return Nautilus.OperationResult.IN_PROGRESS
+        if path is None or not (path == self._mount or path.startswith(self._mount + "/")):
+            return Nautilus.OperationResult.COMPLETE
 
         handle_id = id(handle)
 
