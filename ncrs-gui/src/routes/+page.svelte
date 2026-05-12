@@ -16,6 +16,7 @@
 
     import SetStatusView from './SetStatusView.svelte';
     import SyncProgressView from './SyncProgressView.svelte';
+    import SearchView from '../components/SearchView.svelte';
 
     // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -49,10 +50,13 @@
 
     // ── State ─────────────────────────────────────────────────────────────────
 
+    type View = "notifications" | "search";
+
     let userInfo = $state<UserInfo | null>(null);
     let syncState = $state<string>("idle");
     let notifications = $state<NcNotification[]>([]);
     let avatarError = $state(false);
+    let activeView = $state<View>("notifications");
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -114,7 +118,7 @@
         document.addEventListener("click", clickOutListener);
 
         const escKeyListener = (event: KeyboardEvent) => {
-            if (event.key === "Escape") close();
+            if (event.key === "Escape" && activeView !== "search") close();
         };
         document.addEventListener("keydown", escKeyListener);
 
@@ -187,7 +191,12 @@
 
             <!-- Toolbar -->
             <div>
-                <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Search">
+                <button
+                    class="btn btn-ghost btn-sm rounded-btn"
+                    class:btn-active={activeView === "search"}
+                    aria-label="Search"
+                    onclick={() => { activeView = activeView === "search" ? "notifications" : "search"; }}
+                >
                     <Icon class="w-6 h-6" path={mdiMagnify} />
                 </button>
                 <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Open Containing Folder" onclick={openFolder}>
@@ -196,8 +205,12 @@
                 <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Activity">
                     <Icon class="w-6 h-6" path={mdiAppsBox} />
                 </button>
-                <!-- Notification bell with badge -->
-                <button class="btn btn-ghost btn-sm rounded-btn relative" aria-label="Notifications">
+                <button
+                    class="btn btn-ghost btn-sm rounded-btn relative"
+                    class:btn-active={activeView === "notifications"}
+                    aria-label="Notifications"
+                    onclick={() => { activeView = "notifications"; }}
+                >
                     <Icon class="w-6 h-6" path={notifications.length > 0 ? mdiBell : mdiBellOutline} />
                     {#if notifications.length > 0}
                         <span class="badge badge-error badge-xs absolute top-0.5 right-0.5">{notifications.length}</span>
@@ -209,63 +222,69 @@
         <!-- Sync status bar -->
         <SyncProgressView {syncState} />
 
-        <!-- Notification list -->
-        <div class="overflow-y-auto p-2 flex-grow">
-            {#if notifications.length === 0}
-                <div class="flex flex-col items-center justify-center h-24 text-gray-400 gap-2">
-                    <Icon class="w-8 h-8 opacity-40" path={mdiBellOutline} />
-                    <span class="text-sm">No new notifications</span>
-                </div>
-            {:else}
-                {#each notifications as n (n.notification_id)}
-                {@const action = primaryAction(n)}
-                <div class="alert shadow-none rounded-none border-0 border-b border-gray-100 py-3 relative">
-                    <div class="flex items-start gap-2 flex-1 min-w-0">
-                        <!-- App icon -->
-                        {#if n.icon}
-                            <img
-                                src={n.icon}
-                                alt={n.app}
-                                class="w-8 h-8 flex-shrink-0 object-contain"
-                                onerror={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
-                            />
-                        {/if}
-                        <div class="min-w-0">
-                            <p class="font-semibold text-sm leading-snug">{n.subject}</p>
-                            {#if n.message}
-                                <p class="text-xs text-gray-500 truncate">{n.message}</p>
+        <!-- Content area: search or notifications -->
+        {#if activeView === "search"}
+            <SearchView
+                class="flex flex-col flex-grow overflow-hidden"
+                onclose={() => { activeView = "notifications"; }}
+            />
+        {:else}
+            <div class="overflow-y-auto p-2 flex-grow">
+                {#if notifications.length === 0}
+                    <div class="flex flex-col items-center justify-center h-24 text-gray-400 gap-2">
+                        <Icon class="w-8 h-8 opacity-40" path={mdiBellOutline} />
+                        <span class="text-sm">No new notifications</span>
+                    </div>
+                {:else}
+                    {#each notifications as n (n.notification_id)}
+                    {@const action = primaryAction(n)}
+                    <div class="alert shadow-none rounded-none border-0 border-b border-gray-100 py-3 relative">
+                        <div class="flex items-start gap-2 flex-1 min-w-0">
+                            {#if n.icon}
+                                <img
+                                    src={n.icon}
+                                    alt={n.app}
+                                    class="w-8 h-8 flex-shrink-0 object-contain"
+                                    onerror={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+                                />
+                            {/if}
+                            <div class="min-w-0">
+                                <p class="font-semibold text-sm leading-snug">{n.subject}</p>
+                                {#if n.message}
+                                    <p class="text-xs text-gray-500 truncate">{n.message}</p>
+                                {/if}
+                            </div>
+                        </div>
+
+                        <div class="flex flex-col items-end gap-1 flex-shrink-0 ml-2">
+                            <div class="flex items-center gap-1">
+                                <time class="text-xs text-gray-400">{relativeTime(n.datetime)}</time>
+                                <button
+                                    class="btn btn-ghost btn-xs p-0 w-5 h-5 min-h-0"
+                                    onclick={() => dismiss(n.notification_id)}
+                                    aria-label="Dismiss"
+                                >
+                                    <Icon class="w-3 h-3" path={mdiClose} />
+                                </button>
+                            </div>
+                            {#if action}
+                                <button
+                                    class="btn btn-primary btn-xs"
+                                    onclick={() => openLink(action!.link)}
+                                >
+                                    {action.label}
+                                </button>
+                            {:else if n.link}
+                                <button class="btn btn-primary btn-xs" onclick={() => openLink(n.link)}>
+                                    Open
+                                </button>
                             {/if}
                         </div>
                     </div>
-
-                    <div class="flex flex-col items-end gap-1 flex-shrink-0 ml-2">
-                        <div class="flex items-center gap-1">
-                            <time class="text-xs text-gray-400">{relativeTime(n.datetime)}</time>
-                            <button
-                                class="btn btn-ghost btn-xs p-0 w-5 h-5 min-h-0"
-                                onclick={() => dismiss(n.notification_id)}
-                                aria-label="Dismiss"
-                            >
-                                <Icon class="w-3 h-3" path={mdiClose} />
-                            </button>
-                        </div>
-                        {#if action}
-                            <button
-                                class="btn btn-primary btn-xs"
-                                onclick={() => openLink(action!.link)}
-                            >
-                                {action.label}
-                            </button>
-                        {:else if n.link}
-                            <button class="btn btn-primary btn-xs" onclick={() => openLink(n.link)}>
-                                Open
-                            </button>
-                        {/if}
-                    </div>
-                </div>
-                {/each}
-            {/if}
-        </div>
+                    {/each}
+                {/if}
+            </div>
+        {/if}
     </div>
 </main>
 
