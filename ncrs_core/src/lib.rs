@@ -12,21 +12,36 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    Request,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, Request,
 };
 use libc::{EIO, ENOENT};
 use remotefs::fs::FileType as RemoteFileType;
 use remotefs::RemoteFs;
 use remotefs_webdav::WebDAVFs;
 use ipc::{FileStatus, StatusMap};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{Deserialize, Serialize};
 use yaml_rust2::YamlLoader;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 const TTL: Duration = Duration::from_secs(1);
 const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const READ_AHEAD: usize = 2 * 1024 * 1024; // 2 MB
+
+const PATH_ENCODE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'#')
+    .add(b'%')
+    .add(b'?')
+    .add(b'[')
+    .add(b']')
+    .add(b'{')
+    .add(b'}');
 
 // ── Cache data types ──────────────────────────────────────────────────────────
 
@@ -38,6 +53,18 @@ struct DirCacheEntry {
 struct FileCacheEntry {
     local_path: PathBuf,
     remote_modified: Option<SystemTime>,
+}
+
+struct ReadAheadBuf {
+    start: u64,
+    data: Vec<u8>,
+}
+
+struct OpenFile {
+    #[allow(dead_code)]
+    remote_path: PathBuf,
+    local: Option<PathBuf>,
+    buf: Option<ReadAheadBuf>,
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -279,6 +306,7 @@ fn root_attr() -> FileAttr {
 
 struct ConnInfo {
     base_url: String,
+    webdav_url: String,
     username: String,
     password: String,
     mount_point: PathBuf,
@@ -289,6 +317,8 @@ pub struct NextCloudFs {
     cache: Arc<Mutex<FsCache>>,
     status: StatusMap,
     conn: Arc<ConnInfo>,
+    open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+    next_fh: Arc<Mutex<u64>>,
     log_user: String,
 }
 
@@ -315,6 +345,7 @@ impl NextCloudFs {
 
         let conn = Arc::new(ConnInfo {
             base_url: notifications::base_url(&options.url),
+            webdav_url: options.url.clone(),
             username: username.clone(),
             password: password.clone(),
             mount_point: options.mount_point.clone(),
@@ -332,6 +363,8 @@ impl NextCloudFs {
             })),
             status,
             conn,
+            open_files: Arc::new(Mutex::new(HashMap::new())),
+            next_fh: Arc::new(Mutex::new(1)),
             log_user: options.log_user,
         })
     }
@@ -439,11 +472,43 @@ impl Filesystem for NextCloudFs {
         });
     }
 
+    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let (path, local) = {
+            let c = self.cache.lock().unwrap();
+            let path = match c.get_path(ino) {
+                Some(p) => p,
+                None => {
+                    reply.error(ENOENT);
+                    return;
+                }
+            };
+            let local = c
+                .file_cache
+                .get(&path)
+                .filter(|e| e.local_path.exists())
+                .map(|e| e.local_path.clone());
+            (path, local)
+        };
+
+        let fh = {
+            let mut n = self.next_fh.lock().unwrap();
+            let fh = *n;
+            *n += 1;
+            fh
+        };
+
+        self.open_files
+            .lock()
+            .unwrap()
+            .insert(fh, OpenFile { remote_path: path, local, buf: None });
+        reply.opened(fh, 0);
+    }
+
     fn read(
         &mut self,
         _req: &Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
@@ -460,33 +525,98 @@ impl Filesystem for NextCloudFs {
 
         log::debug!("[{}] READ {} offset={} size={}", self.log_user, path.display(), offset, size);
 
+        let open_files = self.open_files.clone();
+        let conn = self.conn.clone();
         let net = self.net.clone();
         let cache = self.cache.clone();
         let status = self.status.clone();
 
         thread::spawn(move || {
-            match ensure_file_cached(&net, &cache, &status, path.clone()) {
-                Ok(local) => match std::fs::read(&local) {
-                    Ok(data) => {
-                        let off = offset as usize;
-                        if off >= data.len() {
-                            reply.data(&[]);
-                        } else {
-                            let end = std::cmp::min(off + size as usize, data.len());
-                            reply.data(&data[off..end]);
+            let off = offset as u64;
+            let sz = size as usize;
+
+            // Try serving from open-file state (local cache or read-ahead buffer).
+            {
+                let files = open_files.lock().unwrap();
+                if let Some(of) = files.get(&fh) {
+                    if let Some(ref local) = of.local {
+                        if let Ok(f) = std::fs::File::open(local) {
+                            let mut buf = vec![0u8; sz];
+                            match f.read_at(&mut buf, off) {
+                                Ok(n) => {
+                                    buf.truncate(n);
+                                    reply.data(&buf);
+                                    return;
+                                }
+                                Err(_) => {}
+                            }
                         }
                     }
-                    Err(e) => {
-                        log::error!("read cache {}: {}", local.display(), e);
-                        reply.error(EIO);
+                    if let Some(ref ra) = of.buf {
+                        let buf_end = ra.start + ra.data.len() as u64;
+                        if off >= ra.start && off + sz as u64 <= buf_end {
+                            let s = (off - ra.start) as usize;
+                            reply.data(&ra.data[s..s + sz]);
+                            return;
+                        }
                     }
-                },
+                }
+            }
+
+            // HTTP Range read with read-ahead.
+            let fetch = std::cmp::max(sz, READ_AHEAD);
+            match range_read_timeout(&conn, &path, off, fetch) {
+                Ok(data) => {
+                    let end = std::cmp::min(sz, data.len());
+                    reply.data(&data[..end]);
+                    open_files
+                        .lock()
+                        .unwrap()
+                        .entry(fh)
+                        .and_modify(|of| of.buf = Some(ReadAheadBuf { start: off, data }));
+                }
                 Err(e) => {
-                    log::error!("ensure_file_cached {}: {}", path.display(), e);
-                    reply.error(EIO);
+                    log::warn!("range read failed, falling back to full download: {}", e);
+                    match ensure_file_cached(&net, &cache, &status, path.clone()) {
+                        Ok(local) => {
+                            if let Ok(f) = std::fs::File::open(&local) {
+                                let mut buf = vec![0u8; sz];
+                                match f.read_at(&mut buf, off) {
+                                    Ok(n) => {
+                                        buf.truncate(n);
+                                        reply.data(&buf);
+                                        open_files.lock().unwrap().entry(fh).and_modify(
+                                            |of| of.local = Some(local),
+                                        );
+                                        return;
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            reply.error(EIO);
+                        }
+                        Err(e2) => {
+                            log::error!("fallback download failed {}: {}", path.display(), e2);
+                            reply.error(EIO);
+                        }
+                    }
                 }
             }
         });
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.open_files.lock().unwrap().remove(&fh);
+        reply.ok();
     }
 
     fn readdir(
@@ -581,6 +711,46 @@ impl Filesystem for NextCloudFs {
                 }
             }
         });
+    }
+}
+
+// ── HTTP Range reads ─────────────────────────────────────────────────────────
+
+fn webdav_file_url(base: &str, remote_path: &Path) -> String {
+    let rel = remote_path.strip_prefix("/").unwrap_or(remote_path);
+    let encoded = utf8_percent_encode(&rel.to_string_lossy(), PATH_ENCODE).to_string();
+    format!("{}/{}", base.trim_end_matches('/'), encoded)
+}
+
+fn range_read_timeout(conn: &Arc<ConnInfo>, path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+    let (tx, rx) = mpsc::channel();
+    let c = conn.clone();
+    let p = path.to_path_buf();
+    thread::spawn(move || {
+        let _ = tx.send(do_range_read(&c, &p, offset, size));
+    });
+    rx.recv_timeout(DOWNLOAD_TIMEOUT)
+        .unwrap_or_else(|_| Err("range read timeout".into()))
+}
+
+fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+    let url = webdav_file_url(&conn.webdav_url, path);
+    let end = offset + size as u64 - 1;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(DOWNLOAD_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .header("Range", format!("bytes={}-{}", offset, end))
+        .basic_auth(&conn.username, Some(&conn.password))
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::PARTIAL_CONTENT || status.is_success() {
+        resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+    } else {
+        Err(format!("range read returned {}", status))
     }
 }
 
