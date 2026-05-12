@@ -1,6 +1,7 @@
 pub mod config;
 pub mod ipc;
 pub mod notifications;
+pub mod search;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
