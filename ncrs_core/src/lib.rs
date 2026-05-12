@@ -59,6 +59,13 @@ struct DirCacheEntry {
     refreshing: bool,
 }
 
+struct PendingDir {
+    entries: Vec<DavEntry>,
+    rx: mpsc::Receiver<DavEntry>,
+    etag_rx: mpsc::Receiver<Option<String>>,
+    etag: Option<String>,
+}
+
 struct FileCacheEntry {
     local_path: PathBuf,
     remote_modified: Option<SystemTime>,
@@ -183,6 +190,7 @@ struct FsCache {
     paths: HashMap<PathBuf, u64>,
     next_inode: u64,
     dir_cache: HashMap<PathBuf, DirCacheEntry>,
+    pending_dirs: HashMap<PathBuf, PendingDir>,
     file_cache: HashMap<PathBuf, FileCacheEntry>,
     cache_dir: PathBuf,
 }
@@ -229,6 +237,47 @@ impl FsCache {
         if let Some(entry) = self.dir_cache.get_mut(path) {
             entry.at = Instant::now();
             entry.refreshing = false;
+        }
+    }
+
+    fn start_pending(&mut self, path: PathBuf, rx: mpsc::Receiver<DavEntry>, etag_rx: mpsc::Receiver<Option<String>>) {
+        self.pending_dirs.insert(path, PendingDir {
+            entries: Vec::new(),
+            rx,
+            etag_rx,
+            etag: None,
+        });
+    }
+
+    fn promote_pending(&mut self, path: &Path) {
+        if let Some(mut pending) = self.pending_dirs.remove(path) {
+            while let Ok(entry) = pending.rx.try_recv() {
+                pending.entries.push(entry);
+            }
+            if let Ok(etag) = pending.etag_rx.try_recv() {
+                pending.etag = etag;
+            }
+            self.put_dir_cache(path.to_path_buf(), pending.etag, pending.entries);
+        }
+    }
+
+    fn get_pending_snapshot(&mut self, path: &Path) -> Option<Vec<DavEntry>> {
+        let pending = self.pending_dirs.get_mut(path)?;
+        loop {
+            match pending.rx.try_recv() {
+                Ok(entry) => pending.entries.push(entry),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Sender dropped = fetch complete. Promote to full cache.
+                    self.promote_pending(path);
+                    return self.dir_cache.get(path).map(|e| e.files.to_vec());
+                }
+            }
+        }
+        if !pending.entries.is_empty() {
+            Some(pending.entries.clone())
+        } else {
+            None
         }
     }
 
@@ -319,10 +368,72 @@ fn get_or_list_dir(
         }
         return Ok(files);
     }
-    let (etag, files) = list_dir_propfind(conn, path.clone())?;
+    // Check if there's already an in-progress incremental fetch
+    {
+        let mut c = cache.lock().unwrap();
+        if let Some(snapshot) = c.get_pending_snapshot(&path) {
+            return Ok(Arc::new(snapshot));
+        }
+    }
+
+    // Start incremental streaming fetch
+    let (entry_tx, entry_rx) = mpsc::channel();
+    let (etag_tx, etag_rx) = mpsc::channel();
+    {
+        let mut c = cache.lock().unwrap();
+        if c.pending_dirs.contains_key(&path) || c.dir_cache.contains_key(&path) {
+            // Race: another thread started it. Try cache again.
+            if let Some((files, _)) = c.get_cached_dir(&path) {
+                return Ok(files);
+            }
+        }
+        c.start_pending(path.clone(), entry_rx, etag_rx);
+    }
+
+    let conn2 = conn.clone();
+    let path2 = path.clone();
+    std::thread::spawn(move || {
+        match propfind::propfind_list_streaming(
+            &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
+            &path2, PROPFIND_TIMEOUT, entry_tx,
+        ) {
+            Ok(etag) => {
+                let _ = etag_tx.send(etag);
+            }
+            Err(e) => {
+                log::debug!("incremental list {}: {}", path2.display(), e);
+                let _ = etag_tx.send(None);
+            }
+        }
+        // Sender drops here, signaling completion.
+        // Promote pending → full cache on next access.
+    });
+
+    // Block briefly for the first entries to arrive
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        {
+            let mut c = cache.lock().unwrap();
+            if let Some(snapshot) = c.get_pending_snapshot(&path) {
+                if !snapshot.is_empty() {
+                    return Ok(Arc::new(snapshot));
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // If we still have nothing, try one more time then promote whatever we have
     let mut c = cache.lock().unwrap();
-    c.put_dir_cache(path.clone(), etag, files);
-    Ok(c.get_cached_dir(&path).unwrap().0)
+    c.promote_pending(&path);
+    if let Some((files, _)) = c.get_cached_dir(&path) {
+        Ok(files)
+    } else {
+        Err(format!("PROPFIND timeout for {}", path.display()))
+    }
 }
 
 fn ensure_file_cached(
@@ -564,6 +675,7 @@ impl NextCloudFs {
                 paths,
                 next_inode: 2,
                 dir_cache: HashMap::new(),
+                pending_dirs: HashMap::new(),
                 file_cache: HashMap::new(),
                 cache_dir,
             })),

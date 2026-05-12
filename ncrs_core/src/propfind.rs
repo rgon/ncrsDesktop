@@ -149,6 +149,62 @@ fn parse_multistatus_stream<R: std::io::BufRead>(
     Ok((dir_etag, entries))
 }
 
+pub fn propfind_list_streaming(
+    client: &reqwest::blocking::Client,
+    webdav_url: &str,
+    username: &str,
+    password: &str,
+    path: &std::path::Path,
+    timeout: Duration,
+    tx: std::sync::mpsc::Sender<DavEntry>,
+) -> Result<Option<String>, String> {
+    let url = build_url(webdav_url, path);
+    log::debug!("PROPFIND_STREAM {}", url);
+
+    let resp = client
+        .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
+        .timeout(timeout)
+        .header("Depth", "1")
+        .header("Content-Type", "application/xml")
+        .basic_auth(username, Some(password))
+        .body(PROPFIND_BODY)
+        .send()
+        .map_err(|e| format!("PROPFIND {}: {}", path.display(), e))?;
+
+    let status = resp.status();
+    if status != reqwest::StatusCode::MULTI_STATUS && !status.is_success() {
+        return Err(format!("PROPFIND {} returned {}", path.display(), status));
+    }
+
+    let reader = std::io::BufReader::new(resp);
+    let prefix = webdav_prefix(webdav_url);
+    let xml_reader = quick_xml::Reader::from_reader(reader);
+    let mut buf_reader = ResponseReader::new(xml_reader);
+
+    let mut dir_etag: Option<String> = None;
+    let mut is_first = true;
+    while let Some(resp) = buf_reader.next_response()? {
+        let remote_path = href_to_remote_path(&resp.href, &prefix);
+        let entry = DavEntry {
+            path: remote_path,
+            is_dir: resp.is_collection,
+            size: if resp.is_collection { resp.oc_size } else { resp.content_length },
+            modified: resp.last_modified,
+            etag: resp.etag.clone(),
+            content_type: resp.content_type,
+            has_preview: resp.has_preview,
+            is_shared: resp.is_shared,
+        };
+        if is_first {
+            dir_etag = resp.etag;
+            is_first = false;
+        } else if tx.send(entry).is_err() {
+            break;
+        }
+    }
+    Ok(dir_etag)
+}
+
 #[cfg(test)]
 fn parse_multistatus_str(
     xml: &str,
@@ -488,5 +544,52 @@ mod tests {
         let prefix = "/remote.php/dav/files/user";
         let p = href_to_remote_path("/remote.php/dav/files/user/", prefix);
         assert_eq!(p, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn streaming_channel_delivery() {
+        let webdav_url = "https://cloud.example.com/remote.php/dav/files/user";
+        let prefix = webdav_prefix(webdav_url);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let xml = SAMPLE.to_string();
+        let handle = std::thread::spawn(move || {
+            let reader = quick_xml::Reader::from_reader(xml.as_bytes());
+            let mut buf_reader = ResponseReader::new(reader);
+            let mut dir_etag = None;
+            let mut is_first = true;
+            while let Some(resp) = buf_reader.next_response().unwrap() {
+                let remote_path = href_to_remote_path(&resp.href, &prefix);
+                let entry = DavEntry {
+                    path: remote_path,
+                    is_dir: resp.is_collection,
+                    size: if resp.is_collection { resp.oc_size } else { resp.content_length },
+                    modified: resp.last_modified,
+                    etag: resp.etag.clone(),
+                    content_type: resp.content_type,
+                    has_preview: resp.has_preview,
+                    is_shared: resp.is_shared,
+                };
+                if is_first {
+                    dir_etag = resp.etag;
+                    is_first = false;
+                } else {
+                    tx.send(entry).unwrap();
+                }
+            }
+            dir_etag
+        });
+
+        let mut received = Vec::new();
+        while let Ok(entry) = rx.recv() {
+            received.push(entry);
+        }
+        let dir_etag = handle.join().unwrap();
+
+        assert_eq!(dir_etag.as_deref(), Some("abc123"));
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].path, PathBuf::from("/Photos/sunset.jpg"));
+        assert!(received[0].is_shared);
+        assert_eq!(received[1].path, PathBuf::from("/Photos/Vacation 2024"));
     }
 }
