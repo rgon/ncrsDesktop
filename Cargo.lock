@@ -816,7 +816,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2266,6 +2266,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2532096657941c2fea9c289d370a250971c689d4f143798ff67113ec042024a5"
 
 [[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
 name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2366,11 +2372,13 @@ dependencies = [
 name = "ncrs_core"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "dirs",
  "env_logger",
  "fuser",
  "libc",
  "log",
+ "md5",
  "percent-encoding",
  "remotefs",
  "remotefs-webdav",

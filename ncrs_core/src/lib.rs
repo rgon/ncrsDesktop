@@ -1,6 +1,7 @@
 pub mod config;
 pub mod ipc;
 pub mod notifications;
+pub mod preview;
 pub mod search;
 
 use std::collections::HashMap;
@@ -276,10 +277,18 @@ fn root_attr() -> FileAttr {
 
 // ── Filesystem ────────────────────────────────────────────────────────────────
 
+struct ConnInfo {
+    base_url: String,
+    username: String,
+    password: String,
+    mount_point: PathBuf,
+}
+
 pub struct NextCloudFs {
     net: Arc<FsNetwork>,
     cache: Arc<Mutex<FsCache>>,
     status: StatusMap,
+    conn: Arc<ConnInfo>,
     log_user: String,
 }
 
@@ -304,6 +313,13 @@ impl NextCloudFs {
 
         let status: StatusMap = Arc::new(Mutex::new(HashMap::new()));
 
+        let conn = Arc::new(ConnInfo {
+            base_url: notifications::base_url(&options.url),
+            username: username.clone(),
+            password: password.clone(),
+            mount_point: options.mount_point.clone(),
+        });
+
         Ok(NextCloudFs {
             net: Arc::new(FsNetwork { webdav: Mutex::new(webdav) }),
             cache: Arc::new(Mutex::new(FsCache {
@@ -315,6 +331,7 @@ impl NextCloudFs {
                 cache_dir,
             })),
             status,
+            conn,
             log_user: options.log_user,
         })
     }
@@ -503,6 +520,7 @@ impl Filesystem for NextCloudFs {
         let net = self.net.clone();
         let cache = self.cache.clone();
         let status = self.status.clone();
+        let conn = self.conn.clone();
 
         thread::spawn(move || {
             if offset == 0 {
@@ -519,6 +537,7 @@ impl Filesystem for NextCloudFs {
             match get_or_list_dir(&net, &cache, path.clone()) {
                 Ok(entries) => {
                     let skip = if offset > 2 { (offset - 2) as usize } else { 0 };
+                    let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
                     for (i, entry) in entries.iter().enumerate().skip(skip) {
                         let name = match entry.path.file_name().and_then(|n| n.to_str()) {
                             Some(n) => n.to_string(),
@@ -532,8 +551,9 @@ impl Filesystem for NextCloudFs {
                             status
                                 .lock()
                                 .unwrap()
-                                .entry(entry_path)
+                                .entry(entry_path.clone())
                                 .or_insert(FileStatus::Remote);
+                            thumb_candidates.push((entry_path, entry.metadata.modified));
                         }
                         let kind =
                             if is_dir { FileType::Directory } else { FileType::RegularFile };
@@ -542,6 +562,18 @@ impl Filesystem for NextCloudFs {
                         }
                     }
                     reply.ok();
+
+                    if !thumb_candidates.is_empty() {
+                        thread::spawn(move || {
+                            preview::prefetch_directory_thumbnails(
+                                &conn.base_url,
+                                &conn.username,
+                                &conn.password,
+                                &conn.mount_point,
+                                &thumb_candidates,
+                            );
+                        });
+                    }
                 }
                 Err(e) => {
                     log::error!("readdir {}: {}", path.display(), e);
