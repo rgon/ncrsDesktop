@@ -218,16 +218,36 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             if not paths:
                 return []
 
-            item = Nautilus.MenuItem(
+            keep = Nautilus.MenuItem(
                 name="NcrsMenuProvider::KeepLocally",
                 label="Keep Locally",
                 tip="Download and keep a local copy of the selected files",
             )
-            item.connect("activate", self._on_keep_locally, paths)
-            return [item]
+            keep.connect("activate", self._on_keep_locally, paths)
+
+            view_web = Nautilus.MenuItem(
+                name="NcrsMenuProvider::ViewInWeb",
+                label="View in Nextcloud Web",
+                tip="Open this file in the Nextcloud web interface",
+            )
+            view_web.connect("activate", self._on_view_in_web, paths)
+
+            return [keep, view_web]
         except Exception:
             _log_error("get_file_items")
             return []
+
+    def _on_view_in_web(self, _menu_item, paths):
+        def _do():
+            try:
+                import subprocess
+                for path in paths:
+                    url = _send_command(f"WEBURL {path}")
+                    if url.startswith("http"):
+                        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                _log_error("_on_view_in_web")
+        _POOL.submit(_do)
 
     def _on_keep_locally(self, _menu_item, paths):
         def _do():

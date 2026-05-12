@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 pub type KeepCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type SharedSet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
+pub type FileIdMap = Arc<Mutex<std::collections::HashMap<PathBuf, u64>>>;
 
 pub fn socket_path() -> PathBuf {
     std::env::var("XDG_RUNTIME_DIR")
@@ -54,7 +55,7 @@ pub type StatusMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileStatus>>>;
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, keep_cb: Option<KeepCallback>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, base_url: String, keep_cb: Option<KeepCallback>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -79,8 +80,10 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let mount = mount_point.clone();
             let map = status_map.clone();
             let shared = shared_set.clone();
+            let fids = fileid_map.clone();
+            let burl = base_url.clone();
             let cb = keep_cb.clone();
-            std::thread::spawn(move || handle_client(stream, mount, map, shared, cb));
+            std::thread::spawn(move || handle_client(stream, mount, map, shared, fids, burl, cb));
         }
     });
 }
@@ -102,6 +105,8 @@ fn handle_client(
     mount_point: PathBuf,
     status_map: StatusMap,
     shared_set: SharedSet,
+    fileid_map: FileIdMap,
+    base_url: String,
     keep_cb: Option<KeepCallback>,
 ) {
     let mut write_half = match stream.try_clone() {
@@ -135,6 +140,18 @@ fn handle_client(
                     }
                 }
                 None => "unknown".to_string(),
+            }
+        } else if let Some(path_str) = trimmed.strip_prefix("WEBURL ") {
+            match strip_mount(Path::new(path_str), &mount_point) {
+                Some(remote) => {
+                    let parent = remote.parent().unwrap_or(Path::new("/"));
+                    let dir = parent.to_string_lossy();
+                    match fileid_map.lock().unwrap().get(&remote) {
+                        Some(fid) => format!("{}/apps/files/?dir={}&fileid={}", base_url, dir, fid),
+                        None => format!("{}/apps/files/?dir={}", base_url, dir),
+                    }
+                }
+                None => "error: path not under mount".to_string(),
             }
         } else if let Some(path_str) = trimmed.strip_prefix("KEEP ") {
             match (strip_mount(Path::new(path_str), &mount_point), &keep_cb) {
