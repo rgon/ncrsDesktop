@@ -10,6 +10,8 @@ const PROPFIND_BODY: &str = r#"<?xml version="1.0"?>
     <d:getlastmodified />
     <d:resourcetype />
     <oc:size />
+    <oc:permissions />
+    <oc:fileid />
     <nc:has-preview />
     <oc:share-types />
   </d:prop>
@@ -32,6 +34,8 @@ pub struct DavEntry {
     pub content_type: Option<String>,
     pub has_preview: bool,
     pub is_shared: bool,
+    pub permissions: Option<String>,
+    pub fileid: Option<u64>,
 }
 
 pub fn propfind_list(
@@ -136,6 +140,8 @@ fn parse_multistatus_stream<R: std::io::BufRead>(
             content_type: resp.content_type,
             has_preview: resp.has_preview,
             is_shared: resp.is_shared,
+            permissions: resp.permissions,
+            fileid: resp.fileid,
         };
 
         if is_first {
@@ -194,6 +200,8 @@ pub fn propfind_list_streaming(
             content_type: resp.content_type,
             has_preview: resp.has_preview,
             is_shared: resp.is_shared,
+            permissions: resp.permissions,
+            fileid: resp.fileid,
         };
         if is_first {
             dir_etag = resp.etag;
@@ -252,6 +260,8 @@ struct RawResponse {
     content_type: Option<String>,
     has_preview: bool,
     is_shared: bool,
+    permissions: Option<String>,
+    fileid: Option<u64>,
 }
 
 struct ResponseReader<R: std::io::BufRead> {
@@ -344,6 +354,12 @@ impl<R: std::io::BufRead> ResponseReader<R> {
                         }
                         "has-preview" => {
                             resp.has_preview = self.read_text()? == "true";
+                        }
+                        "permissions" => {
+                            resp.permissions = Some(self.read_text()?);
+                        }
+                        "fileid" => {
+                            resp.fileid = self.read_text()?.parse().ok();
                         }
                         "share-types" => {
                             resp.is_shared = self.read_has_children("share-types")?;
@@ -470,6 +486,8 @@ mod tests {
         <d:getlastmodified>Mon, 12 May 2025 10:00:00 GMT</d:getlastmodified>
         <d:getetag>"abc123"</d:getetag>
         <oc:size>5000000</oc:size>
+        <oc:permissions>RGDNVCK</oc:permissions>
+        <oc:fileid>100</oc:fileid>
         <nc:has-preview>false</nc:has-preview>
       </d:prop>
       <d:status>HTTP/1.1 200 OK</d:status>
@@ -484,6 +502,8 @@ mod tests {
         <d:getcontenttype>image/jpeg</d:getcontenttype>
         <d:getlastmodified>Sun, 11 May 2025 08:30:00 GMT</d:getlastmodified>
         <d:getetag>"def456"</d:getetag>
+        <oc:permissions>RGDNVW</oc:permissions>
+        <oc:fileid>101</oc:fileid>
         <nc:has-preview>true</nc:has-preview>
         <oc:share-types><oc:share-type>0</oc:share-type></oc:share-types>
       </d:prop>
@@ -523,6 +543,8 @@ mod tests {
         assert!(file.has_preview);
         assert!(file.is_shared);
         assert!(file.modified.is_some());
+        assert_eq!(file.permissions.as_deref(), Some("RGDNVW"));
+        assert_eq!(file.fileid, Some(101));
 
         let dir = &entries[1];
         assert_eq!(dir.path, PathBuf::from("/Photos/Vacation 2024"));
@@ -569,6 +591,8 @@ mod tests {
                     content_type: resp.content_type,
                     has_preview: resp.has_preview,
                     is_shared: resp.is_shared,
+                    permissions: resp.permissions,
+                    fileid: resp.fileid,
                 };
                 if is_first {
                     dir_etag = resp.etag;
