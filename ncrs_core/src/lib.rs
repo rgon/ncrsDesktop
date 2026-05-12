@@ -51,6 +51,7 @@ const PATH_ENCODE: &AsciiSet = &CONTROLS
 struct DirCacheEntry {
     files: Vec<remotefs::fs::File>,
     at: Instant,
+    refreshing: bool,
 }
 
 struct FileCacheEntry {
@@ -207,15 +208,24 @@ impl FsCache {
         ino
     }
 
-    fn check_dir_cache(&self, path: &Path) -> Option<Vec<remotefs::fs::File>> {
-        self.dir_cache
-            .get(path)
-            .filter(|e| e.at.elapsed() < DIR_CACHE_TTL)
-            .map(|e| e.files.clone())
+    fn get_cached_dir(&mut self, path: &Path) -> Option<(Vec<remotefs::fs::File>, bool)> {
+        let entry = self.dir_cache.get_mut(path)?;
+        let stale = entry.at.elapsed() >= DIR_CACHE_TTL;
+        let needs_refresh = stale && !entry.refreshing;
+        if needs_refresh {
+            entry.refreshing = true;
+        }
+        Some((entry.files.clone(), needs_refresh))
     }
 
     fn put_dir_cache(&mut self, path: PathBuf, files: Vec<remotefs::fs::File>) {
-        self.dir_cache.insert(path, DirCacheEntry { files, at: Instant::now() });
+        self.dir_cache.insert(path, DirCacheEntry { files, at: Instant::now(), refreshing: false });
+    }
+
+    fn clear_refreshing(&mut self, path: &Path) {
+        if let Some(entry) = self.dir_cache.get_mut(path) {
+            entry.refreshing = false;
+        }
     }
 
     fn is_known_directory(&self, path: &Path) -> Option<bool> {
@@ -273,8 +283,27 @@ fn get_or_list_dir(
     cache: &Arc<Mutex<FsCache>>,
     path: PathBuf,
 ) -> Result<Vec<remotefs::fs::File>, String> {
-    if let Some(files) = cache.lock().unwrap().check_dir_cache(&path) {
-        log::debug!("LIST_CACHED {} ({} entries)", path.display(), files.len());
+    if let Some((files, needs_refresh)) = cache.lock().unwrap().get_cached_dir(&path) {
+        log::debug!("LIST_CACHED {} ({} entries, refresh={})", path.display(), files.len(), needs_refresh);
+        if needs_refresh {
+            let net = net.clone();
+            let cache = cache.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                match list_dir_timeout(&net, path.clone()) {
+                    Ok(mut fresh) => {
+                        for f in &mut fresh {
+                            f.path = decode_remote_path(&f.path);
+                        }
+                        cache.lock().unwrap().put_dir_cache(path, fresh);
+                    }
+                    Err(e) => {
+                        log::debug!("background refresh {}: {}", path.display(), e);
+                        cache.lock().unwrap().clear_refreshing(&path);
+                    }
+                }
+            });
+        }
         return Ok(files);
     }
     let mut files = list_dir_timeout(net, path.clone())?;
@@ -398,7 +427,7 @@ fn keep_locally_recursive(
 }
 
 fn prefetch_list_dir(net: &FsNetwork, cache: &Mutex<FsCache>, path: &Path) {
-    if cache.lock().unwrap().check_dir_cache(path).is_some() {
+    if cache.lock().unwrap().get_cached_dir(path).is_some() {
         return;
     }
     log::debug!("PREFETCH_LIST {}", path.display());
