@@ -138,8 +138,6 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
 
                 if status == "local":
                     file_info.add_emblem(_EMBLEM_LOCAL)
-                elif status == "remote":
-                    file_info.add_emblem(_EMBLEM_REMOTE)
                 elif status == "synced":
                     file_info.add_emblem(_EMBLEM_SYNCED)
 
@@ -158,14 +156,66 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             self._cancelled.add(id(handle))
 
 
+# ── IPC command helper ────────────────────────────────────────────────────────
+
+def _send_command(cmd: str) -> str:
+    sp = _sock_path()
+    if not os.path.exists(sp):
+        return "error: daemon not running"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(SOCKET_TIMEOUT)
+            s.connect(sp)
+            s.sendall(f"{cmd}\n".encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(64)
+                if not chunk:
+                    break
+                buf += chunk
+            return buf.decode(errors="replace").strip()
+    except (OSError, socket.timeout):
+        return "error: socket timeout"
+
+
 # ── Menu provider ─────────────────────────────────────────────────────────────
 
 class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
-    """Right-click menu items for ncRS-managed files (placeholder)."""
+    """Right-click menu items for ncRS-managed files."""
+
+    def __init__(self):
+        super().__init__()
+        self._mount = _load_mount_point()
 
     def get_file_items(self, *args):
-        # args is (files,) in Nautilus 4; variadic to stay compatible with 3.
-        return []
+        files = args[-1] if args else []
+        if not self._mount:
+            return []
+
+        paths = []
+        for f in files:
+            if f.get_uri_scheme() != "file":
+                continue
+            path = f.get_location().get_path()
+            if path and (path == self._mount or path.startswith(self._mount + "/")):
+                paths.append(path)
+
+        if not paths:
+            return []
+
+        item = Nautilus.MenuItem(
+            name="NcrsMenuProvider::KeepLocally",
+            label="Keep Locally",
+            tip="Download and keep a local copy of the selected files",
+        )
+        item.connect("activate", self._on_keep_locally, paths)
+        return [item]
+
+    def _on_keep_locally(self, _menu_item, paths):
+        def _do():
+            for path in paths:
+                _send_command(f"KEEP {path}")
+        _POOL.submit(_do)
 
     def get_background_items(self, *args):
         return []

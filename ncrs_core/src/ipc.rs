@@ -14,6 +14,8 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub type KeepCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
+
 pub fn socket_path() -> PathBuf {
     std::env::var("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -49,9 +51,9 @@ pub type StatusMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileStatus>>>;
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, keep_cb: Option<KeepCallback>) {
     let sock = socket_path();
-    let _ = std::fs::remove_file(&sock); // clean up stale socket
+    let _ = std::fs::remove_file(&sock);
 
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
@@ -73,15 +75,29 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap) {
             };
             let mount = mount_point.clone();
             let map = status_map.clone();
-            std::thread::spawn(move || handle_client(stream, mount, map));
+            let cb = keep_cb.clone();
+            std::thread::spawn(move || handle_client(stream, mount, map, cb));
         }
     });
+}
+
+fn strip_mount<'a>(path: &'a Path, mount_point: &Path) -> Option<PathBuf> {
+    if path.starts_with(mount_point) {
+        Some(
+            path.strip_prefix(mount_point)
+                .map(|p| Path::new("/").join(p))
+                .unwrap_or_else(|_| PathBuf::from("/")),
+        )
+    } else {
+        None
+    }
 }
 
 fn handle_client(
     stream: std::os::unix::net::UnixStream,
     mount_point: PathBuf,
     status_map: StatusMap,
+    keep_cb: Option<KeepCallback>,
 ) {
     let mut write_half = match stream.try_clone() {
         Ok(s) => s,
@@ -95,28 +111,34 @@ fn handle_client(
             Err(_) => break,
         };
         let trimmed = line.trim();
-        let status = if let Some(path_str) = trimmed.strip_prefix("STATUS ") {
-            let path = Path::new(path_str);
-            if path.starts_with(&mount_point) {
-                // Strip the mount point to get the remote path.
-                let remote = path
-                    .strip_prefix(&mount_point)
-                    .map(|p| Path::new("/").join(p))
-                    .unwrap_or_else(|_| PathBuf::from("/"));
-                status_map
+
+        let reply = if let Some(path_str) = trimmed.strip_prefix("STATUS ") {
+            match strip_mount(Path::new(path_str), &mount_point) {
+                Some(remote) => status_map
                     .lock()
                     .unwrap()
                     .get(&remote)
                     .copied()
                     .unwrap_or(FileStatus::Remote)
-            } else {
-                FileStatus::Unknown
+                    .as_str()
+                    .to_string(),
+                None => "unknown".to_string(),
+            }
+        } else if let Some(path_str) = trimmed.strip_prefix("KEEP ") {
+            match (strip_mount(Path::new(path_str), &mount_point), &keep_cb) {
+                (Some(remote), Some(cb)) => {
+                    let cb = cb.clone();
+                    std::thread::spawn(move || cb(remote));
+                    "ok".to_string()
+                }
+                (None, _) => "error: path not under mount".to_string(),
+                (_, None) => "error: not supported".to_string(),
             }
         } else {
-            FileStatus::Unknown
+            "unknown".to_string()
         };
 
-        if writeln!(write_half, "{}", status.as_str()).is_err() {
+        if writeln!(write_half, "{}", reply).is_err() {
             break;
         }
     }

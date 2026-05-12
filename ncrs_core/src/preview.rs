@@ -47,6 +47,7 @@ fn fetch_preview_bytes(
     password: &str,
     remote_path: &str,
 ) -> Result<Vec<u8>, String> {
+    log::debug!("GET_THUMB {}", remote_path);
     let url = format!("{}/index.php/core/preview.png", base);
     let size = PREVIEW_SIZE.to_string();
     let resp = client

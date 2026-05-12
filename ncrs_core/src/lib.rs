@@ -132,6 +132,7 @@ fn list_dir_timeout(
     net: &Arc<FsNetwork>,
     path: PathBuf,
 ) -> Result<Vec<remotefs::fs::File>, String> {
+    log::debug!("LIST {}", path.display());
     let (tx, rx) = mpsc::channel();
     let n = net.clone();
     thread::spawn(move || {
@@ -154,6 +155,7 @@ fn open_file_timeout(
     path: PathBuf,
     dest: std::fs::File,
 ) -> Result<(), String> {
+    log::info!("DOWNLOAD {}", path.display());
     let (tx, rx) = mpsc::channel();
     let n = net.clone();
     thread::spawn(move || {
@@ -250,6 +252,7 @@ fn get_or_list_dir(
     path: PathBuf,
 ) -> Result<Vec<remotefs::fs::File>, String> {
     if let Some(files) = cache.lock().unwrap().check_dir_cache(&path) {
+        log::debug!("LIST_CACHED {} ({} entries)", path.display(), files.len());
         return Ok(files);
     }
     let mut files = list_dir_timeout(net, path.clone())?;
@@ -304,10 +307,60 @@ fn ensure_file_cached(
     Ok(local_path)
 }
 
+fn keep_locally_recursive(
+    net: &Arc<FsNetwork>,
+    cache: &Arc<Mutex<FsCache>>,
+    status: &StatusMap,
+    remote_path: PathBuf,
+) {
+    log::info!("KEEP {}", remote_path.display());
+    let entries = match get_or_list_dir(net, cache, remote_path.clone()) {
+        Ok(e) => e,
+        Err(_) => {
+            if let Err(e) = ensure_file_cached(net, cache, status, remote_path.clone()) {
+                log::warn!("keep failed {}: {}", remote_path.display(), e);
+            }
+            return;
+        }
+    };
+
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    for entry in &entries {
+        let name = match entry.path.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => continue,
+        };
+        let child = remote_path.join(&name);
+        if entry.metadata.file_type == RemoteFileType::Directory {
+            dirs.push(child);
+        } else {
+            files.push(child);
+        }
+    }
+
+    for chunk in files.chunks(PREFETCH_BATCH) {
+        std::thread::scope(|s| {
+            for path in chunk {
+                s.spawn(|| {
+                    if let Err(e) = ensure_file_cached(net, cache, status, path.clone()) {
+                        log::warn!("keep failed {}: {}", path.display(), e);
+                    }
+                });
+            }
+        });
+    }
+
+    for dir in dirs {
+        keep_locally_recursive(net, cache, status, dir);
+    }
+}
+
 fn prefetch_list_dir(net: &FsNetwork, cache: &Mutex<FsCache>, path: &Path) {
     if cache.lock().unwrap().check_dir_cache(path).is_some() {
         return;
     }
+    log::debug!("PREFETCH_LIST {}", path.display());
     match net.checkout() {
         Ok(mut conn) => {
             let r = conn.list_dir(path).map_err(|e| e.to_string());
@@ -452,6 +505,15 @@ impl NextCloudFs {
     pub fn status_map(&self) -> StatusMap {
         self.status.clone()
     }
+
+    pub fn keep_callback(&self) -> ipc::KeepCallback {
+        let net = self.net.clone();
+        let cache = self.cache.clone();
+        let status = self.status.clone();
+        Arc::new(move |remote_path| {
+            keep_locally_recursive(&net, &cache, &status, remote_path);
+        })
+    }
 }
 
 impl Filesystem for NextCloudFs {
@@ -577,11 +639,29 @@ impl Filesystem for NextCloudFs {
             fh
         };
 
+        let start_bg = local.is_none();
         self.open_files
             .lock()
             .unwrap()
-            .insert(fh, OpenFile { remote_path: path, local, buf: None });
+            .insert(fh, OpenFile { remote_path: path.clone(), local, buf: None });
         reply.opened(fh, 0);
+
+        if start_bg {
+            let net = self.net.clone();
+            let cache = self.cache.clone();
+            let status = self.status.clone();
+            let open_files = self.open_files.clone();
+            thread::spawn(move || {
+                match ensure_file_cached(&net, &cache, &status, path.clone()) {
+                    Ok(local_path) => {
+                        open_files.lock().unwrap().entry(fh).and_modify(|of| {
+                            of.local = Some(local_path);
+                        });
+                    }
+                    Err(e) => log::debug!("background cache {}: {}", path.display(), e),
+                }
+            });
+        }
     }
 
     fn read(
@@ -833,6 +913,7 @@ fn range_read_timeout(conn: &Arc<ConnInfo>, path: &Path, offset: u64, size: usiz
 }
 
 fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+    log::debug!("RANGE_READ {} offset={} size={}", path.display(), offset, size);
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
     let resp = conn.http
@@ -854,7 +935,8 @@ fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Resu
 
 pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
     let filesystem = NextCloudFs::new(options.clone())?;
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map());
+    let keep_cb = filesystem.keep_callback();
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), Some(keep_cb));
 
     let fuse_options = vec![
         MountOption::RO,
