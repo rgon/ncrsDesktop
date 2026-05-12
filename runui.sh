@@ -2,6 +2,12 @@
 # pnpm i
 # pnpm run build
 # cd ../..
+
+DEST="$HOME/.local/share/nautilus-python/extensions"
+mkdir -p "$DEST"
+cp shell_integration/nautilus/syncstate.py "$DEST/"
+nautilus -q 2>/dev/null || true
+
 cd ncrs-gui
 RUST_LOG=info pnpm run tauri dev
 # cargo run --bin ncrs-gui
