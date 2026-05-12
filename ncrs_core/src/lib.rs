@@ -32,6 +32,9 @@ const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const READ_AHEAD: usize = 2 * 1024 * 1024; // 2 MB
+const PREFETCH_SUBDIRS: usize = 20;
+const PREFETCH_BATCH: usize = 8;
+const MAX_POOL_IDLE: usize = 8;
 
 const PATH_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -101,7 +104,28 @@ impl std::fmt::Display for SyncState {
 //    deadline via recv_timeout without blocking the FUSE session thread. ───────
 
 struct FsNetwork {
-    webdav: Mutex<WebDAVFs>,
+    conns: Mutex<Vec<WebDAVFs>>,
+    url: String,
+    username: String,
+    password: String,
+}
+
+impl FsNetwork {
+    fn checkout(&self) -> Result<WebDAVFs, String> {
+        if let Some(conn) = self.conns.lock().unwrap().pop() {
+            return Ok(conn);
+        }
+        let mut conn = WebDAVFs::new(&self.username, &self.password, &self.url);
+        conn.connect().map_err(|e| format!("WebDAV connect: {}", e))?;
+        Ok(conn)
+    }
+
+    fn checkin(&self, conn: WebDAVFs) {
+        let mut pool = self.conns.lock().unwrap();
+        if pool.len() < MAX_POOL_IDLE {
+            pool.push(conn);
+        }
+    }
 }
 
 fn list_dir_timeout(
@@ -111,8 +135,15 @@ fn list_dir_timeout(
     let (tx, rx) = mpsc::channel();
     let n = net.clone();
     thread::spawn(move || {
-        let r = n.webdav.lock().unwrap().list_dir(&path).map_err(|e| e.to_string());
-        let _ = tx.send(r);
+        let result = match n.checkout() {
+            Ok(mut conn) => {
+                let r = conn.list_dir(&path).map_err(|e| e.to_string());
+                n.checkin(conn);
+                r
+            }
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(result);
     });
     rx.recv_timeout(PROPFIND_TIMEOUT)
         .unwrap_or_else(|_| Err("WebDAV PROPFIND timeout".into()))
@@ -126,14 +157,18 @@ fn open_file_timeout(
     let (tx, rx) = mpsc::channel();
     let n = net.clone();
     thread::spawn(move || {
-        let r = n
-            .webdav
-            .lock()
-            .unwrap()
-            .open_file(&path, Box::new(dest))
-            .map(|_| ())
-            .map_err(|e| e.to_string());
-        let _ = tx.send(r);
+        let result = match n.checkout() {
+            Ok(mut conn) => {
+                let r = conn
+                    .open_file(&path, Box::new(dest))
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                n.checkin(conn);
+                r
+            }
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(result);
     });
     rx.recv_timeout(DOWNLOAD_TIMEOUT)
         .unwrap_or_else(|_| Err("WebDAV download timeout".into()))
@@ -269,6 +304,28 @@ fn ensure_file_cached(
     Ok(local_path)
 }
 
+fn prefetch_list_dir(net: &FsNetwork, cache: &Mutex<FsCache>, path: &Path) {
+    if cache.lock().unwrap().check_dir_cache(path).is_some() {
+        return;
+    }
+    match net.checkout() {
+        Ok(mut conn) => {
+            let r = conn.list_dir(path).map_err(|e| e.to_string());
+            net.checkin(conn);
+            match r {
+                Ok(mut files) => {
+                    for f in &mut files {
+                        f.path = decode_remote_path(&f.path);
+                    }
+                    cache.lock().unwrap().put_dir_cache(path.to_path_buf(), files);
+                }
+                Err(e) => log::debug!("prefetch {}: {}", path.display(), e),
+            }
+        }
+        Err(e) => log::debug!("prefetch checkout: {}", e),
+    }
+}
+
 // ── FileAttr helpers ──────────────────────────────────────────────────────────
 
 fn make_file_attr(inode: u64, metadata: &remotefs::fs::Metadata) -> FileAttr {
@@ -338,8 +395,8 @@ impl NextCloudFs {
     pub fn new(options: MountOptions) -> Result<Self, String> {
         let username = options.username.unwrap_or_default();
         let password = options.password.unwrap_or_default();
-        let mut webdav = WebDAVFs::new(&username, &password, &options.url);
-        webdav.connect().map_err(|e| format!("WebDAV connect failed: {}", e))?;
+        let mut initial = WebDAVFs::new(&username, &password, &options.url);
+        initial.connect().map_err(|e| format!("WebDAV connect failed: {}", e))?;
 
         let cache_dir = dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -370,7 +427,12 @@ impl NextCloudFs {
         });
 
         Ok(NextCloudFs {
-            net: Arc::new(FsNetwork { webdav: Mutex::new(webdav) }),
+            net: Arc::new(FsNetwork {
+                conns: Mutex::new(vec![initial]),
+                url: options.url.clone(),
+                username: username.clone(),
+                password: password.clone(),
+            }),
             cache: Arc::new(Mutex::new(FsCache {
                 inodes,
                 paths,
@@ -721,6 +783,24 @@ impl Filesystem for NextCloudFs {
                                 &conn.mount_point,
                                 &thumb_candidates,
                             );
+                        });
+                    }
+
+                    let subdirs: Vec<PathBuf> = entries.iter()
+                        .filter(|e| e.metadata.file_type == RemoteFileType::Directory)
+                        .take(PREFETCH_SUBDIRS)
+                        .filter_map(|e| e.path.file_name().map(|n| path.join(n.to_string_lossy().as_ref())))
+                        .collect();
+
+                    if !subdirs.is_empty() {
+                        thread::spawn(move || {
+                            for chunk in subdirs.chunks(PREFETCH_BATCH) {
+                                std::thread::scope(|s| {
+                                    for dir in chunk {
+                                        s.spawn(|| prefetch_list_dir(&net, &cache, dir));
+                                    }
+                                });
+                            }
                         });
                     }
                 }
