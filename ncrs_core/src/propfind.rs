@@ -60,8 +60,8 @@ pub fn propfind_list(
         return Err(format!("PROPFIND {} returned {}", path.display(), status));
     }
 
-    let body = resp.text().map_err(|e| e.to_string())?;
-    parse_multistatus(&body, webdav_url)
+    let reader = std::io::BufReader::new(resp);
+    parse_multistatus_stream(reader, webdav_url)
 }
 
 pub fn propfind_etag(
@@ -90,8 +90,8 @@ pub fn propfind_etag(
         return Err(format!("PROPFIND_ETAG {} returned {}", path.display(), status));
     }
 
-    let body = resp.text().map_err(|e| e.to_string())?;
-    let (dir_etag, _) = parse_multistatus(&body, webdav_url)?;
+    let reader = std::io::BufReader::new(resp);
+    let (dir_etag, _) = parse_multistatus_stream(reader, webdav_url)?;
     Ok(dir_etag)
 }
 
@@ -112,16 +112,16 @@ fn build_url(webdav_url: &str, path: &std::path::Path) -> String {
 
 // ── XML parser ──────────────────────────────────────────────────────────────
 
-fn parse_multistatus(
-    xml: &str,
+fn parse_multistatus_stream<R: std::io::BufRead>(
+    reader: R,
     webdav_url: &str,
 ) -> Result<(Option<String>, Vec<DavEntry>), String> {
     let mut entries = Vec::new();
     let mut dir_etag: Option<String> = None;
     let prefix = webdav_prefix(webdav_url);
 
-    let reader = quick_xml::Reader::from_str(xml);
-    let mut buf_reader = ResponseReader::new(reader);
+    let xml_reader = quick_xml::Reader::from_reader(reader);
+    let mut buf_reader = ResponseReader::new(xml_reader);
 
     let mut is_first = true;
     while let Some(resp) = buf_reader.next_response()? {
@@ -147,6 +147,14 @@ fn parse_multistatus(
     }
 
     Ok((dir_etag, entries))
+}
+
+#[cfg(test)]
+fn parse_multistatus_str(
+    xml: &str,
+    webdav_url: &str,
+) -> Result<(Option<String>, Vec<DavEntry>), String> {
+    parse_multistatus_stream(xml.as_bytes(), webdav_url)
 }
 
 fn webdav_prefix(webdav_url: &str) -> String {
@@ -190,13 +198,13 @@ struct RawResponse {
     is_shared: bool,
 }
 
-struct ResponseReader<'a> {
-    reader: quick_xml::Reader<&'a [u8]>,
+struct ResponseReader<R: std::io::BufRead> {
+    reader: quick_xml::Reader<R>,
     buf: Vec<u8>,
 }
 
-impl<'a> ResponseReader<'a> {
-    fn new(reader: quick_xml::Reader<&'a [u8]>) -> Self {
+impl<R: std::io::BufRead> ResponseReader<R> {
+    fn new(reader: quick_xml::Reader<R>) -> Self {
         Self { reader, buf: Vec::with_capacity(256) }
     }
 
@@ -445,7 +453,7 @@ mod tests {
     fn parse_multistatus_basic() {
         let prefix = "/remote.php/dav/files/user";
         let (dir_etag, entries) =
-            parse_multistatus(SAMPLE, &format!("https://cloud.example.com{}", prefix)).unwrap();
+            parse_multistatus_str(SAMPLE, &format!("https://cloud.example.com{}", prefix)).unwrap();
 
         assert_eq!(dir_etag.as_deref(), Some("abc123"));
         assert_eq!(entries.len(), 2);
