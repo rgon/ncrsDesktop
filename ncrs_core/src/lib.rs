@@ -629,6 +629,7 @@ pub struct NextCloudFs {
     status: StatusMap,
     shared: ipc::SharedSet,
     fileids: ipc::FileIdMap,
+    details: ipc::FileDetailMap,
     conn: Arc<ConnInfo>,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     next_fh: Arc<Mutex<u64>>,
@@ -657,6 +658,7 @@ impl NextCloudFs {
         let status: StatusMap = Arc::new(Mutex::new(HashMap::new()));
         let shared: ipc::SharedSet = Arc::new(Mutex::new(std::collections::HashSet::new()));
         let fileids: ipc::FileIdMap = Arc::new(Mutex::new(HashMap::new()));
+        let details: ipc::FileDetailMap = Arc::new(Mutex::new(HashMap::new()));
 
         let http = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(4)
@@ -691,6 +693,7 @@ impl NextCloudFs {
             status,
             shared,
             fileids,
+            details,
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
@@ -708,6 +711,10 @@ impl NextCloudFs {
 
     pub fn fileid_map(&self) -> ipc::FileIdMap {
         self.fileids.clone()
+    }
+
+    pub fn detail_map(&self) -> ipc::FileDetailMap {
+        self.details.clone()
     }
 
     pub fn keep_callback(&self) -> ipc::KeepCallback {
@@ -997,6 +1004,7 @@ impl Filesystem for NextCloudFs {
         let status = self.status.clone();
         let shared = self.shared.clone();
         let fileids = self.fileids.clone();
+        let details = self.details.clone();
         let conn = self.conn.clone();
 
         thread::spawn(move || {
@@ -1029,10 +1037,15 @@ impl Filesystem for NextCloudFs {
                         if let Some(fid) = entry.fileid {
                             fileids.safe_lock().insert(entry_path.clone(), fid);
                         }
+                        details.safe_lock().insert(entry_path.clone(), ipc::FileDetail {
+                            permissions: entry.permissions.clone(),
+                            owner_id: entry.owner_id.clone(),
+                            owner_display_name: entry.owner_display_name.clone(),
+                            size: entry.size,
+                        });
                         if !entry.is_dir {
                             status
-                                .lock()
-                                .unwrap()
+                                .safe_lock()
                                 .entry(entry_path.clone())
                                 .or_insert(FileStatus::Remote);
                             thumb_candidates.push((entry_path, entry.modified, entry.has_preview, entry.fileid));
@@ -1136,7 +1149,8 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
     let filesystem = NextCloudFs::new(options.clone())?;
     let keep_cb = filesystem.keep_callback();
     let base_url = notifications::base_url(&options.url);
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), base_url, Some(keep_cb));
+    let username = options.username.clone().unwrap_or_default();
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), username, base_url, Some(keep_cb));
 
     let fuse_options = vec![
         MountOption::RO,

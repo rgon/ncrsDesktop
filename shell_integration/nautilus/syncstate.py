@@ -1,7 +1,6 @@
 """
 ncRS Nautilus extension — decorates files under the ncRS mount point with
-sync-state emblems so the user can tell at a glance which files are local
-(downloaded to disk) and which are still remote-only (will download on open).
+sync-state emblems and custom columns showing Nextcloud metadata.
 
 Requires:
   sudo apt install python3-nautilus
@@ -13,11 +12,11 @@ Install:
 The ncRS daemon must be running; it exposes a Unix socket at
 $XDG_RUNTIME_DIR/ncrs.sock (usually /run/user/<UID>/ncrs.sock).
 
-Protocol: send "STATUS <abs-path>\\n", receive one of:
-  local   — cached on disk, up to date
-  synced  — cached but dir-listing freshness not confirmed
-  remote  — known to exist on server, not yet downloaded
-  unknown — path not under mount point or daemon hasn't seen it
+Protocol (line-oriented over Unix socket):
+  STATUS <abs-path>  → local | synced | remote | downloading | unknown[,shared]
+  DETAIL <abs-path>  → status\\tsharing\\tpermissions\\towner\\tsize  (tab-separated)
+  WEBURL <abs-path>  → https://…  (Nextcloud web link)
+  KEEP   <abs-path>  → ok
 """
 
 import os
@@ -40,8 +39,20 @@ _EMBLEM_SHARED = "emblem-shared"        # people / shared
 SOCKET_TIMEOUT = 0.15  # seconds; daemon replies instantly (HashMap lookup)
 _MAX_RECV = 4096
 
-# One shared pool so we don't spawn unbounded threads for large directories.
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
+
+_PERM_FLAGS = {
+    "R": "Read",
+    "G": "Read",
+    "W": "Write",
+    "C": "Create",
+    "D": "Delete",
+    "N": "Rename/Move",
+    "V": "Move",
+    "M": "Modify",
+    "S": "Share",
+    "K": "Lock",
+}
 
 
 def _log_error(context: str) -> None:
@@ -55,7 +66,6 @@ def _sock_path() -> str:
 
 
 def _load_mount_point(config_path: str | None = None) -> str | None:
-    """Read mount_point from the ncRS config YAML (simple line parse)."""
     if config_path is None:
         config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
         config_path = os.path.join(config_home, "ncrs", "config.yaml")
@@ -71,113 +81,6 @@ def _load_mount_point(config_path: str | None = None) -> str | None:
         pass
     return None
 
-
-def query_status(path: str, sock_path: str | None = None) -> str:
-    """Query the ncRS daemon for the sync status of *path*.
-
-    Returns 'unknown' on any error (daemon not running, timeout, etc.).
-    *sock_path* is injectable for tests.
-    """
-    sp = sock_path or _sock_path()
-    if not os.path.exists(sp):
-        return "unknown"
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(SOCKET_TIMEOUT)
-            s.connect(sp)
-            s.sendall(f"STATUS {path}\n".encode())
-            buf = b""
-            while b"\n" not in buf and len(buf) < _MAX_RECV:
-                chunk = s.recv(64)
-                if not chunk:
-                    break
-                buf += chunk
-            return buf.decode(errors="replace").strip()
-    except (OSError, socket.timeout):
-        return "unknown"
-
-
-# ── Info provider ─────────────────────────────────────────────────────────────
-
-class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
-    """Decorates files with emblems reflecting their ncRS sync state."""
-
-    def __init__(self):
-        super().__init__()
-        self._cancelled: set[int] = set()
-        self._lock = threading.Lock()
-        self._mount = _load_mount_point()
-
-    # Synchronous fast path: called for items already in cache.
-    # We return COMPLETE immediately without doing any I/O; the async full
-    # path below is what does real work.
-    def update_file_info(self, file_info):
-        return Nautilus.OperationResult.COMPLETE
-
-    # Async path: Nautilus calls this and expects IN_PROGRESS while we work,
-    # then update_complete_invoke when we're done.
-    def update_file_info_full(self, provider, handle, closure, file_info):
-        try:
-            if not self._mount:
-                return Nautilus.OperationResult.COMPLETE
-
-            if file_info.get_uri_scheme() != "file":
-                return Nautilus.OperationResult.COMPLETE
-
-            path = file_info.get_location().get_path()
-            if path is None or not (path == self._mount or path.startswith(self._mount + "/")):
-                return Nautilus.OperationResult.COMPLETE
-        except Exception:
-            _log_error("update_file_info_full (pre-check)")
-            return Nautilus.OperationResult.COMPLETE
-
-        handle_id = id(handle)
-
-        def _work():
-            try:
-                status = query_status(path)
-            except Exception:
-                _log_error(f"query_status({path})")
-                status = "unknown"
-
-            def _apply():
-                try:
-                    with self._lock:
-                        if handle_id in self._cancelled:
-                            self._cancelled.discard(handle_id)
-                            return GLib.SOURCE_REMOVE
-
-                    flags = status.split(",")
-                    sync = flags[0]
-                    if sync == "local":
-                        file_info.add_emblem(_EMBLEM_LOCAL)
-                    elif sync == "synced":
-                        file_info.add_emblem(_EMBLEM_SYNCED)
-                    elif sync == "downloading":
-                        file_info.add_emblem(_EMBLEM_REMOTE)
-                    if "shared" in flags:
-                        file_info.add_emblem(_EMBLEM_SHARED)
-
-                    Nautilus.info_provider_update_complete_invoke(
-                        closure, provider, handle, Nautilus.OperationResult.COMPLETE)
-                except Exception:
-                    _log_error(f"_apply({path})")
-                return GLib.SOURCE_REMOVE
-
-            GLib.idle_add(_apply)
-
-        _POOL.submit(_work)
-        return Nautilus.OperationResult.IN_PROGRESS
-
-    def cancel_update(self, provider, handle):
-        try:
-            with self._lock:
-                self._cancelled.add(id(handle))
-        except Exception:
-            _log_error("cancel_update")
-
-
-# ── IPC command helper ────────────────────────────────────────────────────────
 
 def _send_command(cmd: str) -> str:
     sp = _sock_path()
@@ -199,11 +102,173 @@ def _send_command(cmd: str) -> str:
         return "error: socket timeout"
 
 
+def _human_perms(raw: str) -> str:
+    if not raw:
+        return ""
+    seen = set()
+    parts = []
+    for ch in raw:
+        label = _PERM_FLAGS.get(ch)
+        if label and label not in seen:
+            seen.add(label)
+            parts.append(label)
+    return ", ".join(parts) if parts else raw
+
+
+def _human_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        n /= 1024.0
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} PiB"
+
+
+# ── Column provider ──────────────────────────────────────────────────────────
+
+class NcrsColumnProvider(GObject.GObject, Nautilus.ColumnProvider):
+    def get_columns(self):
+        try:
+            return [
+                Nautilus.Column(
+                    name="NcrsExtension::sync_status",
+                    attribute="ncrs_sync",
+                    label="Sync",
+                    description="ncRS sync status",
+                ),
+                Nautilus.Column(
+                    name="NcrsExtension::sharing",
+                    attribute="ncrs_sharing",
+                    label="Sharing",
+                    description="Nextcloud sharing status",
+                ),
+                Nautilus.Column(
+                    name="NcrsExtension::permissions",
+                    attribute="ncrs_permissions",
+                    label="NC Permissions",
+                    description="Nextcloud permission flags",
+                ),
+                Nautilus.Column(
+                    name="NcrsExtension::owner",
+                    attribute="ncrs_owner",
+                    label="Owner",
+                    description="File owner on Nextcloud",
+                ),
+                Nautilus.Column(
+                    name="NcrsExtension::nc_size",
+                    attribute="ncrs_size",
+                    label="NC Size",
+                    description="Size on Nextcloud (includes folder contents)",
+                ),
+            ]
+        except Exception:
+            _log_error("get_columns")
+            return []
+
+
+# ── Info provider ─────────────────────────────────────────────────────────────
+
+_SYNC_LABELS = {
+    "local": "Local",
+    "synced": "Synced",
+    "remote": "Remote",
+    "downloading": "Downloading",
+    "unknown": "",
+}
+
+
+class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
+    def __init__(self):
+        super().__init__()
+        self._cancelled: set[int] = set()
+        self._lock = threading.Lock()
+        self._mount = _load_mount_point()
+
+    def update_file_info(self, file_info):
+        return Nautilus.OperationResult.COMPLETE
+
+    def update_file_info_full(self, provider, handle, closure, file_info):
+        try:
+            if not self._mount:
+                return Nautilus.OperationResult.COMPLETE
+
+            if file_info.get_uri_scheme() != "file":
+                return Nautilus.OperationResult.COMPLETE
+
+            path = file_info.get_location().get_path()
+            if path is None or not (path == self._mount or path.startswith(self._mount + "/")):
+                return Nautilus.OperationResult.COMPLETE
+        except Exception:
+            _log_error("update_file_info_full (pre-check)")
+            return Nautilus.OperationResult.COMPLETE
+
+        handle_id = id(handle)
+
+        def _work():
+            try:
+                detail = _send_command(f"DETAIL {path}")
+            except Exception:
+                _log_error(f"DETAIL({path})")
+                detail = "unknown\t\t\t\t0"
+
+            def _apply():
+                try:
+                    with self._lock:
+                        if handle_id in self._cancelled:
+                            self._cancelled.discard(handle_id)
+                            return GLib.SOURCE_REMOVE
+
+                    parts = detail.split("\t")
+                    sync = parts[0] if len(parts) > 0 else "unknown"
+                    sharing = parts[1] if len(parts) > 1 else ""
+                    perms = parts[2] if len(parts) > 2 else ""
+                    owner = parts[3] if len(parts) > 3 else ""
+                    size_str = parts[4] if len(parts) > 4 else "0"
+
+                    # Emblems
+                    if sync == "local":
+                        file_info.add_emblem(_EMBLEM_LOCAL)
+                    elif sync == "synced":
+                        file_info.add_emblem(_EMBLEM_SYNCED)
+                    elif sync == "downloading":
+                        file_info.add_emblem(_EMBLEM_REMOTE)
+                    if sharing:
+                        file_info.add_emblem(_EMBLEM_SHARED)
+
+                    # Columns
+                    file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
+                    file_info.add_string_attribute("ncrs_sharing", sharing)
+                    file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
+                    file_info.add_string_attribute("ncrs_owner", owner)
+                    try:
+                        size_val = int(size_str)
+                        file_info.add_string_attribute("ncrs_size", _human_size(size_val) if size_val > 0 else "")
+                    except ValueError:
+                        file_info.add_string_attribute("ncrs_size", "")
+
+                    Nautilus.info_provider_update_complete_invoke(
+                        closure, provider, handle, Nautilus.OperationResult.COMPLETE)
+                except Exception:
+                    _log_error(f"_apply({path})")
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(_apply)
+
+        _POOL.submit(_work)
+        return Nautilus.OperationResult.IN_PROGRESS
+
+    def cancel_update(self, provider, handle):
+        try:
+            with self._lock:
+                self._cancelled.add(id(handle))
+        except Exception:
+            _log_error("cancel_update")
+
+
 # ── Menu provider ─────────────────────────────────────────────────────────────
 
 class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
-    """Right-click menu items for ncRS-managed files."""
-
     def __init__(self):
         super().__init__()
         self._mount = _load_mount_point()

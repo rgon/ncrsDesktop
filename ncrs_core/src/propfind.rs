@@ -12,6 +12,8 @@ const PROPFIND_BODY: &str = r#"<?xml version="1.0"?>
     <oc:size />
     <oc:permissions />
     <oc:fileid />
+    <oc:owner-id />
+    <oc:owner-display-name />
     <nc:has-preview />
     <oc:share-types />
   </d:prop>
@@ -36,6 +38,8 @@ pub struct DavEntry {
     pub is_shared: bool,
     pub permissions: Option<String>,
     pub fileid: Option<u64>,
+    pub owner_id: Option<String>,
+    pub owner_display_name: Option<String>,
 }
 
 pub fn propfind_list(
@@ -142,6 +146,8 @@ fn parse_multistatus_stream<R: std::io::BufRead>(
             is_shared: resp.is_shared,
             permissions: resp.permissions,
             fileid: resp.fileid,
+            owner_id: resp.owner_id,
+            owner_display_name: resp.owner_display_name,
         };
 
         if is_first {
@@ -202,6 +208,8 @@ pub fn propfind_list_streaming(
             is_shared: resp.is_shared,
             permissions: resp.permissions,
             fileid: resp.fileid,
+            owner_id: resp.owner_id,
+            owner_display_name: resp.owner_display_name,
         };
         if is_first {
             dir_etag = resp.etag;
@@ -262,6 +270,8 @@ struct RawResponse {
     is_shared: bool,
     permissions: Option<String>,
     fileid: Option<u64>,
+    owner_id: Option<String>,
+    owner_display_name: Option<String>,
 }
 
 struct ResponseReader<R: std::io::BufRead> {
@@ -360,6 +370,12 @@ impl<R: std::io::BufRead> ResponseReader<R> {
                         }
                         "fileid" => {
                             resp.fileid = self.read_text()?.parse().ok();
+                        }
+                        "owner-id" => {
+                            resp.owner_id = Some(self.read_text()?);
+                        }
+                        "owner-display-name" => {
+                            resp.owner_display_name = Some(self.read_text()?);
                         }
                         "share-types" => {
                             resp.is_shared = self.read_has_children("share-types")?;
@@ -504,6 +520,8 @@ mod tests {
         <d:getetag>"def456"</d:getetag>
         <oc:permissions>RGDNVW</oc:permissions>
         <oc:fileid>101</oc:fileid>
+        <oc:owner-id>alice</oc:owner-id>
+        <oc:owner-display-name>Alice Smith</oc:owner-display-name>
         <nc:has-preview>true</nc:has-preview>
         <oc:share-types><oc:share-type>0</oc:share-type></oc:share-types>
       </d:prop>
@@ -545,6 +563,8 @@ mod tests {
         assert!(file.modified.is_some());
         assert_eq!(file.permissions.as_deref(), Some("RGDNVW"));
         assert_eq!(file.fileid, Some(101));
+        assert_eq!(file.owner_id.as_deref(), Some("alice"));
+        assert_eq!(file.owner_display_name.as_deref(), Some("Alice Smith"));
 
         let dir = &entries[1];
         assert_eq!(dir.path, PathBuf::from("/Photos/Vacation 2024"));
@@ -593,6 +613,8 @@ mod tests {
                     is_shared: resp.is_shared,
                     permissions: resp.permissions,
                     fileid: resp.fileid,
+                    owner_id: resp.owner_id,
+                    owner_display_name: resp.owner_display_name,
                 };
                 if is_first {
                     dir_etag = resp.etag;
