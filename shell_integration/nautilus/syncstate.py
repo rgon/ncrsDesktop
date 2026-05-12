@@ -22,7 +22,9 @@ Protocol: send "STATUS <abs-path>\\n", receive one of:
 
 import os
 import socket
+import sys
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import gi
@@ -38,6 +40,11 @@ SOCKET_TIMEOUT = 0.15  # seconds; daemon replies instantly (HashMap lookup)
 
 # One shared pool so we don't spawn unbounded threads for large directories.
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
+
+
+def _log_error(context: str) -> None:
+    print(f"[ncrs-nautilus] {context}:", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
 
 
 def _sock_path() -> str:
@@ -121,24 +128,30 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         handle_id = id(handle)
 
         def _work():
-            status = query_status(path)
+            try:
+                status = query_status(path)
+            except Exception:
+                _log_error(f"query_status({path})")
+                status = "unknown"
 
             def _apply():
-                # Check if Nautilus cancelled this request while we were querying.
-                with self._lock:
-                    if handle_id in self._cancelled:
-                        self._cancelled.discard(handle_id)
-                        return GLib.SOURCE_REMOVE
+                try:
+                    with self._lock:
+                        if handle_id in self._cancelled:
+                            self._cancelled.discard(handle_id)
+                            return GLib.SOURCE_REMOVE
 
-                if status == "local":
-                    file_info.add_emblem(_EMBLEM_LOCAL)
-                elif status == "synced":
-                    file_info.add_emblem(_EMBLEM_SYNCED)
-                elif status == "downloading":
-                    file_info.add_emblem(_EMBLEM_REMOTE)
+                    if status == "local":
+                        file_info.add_emblem(_EMBLEM_LOCAL)
+                    elif status == "synced":
+                        file_info.add_emblem(_EMBLEM_SYNCED)
+                    elif status == "downloading":
+                        file_info.add_emblem(_EMBLEM_REMOTE)
 
-                Nautilus.info_provider_update_complete_invoke(
-                    closure, provider, handle, Nautilus.OperationResult.COMPLETE)
+                    Nautilus.info_provider_update_complete_invoke(
+                        closure, provider, handle, Nautilus.OperationResult.COMPLETE)
+                except Exception:
+                    _log_error(f"_apply({path})")
                 return GLib.SOURCE_REMOVE
 
             GLib.idle_add(_apply)
@@ -184,33 +197,40 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         self._mount = _load_mount_point()
 
     def get_file_items(self, *args):
-        files = args[-1] if args else []
-        if not self._mount:
+        try:
+            files = args[-1] if args else []
+            if not self._mount:
+                return []
+
+            paths = []
+            for f in files:
+                if f.get_uri_scheme() != "file":
+                    continue
+                path = f.get_location().get_path()
+                if path and (path == self._mount or path.startswith(self._mount + "/")):
+                    paths.append(path)
+
+            if not paths:
+                return []
+
+            item = Nautilus.MenuItem(
+                name="NcrsMenuProvider::KeepLocally",
+                label="Keep Locally",
+                tip="Download and keep a local copy of the selected files",
+            )
+            item.connect("activate", self._on_keep_locally, paths)
+            return [item]
+        except Exception:
+            _log_error("get_file_items")
             return []
-
-        paths = []
-        for f in files:
-            if f.get_uri_scheme() != "file":
-                continue
-            path = f.get_location().get_path()
-            if path and (path == self._mount or path.startswith(self._mount + "/")):
-                paths.append(path)
-
-        if not paths:
-            return []
-
-        item = Nautilus.MenuItem(
-            name="NcrsMenuProvider::KeepLocally",
-            label="Keep Locally",
-            tip="Download and keep a local copy of the selected files",
-        )
-        item.connect("activate", self._on_keep_locally, paths)
-        return [item]
 
     def _on_keep_locally(self, _menu_item, paths):
         def _do():
-            for path in paths:
-                _send_command(f"KEEP {path}")
+            try:
+                for path in paths:
+                    _send_command(f"KEEP {path}")
+            except Exception:
+                _log_error("_on_keep_locally")
         _POOL.submit(_do)
 
     def get_background_items(self, *args):
