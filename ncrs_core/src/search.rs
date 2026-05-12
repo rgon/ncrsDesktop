@@ -1,3 +1,4 @@
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -71,6 +72,10 @@ fn client() -> reqwest::blocking::Client {
         .timeout(API_TIMEOUT)
         .build()
         .expect("reqwest client")
+}
+
+fn decode_pct(s: &str) -> String {
+    percent_decode_str(s).decode_utf8_lossy().into_owned()
 }
 
 fn absolutize(base: &str, url: &str) -> String {
@@ -155,6 +160,8 @@ pub fn search_all(
                             let entries = entries
                                 .into_iter()
                                 .map(|mut e| {
+                                    e.title = decode_pct(&e.title);
+                                    e.subline = decode_pct(&e.subline);
                                     e.resource_url = absolutize(base, &e.resource_url);
                                     e.icon = absolutize(base, &e.icon);
                                     e.thumbnail_url = absolutize(base, &e.thumbnail_url);

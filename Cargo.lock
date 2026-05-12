@@ -2371,6 +2371,7 @@ dependencies = [
  "fuser",
  "libc",
  "log",
+ "percent-encoding",
  "remotefs",
  "remotefs-webdav",
  "reqwest 0.11.27",
