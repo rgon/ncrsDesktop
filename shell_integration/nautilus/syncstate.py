@@ -140,6 +140,8 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                     file_info.add_emblem(_EMBLEM_LOCAL)
                 elif status == "synced":
                     file_info.add_emblem(_EMBLEM_SYNCED)
+                elif status == "downloading":
+                    file_info.add_emblem(_EMBLEM_REMOTE)
 
                 Nautilus.info_provider_update_complete_invoke(
                     closure, provider, handle, Nautilus.OperationResult.COMPLETE)

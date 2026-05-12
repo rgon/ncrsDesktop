@@ -238,6 +238,18 @@ impl FsCache {
 
 // ── Shared operation helpers ──────────────────────────────────────────────────
 
+const STREAMING_EXTS: &[&str] = &[
+    "mp3", "flac", "ogg", "m4a", "wav", "opus", "aac", "wma",
+    "mp4", "mkv", "avi", "mov", "webm", "m4v", "wmv", "flv",
+];
+
+fn is_streaming(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| STREAMING_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 fn decode_remote_path(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
     let decoded = percent_encoding::percent_decode_str(&s)
@@ -286,6 +298,8 @@ fn ensure_file_cached(
         }
     }
 
+    status.lock().unwrap().insert(remote_path.clone(), FileStatus::Downloading);
+
     let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
     let local_path = cache_dir.join(rel);
     if let Some(parent) = local_path.parent() {
@@ -293,7 +307,10 @@ fn ensure_file_cached(
     }
     let file =
         std::fs::File::create(&local_path).map_err(|e| format!("create cache file: {}", e))?;
-    open_file_timeout(net, remote_path.clone(), file)?;
+    if let Err(e) = open_file_timeout(net, remote_path.clone(), file) {
+        status.lock().unwrap().insert(remote_path, FileStatus::Remote);
+        return Err(e);
+    }
 
     {
         let mut c = cache.lock().unwrap();
@@ -639,7 +656,7 @@ impl Filesystem for NextCloudFs {
             fh
         };
 
-        let start_bg = local.is_none();
+        let start_bg = local.is_none() && !is_streaming(&path);
         self.open_files
             .lock()
             .unwrap()

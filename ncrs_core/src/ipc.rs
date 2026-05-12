@@ -31,6 +31,7 @@ pub enum FileStatus {
     Local,
     Synced,
     Remote,
+    Downloading,
     Unknown,
 }
 
@@ -40,6 +41,7 @@ impl FileStatus {
             FileStatus::Local => "local",
             FileStatus::Synced => "synced",
             FileStatus::Remote => "remote",
+            FileStatus::Downloading => "downloading",
             FileStatus::Unknown => "unknown",
         }
     }
