@@ -50,7 +50,7 @@ const PATH_ENCODE: &AsciiSet = &CONTROLS
 // ── Cache data types ──────────────────────────────────────────────────────────
 
 struct DirCacheEntry {
-    files: Vec<DavEntry>,
+    files: Arc<Vec<DavEntry>>,
     etag: Option<String>,
     at: Instant,
     refreshing: bool,
@@ -204,14 +204,14 @@ impl FsCache {
         ino
     }
 
-    fn get_cached_dir(&mut self, path: &Path) -> Option<(Vec<DavEntry>, bool)> {
+    fn get_cached_dir(&mut self, path: &Path) -> Option<(Arc<Vec<DavEntry>>, bool)> {
         let entry = self.dir_cache.get_mut(path)?;
         let stale = entry.at.elapsed() >= DIR_CACHE_TTL;
         let needs_refresh = stale && !entry.refreshing;
         if needs_refresh {
             entry.refreshing = true;
         }
-        Some((entry.files.clone(), needs_refresh))
+        Some((Arc::clone(&entry.files), needs_refresh))
     }
 
     fn cached_dir_etag(&self, path: &Path) -> Option<String> {
@@ -219,7 +219,7 @@ impl FsCache {
     }
 
     fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, files: Vec<DavEntry>) {
-        self.dir_cache.insert(path, DirCacheEntry { files, etag, at: Instant::now(), refreshing: false });
+        self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), etag, at: Instant::now(), refreshing: false });
     }
 
     fn touch_dir_cache(&mut self, path: &Path) {
@@ -281,7 +281,7 @@ fn get_or_list_dir(
     conn: &Arc<ConnInfo>,
     cache: &Arc<Mutex<FsCache>>,
     path: PathBuf,
-) -> Result<Vec<DavEntry>, String> {
+) -> Result<Arc<Vec<DavEntry>>, String> {
     if let Some((files, needs_refresh)) = cache.lock().unwrap().get_cached_dir(&path) {
         log::debug!("LIST_CACHED {} ({} entries, refresh={})", path.display(), files.len(), needs_refresh);
         if needs_refresh {
@@ -317,8 +317,9 @@ fn get_or_list_dir(
         return Ok(files);
     }
     let (etag, files) = list_dir_propfind(conn, path.clone())?;
-    cache.lock().unwrap().put_dir_cache(path, etag, files.clone());
-    Ok(files)
+    let mut c = cache.lock().unwrap();
+    c.put_dir_cache(path.clone(), etag, files);
+    Ok(c.get_cached_dir(&path).unwrap().0)
 }
 
 fn ensure_file_cached(
@@ -404,7 +405,7 @@ fn keep_locally_recursive(
 
     let mut files = Vec::new();
     let mut dirs = Vec::new();
-    for entry in &entries {
+    for entry in entries.iter() {
         let name = match entry.path.file_name() {
             Some(n) => n.to_string_lossy().to_string(),
             None => continue,
@@ -613,7 +614,7 @@ impl Filesystem for NextCloudFs {
         thread::spawn(move || {
             match get_or_list_dir(&conn, &cache, parent_path.clone()) {
                 Ok(entries) => {
-                    for entry in &entries {
+                    for entry in entries.iter() {
                         let entry_name =
                             entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                         if entry_name == name_str {
@@ -667,7 +668,7 @@ impl Filesystem for NextCloudFs {
         thread::spawn(move || {
             match get_or_list_dir(&conn, &cache, parent.clone()) {
                 Ok(entries) => {
-                    for entry in &entries {
+                    for entry in entries.iter() {
                         if entry
                             .path
                             .file_name()
