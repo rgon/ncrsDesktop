@@ -11,6 +11,7 @@ const PROPFIND_BODY: &str = r#"<?xml version="1.0"?>
     <d:resourcetype />
     <oc:size />
     <nc:has-preview />
+    <oc:share-types />
   </d:prop>
 </d:propfind>"#;
 
@@ -30,6 +31,7 @@ pub struct DavEntry {
     pub etag: Option<String>,
     pub content_type: Option<String>,
     pub has_preview: bool,
+    pub is_shared: bool,
 }
 
 pub fn propfind_list(
@@ -133,6 +135,7 @@ fn parse_multistatus(
             etag: resp.etag.clone(),
             content_type: resp.content_type,
             has_preview: resp.has_preview,
+            is_shared: resp.is_shared,
         };
 
         if is_first {
@@ -184,6 +187,7 @@ struct RawResponse {
     etag: Option<String>,
     content_type: Option<String>,
     has_preview: bool,
+    is_shared: bool,
 }
 
 struct ResponseReader<'a> {
@@ -277,6 +281,9 @@ impl<'a> ResponseReader<'a> {
                         "has-preview" => {
                             resp.has_preview = self.read_text()? == "true";
                         }
+                        "share-types" => {
+                            resp.is_shared = self.read_has_children("share-types")?;
+                        }
                         _ => {}
                     }
                 }
@@ -308,6 +315,26 @@ impl<'a> ResponseReader<'a> {
                     return Ok(found);
                 }
                 Ok(Event::Eof) => return Err("unexpected EOF in resourcetype".into()),
+                Err(e) => return Err(format!("XML parse: {}", e)),
+                _ => {}
+            }
+        }
+    }
+
+    fn read_has_children(&mut self, end_tag: &str) -> Result<bool, String> {
+        use quick_xml::events::Event;
+        let mut found = false;
+        loop {
+            self.buf.clear();
+            match self.reader.read_event_into(&mut self.buf) {
+                Ok(Event::Start(_) | Event::Empty(_)) => found = true,
+                Ok(Event::End(ref e)) => {
+                    let name = e.name();
+                    if tag_local_name(name.as_ref()) == end_tag {
+                        return Ok(found);
+                    }
+                }
+                Ok(Event::Eof) => return Ok(found),
                 Err(e) => return Err(format!("XML parse: {}", e)),
                 _ => {}
             }
@@ -394,6 +421,7 @@ mod tests {
         <d:getlastmodified>Sun, 11 May 2025 08:30:00 GMT</d:getlastmodified>
         <d:getetag>"def456"</d:getetag>
         <nc:has-preview>true</nc:has-preview>
+        <oc:share-types><oc:share-type>0</oc:share-type></oc:share-types>
       </d:prop>
       <d:status>HTTP/1.1 200 OK</d:status>
     </d:propstat>
@@ -429,6 +457,7 @@ mod tests {
         assert_eq!(file.etag.as_deref(), Some("def456"));
         assert_eq!(file.content_type.as_deref(), Some("image/jpeg"));
         assert!(file.has_preview);
+        assert!(file.is_shared);
         assert!(file.modified.is_some());
 
         let dir = &entries[1];
@@ -436,6 +465,7 @@ mod tests {
         assert!(dir.is_dir);
         assert_eq!(dir.size, 2000000);
         assert!(!dir.has_preview);
+        assert!(!dir.is_shared);
     }
 
     #[test]

@@ -35,6 +35,7 @@ from gi.repository import GLib, GObject, Nautilus  # noqa: E402
 _EMBLEM_LOCAL  = "emblem-default"       # green tick
 _EMBLEM_REMOTE = "emblem-downloads"     # cloud / down-arrow
 _EMBLEM_SYNCED = "emblem-synchronizing" # circular arrows
+_EMBLEM_SHARED = "emblem-shared"        # people / shared
 
 SOCKET_TIMEOUT = 0.15  # seconds; daemon replies instantly (HashMap lookup)
 
@@ -141,12 +142,16 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                             self._cancelled.discard(handle_id)
                             return GLib.SOURCE_REMOVE
 
-                    if status == "local":
+                    flags = status.split(",")
+                    sync = flags[0]
+                    if sync == "local":
                         file_info.add_emblem(_EMBLEM_LOCAL)
-                    elif status == "synced":
+                    elif sync == "synced":
                         file_info.add_emblem(_EMBLEM_SYNCED)
-                    elif status == "downloading":
+                    elif sync == "downloading":
                         file_info.add_emblem(_EMBLEM_REMOTE)
+                    if "shared" in flags:
+                        file_info.add_emblem(_EMBLEM_SHARED)
 
                     Nautilus.info_provider_update_complete_invoke(
                         closure, provider, handle, Nautilus.OperationResult.COMPLETE)

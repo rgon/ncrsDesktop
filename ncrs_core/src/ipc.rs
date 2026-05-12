@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub type KeepCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
+pub type SharedSet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
 
 pub fn socket_path() -> PathBuf {
     std::env::var("XDG_RUNTIME_DIR")
@@ -53,7 +54,7 @@ pub type StatusMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileStatus>>>;
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, keep_cb: Option<KeepCallback>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, keep_cb: Option<KeepCallback>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -77,8 +78,9 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, keep_cb: Option
             };
             let mount = mount_point.clone();
             let map = status_map.clone();
+            let shared = shared_set.clone();
             let cb = keep_cb.clone();
-            std::thread::spawn(move || handle_client(stream, mount, map, cb));
+            std::thread::spawn(move || handle_client(stream, mount, map, shared, cb));
         }
     });
 }
@@ -99,6 +101,7 @@ fn handle_client(
     stream: std::os::unix::net::UnixStream,
     mount_point: PathBuf,
     status_map: StatusMap,
+    shared_set: SharedSet,
     keep_cb: Option<KeepCallback>,
 ) {
     let mut write_half = match stream.try_clone() {
@@ -116,14 +119,21 @@ fn handle_client(
 
         let reply = if let Some(path_str) = trimmed.strip_prefix("STATUS ") {
             match strip_mount(Path::new(path_str), &mount_point) {
-                Some(remote) => status_map
-                    .lock()
-                    .unwrap()
-                    .get(&remote)
-                    .copied()
-                    .unwrap_or(FileStatus::Remote)
-                    .as_str()
-                    .to_string(),
+                Some(remote) => {
+                    let status = status_map
+                        .lock()
+                        .unwrap()
+                        .get(&remote)
+                        .copied()
+                        .unwrap_or(FileStatus::Remote)
+                        .as_str();
+                    let shared = shared_set.lock().unwrap().contains(&remote);
+                    if shared {
+                        format!("{},shared", status)
+                    } else {
+                        status.to_string()
+                    }
+                }
                 None => "unknown".to_string(),
             }
         } else if let Some(path_str) = trimmed.strip_prefix("KEEP ") {

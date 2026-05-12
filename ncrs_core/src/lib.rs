@@ -505,6 +505,7 @@ pub struct NextCloudFs {
     net: Arc<FsNetwork>,
     cache: Arc<Mutex<FsCache>>,
     status: StatusMap,
+    shared: ipc::SharedSet,
     conn: Arc<ConnInfo>,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     next_fh: Arc<Mutex<u64>>,
@@ -531,6 +532,7 @@ impl NextCloudFs {
         paths.insert(PathBuf::from("/"), 1);
 
         let status: StatusMap = Arc::new(Mutex::new(HashMap::new()));
+        let shared: ipc::SharedSet = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
         let http = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(4)
@@ -562,6 +564,7 @@ impl NextCloudFs {
                 cache_dir,
             })),
             status,
+            shared,
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
@@ -571,6 +574,10 @@ impl NextCloudFs {
 
     pub fn status_map(&self) -> StatusMap {
         self.status.clone()
+    }
+
+    pub fn shared_set(&self) -> ipc::SharedSet {
+        self.shared.clone()
     }
 
     pub fn keep_callback(&self) -> ipc::KeepCallback {
@@ -877,6 +884,7 @@ impl Filesystem for NextCloudFs {
 
         let cache = self.cache.clone();
         let status = self.status.clone();
+        let shared = self.shared.clone();
         let conn = self.conn.clone();
 
         thread::spawn(move || {
@@ -903,6 +911,9 @@ impl Filesystem for NextCloudFs {
                         let entry_path = path.join(&name);
                         let entry_ino =
                             cache.lock().unwrap().allocate_inode(entry_path.clone());
+                        if entry.is_shared {
+                            shared.lock().unwrap().insert(entry_path.clone());
+                        }
                         if !entry.is_dir {
                             status
                                 .lock()
@@ -1003,7 +1014,7 @@ fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Resu
 pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
     let filesystem = NextCloudFs::new(options.clone())?;
     let keep_cb = filesystem.keep_callback();
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), Some(keep_cb));
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), Some(keep_cb));
 
     let fuse_options = vec![
         MountOption::RO,
