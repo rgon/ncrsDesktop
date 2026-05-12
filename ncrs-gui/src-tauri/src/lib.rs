@@ -13,7 +13,7 @@ use tauri::async_runtime::spawn;
 use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration};
 
-use ncrs_core::{mount_ncfs, notifications::NcNotification, MountOptions, SyncState};
+use ncrs_core::{mount_ncfs, notifications::NcNotification, search::SearchResultGroup, MountOptions, SyncState};
 
 // ── Shared app state ─────────────────────────────────────────────────────────
 
@@ -119,6 +119,29 @@ fn open_link(url: String, app: AppHandle) {
     app.opener().open_url(&url, None::<&str>).ok();
 }
 
+#[tauri::command]
+fn search_nextcloud(
+    state: State<Arc<AppState>>,
+    term: String,
+) -> Result<Vec<SearchResultGroup>, String> {
+    let opts = state
+        .mount_options
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "not connected".to_string())?;
+    let base = ncrs_core::notifications::base_url(&opts.url);
+    let user = opts.username.unwrap_or_default();
+    let pass = opts.password.unwrap_or_default();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(ncrs_core::search::search_all(&base, &user, &pass, &term));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap_or_else(|_| Err("search timeout".to_string()))
+}
+
 // ── Tray helpers ──────────────────────────────────────────────────────────────
 
 fn rerender_tray_menu(
@@ -191,6 +214,7 @@ pub fn run() {
             get_notifications,
             dismiss_notification,
             open_link,
+            search_nextcloud,
         ])
         .setup(move |app| {
             spawn(start_ncfs_daemon(app.handle().clone(), app_state_setup));
