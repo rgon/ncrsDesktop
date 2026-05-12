@@ -36,6 +36,9 @@ const READ_AHEAD: usize = 2 * 1024 * 1024; // 2 MB
 const PREFETCH_SUBDIRS: usize = 20;
 const PREFETCH_BATCH: usize = 8;
 const MAX_POOL_IDLE: usize = 8;
+const LARGE_DIR_THRESHOLD: usize = 200;
+const LARGE_DIR_SUBDIRS: usize = 5;
+const THUMB_PREFETCH_MAX: usize = 50;
 
 const PATH_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -931,7 +934,12 @@ impl Filesystem for NextCloudFs {
                     }
                     reply.ok();
 
+                    let is_large = entries.len() > LARGE_DIR_THRESHOLD;
+
                     if !thumb_candidates.is_empty() {
+                        if is_large {
+                            thumb_candidates.truncate(THUMB_PREFETCH_MAX);
+                        }
                         let conn2 = conn.clone();
                         thread::spawn(move || {
                             preview::prefetch_directory_thumbnails(
@@ -945,9 +953,10 @@ impl Filesystem for NextCloudFs {
                         });
                     }
 
+                    let subdir_limit = if is_large { LARGE_DIR_SUBDIRS } else { PREFETCH_SUBDIRS };
                     let subdirs: Vec<PathBuf> = entries.iter()
                         .filter(|e| e.is_dir)
-                        .take(PREFETCH_SUBDIRS)
+                        .take(subdir_limit)
                         .filter_map(|e| e.path.file_name().map(|n| path.join(n.to_string_lossy().as_ref())))
                         .collect();
 
