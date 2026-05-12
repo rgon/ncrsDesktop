@@ -321,6 +321,7 @@ struct ConnInfo {
     username: String,
     password: String,
     mount_point: PathBuf,
+    http: reqwest::blocking::Client,
 }
 
 pub struct NextCloudFs {
@@ -354,12 +355,18 @@ impl NextCloudFs {
 
         let status: StatusMap = Arc::new(Mutex::new(HashMap::new()));
 
+        let http = reqwest::blocking::Client::builder()
+            .pool_max_idle_per_host(4)
+            .build()
+            .map_err(|e| format!("HTTP client: {}", e))?;
+
         let conn = Arc::new(ConnInfo {
             base_url: notifications::base_url(&options.url),
             webdav_url: options.url.clone(),
             username: username.clone(),
             password: password.clone(),
             mount_point: options.mount_point.clone(),
+            http,
         });
 
         Ok(NextCloudFs {
@@ -707,6 +714,7 @@ impl Filesystem for NextCloudFs {
                     if !thumb_candidates.is_empty() {
                         thread::spawn(move || {
                             preview::prefetch_directory_thumbnails(
+                                &conn.http,
                                 &conn.base_url,
                                 &conn.username,
                                 &conn.password,
@@ -747,12 +755,9 @@ fn range_read_timeout(conn: &Arc<ConnInfo>, path: &Path, offset: u64, size: usiz
 fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(DOWNLOAD_TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
+    let resp = conn.http
         .get(&url)
+        .timeout(DOWNLOAD_TIMEOUT)
         .header("Range", format!("bytes={}-{}", offset, end))
         .basic_auth(&conn.username, Some(&conn.password))
         .send()

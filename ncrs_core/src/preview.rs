@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime};
 const PREVIEW_SIZE: u32 = 256;
 const API_TIMEOUT: Duration = Duration::from_secs(10);
 const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+const THUMB_BATCH: usize = 8;
 
 const PREVIEWABLE: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic",
@@ -40,20 +41,17 @@ fn xdg_thumb_path(file_uri: &str) -> PathBuf {
 // ── NC preview API ────────────────────────────────────────────────────────────
 
 fn fetch_preview_bytes(
+    client: &reqwest::blocking::Client,
     base: &str,
     username: &str,
     password: &str,
     remote_path: &str,
 ) -> Result<Vec<u8>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(API_TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())?;
-
     let url = format!("{}/index.php/core/preview.png", base);
     let size = PREVIEW_SIZE.to_string();
     let resp = client
         .get(&url)
+        .timeout(API_TIMEOUT)
         .query(&[("file", remote_path), ("x", &size), ("y", &size), ("a", "1")])
         .basic_auth(username, Some(password))
         .send()
@@ -103,6 +101,7 @@ fn inject_png_text_chunks(png: &[u8], entries: &[(&str, &str)]) -> Option<Vec<u8
 // ── Public interface ──────────────────────────────────────────────────────────
 
 pub fn prefetch_thumbnail(
+    client: &reqwest::blocking::Client,
     base: &str,
     username: &str,
     password: &str,
@@ -116,7 +115,7 @@ pub fn prefetch_thumbnail(
         return;
     }
 
-    let png = match fetch_preview_bytes(base, username, password, &remote_path.to_string_lossy()) {
+    let png = match fetch_preview_bytes(client, base, username, password, &remote_path.to_string_lossy()) {
         Ok(d) => d,
         Err(e) => {
             log::debug!("thumbnail {}: {}", remote_path.display(), e);
@@ -146,15 +145,24 @@ pub fn prefetch_thumbnail(
 }
 
 pub fn prefetch_directory_thumbnails(
+    client: &reqwest::blocking::Client,
     base: &str,
     username: &str,
     password: &str,
     mount_point: &Path,
     entries: &[(PathBuf, Option<SystemTime>)],
 ) {
-    for (path, mtime) in entries {
-        if is_previewable(path) {
-            prefetch_thumbnail(base, username, password, mount_point, path, *mtime);
-        }
+    let previewable: Vec<_> = entries.iter()
+        .filter(|(p, _)| is_previewable(p))
+        .collect();
+
+    for chunk in previewable.chunks(THUMB_BATCH) {
+        std::thread::scope(|s| {
+            for (path, mtime) in chunk {
+                s.spawn(|| {
+                    prefetch_thumbnail(client, base, username, password, mount_point, path, *mtime);
+                });
+            }
+        });
     }
 }
