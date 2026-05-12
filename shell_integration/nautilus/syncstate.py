@@ -38,6 +38,7 @@ _EMBLEM_SYNCED = "emblem-synchronizing" # circular arrows
 _EMBLEM_SHARED = "emblem-shared"        # people / shared
 
 SOCKET_TIMEOUT = 0.15  # seconds; daemon replies instantly (HashMap lookup)
+_MAX_RECV = 4096
 
 # One shared pool so we don't spawn unbounded threads for large directories.
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
@@ -66,7 +67,7 @@ def _load_mount_point(config_path: str | None = None) -> str | None:
                     val = stripped[len("mount_point:"):].strip().strip('"').strip("'")
                     if val:
                         return val.rstrip("/")
-    except OSError:
+    except (OSError, ValueError):
         pass
     return None
 
@@ -86,7 +87,7 @@ def query_status(path: str, sock_path: str | None = None) -> str:
             s.connect(sp)
             s.sendall(f"STATUS {path}\n".encode())
             buf = b""
-            while b"\n" not in buf:
+            while b"\n" not in buf and len(buf) < _MAX_RECV:
                 chunk = s.recv(64)
                 if not chunk:
                     break
@@ -116,14 +117,18 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
     # Async path: Nautilus calls this and expects IN_PROGRESS while we work,
     # then update_complete_invoke when we're done.
     def update_file_info_full(self, provider, handle, closure, file_info):
-        if not self._mount:
-            return Nautilus.OperationResult.COMPLETE
+        try:
+            if not self._mount:
+                return Nautilus.OperationResult.COMPLETE
 
-        if file_info.get_uri_scheme() != "file":
-            return Nautilus.OperationResult.COMPLETE
+            if file_info.get_uri_scheme() != "file":
+                return Nautilus.OperationResult.COMPLETE
 
-        path = file_info.get_location().get_path()
-        if path is None or not (path == self._mount or path.startswith(self._mount + "/")):
+            path = file_info.get_location().get_path()
+            if path is None or not (path == self._mount or path.startswith(self._mount + "/")):
+                return Nautilus.OperationResult.COMPLETE
+        except Exception:
+            _log_error("update_file_info_full (pre-check)")
             return Nautilus.OperationResult.COMPLETE
 
         handle_id = id(handle)
@@ -165,9 +170,11 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         return Nautilus.OperationResult.IN_PROGRESS
 
     def cancel_update(self, provider, handle):
-        """Called by Nautilus when it no longer needs the result (e.g. window closed)."""
-        with self._lock:
-            self._cancelled.add(id(handle))
+        try:
+            with self._lock:
+                self._cancelled.add(id(handle))
+        except Exception:
+            _log_error("cancel_update")
 
 
 # ── IPC command helper ────────────────────────────────────────────────────────
@@ -182,7 +189,7 @@ def _send_command(cmd: str) -> str:
             s.connect(sp)
             s.sendall(f"{cmd}\n".encode())
             buf = b""
-            while b"\n" not in buf:
+            while b"\n" not in buf and len(buf) < _MAX_RECV:
                 chunk = s.recv(64)
                 if not chunk:
                     break

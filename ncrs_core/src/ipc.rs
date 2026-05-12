@@ -14,6 +14,16 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+trait MutexExt<T> {
+    fn safe_lock(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for Mutex<T> {
+    fn safe_lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 pub type KeepCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type SharedSet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
 pub type FileIdMap = Arc<Mutex<std::collections::HashMap<PathBuf, u64>>>;
@@ -126,13 +136,12 @@ fn handle_client(
             match strip_mount(Path::new(path_str), &mount_point) {
                 Some(remote) => {
                     let status = status_map
-                        .lock()
-                        .unwrap()
+                        .safe_lock()
                         .get(&remote)
                         .copied()
                         .unwrap_or(FileStatus::Remote)
                         .as_str();
-                    let shared = shared_set.lock().unwrap().contains(&remote);
+                    let shared = shared_set.safe_lock().contains(&remote);
                     if shared {
                         format!("{},shared", status)
                     } else {
@@ -146,7 +155,7 @@ fn handle_client(
                 Some(remote) => {
                     let parent = remote.parent().unwrap_or(Path::new("/"));
                     let dir = parent.to_string_lossy();
-                    match fileid_map.lock().unwrap().get(&remote) {
+                    match fileid_map.safe_lock().get(&remote) {
                         Some(fid) => format!("{}/apps/files/?dir={}&fileid={}", base_url, dir, fid),
                         None => format!("{}/apps/files/?dir={}", base_url, dir),
                     }
@@ -157,7 +166,11 @@ fn handle_client(
             match (strip_mount(Path::new(path_str), &mount_point), &keep_cb) {
                 (Some(remote), Some(cb)) => {
                     let cb = cb.clone();
-                    std::thread::spawn(move || cb(remote));
+                    std::thread::spawn(move || {
+                        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
+                            log::error!("KEEP callback panicked: {:?}", e);
+                        }
+                    });
                     "ok".to_string()
                 }
                 (None, _) => "error: path not under mount".to_string(),

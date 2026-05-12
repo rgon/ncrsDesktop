@@ -16,7 +16,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, Request,
 };
-use libc::{EIO, ENOENT};
+use libc::{EACCES, EIO, ENOENT};
 use remotefs::RemoteFs;
 use remotefs_webdav::WebDAVFs;
 use ipc::{FileStatus, StatusMap};
@@ -27,6 +27,16 @@ use yaml_rust2::YamlLoader;
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
+
+trait MutexExt<T> {
+    fn safe_lock(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for Mutex<T> {
+    fn safe_lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 const TTL: Duration = Duration::from_secs(1);
 const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
@@ -125,7 +135,7 @@ struct FsNetwork {
 
 impl FsNetwork {
     fn checkout(&self) -> Result<WebDAVFs, String> {
-        if let Some(conn) = self.conns.lock().unwrap().pop() {
+        if let Some(conn) = self.conns.safe_lock().pop() {
             return Ok(conn);
         }
         let mut conn = WebDAVFs::new(&self.username, &self.password, &self.url);
@@ -134,10 +144,20 @@ impl FsNetwork {
     }
 
     fn checkin(&self, conn: WebDAVFs) {
-        let mut pool = self.conns.lock().unwrap();
+        let mut pool = self.conns.safe_lock();
         if pool.len() < MAX_POOL_IDLE {
             pool.push(conn);
         }
+    }
+}
+
+fn error_to_errno(err: &str) -> i32 {
+    if err.contains("401") || err.contains("403") || err.contains("Unauthorized") || err.contains("Forbidden") {
+        EACCES
+    } else if err.contains("404") || err.contains("Not Found") {
+        ENOENT
+    } else {
+        EIO
     }
 }
 
@@ -334,19 +354,19 @@ fn get_or_list_dir(
     cache: &Arc<Mutex<FsCache>>,
     path: PathBuf,
 ) -> Result<Arc<Vec<DavEntry>>, String> {
-    if let Some((files, needs_refresh)) = cache.lock().unwrap().get_cached_dir(&path) {
+    if let Some((files, needs_refresh)) = cache.safe_lock().get_cached_dir(&path) {
         log::debug!("LIST_CACHED {} ({} entries, refresh={})", path.display(), files.len(), needs_refresh);
         if needs_refresh {
             let conn = conn.clone();
             let cache = cache.clone();
             let path = path.clone();
             std::thread::spawn(move || {
-                let old_etag = cache.lock().unwrap().cached_dir_etag(&path);
+                let old_etag = cache.safe_lock().cached_dir_etag(&path);
                 if let Some(ref old) = old_etag {
                     match propfind::propfind_etag(&conn.http, &conn.webdav_url, &conn.username, &conn.password, &path, PROPFIND_TIMEOUT) {
                         Ok(Some(ref new_etag)) if new_etag == old => {
                             log::debug!("ETAG_MATCH {} — skipping full re-list", path.display());
-                            cache.lock().unwrap().touch_dir_cache(&path);
+                            cache.safe_lock().touch_dir_cache(&path);
                             return;
                         }
                         Ok(_) => {}
@@ -357,11 +377,11 @@ fn get_or_list_dir(
                 }
                 match list_dir_propfind(&conn, path.clone()) {
                     Ok((etag, fresh)) => {
-                        cache.lock().unwrap().put_dir_cache(path, etag, fresh);
+                        cache.safe_lock().put_dir_cache(path, etag, fresh);
                     }
                     Err(e) => {
                         log::debug!("background refresh {}: {}", path.display(), e);
-                        cache.lock().unwrap().clear_refreshing(&path);
+                        cache.safe_lock().clear_refreshing(&path);
                     }
                 }
             });
@@ -370,7 +390,7 @@ fn get_or_list_dir(
     }
     // Check if there's already an in-progress incremental fetch
     {
-        let mut c = cache.lock().unwrap();
+        let mut c = cache.safe_lock();
         if let Some(snapshot) = c.get_pending_snapshot(&path) {
             return Ok(Arc::new(snapshot));
         }
@@ -380,7 +400,7 @@ fn get_or_list_dir(
     let (entry_tx, entry_rx) = mpsc::channel();
     let (etag_tx, etag_rx) = mpsc::channel();
     {
-        let mut c = cache.lock().unwrap();
+        let mut c = cache.safe_lock();
         if c.pending_dirs.contains_key(&path) || c.dir_cache.contains_key(&path) {
             // Race: another thread started it. Try cache again.
             if let Some((files, _)) = c.get_cached_dir(&path) {
@@ -413,7 +433,7 @@ fn get_or_list_dir(
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         {
-            let mut c = cache.lock().unwrap();
+            let mut c = cache.safe_lock();
             if let Some(snapshot) = c.get_pending_snapshot(&path) {
                 if !snapshot.is_empty() {
                     return Ok(Arc::new(snapshot));
@@ -427,7 +447,7 @@ fn get_or_list_dir(
     }
 
     // If we still have nothing, try one more time then promote whatever we have
-    let mut c = cache.lock().unwrap();
+    let mut c = cache.safe_lock();
     c.promote_pending(&path);
     if let Some((files, _)) = c.get_cached_dir(&path) {
         Ok(files)
@@ -443,7 +463,7 @@ fn ensure_file_cached(
     remote_path: PathBuf,
 ) -> Result<PathBuf, String> {
     let (maybe_local, cached_mod, current_mod, cache_dir) = {
-        let c = cache.lock().unwrap();
+        let c = cache.safe_lock();
         let entry = c.file_cache.get(&remote_path);
         let maybe_local = entry
             .filter(|e| e.local_path.exists())
@@ -459,7 +479,7 @@ fn ensure_file_cached(
         }
     }
 
-    status.lock().unwrap().insert(remote_path.clone(), FileStatus::Downloading);
+    status.safe_lock().insert(remote_path.clone(), FileStatus::Downloading);
 
     let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
     let local_path = cache_dir.join(rel);
@@ -469,19 +489,19 @@ fn ensure_file_cached(
     let file =
         std::fs::File::create(&local_path).map_err(|e| format!("create cache file: {}", e))?;
     if let Err(e) = open_file_timeout(net, remote_path.clone(), file) {
-        status.lock().unwrap().insert(remote_path, FileStatus::Remote);
+        status.safe_lock().insert(remote_path, FileStatus::Remote);
         return Err(e);
     }
 
     {
-        let mut c = cache.lock().unwrap();
+        let mut c = cache.safe_lock();
         let mod_time = c.remote_modified_for(&remote_path);
         c.file_cache.insert(
             remote_path.clone(),
             FileCacheEntry { local_path: local_path.clone(), remote_modified: mod_time },
         );
     }
-    status.lock().unwrap().insert(remote_path, FileStatus::Local);
+    status.safe_lock().insert(remote_path, FileStatus::Local);
     Ok(local_path)
 }
 
@@ -494,7 +514,7 @@ fn keep_locally_recursive(
 ) {
     log::info!("KEEP {}", remote_path.display());
 
-    let known_dir = cache.lock().unwrap().is_known_directory(&remote_path);
+    let known_dir = cache.safe_lock().is_known_directory(&remote_path);
 
     if known_dir == Some(false) {
         if let Err(e) = ensure_file_cached(net, cache, status, remote_path.clone()) {
@@ -550,13 +570,13 @@ fn keep_locally_recursive(
 }
 
 fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
-    if cache.lock().unwrap().get_cached_dir(path).is_some() {
+    if cache.safe_lock().get_cached_dir(path).is_some() {
         return;
     }
     log::debug!("PREFETCH_LIST {}", path.display());
     match propfind::propfind_list(&conn.http, &conn.webdav_url, &conn.username, &conn.password, path, PROPFIND_TIMEOUT) {
         Ok((etag, files)) => {
-            cache.lock().unwrap().put_dir_cache(path.to_path_buf(), etag, files);
+            cache.safe_lock().put_dir_cache(path.to_path_buf(), etag, files);
         }
         Err(e) => log::debug!("prefetch {}: {}", path.display(), e),
     }
@@ -717,7 +737,7 @@ impl NextCloudFs {
 impl Filesystem for NextCloudFs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let (parent_path, name_str) = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.safe_lock();
             match (c.get_path(parent), name.to_str()) {
                 (Some(p), Some(n)) => (p, n.to_string()),
                 _ => {
@@ -741,7 +761,7 @@ impl Filesystem for NextCloudFs {
                             entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                         if entry_name == name_str {
                             let target_path = parent_path.join(&name_str);
-                            let ino = cache.lock().unwrap().allocate_inode(target_path.clone());
+                            let ino = cache.safe_lock().allocate_inode(target_path.clone());
                             let attr = make_file_attr(ino, entry);
                             if !entry.is_dir {
                                 status
@@ -758,7 +778,7 @@ impl Filesystem for NextCloudFs {
                 }
                 Err(e) => {
                     log::error!("lookup {}/{}: {}", parent_path.display(), name_str, e);
-                    reply.error(EIO);
+                    reply.error(error_to_errno(&e));
                 }
             }
         });
@@ -770,7 +790,7 @@ impl Filesystem for NextCloudFs {
             return;
         }
 
-        let path = match self.cache.lock().unwrap().get_path(ino) {
+        let path = match self.cache.safe_lock().get_path(ino) {
             Some(p) => p,
             None => {
                 reply.error(ENOENT);
@@ -806,7 +826,7 @@ impl Filesystem for NextCloudFs {
                 }
                 Err(e) => {
                     log::error!("getattr {}: {}", parent.display(), e);
-                    reply.error(EIO);
+                    reply.error(error_to_errno(&e));
                 }
             }
         });
@@ -814,7 +834,7 @@ impl Filesystem for NextCloudFs {
 
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         let (path, local) = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.safe_lock();
             let path = match c.get_path(ino) {
                 Some(p) => p,
                 None => {
@@ -831,7 +851,7 @@ impl Filesystem for NextCloudFs {
         };
 
         let fh = {
-            let mut n = self.next_fh.lock().unwrap();
+            let mut n = self.next_fh.safe_lock();
             let fh = *n;
             *n += 1;
             fh
@@ -852,7 +872,7 @@ impl Filesystem for NextCloudFs {
             thread::spawn(move || {
                 match ensure_file_cached(&net, &cache, &status, path.clone()) {
                     Ok(local_path) => {
-                        open_files.lock().unwrap().entry(fh).and_modify(|of| {
+                        open_files.safe_lock().entry(fh).and_modify(|of| {
                             of.local = Some(local_path);
                         });
                     }
@@ -873,7 +893,7 @@ impl Filesystem for NextCloudFs {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let path = match self.cache.lock().unwrap().get_path(ino) {
+        let path = match self.cache.safe_lock().get_path(ino) {
             Some(p) => p,
             None => {
                 reply.error(ENOENT);
@@ -895,7 +915,7 @@ impl Filesystem for NextCloudFs {
 
             // Try serving from open-file state (local cache or read-ahead buffer).
             {
-                let files = open_files.lock().unwrap();
+                let files = open_files.safe_lock();
                 if let Some(of) = files.get(&fh) {
                     if let Some(ref local) = of.local {
                         if let Ok(f) = std::fs::File::open(local) {
@@ -943,7 +963,7 @@ impl Filesystem for NextCloudFs {
                                     Ok(n) => {
                                         buf.truncate(n);
                                         reply.data(&buf);
-                                        open_files.lock().unwrap().entry(fh).and_modify(
+                                        open_files.safe_lock().entry(fh).and_modify(
                                             |of| of.local = Some(local),
                                         );
                                         return;
@@ -955,7 +975,7 @@ impl Filesystem for NextCloudFs {
                         }
                         Err(e2) => {
                             log::error!("fallback download failed {}: {}", path.display(), e2);
-                            reply.error(EIO);
+                            reply.error(error_to_errno(&e2));
                         }
                     }
                 }
@@ -973,7 +993,7 @@ impl Filesystem for NextCloudFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.open_files.lock().unwrap().remove(&fh);
+        self.open_files.safe_lock().remove(&fh);
         reply.ok();
     }
 
@@ -986,7 +1006,7 @@ impl Filesystem for NextCloudFs {
         mut reply: ReplyDirectory,
     ) {
         let (path, parent_ino) = {
-            let c = self.cache.lock().unwrap();
+            let c = self.cache.safe_lock();
             let path = match c.get_path(ino) {
                 Some(p) => p,
                 None => {
@@ -1034,12 +1054,12 @@ impl Filesystem for NextCloudFs {
                         };
                         let entry_path = path.join(&name);
                         let entry_ino =
-                            cache.lock().unwrap().allocate_inode(entry_path.clone());
+                            cache.safe_lock().allocate_inode(entry_path.clone());
                         if entry.is_shared {
-                            shared.lock().unwrap().insert(entry_path.clone());
+                            shared.safe_lock().insert(entry_path.clone());
                         }
                         if let Some(fid) = entry.fileid {
-                            fileids.lock().unwrap().insert(entry_path.clone(), fid);
+                            fileids.safe_lock().insert(entry_path.clone(), fid);
                         }
                         if !entry.is_dir {
                             status
@@ -1097,7 +1117,7 @@ impl Filesystem for NextCloudFs {
                 }
                 Err(e) => {
                     log::error!("readdir {}: {}", path.display(), e);
-                    reply.error(EIO);
+                    reply.error(error_to_errno(&e));
                 }
             }
         });
