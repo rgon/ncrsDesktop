@@ -201,6 +201,14 @@ impl FsCache {
 
 // ── Shared operation helpers ──────────────────────────────────────────────────
 
+fn decode_remote_path(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    let decoded = percent_encoding::percent_decode_str(&s)
+        .decode_utf8_lossy()
+        .into_owned();
+    PathBuf::from(decoded)
+}
+
 fn get_or_list_dir(
     net: &Arc<FsNetwork>,
     cache: &Arc<Mutex<FsCache>>,
@@ -209,7 +217,10 @@ fn get_or_list_dir(
     if let Some(files) = cache.lock().unwrap().check_dir_cache(&path) {
         return Ok(files);
     }
-    let files = list_dir_timeout(net, path.clone())?;
+    let mut files = list_dir_timeout(net, path.clone())?;
+    for f in &mut files {
+        f.path = decode_remote_path(&f.path);
+    }
     cache.lock().unwrap().put_dir_cache(path, files.clone());
     Ok(files)
 }
