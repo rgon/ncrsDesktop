@@ -212,9 +212,21 @@ fn handle_client(
                 None => "error: path not under mount".to_string(),
             }
         } else if trimmed == "CHANGES" {
-            let paths: Vec<PathBuf> = dirty_set.safe_lock().drain().collect();
+            const MAX_CHANGES: usize = 500;
+            let mut set = dirty_set.safe_lock();
+            let total = set.len();
+            let paths: Vec<PathBuf> = if total <= MAX_CHANGES {
+                set.drain().collect()
+            } else {
+                let batch: Vec<PathBuf> = set.iter().take(MAX_CHANGES).cloned().collect();
+                for p in &batch {
+                    set.remove(p);
+                }
+                batch
+            };
+            drop(set);
             if !paths.is_empty() {
-                log::info!("IPC CHANGES → {} dirty paths", paths.len());
+                log::info!("IPC CHANGES → {} dirty paths (of {} total)", paths.len(), total);
             }
             if paths.is_empty() {
                 String::new()

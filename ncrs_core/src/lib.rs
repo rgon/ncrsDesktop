@@ -712,6 +712,7 @@ pub struct NextCloudFs {
     shared: ipc::SharedSet,
     fileids: ipc::FileIdMap,
     details: ipc::FileDetailMap,
+    ipc_populated: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     conn: Arc<ConnInfo>,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     next_fh: Arc<Mutex<u64>>,
@@ -778,6 +779,7 @@ impl NextCloudFs {
             shared,
             fileids,
             details,
+            ipc_populated: Arc::new(Mutex::new(std::collections::HashSet::new())),
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
@@ -1118,6 +1120,7 @@ impl Filesystem for NextCloudFs {
         let fileids = self.fileids.clone();
         let details = self.details.clone();
         let dirty = self.dirty.clone();
+        let ipc_populated = self.ipc_populated.clone();
         let conn = self.conn.clone();
 
         thread::spawn(move || {
@@ -1134,10 +1137,10 @@ impl Filesystem for NextCloudFs {
 
             match get_or_list_dir(&conn, &cache, path.clone()) {
                 Ok((entries, self_entry)) => {
-                    // Batch-populate IPC maps BEFORE replying so Nautilus
-                    // column queries (DETAIL) find data immediately.
                     let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
-                    {
+
+                    let already_populated = ipc_populated.safe_lock().contains(&path);
+                    if !already_populated {
                         let mut c = cache.safe_lock();
                         let mut sh = shared.safe_lock();
                         let mut fi = fileids.safe_lock();
@@ -1183,18 +1186,19 @@ impl Filesystem for NextCloudFs {
                                 thumb_candidates.push((entry_path, entry.modified, entry.has_preview, entry.fileid));
                             }
                         }
-                    }
 
-                    {
-                        let mut d = dirty.safe_lock();
-                        d.insert(path.clone());
-                        for entry in entries.iter() {
-                            if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
-                                d.insert(path.join(name));
+                        {
+                            let mut d = dirty.safe_lock();
+                            d.insert(path.clone());
+                            for entry in entries.iter() {
+                                if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
+                                    d.insert(path.join(name));
+                                }
                             }
                         }
+                        ipc_populated.safe_lock().insert(path.clone());
+                        log::info!("READDIR {} populated IPC maps: {} entries, self_entry={}", path.display(), entries.len(), self_entry.is_some());
                     }
-                    log::info!("READDIR {} populated IPC maps: {} entries, self_entry={}", path.display(), entries.len(), self_entry.is_some());
 
                     let skip = if offset > 2 { (offset - 2) as usize } else { 0 };
                     for (i, entry) in entries.iter().enumerate().skip(skip) {
