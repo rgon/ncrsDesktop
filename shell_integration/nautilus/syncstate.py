@@ -242,7 +242,7 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         except Exception:
             _log_error("_poll_changes")
 
-    def update_file_info(self, file_info):
+    def update_file_info_full(self, provider, handle, closure, file_info):
         try:
             if not self._mount:
                 return Nautilus.OperationResult.COMPLETE
@@ -282,10 +282,7 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             except ValueError:
                 file_info.add_string_attribute("ncrs_size", "")
         except Exception:
-            _log_error("update_file_info")
-        return Nautilus.OperationResult.COMPLETE
-
-    def update_file_info_full(self, provider, handle, closure, file_info):
+            _log_error("update_file_info_full")
         return Nautilus.OperationResult.COMPLETE
 
     def cancel_update(self, provider, handle):
