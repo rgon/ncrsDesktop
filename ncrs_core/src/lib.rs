@@ -383,38 +383,43 @@ fn get_or_list_dir(
         }
     }
 
-    // Start incremental streaming fetch
-    let (entry_tx, entry_rx) = mpsc::channel();
-    let (etag_tx, etag_rx) = mpsc::channel();
-    {
+    // Start incremental streaming fetch — unless another thread already started one
+    let already_pending = {
         let mut c = cache.safe_lock();
-        if c.pending_dirs.contains_key(&path) || c.dir_cache.contains_key(&path) {
-            // Race: another thread started it. Try cache again.
+        if c.dir_cache.contains_key(&path) {
             if let Some((files, _)) = c.get_cached_dir(&path) {
                 return Ok(files);
             }
         }
-        c.start_pending(path.clone(), entry_rx, etag_rx);
-    }
+        if c.pending_dirs.contains_key(&path) {
+            true
+        } else {
+            let (entry_tx, entry_rx) = mpsc::channel();
+            let (etag_tx, etag_rx) = mpsc::channel();
+            c.start_pending(path.clone(), entry_rx, etag_rx);
 
-    let conn2 = conn.clone();
-    let path2 = path.clone();
-    std::thread::spawn(move || {
-        match propfind::propfind_list_streaming(
-            &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
-            &path2, PROPFIND_TIMEOUT, entry_tx,
-        ) {
-            Ok(etag) => {
-                let _ = etag_tx.send(etag);
-            }
-            Err(e) => {
-                log::debug!("incremental list {}: {}", path2.display(), e);
-                let _ = etag_tx.send(None);
-            }
+            let conn2 = conn.clone();
+            let path2 = path.clone();
+            std::thread::spawn(move || {
+                match propfind::propfind_list_streaming(
+                    &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
+                    &path2, PROPFIND_TIMEOUT, entry_tx,
+                ) {
+                    Ok(etag) => {
+                        let _ = etag_tx.send(etag);
+                    }
+                    Err(e) => {
+                        log::debug!("incremental list {}: {}", path2.display(), e);
+                        let _ = etag_tx.send(None);
+                    }
+                }
+            });
+            false
         }
-        // Sender drops here, signaling completion.
-        // Promote pending → full cache on next access.
-    });
+    };
+    if already_pending {
+        log::debug!("LIST_JOIN {} — waiting for existing fetch", path.display());
+    }
 
     // Block until first entries arrive or PROPFIND completes/times out.
     let deadline = Instant::now() + PROPFIND_TIMEOUT;
@@ -438,14 +443,31 @@ fn get_or_list_dir(
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Timeout: promote whatever we have (may still be empty for a truly empty dir)
+    // Timeout: drain pending channel, only cache if entries arrived or sender finished
     let mut c = cache.safe_lock();
-    c.promote_pending(&path);
-    if let Some((files, _)) = c.get_cached_dir(&path) {
-        Ok(files)
+    let should_promote = if let Some(pending) = c.pending_dirs.get_mut(&path) {
+        let mut disconnected = false;
+        loop {
+            match pending.rx.try_recv() {
+                Ok(entry) => pending.entries.push(entry),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => { disconnected = true; break; }
+            }
+        }
+        !pending.entries.is_empty() || disconnected
     } else {
-        Err(format!("PROPFIND timeout for {}", path.display()))
+        false
+    };
+    if should_promote {
+        c.promote_pending(&path);
+        if let Some((files, _)) = c.get_cached_dir(&path) {
+            return Ok(files);
+        }
+    } else {
+        log::debug!("PROPFIND timeout {} — removing stale pending (no entries yet)", path.display());
+        c.pending_dirs.remove(&path);
     }
+    Err(format!("PROPFIND timeout for {}", path.display()))
 }
 
 fn ensure_file_cached(
