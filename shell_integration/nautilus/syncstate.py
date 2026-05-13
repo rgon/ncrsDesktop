@@ -206,8 +206,6 @@ _SYNC_LABELS = {
 class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
     def __init__(self):
         super().__init__()
-        self._cancelled: set[int] = set()
-        self._lock = threading.Lock()
         self._mount = _load_mount_point()
         GLib.timeout_add_seconds(2, self._poll_changes)
 
@@ -244,9 +242,6 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             _log_error("_poll_changes")
 
     def update_file_info(self, file_info):
-        return Nautilus.OperationResult.COMPLETE
-
-    def update_file_info_full(self, provider, handle, closure, file_info):
         try:
             if not self._mount:
                 return Nautilus.OperationResult.COMPLETE
@@ -257,74 +252,43 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             path = file_info.get_location().get_path()
             if path is None or not (path == self._mount or path.startswith(self._mount + "/")):
                 return Nautilus.OperationResult.COMPLETE
-        except Exception:
-            _log_error("update_file_info_full (pre-check)")
-            return Nautilus.OperationResult.COMPLETE
 
-        handle_id = id(handle)
+            detail = _send_command(f"DETAIL {path}")
 
-        def _work():
-            t0 = time.monotonic()
+            parts = detail.split("\t")
+            sync = parts[0] if len(parts) > 0 else "unknown"
+            sharing = parts[1] if len(parts) > 1 else ""
+            perms = parts[2] if len(parts) > 2 else ""
+            owner = parts[3] if len(parts) > 3 else ""
+            size_str = parts[4] if len(parts) > 4 else "0"
+
+            if sync == "local":
+                file_info.add_emblem(_EMBLEM_LOCAL)
+            elif sync == "synced":
+                file_info.add_emblem(_EMBLEM_SYNCED)
+            elif sync == "downloading":
+                file_info.add_emblem(_EMBLEM_REMOTE)
+            if sharing:
+                file_info.add_emblem(_EMBLEM_SHARED)
+
+            file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
+            file_info.add_string_attribute("ncrs_sharing", sharing)
+            file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
+            file_info.add_string_attribute("ncrs_owner", owner)
             try:
-                detail = _send_command(f"DETAIL {path}")
-            except Exception:
-                _log_error(f"DETAIL({path})")
-                detail = "unknown\t\t\t\t0"
-            elapsed = (time.monotonic() - t0) * 1000
-            _log_to_daemon(f"update_file_info {path}: detail={detail[:40]}... {elapsed:.0f}ms")
+                size_val = int(size_str)
+                file_info.add_string_attribute("ncrs_size", _human_size(size_val) if size_val > 0 else "")
+            except ValueError:
+                file_info.add_string_attribute("ncrs_size", "")
+        except Exception:
+            _log_error("update_file_info")
+        return Nautilus.OperationResult.COMPLETE
 
-            def _apply():
-                try:
-                    with self._lock:
-                        if handle_id in self._cancelled:
-                            self._cancelled.discard(handle_id)
-                            return GLib.SOURCE_REMOVE
-
-                    parts = detail.split("\t")
-                    sync = parts[0] if len(parts) > 0 else "unknown"
-                    sharing = parts[1] if len(parts) > 1 else ""
-                    perms = parts[2] if len(parts) > 2 else ""
-                    owner = parts[3] if len(parts) > 3 else ""
-                    size_str = parts[4] if len(parts) > 4 else "0"
-
-                    # Emblems
-                    if sync == "local":
-                        file_info.add_emblem(_EMBLEM_LOCAL)
-                    elif sync == "synced":
-                        file_info.add_emblem(_EMBLEM_SYNCED)
-                    elif sync == "downloading":
-                        file_info.add_emblem(_EMBLEM_REMOTE)
-                    if sharing:
-                        file_info.add_emblem(_EMBLEM_SHARED)
-
-                    # Columns
-                    file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
-                    file_info.add_string_attribute("ncrs_sharing", sharing)
-                    file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
-                    file_info.add_string_attribute("ncrs_owner", owner)
-                    try:
-                        size_val = int(size_str)
-                        file_info.add_string_attribute("ncrs_size", _human_size(size_val) if size_val > 0 else "")
-                    except ValueError:
-                        file_info.add_string_attribute("ncrs_size", "")
-
-                    Nautilus.info_provider_update_complete_invoke(
-                        closure, provider, handle, Nautilus.OperationResult.COMPLETE)
-                except Exception:
-                    _log_error(f"_apply({path})")
-                return GLib.SOURCE_REMOVE
-
-            GLib.idle_add(_apply)
-
-        _POOL.submit(_work)
-        return Nautilus.OperationResult.IN_PROGRESS
+    def update_file_info_full(self, provider, handle, closure, file_info):
+        return Nautilus.OperationResult.COMPLETE
 
     def cancel_update(self, provider, handle):
-        try:
-            with self._lock:
-                self._cancelled.add(id(handle))
-        except Exception:
-            _log_error("cancel_update")
+        pass
 
 
 # ── Menu provider ─────────────────────────────────────────────────────────────
