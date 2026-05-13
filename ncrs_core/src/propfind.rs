@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const PROPFIND_BODY: &str = r#"<?xml version="1.0"?>
 <d:propfind xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns" xmlns:oc="http://owncloud.org/ns">
@@ -51,7 +51,8 @@ pub fn propfind_list(
     timeout: Duration,
 ) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), String> {
     let url = build_url(webdav_url, path);
-    log::debug!("PROPFIND {}", url);
+    let t0 = Instant::now();
+    log::info!("PROPFIND {} start", path.display());
 
     let resp = client
         .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
@@ -63,13 +64,17 @@ pub fn propfind_list(
         .send()
         .map_err(|e| format!("PROPFIND {}: {}", path.display(), e))?;
 
+    log::info!("PROPFIND {} response {} in {:?}", path.display(), resp.status(), t0.elapsed());
+
     let status = resp.status();
     if status != reqwest::StatusCode::MULTI_STATUS && !status.is_success() {
         return Err(format!("PROPFIND {} returned {}", path.display(), status));
     }
 
     let reader = std::io::BufReader::new(resp);
-    parse_multistatus_stream(reader, webdav_url)
+    let result = parse_multistatus_stream(reader, webdav_url);
+    log::info!("PROPFIND {} parsed in {:?}", path.display(), t0.elapsed());
+    result
 }
 
 pub fn propfind_etag(
@@ -174,7 +179,8 @@ pub fn propfind_list_streaming(
     self_tx: std::sync::mpsc::Sender<DavEntry>,
 ) -> Result<Option<String>, String> {
     let url = build_url(webdav_url, path);
-    log::debug!("PROPFIND_STREAM {}", url);
+    let t0 = Instant::now();
+    log::info!("PROPFIND_STREAM {} start", path.display());
 
     let resp = client
         .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
@@ -185,6 +191,8 @@ pub fn propfind_list_streaming(
         .body(PROPFIND_BODY)
         .send()
         .map_err(|e| format!("PROPFIND {}: {}", path.display(), e))?;
+
+    log::info!("PROPFIND_STREAM {} response {} in {:?}", path.display(), resp.status(), t0.elapsed());
 
     let status = resp.status();
     if status != reqwest::StatusCode::MULTI_STATUS && !status.is_success() {
@@ -197,6 +205,7 @@ pub fn propfind_list_streaming(
     let mut buf_reader = ResponseReader::new(xml_reader);
 
     let mut dir_etag: Option<String> = None;
+    let mut count: usize = 0;
     let mut is_first = true;
     while let Some(resp) = buf_reader.next_response()? {
         let remote_path = href_to_remote_path(&resp.href, &prefix);
@@ -218,10 +227,14 @@ pub fn propfind_list_streaming(
             dir_etag = resp.etag;
             let _ = self_tx.send(entry);
             is_first = false;
-        } else if tx.send(entry).is_err() {
-            break;
+        } else {
+            count += 1;
+            if tx.send(entry).is_err() {
+                break;
+            }
         }
     }
+    log::info!("PROPFIND_STREAM {} done: {} entries in {:?}", path.display(), count, t0.elapsed());
     Ok(dir_etag)
 }
 

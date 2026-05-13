@@ -173,6 +173,7 @@ fn handle_client(
                     let status = status_map.safe_lock()
                         .get(&remote).copied().unwrap_or(FileStatus::Remote).as_str();
                     let is_shared = shared_set.safe_lock().contains(&remote);
+                    let has_detail = detail_map.safe_lock().contains_key(&remote);
                     let detail = detail_map.safe_lock().get(&remote).cloned()
                         .unwrap_or_default();
                     let sharing = if !is_shared {
@@ -186,9 +187,14 @@ fn handle_client(
                     };
                     let perms = detail.permissions.as_deref().unwrap_or("");
                     let owner = detail.owner_display_name.as_deref().unwrap_or("");
+                    log::info!("IPC DETAIL {} → remote={} status={} has_detail={} shared={} perms={:?} owner={:?}",
+                        path_str, remote.display(), status, has_detail, is_shared, perms, owner);
                     format!("{}\t{}\t{}\t{}\t{}", status, sharing, perms, owner, detail.size)
                 }
-                None => "unknown\t\t\t\t0".to_string(),
+                None => {
+                    log::info!("IPC DETAIL {} → not under mount", path_str);
+                    "unknown\t\t\t\t0".to_string()
+                }
             }
         } else if let Some(path_str) = trimmed.strip_prefix("WEBURL ") {
             match strip_mount(Path::new(path_str), &mount_point) {
@@ -204,6 +210,9 @@ fn handle_client(
             }
         } else if trimmed == "CHANGES" {
             let paths: Vec<PathBuf> = dirty_set.safe_lock().drain().collect();
+            if !paths.is_empty() {
+                log::info!("IPC CHANGES → {} dirty paths", paths.len());
+            }
             if paths.is_empty() {
                 String::new()
             } else {
@@ -229,6 +238,9 @@ fn handle_client(
                 (None, _) => "error: path not under mount".to_string(),
                 (_, None) => "error: not supported".to_string(),
             }
+        } else if let Some(msg) = trimmed.strip_prefix("LOG ") {
+            log::info!("[nautilus] {}", msg);
+            "ok".to_string()
         } else {
             "unknown".to_string()
         };

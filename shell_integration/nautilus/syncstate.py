@@ -84,6 +84,21 @@ def _load_mount_point(config_path: str | None = None) -> str | None:
     return None
 
 
+def _log_to_daemon(msg: str) -> None:
+    """Send a log message to the ncrs daemon (fire-and-forget)."""
+    sp = _sock_path()
+    if not os.path.exists(sp):
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.2)
+            s.connect(sp)
+            s.sendall(f"LOG {msg}\n".encode())
+            s.recv(64)
+    except (OSError, socket.timeout):
+        pass
+
+
 def _send_command(cmd: str) -> str:
     sp = _sock_path()
     if not os.path.exists(sp):
@@ -103,11 +118,11 @@ def _send_command(cmd: str) -> str:
             result = buf.decode(errors="replace").strip()
             elapsed = (time.monotonic() - t0) * 1000
             if elapsed > 50:
-                print(f"[ncrs-nautilus] {cmd}: {elapsed:.0f}ms", file=sys.stderr)
+                _log_to_daemon(f"{cmd}: {elapsed:.0f}ms")
             return result
     except (OSError, socket.timeout):
         elapsed = (time.monotonic() - t0) * 1000
-        print(f"[ncrs-nautilus] {cmd}: TIMEOUT ({elapsed:.0f}ms)", file=sys.stderr)
+        _log_to_daemon(f"{cmd}: TIMEOUT ({elapsed:.0f}ms)")
         return "error: socket timeout"
 
 
@@ -244,11 +259,14 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         handle_id = id(handle)
 
         def _work():
+            t0 = time.monotonic()
             try:
                 detail = _send_command(f"DETAIL {path}")
             except Exception:
                 _log_error(f"DETAIL({path})")
                 detail = "unknown\t\t\t\t0"
+            elapsed = (time.monotonic() - t0) * 1000
+            _log_to_daemon(f"update_file_info {path}: detail={detail[:40]}... {elapsed:.0f}ms")
 
             def _apply():
                 try:

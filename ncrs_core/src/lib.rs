@@ -364,7 +364,7 @@ fn get_or_list_dir(
         let mut c = cache.safe_lock();
         if let Some((files, needs_refresh)) = c.get_cached_dir(&path) {
             let self_entry = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
-            log::debug!("LIST_CACHED {} ({} entries, refresh={}) in {:?}", path.display(), files.len(), needs_refresh, t0.elapsed());
+            log::info!("LIST_CACHED {} ({} entries, refresh={}) in {:?}", path.display(), files.len(), needs_refresh, t0.elapsed());
             if needs_refresh {
                 let conn = conn.clone();
                 let cache = cache.clone();
@@ -435,7 +435,7 @@ fn get_or_list_dir(
                         let _ = etag_tx.send(etag);
                     }
                     Err(e) => {
-                        log::debug!("incremental list {}: {}", path2.display(), e);
+                        log::warn!("incremental list {}: {}", path2.display(), e);
                         let _ = etag_tx.send(None);
                     }
                 }
@@ -444,7 +444,7 @@ fn get_or_list_dir(
         }
     };
     if already_pending {
-        log::debug!("LIST_JOIN {} — waiting for existing fetch", path.display());
+        log::info!("LIST_JOIN {} — waiting for existing fetch", path.display());
     }
 
     // Block until first entries arrive or PROPFIND completes/times out.
@@ -454,14 +454,14 @@ fn get_or_list_dir(
             let mut c = cache.safe_lock();
             if let Some(snapshot) = c.get_pending_snapshot(&path) {
                 if !snapshot.is_empty() {
-                    log::debug!("LIST_STREAM {} ({} entries) in {:?}", path.display(), snapshot.len(), t0.elapsed());
+                    log::info!("LIST_STREAM {} ({} entries) in {:?}", path.display(), snapshot.len(), t0.elapsed());
                     let se = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
                     return Ok((Arc::new(snapshot), se));
                 }
             }
             if c.dir_cache.contains_key(&path) {
                 let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
-                log::debug!("LIST_PROMOTED {} in {:?}", path.display(), t0.elapsed());
+                log::info!("LIST_PROMOTED {} in {:?}", path.display(), t0.elapsed());
                 return c.get_cached_dir(&path)
                     .map(|(f, _)| (f, se))
                     .ok_or_else(|| format!("PROPFIND returned empty for {}", path.display()));
@@ -494,7 +494,7 @@ fn get_or_list_dir(
             return Ok((files, se));
         }
     } else {
-        log::debug!("PROPFIND timeout {} — removing stale pending (no entries yet)", path.display());
+        log::warn!("PROPFIND timeout {} — removing stale pending (no entries yet, elapsed {:?})", path.display(), t0.elapsed());
         c.pending_dirs.remove(&path);
     }
     Err(format!("PROPFIND timeout for {}", path.display()))
@@ -812,7 +812,7 @@ impl Filesystem for NextCloudFs {
             }
         };
 
-        log::debug!("[{}] LOOKUP {}/{}", self.log_user, parent_path.display(), name_str);
+        log::info!("[{}] LOOKUP {}/{}", self.log_user, parent_path.display(), name_str);
 
         let conn = self.conn.clone();
         let cache = self.cache.clone();
@@ -874,7 +874,7 @@ impl Filesystem for NextCloudFs {
             }
         };
 
-        log::debug!("[{}] GETATTR {}", self.log_user, path.display());
+        log::info!("[{}] GETATTR {}", self.log_user, path.display());
 
         let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let file_name =
@@ -1120,7 +1120,7 @@ impl Filesystem for NextCloudFs {
             (path, parent_ino)
         };
 
-        log::debug!("[{}] READDIR {}", self.log_user, path.display());
+        log::info!("[{}] READDIR {}", self.log_user, path.display());
 
         let cache = self.cache.clone();
         let status = self.status.clone();
@@ -1195,9 +1195,6 @@ impl Filesystem for NextCloudFs {
                         }
                     }
 
-                    // Mark all populated paths dirty so the CHANGES poll
-                    // triggers Nautilus to re-query DETAIL (handles the case
-                    // where Nautilus queried before IPC maps were populated).
                     {
                         let mut d = dirty.safe_lock();
                         d.insert(path.clone());
@@ -1207,6 +1204,7 @@ impl Filesystem for NextCloudFs {
                             }
                         }
                     }
+                    log::info!("READDIR {} populated IPC maps: {} entries, self_entry={}", path.display(), entries.len(), self_entry.is_some());
 
                     let skip = if offset > 2 { (offset - 2) as usize } else { 0 };
                     for (i, entry) in entries.iter().enumerate().skip(skip) {
