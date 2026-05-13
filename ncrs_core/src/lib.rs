@@ -43,12 +43,12 @@ const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const READ_AHEAD: usize = 2 * 1024 * 1024; // 2 MB
-const PREFETCH_SUBDIRS: usize = 20;
-const PREFETCH_BATCH: usize = 8;
+const PREFETCH_SUBDIRS: usize = 10;
+const PREFETCH_BATCH: usize = 4;
 const MAX_POOL_IDLE: usize = 8;
 const LARGE_DIR_THRESHOLD: usize = 200;
 const LARGE_DIR_SUBDIRS: usize = 5;
-const THUMB_PREFETCH_MAX: usize = 200;
+const THUMB_PREFETCH_MAX: usize = 50;
 
 const PATH_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -704,7 +704,7 @@ impl NextCloudFs {
         let details: ipc::FileDetailMap = Arc::new(Mutex::new(HashMap::new()));
 
         let http = reqwest::blocking::Client::builder()
-            .pool_max_idle_per_host(4)
+            .pool_max_idle_per_host(16)
             .build()
             .map_err(|e| format!("HTTP client: {}", e))?;
 
