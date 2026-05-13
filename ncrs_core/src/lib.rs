@@ -760,6 +760,9 @@ impl Filesystem for NextCloudFs {
         let conn = self.conn.clone();
         let cache = self.cache.clone();
         let status = self.status.clone();
+        let shared = self.shared.clone();
+        let fileids = self.fileids.clone();
+        let details = self.details.clone();
 
         thread::spawn(move || {
             match get_or_list_dir(&conn, &cache, parent_path.clone()) {
@@ -771,12 +774,20 @@ impl Filesystem for NextCloudFs {
                             let target_path = parent_path.join(&name_str);
                             let ino = cache.safe_lock().allocate_inode(target_path.clone());
                             let attr = make_file_attr(ino, entry);
+                            if entry.is_shared {
+                                shared.safe_lock().insert(target_path.clone());
+                            }
+                            if let Some(fid) = entry.fileid {
+                                fileids.safe_lock().insert(target_path.clone(), fid);
+                            }
+                            details.safe_lock().insert(target_path.clone(), ipc::FileDetail {
+                                permissions: entry.permissions.clone(),
+                                owner_id: entry.owner_id.clone(),
+                                owner_display_name: entry.owner_display_name.clone(),
+                                size: entry.size,
+                            });
                             if !entry.is_dir {
-                                status
-                                    .lock()
-                                    .unwrap()
-                                    .entry(target_path)
-                                    .or_insert(FileStatus::Remote);
+                                status.safe_lock().entry(target_path).or_insert(FileStatus::Remote);
                             }
                             reply.entry(&TTL, &attr, 0);
                             return;
@@ -814,6 +825,10 @@ impl Filesystem for NextCloudFs {
 
         let conn = self.conn.clone();
         let cache = self.cache.clone();
+        let shared = self.shared.clone();
+        let fileids = self.fileids.clone();
+        let details = self.details.clone();
+        let status = self.status.clone();
 
         thread::spawn(move || {
             match get_or_list_dir(&conn, &cache, parent.clone()) {
@@ -826,6 +841,22 @@ impl Filesystem for NextCloudFs {
                             .unwrap_or("")
                             == file_name
                         {
+                            let entry_path = parent.join(&file_name);
+                            if entry.is_shared {
+                                shared.safe_lock().insert(entry_path.clone());
+                            }
+                            if let Some(fid) = entry.fileid {
+                                fileids.safe_lock().insert(entry_path.clone(), fid);
+                            }
+                            details.safe_lock().insert(entry_path.clone(), ipc::FileDetail {
+                                permissions: entry.permissions.clone(),
+                                owner_id: entry.owner_id.clone(),
+                                owner_display_name: entry.owner_display_name.clone(),
+                                size: entry.size,
+                            });
+                            if !entry.is_dir {
+                                status.safe_lock().entry(entry_path).or_insert(FileStatus::Remote);
+                            }
                             reply.attr(&TTL, &make_file_attr(ino, entry));
                             return;
                         }
@@ -927,6 +958,26 @@ impl Filesystem for NextCloudFs {
                             reply.data(&ra.data[s..s + sz]);
                             return;
                         }
+                    }
+                }
+            }
+
+            // Serve from file_cache (populated by Keep Locally or previous fallback).
+            let cached_local = cache.safe_lock().file_cache.get(&path)
+                .filter(|fc| fc.local_path.exists())
+                .map(|fc| fc.local_path.clone());
+            if let Some(ref local) = cached_local {
+                if let Ok(f) = std::fs::File::open(local) {
+                    let mut buf = vec![0u8; sz];
+                    match f.read_at(&mut buf, off) {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            reply.data(&buf);
+                            let lp = local.clone();
+                            open_files.safe_lock().entry(fh).and_modify(|of| of.local = Some(lp));
+                            return;
+                        }
+                        Err(_) => {}
                     }
                 }
             }

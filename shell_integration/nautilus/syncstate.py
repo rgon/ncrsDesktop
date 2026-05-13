@@ -153,7 +153,7 @@ class NcrsColumnProvider(GObject.GObject, Nautilus.ColumnProvider):
                 Nautilus.Column(
                     name="NcrsExtension::owner",
                     attribute="ncrs_owner",
-                    label="Owner",
+                    label="NC Owner",
                     description="File owner on Nextcloud",
                 ),
                 Nautilus.Column(
@@ -190,22 +190,33 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         GLib.timeout_add_seconds(2, self._poll_changes)
 
     def _poll_changes(self) -> bool:
+        _POOL.submit(self._do_poll_changes)
+        return True
+
+    def _do_poll_changes(self):
         try:
             resp = _send_command("CHANGES")
             if not resp or resp.startswith("error"):
-                return True
+                return
             paths = resp.split("\t")
-            with self._tracked_lock:
-                for p in paths:
-                    fi = self._tracked.get(p)
-                    if fi and not fi.is_gone():
-                        fi.invalidate_extension_info()
-                self._tracked = {
-                    k: v for k, v in self._tracked.items() if not v.is_gone()
-                }
+
+            def _invalidate():
+                try:
+                    with self._tracked_lock:
+                        for p in paths:
+                            fi = self._tracked.get(p)
+                            if fi and not fi.is_gone():
+                                fi.invalidate_extension_info()
+                        self._tracked = {
+                            k: v for k, v in self._tracked.items() if not v.is_gone()
+                        }
+                except Exception:
+                    _log_error("_invalidate")
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(_invalidate)
         except Exception:
             _log_error("_poll_changes")
-        return True
 
     def update_file_info(self, file_info):
         return Nautilus.OperationResult.COMPLETE
