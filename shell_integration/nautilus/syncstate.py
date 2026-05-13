@@ -38,7 +38,7 @@ _EMBLEM_REMOTE = "emblem-downloads"     # cloud / down-arrow
 _EMBLEM_SYNCED = "emblem-synchronizing" # circular arrows
 _EMBLEM_SHARED = "emblem-shared"        # people / shared
 
-SOCKET_TIMEOUT = 0.5  # seconds
+SOCKET_TIMEOUT = 2.0  # seconds
 _MAX_RECV = 4096
 
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
@@ -111,18 +111,19 @@ def _send_command(cmd: str) -> str:
             s.sendall(f"{cmd}\n".encode())
             buf = b""
             while b"\n" not in buf and len(buf) < _MAX_RECV:
-                chunk = s.recv(64)
+                chunk = s.recv(256)
                 if not chunk:
                     break
                 buf += chunk
             result = buf.decode(errors="replace").strip()
             elapsed = (time.monotonic() - t0) * 1000
-            if elapsed > 50:
+            if elapsed > 50 and not cmd.startswith("LOG "):
                 _log_to_daemon(f"{cmd}: {elapsed:.0f}ms")
             return result
     except (OSError, socket.timeout):
         elapsed = (time.monotonic() - t0) * 1000
-        _log_to_daemon(f"{cmd}: TIMEOUT ({elapsed:.0f}ms)")
+        if not cmd.startswith("LOG "):
+            _log_to_daemon(f"{cmd}: TIMEOUT ({elapsed:.0f}ms)")
         return "error: socket timeout"
 
 
