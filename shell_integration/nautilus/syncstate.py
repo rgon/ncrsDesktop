@@ -223,15 +223,19 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             if not resp or resp.startswith("error"):
                 return
             paths = resp.split("\t")
+            _log_to_daemon(f"CHANGES got {len(paths)} dirty paths")
 
             def _invalidate():
+                found = 0
                 for p in paths:
                     try:
                         fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(p))
                         if fi is not None:
                             fi.invalidate_extension_info()
+                            found += 1
                     except Exception:
                         pass
+                _log_to_daemon(f"CHANGES invalidated {found}/{len(paths)} file infos")
                 return GLib.SOURCE_REMOVE
 
             GLib.idle_add(_invalidate)
