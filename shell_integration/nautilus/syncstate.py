@@ -42,7 +42,7 @@ _EMBLEM_SHARED = "emblem-shared"        # people / shared
 SOCKET_TIMEOUT = 2.0  # seconds
 _MAX_RECV = 4096
 
-_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
+_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="ncrs-nautilus")
 
 _PERM_FLAGS = {
     "R": "Read",
@@ -253,37 +253,54 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             path = file_info.get_location().get_path()
             if path is None or not (path == self._mount or path.startswith(self._mount + "/")):
                 return Nautilus.OperationResult.COMPLETE
-
-            detail = _send_command(f"DETAIL {path}")
-
-            parts = detail.split("\t")
-            sync = parts[0] if len(parts) > 0 else "unknown"
-            sharing = parts[1] if len(parts) > 1 else ""
-            perms = parts[2] if len(parts) > 2 else ""
-            owner = parts[3] if len(parts) > 3 else ""
-            size_str = parts[4] if len(parts) > 4 else "0"
-
-            if sync == "local":
-                file_info.add_emblem(_EMBLEM_LOCAL)
-            elif sync == "synced":
-                file_info.add_emblem(_EMBLEM_SYNCED)
-            elif sync == "downloading":
-                file_info.add_emblem(_EMBLEM_REMOTE)
-            if sharing:
-                file_info.add_emblem(_EMBLEM_SHARED)
-
-            file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
-            file_info.add_string_attribute("ncrs_sharing", sharing)
-            file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
-            file_info.add_string_attribute("ncrs_owner", owner)
-            try:
-                size_val = int(size_str)
-                file_info.add_string_attribute("ncrs_size", _human_size(size_val) if size_val > 0 else "")
-            except ValueError:
-                file_info.add_string_attribute("ncrs_size", "")
         except Exception:
-            _log_error("update_file_info_full")
-        return Nautilus.OperationResult.COMPLETE
+            _log_error("update_file_info_full (pre-check)")
+            return Nautilus.OperationResult.COMPLETE
+
+        def _work():
+            try:
+                detail = _send_command(f"DETAIL {path}")
+            except Exception:
+                detail = "unknown\t\t\t\t0"
+
+            def _apply():
+                try:
+                    parts = detail.split("\t")
+                    sync = parts[0] if len(parts) > 0 else "unknown"
+                    sharing = parts[1] if len(parts) > 1 else ""
+                    perms = parts[2] if len(parts) > 2 else ""
+                    owner = parts[3] if len(parts) > 3 else ""
+                    size_str = parts[4] if len(parts) > 4 else "0"
+
+                    if sync == "local":
+                        file_info.add_emblem(_EMBLEM_LOCAL)
+                    elif sync == "synced":
+                        file_info.add_emblem(_EMBLEM_SYNCED)
+                    elif sync == "downloading":
+                        file_info.add_emblem(_EMBLEM_REMOTE)
+                    if sharing:
+                        file_info.add_emblem(_EMBLEM_SHARED)
+
+                    file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
+                    file_info.add_string_attribute("ncrs_sharing", sharing)
+                    file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
+                    file_info.add_string_attribute("ncrs_owner", owner)
+                    try:
+                        size_val = int(size_str)
+                        file_info.add_string_attribute("ncrs_size", _human_size(size_val) if size_val > 0 else "")
+                    except ValueError:
+                        file_info.add_string_attribute("ncrs_size", "")
+
+                    Nautilus.info_provider_update_complete_invoke(
+                        closure, provider, handle, Nautilus.OperationResult.COMPLETE)
+                except Exception:
+                    _log_error(f"_apply({path})")
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(_apply)
+
+        _POOL.submit(_work)
+        return Nautilus.OperationResult.IN_PROGRESS
 
     def cancel_update(self, provider, handle):
         pass
