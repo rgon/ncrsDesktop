@@ -25,6 +25,7 @@ impl<T> MutexExt<T> for Mutex<T> {
 }
 
 pub type KeepCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
+pub type PrefetchCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type SharedSet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
 pub type FileIdMap = Arc<Mutex<std::collections::HashMap<PathBuf, u64>>>;
 
@@ -76,7 +77,7 @@ pub type StatusMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileStatus>>>;
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, username: String, base_url: String, keep_cb: Option<KeepCallback>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, username: String, base_url: String, keep_cb: Option<KeepCallback>, prefetch_cb: Option<PrefetchCallback>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -107,7 +108,8 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let uname = username.clone();
             let burl = base_url.clone();
             let cb = keep_cb.clone();
-            std::thread::spawn(move || handle_client(stream, mount, map, shared, fids, details, dirty, uname, burl, cb));
+            let pf = prefetch_cb.clone();
+            std::thread::spawn(move || handle_client(stream, mount, map, shared, fids, details, dirty, uname, burl, cb, pf));
         }
     });
 }
@@ -135,6 +137,7 @@ fn handle_client(
     username: String,
     base_url: String,
     keep_cb: Option<KeepCallback>,
+    prefetch_cb: Option<PrefetchCallback>,
 ) {
     let mut write_half = match stream.try_clone() {
         Ok(s) => s,
@@ -231,6 +234,20 @@ fn handle_client(
                     std::thread::spawn(move || {
                         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
                             log::error!("KEEP callback panicked: {:?}", e);
+                        }
+                    });
+                    "ok".to_string()
+                }
+                (None, _) => "error: path not under mount".to_string(),
+                (_, None) => "error: not supported".to_string(),
+            }
+        } else if let Some(path_str) = trimmed.strip_prefix("PREFETCH ") {
+            match (strip_mount(Path::new(path_str), &mount_point), &prefetch_cb) {
+                (Some(remote), Some(cb)) => {
+                    let cb = cb.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
+                            log::error!("PREFETCH callback panicked: {:?}", e);
                         }
                     });
                     "ok".to_string()

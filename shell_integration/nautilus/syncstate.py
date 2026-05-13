@@ -13,11 +13,12 @@ The ncRS daemon must be running; it exposes a Unix socket at
 $XDG_RUNTIME_DIR/ncrs.sock (usually /run/user/<UID>/ncrs.sock).
 
 Protocol (line-oriented over Unix socket):
-  STATUS <abs-path>  → local | synced | remote | downloading | unknown[,shared]
-  DETAIL <abs-path>  → status\\tsharing\\tpermissions\\towner\\tsize  (tab-separated)
-  WEBURL <abs-path>  → https://…  (Nextcloud web link)
-  KEEP   <abs-path>  → ok
-  CHANGES            → tab-separated abs-paths whose status changed (drains queue)
+  STATUS   <abs-path>  → local | synced | remote | downloading | unknown[,shared]
+  DETAIL   <abs-path>  → status\\tsharing\\tpermissions\\towner\\tsize  (tab-separated)
+  WEBURL   <abs-path>  → https://…  (Nextcloud web link)
+  KEEP     <abs-path>  → ok
+  PREFETCH <abs-path>  → ok  (background PROPFIND to warm the dir cache)
+  CHANGES              → tab-separated abs-paths whose status changed (drains queue)
 """
 
 import os

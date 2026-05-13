@@ -43,12 +43,7 @@ const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const READ_AHEAD: usize = 2 * 1024 * 1024; // 2 MB
-const PREFETCH_SUBDIRS: usize = 10;
-const PREFETCH_BATCH: usize = 4;
 const MAX_POOL_IDLE: usize = 8;
-const LARGE_DIR_THRESHOLD: usize = 200;
-const LARGE_DIR_SUBDIRS: usize = 5;
-const THUMB_PREFETCH_MAX: usize = 50;
 
 const PATH_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -800,6 +795,14 @@ impl NextCloudFs {
             keep_locally_recursive(&conn, &net, &cache, &status, &dirty, remote_path);
         })
     }
+
+    pub fn prefetch_callback(&self) -> ipc::PrefetchCallback {
+        let conn = self.conn.clone();
+        let cache = self.cache.clone();
+        Arc::new(move |remote_path| {
+            prefetch_list_dir(&conn, &cache, &remote_path);
+        })
+    }
 }
 
 impl Filesystem for NextCloudFs {
@@ -1225,44 +1228,18 @@ impl Filesystem for NextCloudFs {
                     }
                     reply.ok();
 
-                    if offset == 0 {
-                        let is_large = entries.len() > LARGE_DIR_THRESHOLD;
-
-                        if !thumb_candidates.is_empty() {
-                            if is_large {
-                                thumb_candidates.truncate(THUMB_PREFETCH_MAX);
-                            }
-                            let conn2 = conn.clone();
-                            thread::spawn(move || {
-                                preview::prefetch_directory_thumbnails(
-                                    &conn2.http,
-                                    &conn2.base_url,
-                                    &conn2.username,
-                                    &conn2.password,
-                                    &conn2.mount_point,
-                                    &thumb_candidates,
-                                );
-                            });
-                        }
-
-                        let subdir_limit = if is_large { LARGE_DIR_SUBDIRS } else { PREFETCH_SUBDIRS };
-                        let subdirs: Vec<PathBuf> = entries.iter()
-                            .filter(|e| e.is_dir)
-                            .take(subdir_limit)
-                            .filter_map(|e| e.path.file_name().map(|n| path.join(n.to_string_lossy().as_ref())))
-                            .collect();
-
-                        if !subdirs.is_empty() {
-                            thread::spawn(move || {
-                                for chunk in subdirs.chunks(PREFETCH_BATCH) {
-                                    std::thread::scope(|s| {
-                                        for dir in chunk {
-                                            s.spawn(|| prefetch_list_dir(&conn, &cache, dir));
-                                        }
-                                    });
-                                }
-                            });
-                        }
+                    if offset == 0 && !thumb_candidates.is_empty() {
+                        let conn2 = conn.clone();
+                        thread::spawn(move || {
+                            preview::prefetch_directory_thumbnails(
+                                &conn2.http,
+                                &conn2.base_url,
+                                &conn2.username,
+                                &conn2.password,
+                                &conn2.mount_point,
+                                &thumb_candidates,
+                            );
+                        });
                     }
                 }
                 Err(e) => {
@@ -1317,9 +1294,10 @@ fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Resu
 pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
     let filesystem = NextCloudFs::new(options.clone())?;
     let keep_cb = filesystem.keep_callback();
+    let prefetch_cb = filesystem.prefetch_callback();
     let base_url = notifications::base_url(&options.url);
     let username = options.username.clone().unwrap_or_default();
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, base_url, Some(keep_cb));
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, base_url, Some(keep_cb), Some(prefetch_cb));
 
     let fuse_options = vec![
         MountOption::RO,
