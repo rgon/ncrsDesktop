@@ -1021,38 +1021,52 @@ impl Filesystem for NextCloudFs {
 
             match get_or_list_dir(&conn, &cache, path.clone()) {
                 Ok(entries) => {
-                    let skip = if offset > 2 { (offset - 2) as usize } else { 0 };
+                    // Batch-populate IPC maps BEFORE replying so Nautilus
+                    // column queries (DETAIL) find data immediately.
                     let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
+                    {
+                        let mut c = cache.safe_lock();
+                        let mut sh = shared.safe_lock();
+                        let mut fi = fileids.safe_lock();
+                        let mut dt = details.safe_lock();
+                        let mut st = status.safe_lock();
+                        for entry in entries.iter() {
+                            let name = match entry.path.file_name().and_then(|n| n.to_str()) {
+                                Some(n) => n,
+                                None => continue,
+                            };
+                            let entry_path = path.join(name);
+                            c.allocate_inode(entry_path.clone());
+                            if entry.is_shared {
+                                sh.insert(entry_path.clone());
+                            }
+                            if let Some(fid) = entry.fileid {
+                                fi.insert(entry_path.clone(), fid);
+                            }
+                            dt.insert(entry_path.clone(), ipc::FileDetail {
+                                permissions: entry.permissions.clone(),
+                                owner_id: entry.owner_id.clone(),
+                                owner_display_name: entry.owner_display_name.clone(),
+                                size: entry.size,
+                            });
+                            if !entry.is_dir {
+                                st.entry(entry_path.clone()).or_insert(FileStatus::Remote);
+                                thumb_candidates.push((entry_path, entry.modified, entry.has_preview, entry.fileid));
+                            }
+                        }
+                    }
+
+                    let skip = if offset > 2 { (offset - 2) as usize } else { 0 };
                     for (i, entry) in entries.iter().enumerate().skip(skip) {
                         let name = match entry.path.file_name().and_then(|n| n.to_str()) {
-                            Some(n) => n.to_string(),
+                            Some(n) => n,
                             None => continue,
                         };
-                        let entry_path = path.join(&name);
-                        let entry_ino =
-                            cache.safe_lock().allocate_inode(entry_path.clone());
-                        if entry.is_shared {
-                            shared.safe_lock().insert(entry_path.clone());
-                        }
-                        if let Some(fid) = entry.fileid {
-                            fileids.safe_lock().insert(entry_path.clone(), fid);
-                        }
-                        details.safe_lock().insert(entry_path.clone(), ipc::FileDetail {
-                            permissions: entry.permissions.clone(),
-                            owner_id: entry.owner_id.clone(),
-                            owner_display_name: entry.owner_display_name.clone(),
-                            size: entry.size,
-                        });
-                        if !entry.is_dir {
-                            status
-                                .safe_lock()
-                                .entry(entry_path.clone())
-                                .or_insert(FileStatus::Remote);
-                            thumb_candidates.push((entry_path, entry.modified, entry.has_preview, entry.fileid));
-                        }
+                        let entry_path = path.join(name);
+                        let entry_ino = cache.safe_lock().get_inode(&entry_path).unwrap_or(1);
                         let kind =
                             if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                        if reply.add(entry_ino, (i + 3) as i64, kind, &name) {
+                        if reply.add(entry_ino, (i + 3) as i64, kind, name) {
                             break;
                         }
                     }
