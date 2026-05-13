@@ -171,7 +171,8 @@ pub fn propfind_list_streaming(
     path: &std::path::Path,
     timeout: Duration,
     tx: std::sync::mpsc::Sender<DavEntry>,
-) -> Result<(Option<String>, Option<DavEntry>), String> {
+    self_tx: std::sync::mpsc::Sender<DavEntry>,
+) -> Result<Option<String>, String> {
     let url = build_url(webdav_url, path);
     log::debug!("PROPFIND_STREAM {}", url);
 
@@ -196,7 +197,6 @@ pub fn propfind_list_streaming(
     let mut buf_reader = ResponseReader::new(xml_reader);
 
     let mut dir_etag: Option<String> = None;
-    let mut self_entry: Option<DavEntry> = None;
     let mut is_first = true;
     while let Some(resp) = buf_reader.next_response()? {
         let remote_path = href_to_remote_path(&resp.href, &prefix);
@@ -216,13 +216,13 @@ pub fn propfind_list_streaming(
         };
         if is_first {
             dir_etag = resp.etag;
-            self_entry = Some(entry);
+            let _ = self_tx.send(entry);
             is_first = false;
         } else if tx.send(entry).is_err() {
             break;
         }
     }
-    Ok((dir_etag, self_entry))
+    Ok(dir_etag)
 }
 
 #[cfg(test)]

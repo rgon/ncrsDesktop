@@ -73,7 +73,8 @@ struct DirCacheEntry {
 struct PendingDir {
     entries: Vec<DavEntry>,
     rx: mpsc::Receiver<DavEntry>,
-    etag_rx: mpsc::Receiver<(Option<String>, Option<DavEntry>)>,
+    etag_rx: mpsc::Receiver<Option<String>>,
+    self_rx: mpsc::Receiver<DavEntry>,
     etag: Option<String>,
     self_entry: Option<DavEntry>,
 }
@@ -262,11 +263,12 @@ impl FsCache {
         }
     }
 
-    fn start_pending(&mut self, path: PathBuf, rx: mpsc::Receiver<DavEntry>, etag_rx: mpsc::Receiver<(Option<String>, Option<DavEntry>)>) {
+    fn start_pending(&mut self, path: PathBuf, rx: mpsc::Receiver<DavEntry>, etag_rx: mpsc::Receiver<Option<String>>, self_rx: mpsc::Receiver<DavEntry>) {
         self.pending_dirs.insert(path, PendingDir {
             entries: Vec::new(),
             rx,
             etag_rx,
+            self_rx,
             etag: None,
             self_entry: None,
         });
@@ -277,9 +279,13 @@ impl FsCache {
             while let Ok(entry) = pending.rx.try_recv() {
                 pending.entries.push(entry);
             }
-            if let Ok((etag, self_entry)) = pending.etag_rx.try_recv() {
+            if let Ok(etag) = pending.etag_rx.try_recv() {
                 pending.etag = etag;
-                pending.self_entry = self_entry;
+            }
+            if pending.self_entry.is_none() {
+                if let Ok(se) = pending.self_rx.try_recv() {
+                    pending.self_entry = Some(se);
+                }
             }
             let self_entry = pending.self_entry.take();
             self.put_dir_cache(path.to_path_buf(), pending.etag, self_entry.clone(), pending.entries);
@@ -291,12 +297,16 @@ impl FsCache {
 
     fn get_pending_snapshot(&mut self, path: &Path) -> Option<Vec<DavEntry>> {
         let pending = self.pending_dirs.get_mut(path)?;
+        if pending.self_entry.is_none() {
+            if let Ok(se) = pending.self_rx.try_recv() {
+                pending.self_entry = Some(se);
+            }
+        }
         loop {
             match pending.rx.try_recv() {
                 Ok(entry) => pending.entries.push(entry),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    // Sender dropped = fetch complete. Promote to full cache.
                     self.promote_pending(path);
                     return self.dir_cache.get(path).map(|e| e.files.to_vec());
                 }
@@ -348,46 +358,52 @@ fn get_or_list_dir(
     conn: &Arc<ConnInfo>,
     cache: &Arc<Mutex<FsCache>>,
     path: PathBuf,
-) -> Result<Arc<Vec<DavEntry>>, String> {
-    if let Some((files, needs_refresh)) = cache.safe_lock().get_cached_dir(&path) {
-        log::debug!("LIST_CACHED {} ({} entries, refresh={})", path.display(), files.len(), needs_refresh);
-        if needs_refresh {
-            let conn = conn.clone();
-            let cache = cache.clone();
-            let path = path.clone();
-            std::thread::spawn(move || {
-                let old_etag = cache.safe_lock().cached_dir_etag(&path);
-                if let Some(ref old) = old_etag {
-                    match propfind::propfind_etag(&conn.http, &conn.webdav_url, &conn.username, &conn.password, &path, PROPFIND_TIMEOUT) {
-                        Ok(Some(ref new_etag)) if new_etag == old => {
-                            log::debug!("ETAG_MATCH {} — skipping full re-list", path.display());
-                            cache.safe_lock().touch_dir_cache(&path);
-                            return;
+) -> Result<(Arc<Vec<DavEntry>>, Option<DavEntry>), String> {
+    let t0 = Instant::now();
+    {
+        let mut c = cache.safe_lock();
+        if let Some((files, needs_refresh)) = c.get_cached_dir(&path) {
+            let self_entry = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
+            log::debug!("LIST_CACHED {} ({} entries, refresh={}) in {:?}", path.display(), files.len(), needs_refresh, t0.elapsed());
+            if needs_refresh {
+                let conn = conn.clone();
+                let cache = cache.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let old_etag = cache.safe_lock().cached_dir_etag(&path);
+                    if let Some(ref old) = old_etag {
+                        match propfind::propfind_etag(&conn.http, &conn.webdav_url, &conn.username, &conn.password, &path, PROPFIND_TIMEOUT) {
+                            Ok(Some(ref new_etag)) if new_etag == old => {
+                                log::debug!("ETAG_MATCH {} — skipping full re-list", path.display());
+                                cache.safe_lock().touch_dir_cache(&path);
+                                return;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::debug!("etag check {}: {}", path.display(), e);
+                            }
                         }
-                        Ok(_) => {}
+                    }
+                    match list_dir_propfind(&conn, path.clone()) {
+                        Ok((etag, self_entry, fresh)) => {
+                            cache.safe_lock().put_dir_cache(path, etag, self_entry, fresh);
+                        }
                         Err(e) => {
-                            log::debug!("etag check {}: {}", path.display(), e);
+                            log::debug!("background refresh {}: {}", path.display(), e);
+                            cache.safe_lock().clear_refreshing(&path);
                         }
                     }
-                }
-                match list_dir_propfind(&conn, path.clone()) {
-                    Ok((etag, self_entry, fresh)) => {
-                        cache.safe_lock().put_dir_cache(path, etag, self_entry, fresh);
-                    }
-                    Err(e) => {
-                        log::debug!("background refresh {}: {}", path.display(), e);
-                        cache.safe_lock().clear_refreshing(&path);
-                    }
-                }
-            });
+                });
+            }
+            return Ok((files, self_entry));
         }
-        return Ok(files);
     }
     // Check if there's already an in-progress incremental fetch
     {
         let mut c = cache.safe_lock();
         if let Some(snapshot) = c.get_pending_snapshot(&path) {
-            return Ok(Arc::new(snapshot));
+            let self_entry = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
+            return Ok((Arc::new(snapshot), self_entry));
         }
     }
 
@@ -396,7 +412,8 @@ fn get_or_list_dir(
         let mut c = cache.safe_lock();
         if c.dir_cache.contains_key(&path) {
             if let Some((files, _)) = c.get_cached_dir(&path) {
-                return Ok(files);
+                let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
+                return Ok((files, se));
             }
         }
         if c.pending_dirs.contains_key(&path) {
@@ -404,21 +421,22 @@ fn get_or_list_dir(
         } else {
             let (entry_tx, entry_rx) = mpsc::channel();
             let (etag_tx, etag_rx) = mpsc::channel();
-            c.start_pending(path.clone(), entry_rx, etag_rx);
+            let (self_tx, self_rx) = mpsc::channel();
+            c.start_pending(path.clone(), entry_rx, etag_rx, self_rx);
 
             let conn2 = conn.clone();
             let path2 = path.clone();
             std::thread::spawn(move || {
                 match propfind::propfind_list_streaming(
                     &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
-                    &path2, PROPFIND_TIMEOUT, entry_tx,
+                    &path2, PROPFIND_TIMEOUT, entry_tx, self_tx,
                 ) {
-                    Ok((etag, self_entry)) => {
-                        let _ = etag_tx.send((etag, self_entry));
+                    Ok(etag) => {
+                        let _ = etag_tx.send(etag);
                     }
                     Err(e) => {
                         log::debug!("incremental list {}: {}", path2.display(), e);
-                        let _ = etag_tx.send((None, None));
+                        let _ = etag_tx.send(None);
                     }
                 }
             });
@@ -436,12 +454,16 @@ fn get_or_list_dir(
             let mut c = cache.safe_lock();
             if let Some(snapshot) = c.get_pending_snapshot(&path) {
                 if !snapshot.is_empty() {
-                    return Ok(Arc::new(snapshot));
+                    log::debug!("LIST_STREAM {} ({} entries) in {:?}", path.display(), snapshot.len(), t0.elapsed());
+                    let se = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
+                    return Ok((Arc::new(snapshot), se));
                 }
             }
             if c.dir_cache.contains_key(&path) {
+                let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
+                log::debug!("LIST_PROMOTED {} in {:?}", path.display(), t0.elapsed());
                 return c.get_cached_dir(&path)
-                    .map(|(f, _)| f)
+                    .map(|(f, _)| (f, se))
                     .ok_or_else(|| format!("PROPFIND returned empty for {}", path.display()));
             }
         }
@@ -467,9 +489,9 @@ fn get_or_list_dir(
         false
     };
     if should_promote {
-        c.promote_pending(&path);
+        let se = c.promote_pending(&path);
         if let Some((files, _)) = c.get_cached_dir(&path) {
-            return Ok(files);
+            return Ok((files, se));
         }
     } else {
         log::debug!("PROPFIND timeout {} — removing stale pending (no entries yet)", path.display());
@@ -550,7 +572,7 @@ fn keep_locally_recursive(
         return;
     }
 
-    let entries = match get_or_list_dir(conn, cache, remote_path.clone()) {
+    let (entries, _self_entry) = match get_or_list_dir(conn, cache, remote_path.clone()) {
         Ok(e) => e,
         Err(e) => {
             if known_dir.is_none() {
@@ -801,7 +823,7 @@ impl Filesystem for NextCloudFs {
 
         thread::spawn(move || {
             match get_or_list_dir(&conn, &cache, parent_path.clone()) {
-                Ok(entries) => {
+                Ok((entries, _self_entry)) => {
                     for entry in entries.iter() {
                         let entry_name =
                             entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -867,7 +889,7 @@ impl Filesystem for NextCloudFs {
 
         thread::spawn(move || {
             match get_or_list_dir(&conn, &cache, parent.clone()) {
-                Ok(entries) => {
+                Ok((entries, _self_entry)) => {
                     for entry in entries.iter() {
                         if entry
                             .path
@@ -1105,6 +1127,7 @@ impl Filesystem for NextCloudFs {
         let shared = self.shared.clone();
         let fileids = self.fileids.clone();
         let details = self.details.clone();
+        let dirty = self.dirty.clone();
         let conn = self.conn.clone();
 
         thread::spawn(move || {
@@ -1120,7 +1143,7 @@ impl Filesystem for NextCloudFs {
             }
 
             match get_or_list_dir(&conn, &cache, path.clone()) {
-                Ok(entries) => {
+                Ok((entries, self_entry)) => {
                     // Batch-populate IPC maps BEFORE replying so Nautilus
                     // column queries (DETAIL) find data immediately.
                     let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
@@ -1131,8 +1154,7 @@ impl Filesystem for NextCloudFs {
                         let mut dt = details.safe_lock();
                         let mut st = status.safe_lock();
 
-                        // Populate IPC detail for the directory itself
-                        if let Some(se) = c.dir_cache.get(&path).and_then(|e| e.self_entry.as_ref()) {
+                        if let Some(ref se) = self_entry {
                             if se.is_shared {
                                 sh.insert(path.clone());
                             }
@@ -1169,6 +1191,19 @@ impl Filesystem for NextCloudFs {
                             if !entry.is_dir {
                                 st.entry(entry_path.clone()).or_insert(FileStatus::Remote);
                                 thumb_candidates.push((entry_path, entry.modified, entry.has_preview, entry.fileid));
+                            }
+                        }
+                    }
+
+                    // Mark all populated paths dirty so the CHANGES poll
+                    // triggers Nautilus to re-query DETAIL (handles the case
+                    // where Nautilus queried before IPC maps were populated).
+                    {
+                        let mut d = dirty.safe_lock();
+                        d.insert(path.clone());
+                        for entry in entries.iter() {
+                            if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
+                                d.insert(path.join(name));
                             }
                         }
                     }
