@@ -24,7 +24,6 @@ Protocol (line-oriented over Unix socket):
 import os
 import socket
 import sys
-import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -208,9 +207,6 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
     def __init__(self):
         super().__init__()
         self._mount = _load_mount_point()
-        self._cache = {}
-        self._pending = set()
-        self._lock = threading.Lock()
         GLib.timeout_add_seconds(2, self._poll_changes)
 
     def _poll_changes(self) -> bool:
@@ -227,10 +223,6 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 return
             paths = resp.split("\t")
             _log_to_daemon(f"CHANGES got {len(paths)} dirty paths")
-
-            with self._lock:
-                for p in paths:
-                    self._cache.pop(p, None)
 
             def _invalidate():
                 found = 0
@@ -249,33 +241,6 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         except Exception:
             _log_error("_poll_changes")
 
-    def _apply_detail(self, file_info, detail):
-        parts = detail.split("\t")
-        sync = parts[0] if len(parts) > 0 else "unknown"
-        sharing = parts[1] if len(parts) > 1 else ""
-        perms = parts[2] if len(parts) > 2 else ""
-        owner = parts[3] if len(parts) > 3 else ""
-        size_str = parts[4] if len(parts) > 4 else "0"
-
-        if sync == "local":
-            file_info.add_emblem(_EMBLEM_LOCAL)
-        elif sync == "synced":
-            file_info.add_emblem(_EMBLEM_SYNCED)
-        elif sync == "downloading":
-            file_info.add_emblem(_EMBLEM_REMOTE)
-        if sharing:
-            file_info.add_emblem(_EMBLEM_SHARED)
-
-        file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
-        file_info.add_string_attribute("ncrs_sharing", sharing)
-        file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
-        file_info.add_string_attribute("ncrs_owner", owner)
-        try:
-            size_val = int(size_str)
-            file_info.add_string_attribute("ncrs_size", _human_size(size_val) if size_val > 0 else "")
-        except ValueError:
-            file_info.add_string_attribute("ncrs_size", "")
-
     def update_file_info(self, file_info):
         try:
             if not self._mount:
@@ -288,41 +253,32 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             if path is None or not (path == self._mount or path.startswith(self._mount + "/")):
                 return
 
-            with self._lock:
-                cached = self._cache.get(path)
+            detail = _send_command(f"DETAIL {path}")
+            parts = detail.split("\t")
+            sync = parts[0] if len(parts) > 0 else "unknown"
+            sharing = parts[1] if len(parts) > 1 else ""
+            perms = parts[2] if len(parts) > 2 else ""
+            owner = parts[3] if len(parts) > 3 else ""
+            size_str = parts[4] if len(parts) > 4 else "0"
 
-            if cached is not None:
-                self._apply_detail(file_info, cached)
-                return
+            if sync == "local":
+                file_info.add_emblem(_EMBLEM_LOCAL)
+            elif sync == "synced":
+                file_info.add_emblem(_EMBLEM_SYNCED)
+            elif sync == "downloading":
+                file_info.add_emblem(_EMBLEM_REMOTE)
+            if sharing:
+                file_info.add_emblem(_EMBLEM_SHARED)
 
-            with self._lock:
-                if path in self._pending:
-                    return
-                self._pending.add(path)
-
-            def _fetch():
-                try:
-                    detail = _send_command(f"DETAIL {path}")
-                    with self._lock:
-                        self._cache[path] = detail
-                        self._pending.discard(path)
-
-                    def _invalidate():
-                        try:
-                            fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(path))
-                            if fi is not None:
-                                fi.invalidate_extension_info()
-                        except Exception:
-                            pass
-                        return GLib.SOURCE_REMOVE
-
-                    GLib.idle_add(_invalidate)
-                except Exception:
-                    with self._lock:
-                        self._pending.discard(path)
-                    _log_error(f"_fetch({path})")
-
-            _POOL.submit(_fetch)
+            file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
+            file_info.add_string_attribute("ncrs_sharing", sharing)
+            file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
+            file_info.add_string_attribute("ncrs_owner", owner)
+            try:
+                size_val = int(size_str)
+                file_info.add_string_attribute("ncrs_size", _human_size(size_val) if size_val > 0 else "")
+            except ValueError:
+                file_info.add_string_attribute("ncrs_size", "")
         except Exception:
             _log_error(f"update_file_info({file_info.get_location().get_path()})")
 
