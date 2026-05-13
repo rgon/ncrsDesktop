@@ -242,6 +242,9 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         except Exception:
             _log_error("_poll_changes")
 
+    def update_file_info(self, file_info):
+        return Nautilus.OperationResult.COMPLETE
+
     def update_file_info_full(self, provider, handle, closure, file_info):
         try:
             if not self._mount:
@@ -262,6 +265,7 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 detail = _send_command(f"DETAIL {path}")
             except Exception:
                 detail = "unknown\t\t\t\t0"
+            _log_to_daemon(f"DETAIL_ASYNC {path}: {detail[:60]}")
 
             def _apply():
                 try:
