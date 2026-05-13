@@ -653,6 +653,26 @@ fn make_file_attr(inode: u64, entry: &DavEntry) -> FileAttr {
     }
 }
 
+fn make_dir_attr(inode: u64) -> FileAttr {
+    FileAttr {
+        ino: inode,
+        size: 0,
+        blocks: 0,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::Directory,
+        perm: 0o755,
+        nlink: 2,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        rdev: 0,
+        flags: 0,
+        blksize: 512,
+    }
+}
+
 fn root_attr() -> FileAttr {
     FileAttr {
         ino: 1,
@@ -818,52 +838,42 @@ impl Filesystem for NextCloudFs {
             }
         };
 
-        log::info!("[{}] LOOKUP {}/{}", self.log_user, parent_path.display(), name_str);
-
-        let conn = self.conn.clone();
-        let cache = self.cache.clone();
-        let status = self.status.clone();
-        let shared = self.shared.clone();
-        let fileids = self.fileids.clone();
-        let details = self.details.clone();
-
-        thread::spawn(move || {
-            match get_or_list_dir(&conn, &cache, parent_path.clone()) {
-                Ok((entries, _self_entry)) => {
-                    for entry in entries.iter() {
-                        let entry_name =
-                            entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if entry_name == name_str {
-                            let target_path = parent_path.join(&name_str);
-                            let ino = cache.safe_lock().allocate_inode(target_path.clone());
-                            let attr = make_file_attr(ino, entry);
-                            if entry.is_shared {
-                                shared.safe_lock().insert(target_path.clone());
-                            }
-                            if let Some(fid) = entry.fileid {
-                                fileids.safe_lock().insert(target_path.clone(), fid);
-                            }
-                            details.safe_lock().insert(target_path.clone(), ipc::FileDetail {
-                                permissions: entry.permissions.clone(),
-                                owner_id: entry.owner_id.clone(),
-                                owner_display_name: entry.owner_display_name.clone(),
-                                size: entry.size,
-                            });
-                            if !entry.is_dir {
-                                status.safe_lock().entry(target_path).or_insert(FileStatus::Remote);
-                            }
-                            reply.entry(&TTL, &attr, 0);
-                            return;
-                        }
-                    }
-                    reply.error(ENOENT);
-                }
-                Err(e) => {
-                    log::error!("lookup {}/{}: {}", parent_path.display(), name_str, e);
-                    reply.error(error_to_errno(&e));
-                }
+        let mut c = self.cache.safe_lock();
+        let entries = match c.get_cached_dir(&parent_path) {
+            Some((files, _)) => files,
+            None => {
+                reply.error(ENOENT);
+                return;
             }
-        });
+        };
+
+        for entry in entries.iter() {
+            let entry_name = entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if entry_name == name_str {
+                let target_path = parent_path.join(&name_str);
+                let ino = c.allocate_inode(target_path.clone());
+                let attr = make_file_attr(ino, entry);
+                drop(c);
+                if entry.is_shared {
+                    self.shared.safe_lock().insert(target_path.clone());
+                }
+                if let Some(fid) = entry.fileid {
+                    self.fileids.safe_lock().insert(target_path.clone(), fid);
+                }
+                self.details.safe_lock().insert(target_path.clone(), ipc::FileDetail {
+                    permissions: entry.permissions.clone(),
+                    owner_id: entry.owner_id.clone(),
+                    owner_display_name: entry.owner_display_name.clone(),
+                    size: entry.size,
+                });
+                if !entry.is_dir {
+                    self.status.safe_lock().entry(target_path).or_insert(FileStatus::Remote);
+                }
+                reply.entry(&TTL, &attr, 0);
+                return;
+            }
+        }
+        reply.error(ENOENT);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
@@ -880,58 +890,32 @@ impl Filesystem for NextCloudFs {
             }
         };
 
-        log::info!("[{}] GETATTR {}", self.log_user, path.display());
-
         let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-        let file_name =
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
 
-        let conn = self.conn.clone();
-        let cache = self.cache.clone();
-        let shared = self.shared.clone();
-        let fileids = self.fileids.clone();
-        let details = self.details.clone();
-        let status = self.status.clone();
-
-        thread::spawn(move || {
-            match get_or_list_dir(&conn, &cache, parent.clone()) {
-                Ok((entries, _self_entry)) => {
-                    for entry in entries.iter() {
-                        if entry
-                            .path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            == file_name
-                        {
-                            let entry_path = parent.join(&file_name);
-                            if entry.is_shared {
-                                shared.safe_lock().insert(entry_path.clone());
-                            }
-                            if let Some(fid) = entry.fileid {
-                                fileids.safe_lock().insert(entry_path.clone(), fid);
-                            }
-                            details.safe_lock().insert(entry_path.clone(), ipc::FileDetail {
-                                permissions: entry.permissions.clone(),
-                                owner_id: entry.owner_id.clone(),
-                                owner_display_name: entry.owner_display_name.clone(),
-                                size: entry.size,
-                            });
-                            if !entry.is_dir {
-                                status.safe_lock().entry(entry_path).or_insert(FileStatus::Remote);
-                            }
-                            reply.attr(&TTL, &make_file_attr(ino, entry));
-                            return;
-                        }
-                    }
+        let mut c = self.cache.safe_lock();
+        let entries = match c.get_cached_dir(&parent) {
+            Some((files, _)) => files,
+            None => {
+                // Parent not listed yet — return a synthetic directory attr
+                // so Nautilus can navigate into it once readdir runs.
+                if c.dir_cache.contains_key(&path) || path == Path::new("/") {
+                    drop(c);
+                    reply.attr(&TTL, &make_dir_attr(ino));
+                } else {
                     reply.error(ENOENT);
                 }
-                Err(e) => {
-                    log::error!("getattr {}: {}", parent.display(), e);
-                    reply.error(error_to_errno(&e));
-                }
+                return;
             }
-        });
+        };
+
+        for entry in entries.iter() {
+            if entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == file_name {
+                reply.attr(&TTL, &make_file_attr(ino, entry));
+                return;
+            }
+        }
+        reply.error(ENOENT);
     }
 
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
