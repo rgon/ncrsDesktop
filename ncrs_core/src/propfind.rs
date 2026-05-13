@@ -49,7 +49,7 @@ pub fn propfind_list(
     password: &str,
     path: &std::path::Path,
     timeout: Duration,
-) -> Result<(Option<String>, Vec<DavEntry>), String> {
+) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), String> {
     let url = build_url(webdav_url, path);
     log::debug!("PROPFIND {}", url);
 
@@ -99,7 +99,7 @@ pub fn propfind_etag(
     }
 
     let reader = std::io::BufReader::new(resp);
-    let (dir_etag, _) = parse_multistatus_stream(reader, webdav_url)?;
+    let (dir_etag, _, _) = parse_multistatus_stream(reader, webdav_url)?;
     Ok(dir_etag)
 }
 
@@ -123,9 +123,10 @@ fn build_url(webdav_url: &str, path: &std::path::Path) -> String {
 fn parse_multistatus_stream<R: std::io::BufRead>(
     reader: R,
     webdav_url: &str,
-) -> Result<(Option<String>, Vec<DavEntry>), String> {
+) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), String> {
     let mut entries = Vec::new();
     let mut dir_etag: Option<String> = None;
+    let mut self_entry: Option<DavEntry> = None;
     let prefix = webdav_prefix(webdav_url);
 
     let xml_reader = quick_xml::Reader::from_reader(reader);
@@ -152,13 +153,14 @@ fn parse_multistatus_stream<R: std::io::BufRead>(
 
         if is_first {
             dir_etag = resp.etag;
+            self_entry = Some(entry);
             is_first = false;
         } else {
             entries.push(entry);
         }
     }
 
-    Ok((dir_etag, entries))
+    Ok((dir_etag, self_entry, entries))
 }
 
 pub fn propfind_list_streaming(
@@ -169,7 +171,7 @@ pub fn propfind_list_streaming(
     path: &std::path::Path,
     timeout: Duration,
     tx: std::sync::mpsc::Sender<DavEntry>,
-) -> Result<Option<String>, String> {
+) -> Result<(Option<String>, Option<DavEntry>), String> {
     let url = build_url(webdav_url, path);
     log::debug!("PROPFIND_STREAM {}", url);
 
@@ -194,6 +196,7 @@ pub fn propfind_list_streaming(
     let mut buf_reader = ResponseReader::new(xml_reader);
 
     let mut dir_etag: Option<String> = None;
+    let mut self_entry: Option<DavEntry> = None;
     let mut is_first = true;
     while let Some(resp) = buf_reader.next_response()? {
         let remote_path = href_to_remote_path(&resp.href, &prefix);
@@ -213,19 +216,20 @@ pub fn propfind_list_streaming(
         };
         if is_first {
             dir_etag = resp.etag;
+            self_entry = Some(entry);
             is_first = false;
         } else if tx.send(entry).is_err() {
             break;
         }
     }
-    Ok(dir_etag)
+    Ok((dir_etag, self_entry))
 }
 
 #[cfg(test)]
 fn parse_multistatus_str(
     xml: &str,
     webdav_url: &str,
-) -> Result<(Option<String>, Vec<DavEntry>), String> {
+) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), String> {
     parse_multistatus_stream(xml.as_bytes(), webdav_url)
 }
 
@@ -546,7 +550,7 @@ mod tests {
     #[test]
     fn parse_multistatus_basic() {
         let prefix = "/remote.php/dav/files/user";
-        let (dir_etag, entries) =
+        let (dir_etag, _self_entry, entries) =
             parse_multistatus_str(SAMPLE, &format!("https://cloud.example.com{}", prefix)).unwrap();
 
         assert_eq!(dir_etag.as_deref(), Some("abc123"));

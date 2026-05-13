@@ -24,6 +24,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
@@ -87,6 +88,7 @@ def _send_command(cmd: str) -> str:
     sp = _sock_path()
     if not os.path.exists(sp):
         return "error: daemon not running"
+    t0 = time.monotonic()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(SOCKET_TIMEOUT)
@@ -98,8 +100,14 @@ def _send_command(cmd: str) -> str:
                 if not chunk:
                     break
                 buf += chunk
-            return buf.decode(errors="replace").strip()
+            result = buf.decode(errors="replace").strip()
+            elapsed = (time.monotonic() - t0) * 1000
+            if elapsed > 50:
+                print(f"[ncrs-nautilus] {cmd}: {elapsed:.0f}ms", file=sys.stderr)
+            return result
     except (OSError, socket.timeout):
+        elapsed = (time.monotonic() - t0) * 1000
+        print(f"[ncrs-nautilus] {cmd}: TIMEOUT ({elapsed:.0f}ms)", file=sys.stderr)
         return "error: socket timeout"
 
 

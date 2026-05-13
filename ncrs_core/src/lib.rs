@@ -64,6 +64,7 @@ const PATH_ENCODE: &AsciiSet = &CONTROLS
 
 struct DirCacheEntry {
     files: Arc<Vec<DavEntry>>,
+    self_entry: Option<DavEntry>,
     etag: Option<String>,
     at: Instant,
     refreshing: bool,
@@ -72,8 +73,9 @@ struct DirCacheEntry {
 struct PendingDir {
     entries: Vec<DavEntry>,
     rx: mpsc::Receiver<DavEntry>,
-    etag_rx: mpsc::Receiver<Option<String>>,
+    etag_rx: mpsc::Receiver<(Option<String>, Option<DavEntry>)>,
     etag: Option<String>,
+    self_entry: Option<DavEntry>,
 }
 
 struct FileCacheEntry {
@@ -164,7 +166,7 @@ fn error_to_errno(err: &str) -> i32 {
 fn list_dir_propfind(
     conn: &Arc<ConnInfo>,
     path: PathBuf,
-) -> Result<(Option<String>, Vec<DavEntry>), String> {
+) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), String> {
     log::debug!("LIST {}", path.display());
     let (tx, rx) = mpsc::channel();
     let c = conn.clone();
@@ -249,8 +251,8 @@ impl FsCache {
         self.dir_cache.get(path)?.etag.clone()
     }
 
-    fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, files: Vec<DavEntry>) {
-        self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), etag, at: Instant::now(), refreshing: false });
+    fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, self_entry: Option<DavEntry>, files: Vec<DavEntry>) {
+        self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), refreshing: false });
     }
 
     fn touch_dir_cache(&mut self, path: &Path) {
@@ -260,24 +262,30 @@ impl FsCache {
         }
     }
 
-    fn start_pending(&mut self, path: PathBuf, rx: mpsc::Receiver<DavEntry>, etag_rx: mpsc::Receiver<Option<String>>) {
+    fn start_pending(&mut self, path: PathBuf, rx: mpsc::Receiver<DavEntry>, etag_rx: mpsc::Receiver<(Option<String>, Option<DavEntry>)>) {
         self.pending_dirs.insert(path, PendingDir {
             entries: Vec::new(),
             rx,
             etag_rx,
             etag: None,
+            self_entry: None,
         });
     }
 
-    fn promote_pending(&mut self, path: &Path) {
+    fn promote_pending(&mut self, path: &Path) -> Option<DavEntry> {
         if let Some(mut pending) = self.pending_dirs.remove(path) {
             while let Ok(entry) = pending.rx.try_recv() {
                 pending.entries.push(entry);
             }
-            if let Ok(etag) = pending.etag_rx.try_recv() {
+            if let Ok((etag, self_entry)) = pending.etag_rx.try_recv() {
                 pending.etag = etag;
+                pending.self_entry = self_entry;
             }
-            self.put_dir_cache(path.to_path_buf(), pending.etag, pending.entries);
+            let self_entry = pending.self_entry.take();
+            self.put_dir_cache(path.to_path_buf(), pending.etag, self_entry.clone(), pending.entries);
+            self_entry
+        } else {
+            None
         }
     }
 
@@ -363,8 +371,8 @@ fn get_or_list_dir(
                     }
                 }
                 match list_dir_propfind(&conn, path.clone()) {
-                    Ok((etag, fresh)) => {
-                        cache.safe_lock().put_dir_cache(path, etag, fresh);
+                    Ok((etag, self_entry, fresh)) => {
+                        cache.safe_lock().put_dir_cache(path, etag, self_entry, fresh);
                     }
                     Err(e) => {
                         log::debug!("background refresh {}: {}", path.display(), e);
@@ -405,12 +413,12 @@ fn get_or_list_dir(
                     &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
                     &path2, PROPFIND_TIMEOUT, entry_tx,
                 ) {
-                    Ok(etag) => {
-                        let _ = etag_tx.send(etag);
+                    Ok((etag, self_entry)) => {
+                        let _ = etag_tx.send((etag, self_entry));
                     }
                     Err(e) => {
                         log::debug!("incremental list {}: {}", path2.display(), e);
-                        let _ = etag_tx.send(None);
+                        let _ = etag_tx.send((None, None));
                     }
                 }
             });
@@ -595,8 +603,8 @@ fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
     }
     log::debug!("PREFETCH_LIST {}", path.display());
     match propfind::propfind_list(&conn.http, &conn.webdav_url, &conn.username, &conn.password, path, PROPFIND_TIMEOUT) {
-        Ok((etag, files)) => {
-            cache.safe_lock().put_dir_cache(path.to_path_buf(), etag, files);
+        Ok((etag, self_entry, files)) => {
+            cache.safe_lock().put_dir_cache(path.to_path_buf(), etag, self_entry, files);
         }
         Err(e) => log::debug!("prefetch {}: {}", path.display(), e),
     }
@@ -1122,6 +1130,23 @@ impl Filesystem for NextCloudFs {
                         let mut fi = fileids.safe_lock();
                         let mut dt = details.safe_lock();
                         let mut st = status.safe_lock();
+
+                        // Populate IPC detail for the directory itself
+                        if let Some(se) = c.dir_cache.get(&path).and_then(|e| e.self_entry.as_ref()) {
+                            if se.is_shared {
+                                sh.insert(path.clone());
+                            }
+                            if let Some(fid) = se.fileid {
+                                fi.insert(path.clone(), fid);
+                            }
+                            dt.insert(path.clone(), ipc::FileDetail {
+                                permissions: se.permissions.clone(),
+                                owner_id: se.owner_id.clone(),
+                                owner_display_name: se.owner_display_name.clone(),
+                                size: se.size,
+                            });
+                        }
+
                         for entry in entries.iter() {
                             let name = match entry.path.file_name().and_then(|n| n.to_str()) {
                                 Some(n) => n,
