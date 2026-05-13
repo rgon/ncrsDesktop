@@ -416,8 +416,8 @@ fn get_or_list_dir(
         // Promote pending → full cache on next access.
     });
 
-    // Block briefly for the first entries to arrive
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Block until first entries arrive or PROPFIND completes/times out.
+    let deadline = Instant::now() + PROPFIND_TIMEOUT;
     loop {
         {
             let mut c = cache.safe_lock();
@@ -426,14 +426,19 @@ fn get_or_list_dir(
                     return Ok(Arc::new(snapshot));
                 }
             }
+            if c.dir_cache.contains_key(&path) {
+                return c.get_cached_dir(&path)
+                    .map(|(f, _)| f)
+                    .ok_or_else(|| format!("PROPFIND returned empty for {}", path.display()));
+            }
         }
         if Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(50));
     }
 
-    // If we still have nothing, try one more time then promote whatever we have
+    // Timeout: promote whatever we have (may still be empty for a truly empty dir)
     let mut c = cache.safe_lock();
     c.promote_pending(&path);
     if let Some((files, _)) = c.get_cached_dir(&path) {

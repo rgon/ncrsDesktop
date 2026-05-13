@@ -37,7 +37,7 @@ _EMBLEM_REMOTE = "emblem-downloads"     # cloud / down-arrow
 _EMBLEM_SYNCED = "emblem-synchronizing" # circular arrows
 _EMBLEM_SHARED = "emblem-shared"        # people / shared
 
-SOCKET_TIMEOUT = 0.15  # seconds; daemon replies instantly (HashMap lookup)
+SOCKET_TIMEOUT = 0.5  # seconds
 _MAX_RECV = 4096
 
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
