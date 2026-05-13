@@ -539,7 +539,7 @@ fn keep_locally_recursive(
         }
     }
 
-    for chunk in files.chunks(PREFETCH_BATCH) {
+    for chunk in files.chunks(2) {
         std::thread::scope(|s| {
             for path in chunk {
                 s.spawn(|| {
@@ -549,6 +549,7 @@ fn keep_locally_recursive(
                 });
             }
         });
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     for dir in dirs {
