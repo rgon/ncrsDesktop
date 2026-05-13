@@ -447,6 +447,7 @@ fn ensure_file_cached(
     net: &Arc<FsNetwork>,
     cache: &Arc<Mutex<FsCache>>,
     status: &StatusMap,
+    dirty: &ipc::DirtySet,
     remote_path: PathBuf,
 ) -> Result<PathBuf, String> {
     let (maybe_local, cached_mod, current_mod, cache_dir) = {
@@ -467,6 +468,7 @@ fn ensure_file_cached(
     }
 
     status.safe_lock().insert(remote_path.clone(), FileStatus::Downloading);
+    dirty.safe_lock().insert(remote_path.clone());
 
     let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
     let local_path = cache_dir.join(rel);
@@ -476,7 +478,8 @@ fn ensure_file_cached(
     let file =
         std::fs::File::create(&local_path).map_err(|e| format!("create cache file: {}", e))?;
     if let Err(e) = open_file_timeout(net, remote_path.clone(), file) {
-        status.safe_lock().insert(remote_path, FileStatus::Remote);
+        status.safe_lock().insert(remote_path.clone(), FileStatus::Remote);
+        dirty.safe_lock().insert(remote_path);
         return Err(e);
     }
 
@@ -488,7 +491,8 @@ fn ensure_file_cached(
             FileCacheEntry { local_path: local_path.clone(), remote_modified: mod_time },
         );
     }
-    status.safe_lock().insert(remote_path, FileStatus::Local);
+    status.safe_lock().insert(remote_path.clone(), FileStatus::Local);
+    dirty.safe_lock().insert(remote_path);
     Ok(local_path)
 }
 
@@ -497,6 +501,7 @@ fn keep_locally_recursive(
     net: &Arc<FsNetwork>,
     cache: &Arc<Mutex<FsCache>>,
     status: &StatusMap,
+    dirty: &ipc::DirtySet,
     remote_path: PathBuf,
 ) {
     log::info!("KEEP {}", remote_path.display());
@@ -504,7 +509,7 @@ fn keep_locally_recursive(
     let known_dir = cache.safe_lock().is_known_directory(&remote_path);
 
     if known_dir == Some(false) {
-        if let Err(e) = ensure_file_cached(net, cache, status, remote_path.clone()) {
+        if let Err(e) = ensure_file_cached(net, cache, status, dirty, remote_path.clone()) {
             log::warn!("keep failed {}: {}", remote_path.display(), e);
         }
         return;
@@ -514,7 +519,7 @@ fn keep_locally_recursive(
         Ok(e) => e,
         Err(e) => {
             if known_dir.is_none() {
-                if let Err(e2) = ensure_file_cached(net, cache, status, remote_path.clone()) {
+                if let Err(e2) = ensure_file_cached(net, cache, status, dirty, remote_path.clone()) {
                     log::warn!("keep failed {}: {} / {}", remote_path.display(), e, e2);
                 }
             } else {
@@ -543,7 +548,7 @@ fn keep_locally_recursive(
         std::thread::scope(|s| {
             for path in chunk {
                 s.spawn(|| {
-                    if let Err(e) = ensure_file_cached(net, cache, status, path.clone()) {
+                    if let Err(e) = ensure_file_cached(net, cache, status, dirty, path.clone()) {
                         log::warn!("keep failed {}: {}", path.display(), e);
                     }
                 });
@@ -553,7 +558,7 @@ fn keep_locally_recursive(
     }
 
     for dir in dirs {
-        keep_locally_recursive(conn, net, cache, status, dir);
+        keep_locally_recursive(conn, net, cache, status, dirty, dir);
     }
 }
 
@@ -628,6 +633,7 @@ pub struct NextCloudFs {
     net: Arc<FsNetwork>,
     cache: Arc<Mutex<FsCache>>,
     status: StatusMap,
+    dirty: ipc::DirtySet,
     shared: ipc::SharedSet,
     fileids: ipc::FileIdMap,
     details: ipc::FileDetailMap,
@@ -657,6 +663,7 @@ impl NextCloudFs {
         paths.insert(PathBuf::from("/"), 1);
 
         let status: StatusMap = Arc::new(Mutex::new(HashMap::new()));
+        let dirty: ipc::DirtySet = Arc::new(Mutex::new(std::collections::HashSet::new()));
         let shared: ipc::SharedSet = Arc::new(Mutex::new(std::collections::HashSet::new()));
         let fileids: ipc::FileIdMap = Arc::new(Mutex::new(HashMap::new()));
         let details: ipc::FileDetailMap = Arc::new(Mutex::new(HashMap::new()));
@@ -692,6 +699,7 @@ impl NextCloudFs {
                 cache_dir,
             })),
             status,
+            dirty,
             shared,
             fileids,
             details,
@@ -718,13 +726,18 @@ impl NextCloudFs {
         self.details.clone()
     }
 
+    pub fn dirty_set(&self) -> ipc::DirtySet {
+        self.dirty.clone()
+    }
+
     pub fn keep_callback(&self) -> ipc::KeepCallback {
         let conn = self.conn.clone();
         let net = self.net.clone();
         let cache = self.cache.clone();
         let status = self.status.clone();
+        let dirty = self.dirty.clone();
         Arc::new(move |remote_path| {
-            keep_locally_recursive(&conn, &net, &cache, &status, remote_path);
+            keep_locally_recursive(&conn, &net, &cache, &status, &dirty, remote_path);
         })
     }
 }
@@ -884,6 +897,7 @@ impl Filesystem for NextCloudFs {
         let net = self.net.clone();
         let cache = self.cache.clone();
         let status = self.status.clone();
+        let dirty = self.dirty.clone();
 
         thread::spawn(move || {
             let off = offset as u64;
@@ -930,7 +944,7 @@ impl Filesystem for NextCloudFs {
                 }
                 Err(e) => {
                     log::warn!("range read failed, falling back to full download: {}", e);
-                    match ensure_file_cached(&net, &cache, &status, path.clone()) {
+                    match ensure_file_cached(&net, &cache, &status, &dirty, path.clone()) {
                         Ok(local) => {
                             if let Ok(f) = std::fs::File::open(&local) {
                                 let mut buf = vec![0u8; sz];
@@ -1164,7 +1178,7 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
     let keep_cb = filesystem.keep_callback();
     let base_url = notifications::base_url(&options.url);
     let username = options.username.clone().unwrap_or_default();
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), username, base_url, Some(keep_cb));
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, base_url, Some(keep_cb));
 
     let fuse_options = vec![
         MountOption::RO,

@@ -17,6 +17,7 @@ Protocol (line-oriented over Unix socket):
   DETAIL <abs-path>  → status\\tsharing\\tpermissions\\towner\\tsize  (tab-separated)
   WEBURL <abs-path>  → https://…  (Nextcloud web link)
   KEEP   <abs-path>  → ok
+  CHANGES            → tab-separated abs-paths whose status changed (drains queue)
 """
 
 import os
@@ -184,6 +185,27 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         self._cancelled: set[int] = set()
         self._lock = threading.Lock()
         self._mount = _load_mount_point()
+        self._tracked: dict[str, Nautilus.FileInfo] = {}
+        self._tracked_lock = threading.Lock()
+        GLib.timeout_add_seconds(2, self._poll_changes)
+
+    def _poll_changes(self) -> bool:
+        try:
+            resp = _send_command("CHANGES")
+            if not resp or resp.startswith("error"):
+                return True
+            paths = resp.split("\t")
+            with self._tracked_lock:
+                for p in paths:
+                    fi = self._tracked.get(p)
+                    if fi and not fi.is_gone():
+                        fi.invalidate_extension_info()
+                self._tracked = {
+                    k: v for k, v in self._tracked.items() if not v.is_gone()
+                }
+        except Exception:
+            _log_error("_poll_changes")
+        return True
 
     def update_file_info(self, file_info):
         return Nautilus.OperationResult.COMPLETE
@@ -202,6 +224,9 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         except Exception:
             _log_error("update_file_info_full (pre-check)")
             return Nautilus.OperationResult.COMPLETE
+
+        with self._tracked_lock:
+            self._tracked[path] = file_info
 
         handle_id = id(handle)
 

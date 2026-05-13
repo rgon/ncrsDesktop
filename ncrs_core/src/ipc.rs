@@ -37,6 +37,7 @@ pub struct FileDetail {
 }
 
 pub type FileDetailMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileDetail>>>;
+pub type DirtySet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
 
 pub fn socket_path() -> PathBuf {
     std::env::var("XDG_RUNTIME_DIR")
@@ -75,7 +76,7 @@ pub type StatusMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileStatus>>>;
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, username: String, base_url: String, keep_cb: Option<KeepCallback>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, username: String, base_url: String, keep_cb: Option<KeepCallback>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -102,10 +103,11 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let shared = shared_set.clone();
             let fids = fileid_map.clone();
             let details = detail_map.clone();
+            let dirty = dirty_set.clone();
             let uname = username.clone();
             let burl = base_url.clone();
             let cb = keep_cb.clone();
-            std::thread::spawn(move || handle_client(stream, mount, map, shared, fids, details, uname, burl, cb));
+            std::thread::spawn(move || handle_client(stream, mount, map, shared, fids, details, dirty, uname, burl, cb));
         }
     });
 }
@@ -129,6 +131,7 @@ fn handle_client(
     shared_set: SharedSet,
     fileid_map: FileIdMap,
     detail_map: FileDetailMap,
+    dirty_set: DirtySet,
     username: String,
     base_url: String,
     keep_cb: Option<KeepCallback>,
@@ -198,6 +201,19 @@ fn handle_client(
                     }
                 }
                 None => "error: path not under mount".to_string(),
+            }
+        } else if trimmed == "CHANGES" {
+            let paths: Vec<PathBuf> = dirty_set.safe_lock().drain().collect();
+            if paths.is_empty() {
+                String::new()
+            } else {
+                paths.iter()
+                    .map(|p| {
+                        let rel = p.strip_prefix("/").unwrap_or(p);
+                        mount_point.join(rel).to_string_lossy().into_owned()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t")
             }
         } else if let Some(path_str) = trimmed.strip_prefix("KEEP ") {
             match (strip_mount(Path::new(path_str), &mount_point), &keep_cb) {
