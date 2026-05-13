@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 const PREVIEW_SIZE: u32 = 256;
 const API_TIMEOUT: Duration = Duration::from_secs(10);
 const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-const THUMB_BATCH: usize = 8;
+const THUMB_BATCH: usize = 32;
 
 const PREVIEWABLE: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic",

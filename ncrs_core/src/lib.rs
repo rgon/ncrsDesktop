@@ -48,7 +48,7 @@ const PREFETCH_BATCH: usize = 8;
 const MAX_POOL_IDLE: usize = 8;
 const LARGE_DIR_THRESHOLD: usize = 200;
 const LARGE_DIR_SUBDIRS: usize = 5;
-const THUMB_PREFETCH_MAX: usize = 50;
+const THUMB_PREFETCH_MAX: usize = 200;
 
 const PATH_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -923,8 +923,7 @@ impl Filesystem for NextCloudFs {
                     let end = std::cmp::min(sz, data.len());
                     reply.data(&data[..end]);
                     open_files
-                        .lock()
-                        .unwrap()
+                        .safe_lock()
                         .entry(fh)
                         .and_modify(|of| of.buf = Some(ReadAheadBuf { start: off, data }));
                 }
