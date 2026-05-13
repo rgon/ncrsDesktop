@@ -620,15 +620,18 @@ fn keep_locally_recursive(
 }
 
 fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
-    if cache.safe_lock().get_cached_dir(path).is_some() {
-        return;
+    {
+        let mut c = cache.safe_lock();
+        if c.get_cached_dir(path).is_some() || c.pending_dirs.contains_key(path) {
+            return;
+        }
     }
-    log::debug!("PREFETCH_LIST {}", path.display());
+    log::info!("PREFETCH_LIST {}", path.display());
     match propfind::propfind_list(&conn.http, &conn.webdav_url, &conn.username, &conn.password, path, PROPFIND_TIMEOUT) {
         Ok((etag, self_entry, files)) => {
             cache.safe_lock().put_dir_cache(path.to_path_buf(), etag, self_entry, files);
         }
-        Err(e) => log::debug!("prefetch {}: {}", path.display(), e),
+        Err(e) => log::warn!("prefetch {}: {}", path.display(), e),
     }
 }
 
@@ -1222,42 +1225,44 @@ impl Filesystem for NextCloudFs {
                     }
                     reply.ok();
 
-                    let is_large = entries.len() > LARGE_DIR_THRESHOLD;
+                    if offset == 0 {
+                        let is_large = entries.len() > LARGE_DIR_THRESHOLD;
 
-                    if !thumb_candidates.is_empty() {
-                        if is_large {
-                            thumb_candidates.truncate(THUMB_PREFETCH_MAX);
-                        }
-                        let conn2 = conn.clone();
-                        thread::spawn(move || {
-                            preview::prefetch_directory_thumbnails(
-                                &conn2.http,
-                                &conn2.base_url,
-                                &conn2.username,
-                                &conn2.password,
-                                &conn2.mount_point,
-                                &thumb_candidates,
-                            );
-                        });
-                    }
-
-                    let subdir_limit = if is_large { LARGE_DIR_SUBDIRS } else { PREFETCH_SUBDIRS };
-                    let subdirs: Vec<PathBuf> = entries.iter()
-                        .filter(|e| e.is_dir)
-                        .take(subdir_limit)
-                        .filter_map(|e| e.path.file_name().map(|n| path.join(n.to_string_lossy().as_ref())))
-                        .collect();
-
-                    if !subdirs.is_empty() {
-                        thread::spawn(move || {
-                            for chunk in subdirs.chunks(PREFETCH_BATCH) {
-                                std::thread::scope(|s| {
-                                    for dir in chunk {
-                                        s.spawn(|| prefetch_list_dir(&conn, &cache, dir));
-                                    }
-                                });
+                        if !thumb_candidates.is_empty() {
+                            if is_large {
+                                thumb_candidates.truncate(THUMB_PREFETCH_MAX);
                             }
-                        });
+                            let conn2 = conn.clone();
+                            thread::spawn(move || {
+                                preview::prefetch_directory_thumbnails(
+                                    &conn2.http,
+                                    &conn2.base_url,
+                                    &conn2.username,
+                                    &conn2.password,
+                                    &conn2.mount_point,
+                                    &thumb_candidates,
+                                );
+                            });
+                        }
+
+                        let subdir_limit = if is_large { LARGE_DIR_SUBDIRS } else { PREFETCH_SUBDIRS };
+                        let subdirs: Vec<PathBuf> = entries.iter()
+                            .filter(|e| e.is_dir)
+                            .take(subdir_limit)
+                            .filter_map(|e| e.path.file_name().map(|n| path.join(n.to_string_lossy().as_ref())))
+                            .collect();
+
+                        if !subdirs.is_empty() {
+                            thread::spawn(move || {
+                                for chunk in subdirs.chunks(PREFETCH_BATCH) {
+                                    std::thread::scope(|s| {
+                                        for dir in chunk {
+                                            s.spawn(|| prefetch_list_dir(&conn, &cache, dir));
+                                        }
+                                    });
+                                }
+                            });
+                        }
                     }
                 }
                 Err(e) => {
