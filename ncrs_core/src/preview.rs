@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 const PREVIEW_SIZE: u32 = 128;
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-const THUMB_BATCH: usize = 8;
+const THUMB_BATCH: usize = 4;
 
 const PREVIEWABLE: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic",
@@ -163,7 +163,10 @@ pub fn prefetch_directory_thumbnails(
         .filter(|(_, _, has_preview, _)| *has_preview)
         .collect();
 
-    for chunk in previewable.chunks(THUMB_BATCH) {
+    for (i, chunk) in previewable.chunks(THUMB_BATCH).enumerate() {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         std::thread::scope(|s| {
             for (path, mtime, _, fileid) in chunk {
                 s.spawn(|| {
