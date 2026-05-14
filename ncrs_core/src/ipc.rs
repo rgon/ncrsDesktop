@@ -12,8 +12,13 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
+const MAX_IPC_CLIENTS: usize = 64;
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 const QUERY_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ').add(b'#').add(b'%').add(b'&').add(b'+').add(b'=').add(b'?');
@@ -114,6 +119,8 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
     };
     log::info!("IPC socket listening at {}", sock.display());
 
+    let active = Arc::new(AtomicUsize::new(0));
+
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let stream = match stream {
@@ -123,6 +130,11 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
                     continue;
                 }
             };
+            if active.load(Ordering::Relaxed) >= MAX_IPC_CLIENTS {
+                log::warn!("IPC connection limit ({}) reached, rejecting", MAX_IPC_CLIENTS);
+                continue;
+            }
+            let _ = stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT));
             let mount = mount_point.clone();
             let map = status_map.clone();
             let shared = shared_set.clone();
@@ -134,7 +146,12 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let cb = keep_cb.clone();
             let ev = evict_cb.clone();
             let pf = prefetch_cb.clone();
-            std::thread::spawn(move || handle_client(stream, mount, map, shared, fids, details, dirty, uname, burl, cb, ev, pf));
+            let active = active.clone();
+            active.fetch_add(1, Ordering::Relaxed);
+            std::thread::spawn(move || {
+                handle_client(stream, mount, map, shared, fids, details, dirty, uname, burl, cb, ev, pf);
+                active.fetch_sub(1, Ordering::Relaxed);
+            });
         }
     });
 }
