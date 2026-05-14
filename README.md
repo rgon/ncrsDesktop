@@ -168,7 +168,7 @@ docker compose -f docker/docker-compose.yml down
 + [ ] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
 
 + [ ] Functional tauri menu UI:
-	+ [ ] get avatar: https://github.com/nextcloud/desktop/blob/cd44540a5a30c1e639edc8082228d211a3d9a34b/src/libsync/networkjobs.cpp#L787C1-L787C148
+	+ [x] get avatar: https://github.com/nextcloud/desktop/blob/cd44540a5a30c1e639edc8082228d211a3d9a34b/src/libsync/networkjobs.cpp#L787C1-L787C148
 		yourcloud.domain/remote.php/dav/avatars/userID/256.png
 	+ [ ] View user login info/status: HPB Connection, DAV Connection. Turn orange if HPB NOK.
 	+ [ ] Access mounted folder
