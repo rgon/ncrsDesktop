@@ -8,7 +8,7 @@ pub mod search;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +54,41 @@ const PATH_ENCODE: &AsciiSet = &CONTROLS
     .add(b']')
     .add(b'{')
     .add(b'}');
+
+// ── HTTP request throttle ────────────────────────────────────────────────────
+
+pub struct Throttle {
+    state: Mutex<usize>,
+    cv: Condvar,
+    max: usize,
+}
+
+pub struct ThrottleGuard<'a> {
+    throttle: &'a Throttle,
+}
+
+impl Throttle {
+    pub fn new(max: usize) -> Self {
+        Throttle { state: Mutex::new(0), cv: Condvar::new(), max }
+    }
+
+    pub fn acquire(&self) -> ThrottleGuard<'_> {
+        let mut count = self.state.lock().unwrap();
+        while *count >= self.max {
+            count = self.cv.wait(count).unwrap();
+        }
+        *count += 1;
+        ThrottleGuard { throttle: self }
+    }
+}
+
+impl Drop for ThrottleGuard<'_> {
+    fn drop(&mut self) {
+        let mut count = self.throttle.state.lock().unwrap();
+        *count -= 1;
+        self.throttle.cv.notify_one();
+    }
+}
 
 // ── Cache data types ──────────────────────────────────────────────────────────
 
@@ -102,7 +137,11 @@ pub struct MountOptions {
     pub log_user: String,
     pub aggressive_prefetch: bool,
     pub http3: bool,
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent_requests: usize,
 }
+
+fn default_max_concurrent() -> usize { 10 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SyncState {
@@ -169,6 +208,7 @@ fn list_dir_propfind(
     let (tx, rx) = mpsc::channel();
     let c = conn.clone();
     thread::spawn(move || {
+        let _permit = c.throttle.acquire();
         let _ = tx.send(propfind::propfind_list(
             &c.http, &c.webdav_url, &c.username, &c.password, &path, PROPFIND_TIMEOUT,
         ));
@@ -179,13 +219,16 @@ fn list_dir_propfind(
 
 fn open_file_timeout(
     net: &Arc<FsNetwork>,
+    throttle: &Arc<Throttle>,
     path: PathBuf,
     dest: std::fs::File,
 ) -> Result<(), String> {
     log::info!("DOWNLOAD {}", path.display());
     let (tx, rx) = mpsc::channel();
     let n = net.clone();
+    let throttle = throttle.clone();
     thread::spawn(move || {
+        let _permit = throttle.acquire();
         let result = match n.checkout() {
             Ok(mut conn) => {
                 let r = conn
@@ -443,6 +486,7 @@ fn get_or_list_dir(
                 std::thread::spawn(move || {
                     let old_etag = cache.safe_lock().cached_dir_etag(&path);
                     if let Some(ref old) = old_etag {
+                        let _permit = conn.throttle.acquire();
                         match propfind::propfind_etag(&conn.http, &conn.webdav_url, &conn.username, &conn.password, &path, PROPFIND_TIMEOUT) {
                             Ok(Some(ref new_etag)) if new_etag == old => {
                                 log::debug!("ETAG_MATCH {} — skipping full re-list", path.display());
@@ -498,6 +542,7 @@ fn get_or_list_dir(
             let conn2 = conn.clone();
             let path2 = path.clone();
             std::thread::spawn(move || {
+                let _permit = conn2.throttle.acquire();
                 match propfind::propfind_list_streaming(
                     &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
                     &path2, PROPFIND_TIMEOUT, entry_tx, self_tx,
@@ -573,6 +618,7 @@ fn get_or_list_dir(
 
 fn ensure_file_cached(
     net: &Arc<FsNetwork>,
+    throttle: &Arc<Throttle>,
     cache: &Arc<Mutex<FsCache>>,
     status: &StatusMap,
     dirty: &ipc::DirtySet,
@@ -605,7 +651,7 @@ fn ensure_file_cached(
     }
     let file =
         std::fs::File::create(&local_path).map_err(|e| format!("create cache file: {}", e))?;
-    if let Err(e) = open_file_timeout(net, remote_path.clone(), file) {
+    if let Err(e) = open_file_timeout(net, throttle, remote_path.clone(), file) {
         status.safe_lock().insert(remote_path.clone(), FileStatus::Remote);
         dirty.safe_lock().insert(remote_path);
         return Err(e);
@@ -637,7 +683,7 @@ fn keep_locally_recursive(
     let known_dir = cache.safe_lock().is_known_directory(&remote_path);
 
     if known_dir == Some(false) {
-        if let Err(e) = ensure_file_cached(net, cache, status, dirty, remote_path.clone()) {
+        if let Err(e) = ensure_file_cached(net, &conn.throttle, cache, status, dirty, remote_path.clone()) {
             log::warn!("keep failed {}: {}", remote_path.display(), e);
         }
         return;
@@ -647,7 +693,7 @@ fn keep_locally_recursive(
         Ok(e) => e,
         Err(e) => {
             if known_dir.is_none() {
-                if let Err(e2) = ensure_file_cached(net, cache, status, dirty, remote_path.clone()) {
+                if let Err(e2) = ensure_file_cached(net, &conn.throttle, cache, status, dirty, remote_path.clone()) {
                     log::warn!("keep failed {}: {} / {}", remote_path.display(), e, e2);
                 }
             } else {
@@ -676,7 +722,7 @@ fn keep_locally_recursive(
         std::thread::scope(|s| {
             for path in chunk {
                 s.spawn(|| {
-                    if let Err(e) = ensure_file_cached(net, cache, status, dirty, path.clone()) {
+                    if let Err(e) = ensure_file_cached(net, &conn.throttle, cache, status, dirty, path.clone()) {
                         log::warn!("keep failed {}: {}", path.display(), e);
                     }
                 });
@@ -698,6 +744,7 @@ fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
         }
     }
     log::info!("PREFETCH_LIST {}", path.display());
+    let _permit = conn.throttle.acquire();
     match propfind::propfind_list(&conn.http, &conn.webdav_url, &conn.username, &conn.password, path, PROPFIND_TIMEOUT) {
         Ok((etag, self_entry, files)) => {
             cache.safe_lock().put_dir_cache(path.to_path_buf(), etag, self_entry, files);
@@ -779,6 +826,7 @@ struct ConnInfo {
     mount_point: PathBuf,
     http: reqwest::blocking::Client,
     http_read: reqwest::blocking::Client,
+    throttle: Arc<Throttle>,
 }
 
 pub struct NextCloudFs {
@@ -837,6 +885,9 @@ impl NextCloudFs {
         let http_read = read_builder.build()
             .map_err(|e| format!("HTTP read client: {}", e))?;
 
+        let max_req = if options.max_concurrent_requests == 0 { 10 } else { options.max_concurrent_requests };
+        log::info!("HTTP throttle: max {} concurrent requests", max_req);
+
         let conn = Arc::new(ConnInfo {
             base_url: notifications::base_url(&options.url),
             webdav_url: options.url.clone(),
@@ -845,6 +896,7 @@ impl NextCloudFs {
             mount_point: options.mount_point.clone(),
             http,
             http_read,
+            throttle: Arc::new(Throttle::new(max_req)),
         });
 
         Ok(NextCloudFs {
@@ -1153,7 +1205,7 @@ impl Filesystem for NextCloudFs {
                 }
                 Err(e) => {
                     log::warn!("range read failed, falling back to full download: {}", e);
-                    match ensure_file_cached(&net, &cache, &status, &dirty, path.clone()) {
+                    match ensure_file_cached(&net, &conn.throttle, &cache, &status, &dirty, path.clone()) {
                         Ok(local) => {
                             if let Ok(f) = std::fs::File::open(&local) {
                                 let mut buf = vec![0u8; sz];
@@ -1452,7 +1504,7 @@ impl Filesystem for NextCloudFs {
                             .filter(|e| e.is_dir)
                             .filter_map(|e| e.path.file_name().and_then(|n| n.to_str()).map(|n| path.join(n)))
                             .collect();
-                        if !child_dirs.is_empty() {
+                        if aggressive_prefetch && !child_dirs.is_empty() {
                             let conn_pf = conn.clone();
                             let cache_pf = cache.clone();
                             thread::spawn(move || {
@@ -1505,6 +1557,7 @@ impl Filesystem for NextCloudFs {
                         if !thumb_candidates.is_empty() {
                             let conn2 = conn.clone();
                             thread::spawn(move || {
+                                thread::sleep(Duration::from_millis(500));
                                 preview::prefetch_directory_thumbnails(
                                     &conn2.http,
                                     &conn2.base_url,
@@ -1535,6 +1588,7 @@ fn webdav_file_url(base: &str, remote_path: &Path) -> String {
 }
 
 fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+    let _permit = conn.throttle.acquire();
     log::debug!("RANGE_READ {} offset={} size={}", path.display(), offset, size);
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
@@ -1614,6 +1668,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let log_user = doc["user"].as_str().unwrap_or("default_user").to_string();
     let aggressive_prefetch = doc["aggressive_prefetch"].as_bool().unwrap_or(false);
     let http3 = doc["http3"].as_bool().unwrap_or(false);
+    let max_concurrent_requests = doc["max_concurrent_requests"].as_i64().unwrap_or(10) as usize;
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3 })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests })
 }
