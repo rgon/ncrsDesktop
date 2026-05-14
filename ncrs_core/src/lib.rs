@@ -1425,6 +1425,11 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
         MountOption::AutoUnmount,
     ];
 
+    let mp_str = options.mount_point.to_string_lossy().to_string();
+    let _ = std::process::Command::new("fusermount")
+        .args(["-uz", &mp_str])
+        .output();
+
     log::info!(
         "Mounting WebDAV {} at {}",
         options.url,
