@@ -8,6 +8,7 @@ pub mod search;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -139,6 +140,8 @@ pub struct MountOptions {
     pub http3: bool,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_requests: usize,
+    #[serde(default)]
+    pub offline: bool,
 }
 
 fn default_max_concurrent() -> usize { 10 }
@@ -473,6 +476,13 @@ fn get_or_list_dir(
     cache: &Arc<Mutex<FsCache>>,
     path: PathBuf,
 ) -> Result<(Arc<Vec<DavEntry>>, Option<DavEntry>), String> {
+    if conn.is_offline.load(Ordering::Relaxed) {
+        let c = cache.safe_lock();
+        if let Some(entry) = c.dir_cache.get(&path) {
+            return Ok((Arc::clone(&entry.files), entry.self_entry.clone()));
+        }
+        return Err(format!("{} not available offline", path.display()));
+    }
     let t0 = Instant::now();
     {
         let mut c = cache.safe_lock();
@@ -827,6 +837,7 @@ struct ConnInfo {
     http: reqwest::blocking::Client,
     http_read: reqwest::blocking::Client,
     throttle: Arc<Throttle>,
+    is_offline: Arc<AtomicBool>,
 }
 
 pub struct NextCloudFs {
@@ -851,7 +862,11 @@ impl NextCloudFs {
         let username = options.username.unwrap_or_default();
         let password = options.password.unwrap_or_default();
         let mut initial = WebDAVFs::new(&username, &password, &options.url);
-        initial.connect().map_err(|e| format!("WebDAV connect failed: {}", e))?;
+        if !options.offline {
+            initial.connect().map_err(|e| format!("WebDAV connect failed: {}", e))?;
+        } else {
+            log::info!("OFFLINE mode: skipping initial WebDAV connection");
+        }
 
         let cache_dir = dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -887,6 +902,7 @@ impl NextCloudFs {
 
         let max_req = if options.max_concurrent_requests == 0 { 10 } else { options.max_concurrent_requests };
         log::info!("HTTP throttle: max {} concurrent requests", max_req);
+        let is_offline = Arc::new(AtomicBool::new(options.offline));
 
         let conn = Arc::new(ConnInfo {
             base_url: notifications::base_url(&options.url),
@@ -897,6 +913,7 @@ impl NextCloudFs {
             http,
             http_read,
             throttle: Arc::new(Throttle::new(max_req)),
+            is_offline,
         });
 
         Ok(NextCloudFs {
@@ -952,6 +969,14 @@ impl NextCloudFs {
 
     pub fn dirty_set(&self) -> ipc::DirtySet {
         self.dirty.clone()
+    }
+
+    pub fn is_offline_flag(&self) -> Arc<AtomicBool> {
+        self.conn.is_offline.clone()
+    }
+
+    pub fn conn_http(&self) -> reqwest::blocking::Client {
+        self.conn.http.clone()
     }
 
     pub fn keep_callback(&self) -> ipc::KeepCallback {
@@ -1588,6 +1613,9 @@ fn webdav_file_url(base: &str, remote_path: &Path) -> String {
 }
 
 fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+    if conn.is_offline.load(Ordering::Relaxed) {
+        return Err("file not available offline".into());
+    }
     let _permit = conn.throttle.acquire();
     log::debug!("RANGE_READ {} offset={} size={}", path.display(), offset, size);
     let url = webdav_file_url(&conn.webdav_url, path);
@@ -1617,6 +1645,35 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
     let base_url = notifications::base_url(&options.url);
     let username = options.username.clone().unwrap_or_default();
     ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb));
+
+    // Connectivity monitor
+    let offline_flag = filesystem.is_offline_flag();
+    if !options.offline {
+        let http = filesystem.conn_http();
+        let webdav_url = options.url.clone();
+        let probe_user = options.username.clone().unwrap_or_default();
+        let probe_pass = options.password.clone().unwrap_or_default();
+        let offline = offline_flag.clone();
+        thread::spawn(move || {
+            loop {
+                let currently_offline = offline.load(Ordering::Relaxed);
+                let interval = if currently_offline { Duration::from_secs(5) } else { Duration::from_secs(30) };
+                thread::sleep(interval);
+
+                let reachable = propfind::propfind_etag(
+                    &http, &webdav_url, &probe_user, &probe_pass,
+                    Path::new("/"), Duration::from_secs(5),
+                ).is_ok();
+
+                let was_offline = offline.swap(!reachable, Ordering::Relaxed);
+                if was_offline && reachable {
+                    log::info!("CONNECTIVITY restored");
+                } else if !was_offline && !reachable {
+                    log::warn!("CONNECTIVITY lost — serving from cache");
+                }
+            }
+        });
+    }
 
     let fuse_options = vec![
         MountOption::RO,
@@ -1670,5 +1727,5 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let http3 = doc["http3"].as_bool().unwrap_or(false);
     let max_concurrent_requests = doc["max_concurrent_requests"].as_i64().unwrap_or(10) as usize;
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false })
 }
