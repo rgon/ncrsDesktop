@@ -26,7 +26,7 @@ const PROPFIND_ETAG_BODY: &str = r#"<?xml version="1.0"?>
   </d:prop>
 </d:propfind>"#;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DavEntry {
     pub path: PathBuf,
     pub is_dir: bool,
