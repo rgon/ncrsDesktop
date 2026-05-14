@@ -6,6 +6,7 @@ pub mod notify_push;
 pub mod preview;
 pub mod propfind;
 pub mod search;
+pub mod webdav_ops;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -16,8 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, Request,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{EACCES, EIO, ENOENT};
 use remotefs::RemoteFs;
@@ -123,10 +124,12 @@ struct ReadAheadBuf {
 }
 
 struct OpenFile {
-    #[allow(dead_code)]
     remote_path: PathBuf,
     local: Option<PathBuf>,
     buf: Option<ReadAheadBuf>,
+    write_path: Option<PathBuf>,
+    dirty: bool,
+    original_etag: Option<String>,
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -1117,8 +1120,8 @@ impl Filesystem for NextCloudFs {
         reply.error(ENOENT);
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        let (path, local) = {
+    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+        let (path, local, etag) = {
             let c = self.cache.safe_lock();
             let path = match c.get_path(ino) {
                 Some(p) => p,
@@ -1132,8 +1135,14 @@ impl Filesystem for NextCloudFs {
                 .get(&path)
                 .filter(|e| e.local_path.exists())
                 .map(|e| e.local_path.clone());
-            (path, local)
+            let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+            let etag = c.get_cached_dir_readonly(&parent).and_then(|files| {
+                files.iter().find(|e| e.path == path).and_then(|e| e.etag.clone())
+            });
+            (path, local, etag)
         };
+
+        let writable = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
 
         let fh = {
             let mut n = self.next_fh.safe_lock();
@@ -1142,9 +1151,28 @@ impl Filesystem for NextCloudFs {
             fh
         };
 
-        self.open_files
-            .safe_lock()
-            .insert(fh, OpenFile { remote_path: path.clone(), local, buf: None });
+        let write_path = if writable {
+            let cache_dir = self.cache.safe_lock().cache_dir.clone();
+            let wp = cache_dir.join(format!("write_{}", fh));
+            if let Some(ref local) = local {
+                let _ = std::fs::copy(local, &wp);
+            }
+            Some(wp)
+        } else {
+            None
+        };
+
+        self.open_files.safe_lock().insert(
+            fh,
+            OpenFile {
+                remote_path: path,
+                local,
+                buf: None,
+                write_path,
+                dirty: false,
+                original_etag: etag,
+            },
+        );
         reply.opened(fh, 0);
     }
 
@@ -1608,6 +1636,498 @@ impl Filesystem for NextCloudFs {
             }
         });
     }
+
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        if let Some(new_size) = size {
+            if let Some(fh) = fh {
+                let mut files = self.open_files.safe_lock();
+                if let Some(of) = files.get_mut(&fh) {
+                    let wp = of.write_path.get_or_insert_with(|| {
+                        let cache_dir = self.cache.safe_lock().cache_dir.clone();
+                        cache_dir.join(format!("write_{}", fh))
+                    });
+                    if !wp.exists() {
+                        if let Some(ref local) = of.local {
+                            let _ = std::fs::copy(local, &wp);
+                        } else {
+                            let _ = std::fs::File::create(&wp);
+                        }
+                    }
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&wp) {
+                        let _ = f.set_len(new_size);
+                    }
+                    of.dirty = true;
+                }
+            }
+            let attr = make_dir_attr(ino);
+            reply.attr(&TTL, &attr);
+        } else {
+            self.getattr(_req, ino, reply);
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        let path = match self.cache.safe_lock().get_path(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        log::debug!("[{}] WRITE {} offset={} len={}", self.log_user, path.display(), offset, data.len());
+
+        let mut files = self.open_files.safe_lock();
+        let of = match files.get_mut(&fh) {
+            Some(of) => of,
+            None => {
+                reply.error(EIO);
+                return;
+            }
+        };
+
+        let wp = of.write_path.get_or_insert_with(|| {
+            let cache_dir = self.cache.safe_lock().cache_dir.clone();
+            cache_dir.join(format!("write_{}", fh))
+        });
+        if !wp.exists() {
+            if let Some(ref local) = of.local {
+                let _ = std::fs::copy(local, &wp);
+            } else {
+                let _ = std::fs::File::create(&wp);
+            }
+        }
+
+        let wp_clone = wp.clone();
+        match std::fs::OpenOptions::new().write(true).create(true).open(&wp_clone) {
+            Ok(f) => {
+                match f.write_at(data, offset as u64) {
+                    Ok(n) => {
+                        of.dirty = true;
+                        reply.written(n as u32);
+                    }
+                    Err(e) => {
+                        log::error!("write to staging file: {}", e);
+                        reply.error(EIO);
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("open staging file: {}", e);
+                reply.error(EIO);
+            }
+        }
+    }
+
+    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        let (remote_path, write_path, original_etag) = {
+            let files = self.open_files.safe_lock();
+            match files.get(&fh) {
+                Some(of) if of.dirty => (
+                    of.remote_path.clone(),
+                    of.write_path.clone(),
+                    of.original_etag.clone(),
+                ),
+                _ => {
+                    reply.ok();
+                    return;
+                }
+            }
+        };
+
+        let write_path = match write_path {
+            Some(p) => p,
+            None => {
+                reply.ok();
+                return;
+            }
+        };
+
+        let body = match std::fs::read(&write_path) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("read staging file for flush: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        };
+
+        let conn = self.conn.clone();
+        let cache = self.cache.clone();
+        let dirty = self.dirty.clone();
+        let open_files = self.open_files.clone();
+
+        thread::spawn(move || {
+            let _permit = conn.throttle.acquire();
+            let etag_ref = original_etag.as_deref();
+            match webdav_ops::put_file(&conn.http, &conn.base_url, &conn.username, &conn.password, &remote_path, body.clone(), etag_ref) {
+                Ok(result) => {
+                    log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_etag);
+                    let new_size = body.len() as u64;
+                    {
+                        let mut c = cache.safe_lock();
+                        let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
+                        if let Some(dir) = c.dir_cache.get_mut(&parent) {
+                            let mut files = (*dir.files).clone();
+                            if let Some(entry) = files.iter_mut().find(|e| e.path == remote_path) {
+                                entry.etag = result.new_etag.clone();
+                                entry.size = new_size;
+                                entry.modified = Some(SystemTime::now());
+                            }
+                            dir.files = Arc::new(files);
+                            dir.at = Instant::now();
+                        }
+                    }
+                    if let Some(of) = open_files.safe_lock().get_mut(&fh) {
+                        of.dirty = false;
+                        of.original_etag = result.new_etag;
+                    }
+                    dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
+                    reply.ok();
+                }
+                Err(webdav_ops::WriteError::Conflict) => {
+                    log::warn!("CONFLICT on PUT {} — creating conflicted copy", remote_path.display());
+                    let conflict_name = make_conflict_name(&remote_path);
+                    match webdav_ops::put_file(&conn.http, &conn.base_url, &conn.username, &conn.password, &conflict_name, body, None) {
+                        Ok(_) => log::info!("conflicted copy uploaded as {}", conflict_name.display()),
+                        Err(e) => log::error!("failed to upload conflict copy: {}", e),
+                    }
+                    dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
+                    reply.ok();
+                }
+                Err(e) => {
+                    log::error!("PUT {} failed: {}", remote_path.display(), e);
+                    reply.error(EIO);
+                }
+            }
+        });
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        if let Err(e) = filename_validation::validate(name) {
+            log::warn!("create rejected: {}", e);
+            reply.error(e.to_errno());
+            return;
+        }
+
+        let parent_path = match self.cache.safe_lock().get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let file_name = name.to_string_lossy().to_string();
+        let remote_path = parent_path.join(&file_name);
+
+        let fh = {
+            let mut n = self.next_fh.safe_lock();
+            let fh = *n;
+            *n += 1;
+            fh
+        };
+
+        let cache_dir = self.cache.safe_lock().cache_dir.clone();
+        let write_path = cache_dir.join(format!("write_{}", fh));
+        let _ = std::fs::File::create(&write_path);
+
+        let ino = self.cache.safe_lock().allocate_inode(remote_path.clone());
+
+        let now = SystemTime::now();
+        let new_entry = DavEntry {
+            path: remote_path.clone(),
+            is_dir: false,
+            size: 0,
+            modified: Some(now),
+            etag: None,
+            content_type: None,
+            has_preview: false,
+            is_shared: false,
+            permissions: Some("RGDNVW".to_string()),
+            fileid: None,
+            owner_id: None,
+            owner_display_name: None,
+        };
+
+        {
+            let mut c = self.cache.safe_lock();
+            if let Some(dir) = c.dir_cache.get_mut(&parent_path) {
+                let mut files = (*dir.files).clone();
+                files.push(new_entry.clone());
+                dir.files = Arc::new(files);
+            }
+        }
+
+        self.open_files.safe_lock().insert(
+            fh,
+            OpenFile {
+                remote_path,
+                local: None,
+                buf: None,
+                write_path: Some(write_path),
+                dirty: false,
+                original_etag: None,
+            },
+        );
+
+        let attr = make_file_attr(ino, &new_entry);
+        reply.created(&TTL, &attr, 0, fh, 0);
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        if let Err(e) = filename_validation::validate(name) {
+            log::warn!("mkdir rejected: {}", e);
+            reply.error(e.to_errno());
+            return;
+        }
+
+        let parent_path = match self.cache.safe_lock().get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let dir_name = name.to_string_lossy().to_string();
+        let remote_path = parent_path.join(&dir_name);
+
+        let conn = self.conn.clone();
+        let cache = self.cache.clone();
+        let dirty = self.dirty.clone();
+
+        thread::spawn(move || {
+            let _permit = conn.throttle.acquire();
+            match webdav_ops::mkcol(&conn.http, &conn.base_url, &conn.username, &conn.password, &remote_path) {
+                Ok(()) => {
+                    log::info!("MKCOL {}", remote_path.display());
+                    let now = SystemTime::now();
+                    let new_entry = DavEntry {
+                        path: remote_path.clone(),
+                        is_dir: true,
+                        size: 0,
+                        modified: Some(now),
+                        etag: None,
+                        content_type: None,
+                        has_preview: false,
+                        is_shared: false,
+                        permissions: Some("RGDNVCK".to_string()),
+                        fileid: None,
+                        owner_id: None,
+                        owner_display_name: None,
+                    };
+                    let mut c = cache.safe_lock();
+                    let ino = c.allocate_inode(remote_path.clone());
+                    if let Some(dir) = c.dir_cache.get_mut(&parent_path) {
+                        let mut files = (*dir.files).clone();
+                        files.push(new_entry);
+                        dir.files = Arc::new(files);
+                    }
+                    drop(c);
+                    dirty.safe_lock().insert(parent_path);
+                    reply.entry(&TTL, &make_dir_attr(ino), 0);
+                }
+                Err(e) => {
+                    log::error!("MKCOL {} failed: {}", remote_path.display(), e);
+                    reply.error(EIO);
+                }
+            }
+        });
+    }
+
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let parent_path = match self.cache.safe_lock().get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let file_name = name.to_string_lossy().to_string();
+        let remote_path = parent_path.join(&file_name);
+
+        let conn = self.conn.clone();
+        let cache = self.cache.clone();
+        let dirty = self.dirty.clone();
+
+        thread::spawn(move || {
+            let _permit = conn.throttle.acquire();
+            match webdav_ops::delete(&conn.http, &conn.base_url, &conn.username, &conn.password, &remote_path) {
+                Ok(()) => {
+                    log::info!("DELETE {}", remote_path.display());
+                    let mut c = cache.safe_lock();
+                    if let Some(dir) = c.dir_cache.get_mut(&parent_path) {
+                        let files: Vec<DavEntry> = dir.files.iter().filter(|e| e.path != remote_path).cloned().collect();
+                        dir.files = Arc::new(files);
+                    }
+                    drop(c);
+                    dirty.safe_lock().insert(parent_path);
+                    reply.ok();
+                }
+                Err(e) => {
+                    log::error!("DELETE {} failed: {}", remote_path.display(), e);
+                    reply.error(EIO);
+                }
+            }
+        });
+    }
+
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let parent_path = match self.cache.safe_lock().get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        let dir_name = name.to_string_lossy().to_string();
+        let remote_path = parent_path.join(&dir_name);
+
+        let conn = self.conn.clone();
+        let cache = self.cache.clone();
+        let dirty = self.dirty.clone();
+
+        thread::spawn(move || {
+            let _permit = conn.throttle.acquire();
+            match webdav_ops::delete(&conn.http, &conn.base_url, &conn.username, &conn.password, &remote_path) {
+                Ok(()) => {
+                    log::info!("RMDIR {}", remote_path.display());
+                    let mut c = cache.safe_lock();
+                    if let Some(dir) = c.dir_cache.get_mut(&parent_path) {
+                        let files: Vec<DavEntry> = dir.files.iter().filter(|e| e.path != remote_path).cloned().collect();
+                        dir.files = Arc::new(files);
+                    }
+                    c.dir_cache.remove(&remote_path);
+                    drop(c);
+                    dirty.safe_lock().insert(parent_path);
+                    reply.ok();
+                }
+                Err(e) => {
+                    log::error!("RMDIR {} failed: {}", remote_path.display(), e);
+                    reply.error(EIO);
+                }
+            }
+        });
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        if let Err(e) = filename_validation::validate(newname) {
+            log::warn!("rename rejected: {}", e);
+            reply.error(e.to_errno());
+            return;
+        }
+
+        let (old_parent_path, new_parent_path) = {
+            let c = self.cache.safe_lock();
+            match (c.get_path(parent), c.get_path(newparent)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    reply.error(ENOENT);
+                    return;
+                }
+            }
+        };
+
+        let old_name = name.to_string_lossy().to_string();
+        let new_name = newname.to_string_lossy().to_string();
+        let from = old_parent_path.join(&old_name);
+        let to = new_parent_path.join(&new_name);
+
+        let conn = self.conn.clone();
+        let cache = self.cache.clone();
+        let dirty = self.dirty.clone();
+
+        thread::spawn(move || {
+            let _permit = conn.throttle.acquire();
+            match webdav_ops::move_resource(&conn.http, &conn.base_url, &conn.username, &conn.password, &from, &to) {
+                Ok(()) => {
+                    log::info!("MOVE {} → {}", from.display(), to.display());
+                    let mut c = cache.safe_lock();
+                    let mut moved_entry = None;
+                    if let Some(dir) = c.dir_cache.get_mut(&old_parent_path) {
+                        let (keep, removed): (Vec<_>, Vec<_>) = dir.files.iter().cloned().partition(|e| e.path != from);
+                        dir.files = Arc::new(keep);
+                        moved_entry = removed.into_iter().next();
+                    }
+                    if let Some(mut entry) = moved_entry {
+                        entry.path = to.clone();
+                        if let Some(dir) = c.dir_cache.get_mut(&new_parent_path) {
+                            let mut files = (*dir.files).clone();
+                            files.push(entry);
+                            dir.files = Arc::new(files);
+                        }
+                    }
+                    drop(c);
+                    let same_parent = old_parent_path == new_parent_path;
+                    dirty.safe_lock().insert(old_parent_path);
+                    if !same_parent {
+                        dirty.safe_lock().insert(new_parent_path);
+                    }
+                    reply.ok();
+                }
+                Err(e) => {
+                    log::error!("MOVE {} → {} failed: {}", from.display(), to.display(), e);
+                    reply.error(EIO);
+                }
+            }
+        });
+    }
 }
 
 // ── HTTP Range reads ─────────────────────────────────────────────────────────
@@ -1694,7 +2214,6 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
     }
 
     let fuse_options = vec![
-        MountOption::RO,
         MountOption::FSName("ncrs".to_string()),
         MountOption::AutoUnmount,
     ];
@@ -1715,6 +2234,44 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
+
+fn make_conflict_name(path: &Path) -> PathBuf {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|e| e.to_str());
+    let now = chrono_timestamp();
+    let conflict = match ext {
+        Some(e) => format!("{} (conflicted copy {}).{}", stem, now, e),
+        None => format!("{} (conflicted copy {})", stem, now),
+    };
+    path.with_file_name(conflict)
+}
+
+fn chrono_timestamp() -> String {
+    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs();
+    let days = secs / 86400;
+    let day_secs = secs % 86400;
+    let hours = day_secs / 3600;
+    let mins = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    let mut y = 1970i32;
+    let mut remaining = days;
+    loop {
+        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        if remaining < days_in_year { break; }
+        remaining -= days_in_year;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0;
+    for md in &month_days {
+        if remaining < *md { break; }
+        remaining -= *md;
+        m += 1;
+    }
+    format!("{:04}-{:02}-{:02} {:02}-{:02}-{:02}", y, m + 1, remaining + 1, hours, mins, s)
+}
 
 fn url_to_dir_name(url: &str) -> String {
     url.chars()
