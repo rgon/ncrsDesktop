@@ -104,9 +104,10 @@ fn dismiss_notification(state: State<Arc<AppState>>, id: u64) {
         let base = ncrs_core::notifications::base_url(&opts.url);
         let user = opts.username.unwrap_or_default();
         let pass = opts.password.unwrap_or_default();
+        let http3 = opts.http3;
         thread::spawn(move || {
             if let Err(e) =
-                ncrs_core::notifications::dismiss_notification(&base, &user, &pass, id)
+                ncrs_core::notifications::dismiss_notification(&base, &user, &pass, id, http3)
             {
                 log::warn!("dismiss notification {}: {}", id, e);
             }
@@ -133,10 +134,11 @@ fn search_nextcloud(
     let base = ncrs_core::notifications::base_url(&opts.url);
     let user = opts.username.unwrap_or_default();
     let pass = opts.password.unwrap_or_default();
+    let http3 = opts.http3;
 
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(ncrs_core::search::search_all(&base, &user, &pass, &term));
+        let _ = tx.send(ncrs_core::search::search_all(&base, &user, &pass, &term, http3));
     });
     rx.recv_timeout(std::time::Duration::from_secs(30))
         .unwrap_or_else(|_| Err("search timeout".to_string()))
@@ -317,23 +319,30 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
         Err(e) => log::error!("FUSE error: {}", e),
     });
 
-    // Notification polling thread
+    // Notification polling — async on Tokio runtime, no dedicated OS thread
     let poll_state = state.clone();
     let poll_app = app.clone();
     let poll_url = opts.url.clone();
     let poll_user = opts.username.clone().unwrap_or_default();
     let poll_pass = opts.password.clone().unwrap_or_default();
-    thread::spawn(move || {
+    let poll_http3 = opts.http3;
+    spawn(async move {
         let base = ncrs_core::notifications::base_url(&poll_url);
         loop {
-            match ncrs_core::notifications::fetch_notifications(&base, &poll_user, &poll_pass) {
-                Ok(notifs) => {
+            let b = base.clone();
+            let u = poll_user.clone();
+            let p = poll_pass.clone();
+            match tokio::task::spawn_blocking(move || {
+                ncrs_core::notifications::fetch_notifications(&b, &u, &p, poll_http3)
+            }).await {
+                Ok(Ok(notifs)) => {
                     *poll_state.notifications.lock().unwrap() = notifs.clone();
                     poll_app.emit("notifications-updated", notifs).ok();
                 }
-                Err(e) => log::warn!("fetch notifications: {}", e),
+                Ok(Err(e)) => log::warn!("fetch notifications: {}", e),
+                Err(e) => log::warn!("notification poll panicked: {}", e),
             }
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            sleep(Duration::from_secs(30)).await;
         }
     });
 

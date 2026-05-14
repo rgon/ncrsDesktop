@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tokio = { version = "1.45.1", features = [] }
+tokio = { version = "1.45.1", features = ["rt"] }
 ncrs_core = { path = "../../ncrs_core" }
 log = "0.4"
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
