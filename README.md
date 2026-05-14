@@ -1,6 +1,34 @@
 # ncRS Desktop client
 
 ![Main dialog](docs/screenshot.png)
+FIX:
++ [x] proper & performant-enough read
++ [x] re-starting ncrs story
+
++ [ ] emulate no network access, showing the local cached copy --emulate-no-network-in 15s
+
++ [ ] writes:
+    + [ ] basic file write: local cache-public upload?
+    + [ ] working without network
+    + [ ] diffing algorithm? -> ask which copy we want to save/save conflicting copy separately -> choose conflict resolution strategy
+```
+GOALS:
++ [x] Real vFS on linux: not downloading everything then serving it. Uses the built-in nextcloud thumbnailer for a rich experience
++ [ ] webdav with QUICK/HTTP3 support for speed
++ [ ] Feature parity with the NC file explorer (share, file options, view who shared, keep remote permissions etc)
+    + add/remove from favorites
+    + details
+    + rename/move or copy
+    + send/share (same as details view)
+    + 'sync'
++ [ ] Can we hook into the search function (in FUSE or nautilus) to use the built-in nextcloud search?
+
++ [ ] No dumb 'Some files could not be synced' - Filename contains trailing spaces -> saving will immediately cause a filesystem error
++ [ ] Dash app has feature parity with the Android/iOS app (in driver)
++ [ ] Performs as good in a heavy enterprise than in a new personal cloud
++ [ ] Enterprise OAuth2 login with authd-shared token for automatic login for multi-user computers and zero touch provisioning to new machines
++ [ ] Abstract file explorer API implementation - concrete cosumers (nautilus, demo web GUI, etc)
+```
 
 ## Feature Goals:
 | Feature                   | Nextcloud Desktop | GNOME Integration/GVfs | ncRS |
