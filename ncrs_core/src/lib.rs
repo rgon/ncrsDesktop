@@ -1,4 +1,5 @@
 pub mod config;
+pub mod filename_validation;
 pub mod ipc;
 pub mod notifications;
 pub mod notify_push;
