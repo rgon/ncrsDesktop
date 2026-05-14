@@ -38,7 +38,7 @@ _EMBLEM_LOCAL   = "emblem-default"       # green tick
 _EMBLEM_REMOTE  = "emblem-downloads"    # cloud / down-arrow
 _EMBLEM_SYNCED  = "emblem-synchronizing" # circular arrows
 _EMBLEM_SHARED  = "emblem-shared"       # people / shared
-_EMBLEM_PARTIAL = "emblem-synchronizing" # partial download (some files local)
+_EMBLEM_PARTIAL = "emblem-downloads"     # partial download (some files local)
 
 SOCKET_TIMEOUT = 2.0  # seconds
 _MAX_RECV = 4096
