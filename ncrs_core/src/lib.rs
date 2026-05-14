@@ -42,7 +42,7 @@ const TTL: Duration = Duration::from_secs(1);
 const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-const READ_AHEAD: usize = 2 * 1024 * 1024; // 2 MB
+const READ_AHEAD: usize = 8 * 1024 * 1024; // 8 MB
 const MAX_POOL_IDLE: usize = 8;
 
 const PATH_ENCODE: &AsciiSet = &CONTROLS
@@ -100,6 +100,8 @@ pub struct MountOptions {
     pub password: Option<String>,
     pub mount_point: PathBuf,
     pub log_user: String,
+    pub aggressive_prefetch: bool,
+    pub http3: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -243,6 +245,10 @@ impl FsCache {
         Some((Arc::clone(&entry.files), needs_refresh))
     }
 
+    fn get_cached_dir_readonly(&self, path: &Path) -> Option<Arc<Vec<DavEntry>>> {
+        self.dir_cache.get(path).map(|e| Arc::clone(&e.files))
+    }
+
     fn cached_dir_etag(&self, path: &Path) -> Option<String> {
         self.dir_cache.get(path)?.etag.clone()
     }
@@ -345,6 +351,76 @@ impl FsCache {
             })
             .and_then(|e| e.modified)
     }
+}
+
+// ── Dir cache persistence ────────────────────────────────────────────────────
+
+const DIR_CACHE_FILE: &str = "dir_cache.json";
+
+#[derive(Serialize, Deserialize)]
+struct PersistedDirEntry {
+    etag: Option<String>,
+    self_entry: Option<DavEntry>,
+    files: Vec<DavEntry>,
+}
+
+fn save_dir_cache(cache: &Mutex<FsCache>) {
+    let c = cache.safe_lock();
+    let path = c.cache_dir.join(DIR_CACHE_FILE);
+    let map: HashMap<String, PersistedDirEntry> = c.dir_cache.iter()
+        .map(|(k, v)| {
+            (k.to_string_lossy().into_owned(), PersistedDirEntry {
+                etag: v.etag.clone(),
+                self_entry: v.self_entry.clone(),
+                files: v.files.as_ref().clone(),
+            })
+        })
+        .collect();
+    drop(c);
+    if let Ok(json) = serde_json::to_vec(&map) {
+        let _ = std::fs::write(&path, json);
+        log::info!("DIR_CACHE saved {} dirs to {}", map.len(), path.display());
+    }
+}
+
+fn load_dir_cache(cache: &Mutex<FsCache>) {
+    let path = {
+        let c = cache.safe_lock();
+        c.cache_dir.join(DIR_CACHE_FILE)
+    };
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let map: HashMap<String, PersistedDirEntry> = match serde_json::from_slice(&data) {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("DIR_CACHE load failed: {}", e);
+            return;
+        }
+    };
+    let mut c = cache.safe_lock();
+    let mut count = 0usize;
+    for (k, v) in map {
+        let dir_path = PathBuf::from(&k);
+        if c.dir_cache.contains_key(&dir_path) {
+            continue;
+        }
+        for entry in &v.files {
+            if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
+                c.allocate_inode(dir_path.join(name));
+            }
+        }
+        c.dir_cache.insert(dir_path, DirCacheEntry {
+            files: Arc::new(v.files),
+            self_entry: v.self_entry,
+            etag: v.etag,
+            at: Instant::now(),
+            refreshing: false,
+        });
+        count += 1;
+    }
+    log::info!("DIR_CACHE loaded {} dirs from {}", count, path.display());
 }
 
 // ── Shared operation helpers ──────────────────────────────────────────────────
@@ -465,7 +541,7 @@ fn get_or_list_dir(
         if Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(5));
     }
 
     // Timeout: drain pending channel, only cache if entries arrived or sender finished
@@ -702,6 +778,7 @@ struct ConnInfo {
     password: String,
     mount_point: PathBuf,
     http: reqwest::blocking::Client,
+    http_read: reqwest::blocking::Client,
 }
 
 pub struct NextCloudFs {
@@ -718,6 +795,7 @@ pub struct NextCloudFs {
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     next_fh: Arc<Mutex<u64>>,
     log_user: String,
+    aggressive_prefetch: bool,
 }
 
 impl NextCloudFs {
@@ -745,10 +823,19 @@ impl NextCloudFs {
         let fileids: ipc::FileIdMap = Arc::new(Mutex::new(HashMap::new()));
         let details: ipc::FileDetailMap = Arc::new(Mutex::new(HashMap::new()));
 
-        let http = reqwest::blocking::Client::builder()
-            .pool_max_idle_per_host(16)
-            .build()
+        let mut http_builder = reqwest::blocking::Client::builder()
+            .pool_max_idle_per_host(16);
+        let mut read_builder = reqwest::blocking::Client::builder()
+            .pool_max_idle_per_host(4);
+        if options.http3 {
+            log::info!("HTTP/3 (QUIC) enabled");
+            http_builder = http_builder.http3_prior_knowledge();
+            read_builder = read_builder.http3_prior_knowledge();
+        }
+        let http = http_builder.build()
             .map_err(|e| format!("HTTP client: {}", e))?;
+        let http_read = read_builder.build()
+            .map_err(|e| format!("HTTP read client: {}", e))?;
 
         let conn = Arc::new(ConnInfo {
             base_url: notifications::base_url(&options.url),
@@ -757,6 +844,7 @@ impl NextCloudFs {
             password: password.clone(),
             mount_point: options.mount_point.clone(),
             http,
+            http_read,
         });
 
         Ok(NextCloudFs {
@@ -766,15 +854,19 @@ impl NextCloudFs {
                 username: username.clone(),
                 password: password.clone(),
             }),
-            cache: Arc::new(Mutex::new(FsCache {
-                inodes,
-                paths,
-                next_inode: 2,
-                dir_cache: HashMap::new(),
-                pending_dirs: HashMap::new(),
-                file_cache: HashMap::new(),
-                cache_dir,
-            })),
+            cache: {
+                let c = Arc::new(Mutex::new(FsCache {
+                    inodes,
+                    paths,
+                    next_inode: 2,
+                    dir_cache: HashMap::new(),
+                    pending_dirs: HashMap::new(),
+                    file_cache: HashMap::new(),
+                    cache_dir,
+                }));
+                load_dir_cache(&c);
+                c
+            },
             status,
             dirty,
             shared,
@@ -785,6 +877,7 @@ impl NextCloudFs {
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
+            aggressive_prefetch: options.aggressive_prefetch,
             log_user: options.log_user,
         })
     }
@@ -918,12 +1011,10 @@ impl Filesystem for NextCloudFs {
         let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
 
-        let mut c = self.cache.safe_lock();
-        let entries = match c.get_cached_dir(&parent) {
-            Some((files, _)) => files,
+        let c = self.cache.safe_lock();
+        let entries = match c.get_cached_dir_readonly(&parent) {
+            Some(files) => files,
             None => {
-                // Parent not listed yet — return a synthetic directory attr
-                // so Nautilus can navigate into it once readdir runs.
                 if c.dir_cache.contains_key(&path) || path == Path::new("/") {
                     drop(c);
                     reply.attr(&TTL, &make_dir_attr(ino));
@@ -995,6 +1086,53 @@ impl Filesystem for NextCloudFs {
 
         log::debug!("[{}] READ {} offset={} size={}", self.log_user, path.display(), offset, size);
 
+        let off = offset as u64;
+        let sz = size as usize;
+
+        // Serve from open-file state synchronously (no thread spawn).
+        {
+            let files = self.open_files.safe_lock();
+            if let Some(of) = files.get(&fh) {
+                if let Some(ref local) = of.local {
+                    if let Ok(f) = std::fs::File::open(local) {
+                        let mut buf = vec![0u8; sz];
+                        if let Ok(n) = f.read_at(&mut buf, off) {
+                            buf.truncate(n);
+                            reply.data(&buf);
+                            return;
+                        }
+                    }
+                }
+                if let Some(ref ra) = of.buf {
+                    let buf_end = ra.start + ra.data.len() as u64;
+                    if off >= ra.start && off + sz as u64 <= buf_end {
+                        let s = (off - ra.start) as usize;
+                        reply.data(&ra.data[s..s + sz]);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Check file_cache synchronously too.
+        {
+            let cached_local = self.cache.safe_lock().file_cache.get(&path)
+                .filter(|fc| fc.local_path.exists())
+                .map(|fc| fc.local_path.clone());
+            if let Some(ref local) = cached_local {
+                if let Ok(f) = std::fs::File::open(local) {
+                    let mut buf = vec![0u8; sz];
+                    if let Ok(n) = f.read_at(&mut buf, off) {
+                        buf.truncate(n);
+                        reply.data(&buf);
+                        self.open_files.safe_lock().entry(fh).and_modify(|of| of.local = Some(local.clone()));
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Network fetch — only this path needs a thread.
         let open_files = self.open_files.clone();
         let conn = self.conn.clone();
         let net = self.net.clone();
@@ -1003,60 +1141,8 @@ impl Filesystem for NextCloudFs {
         let dirty = self.dirty.clone();
 
         thread::spawn(move || {
-            let off = offset as u64;
-            let sz = size as usize;
-
-            // Try serving from open-file state (local cache or read-ahead buffer).
-            {
-                let files = open_files.safe_lock();
-                if let Some(of) = files.get(&fh) {
-                    if let Some(ref local) = of.local {
-                        if let Ok(f) = std::fs::File::open(local) {
-                            let mut buf = vec![0u8; sz];
-                            match f.read_at(&mut buf, off) {
-                                Ok(n) => {
-                                    buf.truncate(n);
-                                    reply.data(&buf);
-                                    return;
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                    }
-                    if let Some(ref ra) = of.buf {
-                        let buf_end = ra.start + ra.data.len() as u64;
-                        if off >= ra.start && off + sz as u64 <= buf_end {
-                            let s = (off - ra.start) as usize;
-                            reply.data(&ra.data[s..s + sz]);
-                            return;
-                        }
-                    }
-                }
-            }
-
-            // Serve from file_cache (populated by Keep Locally or previous fallback).
-            let cached_local = cache.safe_lock().file_cache.get(&path)
-                .filter(|fc| fc.local_path.exists())
-                .map(|fc| fc.local_path.clone());
-            if let Some(ref local) = cached_local {
-                if let Ok(f) = std::fs::File::open(local) {
-                    let mut buf = vec![0u8; sz];
-                    match f.read_at(&mut buf, off) {
-                        Ok(n) => {
-                            buf.truncate(n);
-                            reply.data(&buf);
-                            let lp = local.clone();
-                            open_files.safe_lock().entry(fh).and_modify(|of| of.local = Some(lp));
-                            return;
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-
-            // HTTP Range read with read-ahead.
             let fetch = std::cmp::max(sz, READ_AHEAD);
-            match range_read_timeout(&conn, &path, off, fetch) {
+            match do_range_read(&conn, &path, off, fetch) {
                 Ok(data) => {
                     let end = std::cmp::min(sz, data.len());
                     reply.data(&data[..end]);
@@ -1146,6 +1232,7 @@ impl Filesystem for NextCloudFs {
         let ipc_populated = self.ipc_populated.clone();
         let deferred_readdir = self.deferred_readdir.clone();
         let conn = self.conn.clone();
+        let aggressive_prefetch = self.aggressive_prefetch;
 
         thread::spawn(move || {
             if offset == 0 {
@@ -1247,8 +1334,10 @@ impl Filesystem for NextCloudFs {
                 return;
             }
 
+            let t_readdir = Instant::now();
             match get_or_list_dir(&conn, &cache, path.clone()) {
                 Ok((entries, self_entry)) => {
+                    log::info!("READDIR {} get_or_list_dir returned {} entries in {:?}", path.display(), entries.len(), t_readdir.elapsed());
                     let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
 
                     let already_populated = ipc_populated.safe_lock().contains(&path);
@@ -1325,17 +1414,20 @@ impl Filesystem for NextCloudFs {
                     }
 
                     let skip = if offset > 2 { (offset - 2) as usize } else { 0 };
-                    for (i, entry) in entries.iter().enumerate().skip(skip) {
-                        let name = match entry.path.file_name().and_then(|n| n.to_str()) {
-                            Some(n) => n,
-                            None => continue,
-                        };
-                        let entry_path = path.join(name);
-                        let entry_ino = cache.safe_lock().get_inode(&entry_path).unwrap_or(1);
-                        let kind =
-                            if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                        if reply.add(entry_ino, (i + 3) as i64, kind, name) {
-                            break;
+                    {
+                        let c = cache.safe_lock();
+                        for (i, entry) in entries.iter().enumerate().skip(skip) {
+                            let name = match entry.path.file_name().and_then(|n| n.to_str()) {
+                                Some(n) => n,
+                                None => continue,
+                            };
+                            let entry_path = path.join(name);
+                            let entry_ino = c.get_inode(&entry_path).unwrap_or(1);
+                            let kind =
+                                if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
+                            if reply.add(entry_ino, (i + 3) as i64, kind, name) {
+                                break;
+                            }
                         }
                     }
 
@@ -1350,20 +1442,79 @@ impl Filesystem for NextCloudFs {
                         }
                     }
 
+                    log::info!("READDIR {} reply.ok() at {:?}", path.display(), t_readdir.elapsed());
                     reply.ok();
+                    save_dir_cache(&cache);
+                    log::info!("READDIR {} save_dir_cache done at {:?}", path.display(), t_readdir.elapsed());
 
-                    if offset == 0 && !thumb_candidates.is_empty() {
-                        let conn2 = conn.clone();
-                        thread::spawn(move || {
-                            preview::prefetch_directory_thumbnails(
-                                &conn2.http,
-                                &conn2.base_url,
-                                &conn2.username,
-                                &conn2.password,
-                                &conn2.mount_point,
-                                &thumb_candidates,
-                            );
-                        });
+                    if offset == 0 {
+                        let child_dirs: Vec<PathBuf> = entries.iter()
+                            .filter(|e| e.is_dir)
+                            .filter_map(|e| e.path.file_name().and_then(|n| n.to_str()).map(|n| path.join(n)))
+                            .collect();
+                        if !child_dirs.is_empty() {
+                            let conn_pf = conn.clone();
+                            let cache_pf = cache.clone();
+                            thread::spawn(move || {
+                                log::info!("PREFETCH_CHILDREN {} dirs from {}", path.display(), child_dirs.len());
+                                for chunk in child_dirs.chunks(10) {
+                                    let handles: Vec<_> = chunk.iter().map(|dir| {
+                                        let c = conn_pf.clone();
+                                        let ca = cache_pf.clone();
+                                        let d = dir.clone();
+                                        thread::spawn(move || {
+                                            let _ = get_or_list_dir(&c, &ca, d);
+                                        })
+                                    }).collect();
+                                    for h in handles {
+                                        let _ = h.join();
+                                    }
+                                }
+                                save_dir_cache(&cache_pf);
+
+                                if aggressive_prefetch {
+                                    let mut child_thumbs: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
+                                    let mut c = cache_pf.safe_lock();
+                                    for dir in &child_dirs {
+                                        if let Some((entries, _)) = c.get_cached_dir(dir) {
+                                            for entry in entries.iter() {
+                                                if !entry.is_dir && entry.has_preview {
+                                                    if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
+                                                        child_thumbs.push((dir.join(name), entry.modified, true, entry.fileid));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    drop(c);
+                                    if !child_thumbs.is_empty() {
+                                        log::info!("PREFETCH_CHILD_THUMBS {} thumbnails", child_thumbs.len());
+                                        preview::prefetch_directory_thumbnails(
+                                            &conn_pf.http,
+                                            &conn_pf.base_url,
+                                            &conn_pf.username,
+                                            &conn_pf.password,
+                                            &conn_pf.mount_point,
+                                            &child_thumbs,
+                                        );
+                                    }
+                                }
+                            });
+                        }
+
+                        if !thumb_candidates.is_empty() {
+                            let conn2 = conn.clone();
+                            thread::spawn(move || {
+                                preview::prefetch_directory_thumbnails(
+                                    &conn2.http,
+                                    &conn2.base_url,
+                                    &conn2.username,
+                                    &conn2.password,
+                                    &conn2.mount_point,
+                                    &thumb_candidates,
+                                );
+                            });
+                        }
                     }
                 }
                 Err(e) => {
@@ -1383,22 +1534,11 @@ fn webdav_file_url(base: &str, remote_path: &Path) -> String {
     format!("{}/{}", base.trim_end_matches('/'), encoded)
 }
 
-fn range_read_timeout(conn: &Arc<ConnInfo>, path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
-    let (tx, rx) = mpsc::channel();
-    let c = conn.clone();
-    let p = path.to_path_buf();
-    thread::spawn(move || {
-        let _ = tx.send(do_range_read(&c, &p, offset, size));
-    });
-    rx.recv_timeout(DOWNLOAD_TIMEOUT)
-        .unwrap_or_else(|_| Err("range read timeout".into()))
-}
-
 fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
     log::debug!("RANGE_READ {} offset={} size={}", path.display(), offset, size);
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
-    let resp = conn.http
+    let resp = conn.http_read
         .get(&url)
         .timeout(DOWNLOAD_TIMEOUT)
         .header("Range", format!("bytes={}-{}", offset, end))
@@ -1472,6 +1612,8 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let mount_point =
         PathBuf::from(doc["mount_point"].as_str().unwrap_or("/media/ncrs_mount"));
     let log_user = doc["user"].as_str().unwrap_or("default_user").to_string();
+    let aggressive_prefetch = doc["aggressive_prefetch"].as_bool().unwrap_or(false);
+    let http3 = doc["http3"].as_bool().unwrap_or(false);
 
-    Ok(MountOptions { url, username, password, mount_point, log_user })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3 })
 }
