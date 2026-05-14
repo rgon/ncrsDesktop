@@ -67,11 +67,13 @@ struct OcsSearchResponse {
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-fn client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(API_TIMEOUT)
-        .build()
-        .expect("reqwest client")
+fn client(http3: bool) -> reqwest::blocking::Client {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(API_TIMEOUT);
+    if http3 {
+        builder = builder.http3_prior_knowledge();
+    }
+    builder.build().expect("reqwest client")
 }
 
 fn decode_pct(s: &str) -> String {
@@ -94,9 +96,10 @@ pub fn fetch_providers(
     base: &str,
     username: &str,
     password: &str,
+    http3: bool,
 ) -> Result<Vec<SearchProvider>, String> {
     let url = format!("{}/ocs/v2.php/search/providers", base);
-    let resp = client()
+    let resp = client(http3)
         .get(&url)
         .query(&[("format", "json")])
         .basic_auth(username, Some(password))
@@ -116,13 +119,14 @@ pub fn search_provider(
     password: &str,
     provider_id: &str,
     term: &str,
+    http3: bool,
 ) -> Result<Vec<SearchEntry>, String> {
     let url = format!(
         "{}/ocs/v2.php/search/providers/{}/search",
         base, provider_id,
     );
     let limit = RESULTS_PER_PROVIDER.to_string();
-    let resp = client()
+    let resp = client(http3)
         .get(&url)
         .query(&[("term", term), ("limit", &limit), ("format", "json")])
         .basic_auth(username, Some(password))
@@ -142,8 +146,9 @@ pub fn search_all(
     username: &str,
     password: &str,
     term: &str,
+    http3: bool,
 ) -> Result<Vec<SearchResultGroup>, String> {
-    let mut providers = fetch_providers(base, username, password)?;
+    let mut providers = fetch_providers(base, username, password, http3)?;
     providers.sort_by_key(|p| p.order);
 
     let mut results: Vec<SearchResultGroup> = Vec::new();
@@ -155,7 +160,7 @@ pub fn search_all(
                 let pid = p.id.clone();
                 let pname = p.name.clone();
                 s.spawn(move || {
-                    match search_provider(base, username, password, &pid, term) {
+                    match search_provider(base, username, password, &pid, term, http3) {
                         Ok(entries) if !entries.is_empty() => {
                             let entries = entries
                                 .into_iter()

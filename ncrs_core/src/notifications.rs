@@ -56,23 +56,26 @@ pub fn base_url(webdav_url: &str) -> String {
     webdav_url[..host_end].to_string()
 }
 
-fn client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(API_TIMEOUT)
-        .build()
-        .expect("reqwest client")
+fn client(http3: bool) -> reqwest::blocking::Client {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(API_TIMEOUT);
+    if http3 {
+        builder = builder.http3_prior_knowledge();
+    }
+    builder.build().expect("reqwest client")
 }
 
 pub fn fetch_notifications(
     base: &str,
     username: &str,
     password: &str,
+    http3: bool,
 ) -> Result<Vec<NcNotification>, String> {
     let url = format!(
         "{}/ocs/v2.php/apps/notifications/api/v2/notifications?format=json",
         base
     );
-    let resp = client()
+    let resp = client(http3)
         .get(&url)
         .basic_auth(username, Some(password))
         .header("OCS-APIREQUEST", "true")
@@ -91,12 +94,13 @@ pub fn dismiss_notification(
     username: &str,
     password: &str,
     notification_id: u64,
+    http3: bool,
 ) -> Result<(), String> {
     let url = format!(
         "{}/ocs/v2.php/apps/notifications/api/v2/notifications/{}",
         base, notification_id
     );
-    client()
+    client(http3)
         .delete(&url)
         .basic_auth(username, Some(password))
         .header("OCS-APIREQUEST", "true")
