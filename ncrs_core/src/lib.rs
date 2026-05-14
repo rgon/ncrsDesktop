@@ -2170,7 +2170,8 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
     let prefetch_cb = filesystem.prefetch_callback();
     let base_url = notifications::base_url(&options.url);
     let username = options.username.clone().unwrap_or_default();
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb));
+    let ipc_password = options.password.clone().unwrap_or_default();
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, ipc_password, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb));
 
     // Connectivity monitor
     let offline_flag = filesystem.is_offline_flag();

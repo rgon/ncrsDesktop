@@ -22,8 +22,10 @@ Protocol (line-oriented over Unix socket):
   CHANGES              → tab-separated abs-paths whose status changed (drains queue)
 """
 
+import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import traceback
@@ -31,7 +33,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import gi
 gi.require_version("Nautilus", "4.0")
-from gi.repository import Gio, GLib, GObject, Nautilus  # noqa: E402
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
 # ── Emblem names (standard XDG / FreeDesktop icon names) ─────────────────────
 _EMBLEM_LOCAL   = "emblem-default"       # green tick
@@ -101,7 +104,7 @@ def _log_to_daemon(msg: str) -> None:
         pass
 
 
-def _send_command(cmd: str) -> str:
+def _send_command(cmd: str, max_recv: int = _MAX_RECV) -> str:
     sp = _sock_path()
     if not os.path.exists(sp):
         return "error: daemon not running"
@@ -112,8 +115,8 @@ def _send_command(cmd: str) -> str:
             s.connect(sp)
             s.sendall(f"{cmd}\n".encode())
             buf = b""
-            while b"\n" not in buf and len(buf) < _MAX_RECV:
-                chunk = s.recv(256)
+            while b"\n" not in buf and len(buf) < max_recv:
+                chunk = s.recv(4096)
                 if not chunk:
                     break
                 buf += chunk
@@ -377,7 +380,6 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
     def _on_view_in_web(self, _menu_item, paths):
         def _do():
             try:
-                import subprocess
                 for path in paths:
                     url = _send_command(f"WEBURL {path}")
                     if url.startswith("http"):
@@ -411,4 +413,146 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         _POOL.submit(_do)
 
     def get_background_items(self, *args):
-        return []
+        try:
+            if not self._mount:
+                return []
+            search_item = Nautilus.MenuItem(
+                name="NcrsMenuProvider::SearchNextcloud",
+                label="Search Nextcloud...",
+                tip="Search files across your Nextcloud instance",
+            )
+            search_item.connect("activate", self._on_search)
+            return [search_item]
+        except Exception:
+            _log_error("get_background_items")
+            return []
+
+    def _on_search(self, _menu_item, *_args):
+        GLib.idle_add(self._show_search_dialog)
+
+    def _show_search_dialog(self):
+        try:
+            dialog = _SearchDialog()
+            dialog.present()
+        except Exception:
+            _log_error("_show_search_dialog")
+        return GLib.SOURCE_REMOVE
+
+
+class _SearchDialog(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Search Nextcloud", default_width=600, default_height=450)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        self.set_child(box)
+
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._entry = Gtk.Entry()
+        self._entry.set_hexpand(True)
+        self._entry.set_placeholder_text("Search term...")
+        self._entry.connect("activate", self._on_search)
+        hbox.append(self._entry)
+
+        btn = Gtk.Button(label="Search")
+        btn.connect("clicked", self._on_search)
+        hbox.append(btn)
+        box.append(hbox)
+
+        self._spinner = Gtk.Spinner()
+        box.append(self._spinner)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        self._results_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        scroll.set_child(self._results_box)
+        box.append(scroll)
+
+    def _on_search(self, _widget):
+        term = self._entry.get_text().strip()
+        if not term:
+            return
+        self._spinner.start()
+        self._clear_results()
+        _POOL.submit(self._do_search, term)
+
+    def _clear_results(self):
+        while True:
+            child = self._results_box.get_first_child()
+            if child is None:
+                break
+            self._results_box.remove(child)
+
+    def _do_search(self, term):
+        try:
+            resp = _send_command(f"SEARCH {term}", max_recv=65536)
+            if resp.startswith("error"):
+                GLib.idle_add(self._show_error, resp)
+                return
+            groups = json.loads(resp)
+            GLib.idle_add(self._show_results, groups)
+        except Exception:
+            _log_error(f"_do_search({term})")
+            GLib.idle_add(self._show_error, "Search failed")
+
+    def _show_error(self, msg):
+        self._spinner.stop()
+        label = Gtk.Label(label=msg)
+        label.set_halign(Gtk.Align.START)
+        self._results_box.append(label)
+        return GLib.SOURCE_REMOVE
+
+    def _show_results(self, groups):
+        self._spinner.stop()
+        self._clear_results()
+        if not groups:
+            label = Gtk.Label(label="No results found.")
+            label.set_halign(Gtk.Align.START)
+            self._results_box.append(label)
+            return GLib.SOURCE_REMOVE
+        for group in groups:
+            header = Gtk.Label()
+            header.set_markup(f"<b>{GLib.markup_escape_text(group.get('provider_name', ''))}</b>")
+            header.set_halign(Gtk.Align.START)
+            self._results_box.append(header)
+            for entry in group.get("entries", []):
+                row = self._make_result_row(entry)
+                self._results_box.append(row)
+        return GLib.SOURCE_REMOVE
+
+    def _make_result_row(self, entry):
+        btn = Gtk.Button()
+        btn.set_has_frame(False)
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        title = Gtk.Label(label=entry.get("title", ""))
+        title.set_halign(Gtk.Align.START)
+        title.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+        vbox.append(title)
+        subline = entry.get("subline", "")
+        if subline:
+            sub = Gtk.Label(label=subline)
+            sub.set_halign(Gtk.Align.START)
+            sub.set_ellipsize(3)
+            sub.add_css_class("dim-label")
+            vbox.append(sub)
+        hbox.append(vbox)
+        btn.set_child(hbox)
+        url = entry.get("resource_url", "")
+        if url:
+            btn.connect("clicked", self._on_open_url, url)
+        return btn
+
+    @staticmethod
+    def _on_open_url(_btn, url):
+        try:
+            subprocess.Popen(
+                ["xdg-open", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            _log_error(f"_on_open_url({url})")

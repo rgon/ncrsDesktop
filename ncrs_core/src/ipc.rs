@@ -2,13 +2,11 @@
 ///
 /// Clients (e.g. the Nautilus extension) connect and send line-oriented queries:
 ///
-///   STATUS <absolute-local-path>\n
-///
-/// The server responds with one of:
-///   local\n    — file exists in the disk cache and is up to date
-///   synced\n   — file is in cache but the dir listing TTL has expired (status uncertain)
-///   remote\n   — file is known but has no local copy yet
-///   unknown\n  — path is not under the mount point or not seen yet
+///   STATUS <absolute-local-path>\n   → local|synced|remote|unknown[,shared]
+///   DETAIL <absolute-local-path>\n   → status\tsharing\tperms\towner\tsize
+///   SEARCH <term>\n                  → JSON array of SearchResultGroup
+///   WEBURL <absolute-local-path>\n   → Nextcloud web URL for the file
+///   CHANGES\n                        → tab-separated changed paths
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -106,7 +104,7 @@ fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>,
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, username: String, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, username: String, password: String, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -142,6 +140,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let details = detail_map.clone();
             let dirty = dirty_set.clone();
             let uname = username.clone();
+            let passwd = password.clone();
             let burl = base_url.clone();
             let cb = keep_cb.clone();
             let ev = evict_cb.clone();
@@ -149,7 +148,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let active = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, dirty, uname, burl, cb, ev, pf);
+                handle_client(stream, mount, map, shared, fids, details, dirty, uname, passwd, burl, cb, ev, pf);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -177,6 +176,7 @@ fn handle_client(
     detail_map: FileDetailMap,
     dirty_set: DirtySet,
     username: String,
+    password: String,
     base_url: String,
     keep_cb: Option<KeepCallback>,
     evict_cb: Option<EvictCallback>,
@@ -342,6 +342,18 @@ fn handle_client(
                 }
                 (None, _) => "error: path not under mount".to_string(),
                 (_, None) => "error: not supported".to_string(),
+            }
+        } else if let Some(term) = trimmed.strip_prefix("SEARCH ") {
+            if term.is_empty() {
+                "[]".to_string()
+            } else {
+                match crate::search::search_all(&base_url, &username, &password, term, false) {
+                    Ok(results) => serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string()),
+                    Err(e) => {
+                        log::error!("IPC SEARCH failed: {}", e);
+                        format!("error: {}", e)
+                    }
+                }
             }
         } else if let Some(msg) = trimmed.strip_prefix("LOG ") {
             log::info!("[nautilus] {}", msg);
