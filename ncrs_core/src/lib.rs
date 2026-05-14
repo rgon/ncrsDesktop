@@ -857,6 +857,11 @@ impl Filesystem for NextCloudFs {
             }
         };
 
+        let is_cached = self.cache.safe_lock().dir_cache.contains_key(&parent_path);
+        if !is_cached {
+            let _ = get_or_list_dir(&self.conn, &self.cache, parent_path.clone());
+        }
+
         let mut c = self.cache.safe_lock();
         let entries = match c.get_cached_dir(&parent_path) {
             Some((files, _)) => files,
