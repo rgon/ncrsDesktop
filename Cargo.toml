@@ -5,5 +5,5 @@ members = [
 ]
 resolver = "2"
 
-[workspace-dependencies]
+[workspace.dependencies]
 clap = "4.5.40"
