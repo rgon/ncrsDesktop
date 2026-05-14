@@ -17,6 +17,7 @@ Protocol (line-oriented over Unix socket):
   DETAIL   <abs-path>  → status\\tsharing\\tpermissions\\towner\\tsize  (tab-separated)
   WEBURL   <abs-path>  → https://…  (Nextcloud web link)
   KEEP     <abs-path>  → ok
+  EVICT    <abs-path>  → ok  (remove local copy, set status to remote)
   PREFETCH <abs-path>  → ok  (background PROPFIND to warm the dir cache)
   CHANGES              → tab-separated abs-paths whose status changed (drains queue)
 """
@@ -33,10 +34,11 @@ gi.require_version("Nautilus", "4.0")
 from gi.repository import Gio, GLib, GObject, Nautilus  # noqa: E402
 
 # ── Emblem names (standard XDG / FreeDesktop icon names) ─────────────────────
-_EMBLEM_LOCAL  = "emblem-default"       # green tick
-_EMBLEM_REMOTE = "emblem-downloads"     # cloud / down-arrow
-_EMBLEM_SYNCED = "emblem-synchronizing" # circular arrows
-_EMBLEM_SHARED = "emblem-shared"        # people / shared
+_EMBLEM_LOCAL   = "emblem-default"       # green tick
+_EMBLEM_REMOTE  = "emblem-downloads"    # cloud / down-arrow
+_EMBLEM_SYNCED  = "emblem-synchronizing" # circular arrows
+_EMBLEM_SHARED  = "emblem-shared"       # people / shared
+_EMBLEM_PARTIAL = "emblem-synchronizing" # partial download (some files local)
 
 SOCKET_TIMEOUT = 2.0  # seconds
 _MAX_RECV = 4096
@@ -150,6 +152,28 @@ def _human_size(n: int) -> str:
     return f"{n:.1f} PiB"
 
 
+def _invalidate_path(path: str) -> bool:
+    try:
+        fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(path))
+        if fi is not None:
+            fi.invalidate_extension_info()
+    except Exception:
+        pass
+    return GLib.SOURCE_REMOVE
+
+
+def _poll_keep_done(path: str) -> None:
+    try:
+        for _ in range(240):
+            time.sleep(0.5)
+            status = _send_command(f"STATUS {path}")
+            if not status.split(",")[0] == "downloading":
+                GLib.idle_add(_invalidate_path, path)
+                return
+    except Exception:
+        _log_error(f"_poll_keep_done({path})")
+
+
 # ── Column provider ──────────────────────────────────────────────────────────
 
 class NcrsColumnProvider(GObject.GObject, Nautilus.ColumnProvider):
@@ -199,6 +223,7 @@ _SYNC_LABELS = {
     "synced": "Synced",
     "remote": "Remote",
     "downloading": "Downloading",
+    "partial": "Partial",
     "unknown": "",
 }
 
@@ -267,6 +292,8 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 file_info.add_emblem(_EMBLEM_SYNCED)
             elif sync == "downloading":
                 file_info.add_emblem(_EMBLEM_REMOTE)
+            elif sync == "partial":
+                file_info.add_emblem(_EMBLEM_PARTIAL)
             if sharing:
                 file_info.add_emblem(_EMBLEM_SHARED)
 
@@ -307,12 +334,32 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             if not paths:
                 return []
 
-            keep = Nautilus.MenuItem(
-                name="NcrsMenuProvider::KeepLocally",
-                label="Keep Locally",
-                tip="Download and keep a local copy of the selected files",
-            )
-            keep.connect("activate", self._on_keep_locally, paths)
+            has_local = False
+            has_remote = False
+            for path in paths:
+                status = _send_command(f"STATUS {path}").split(",")[0]
+                if status in ("local", "partial"):
+                    has_local = True
+                else:
+                    has_remote = True
+
+            items = []
+            if has_remote:
+                keep = Nautilus.MenuItem(
+                    name="NcrsMenuProvider::KeepLocally",
+                    label="Keep Locally",
+                    tip="Download and keep a local copy of the selected files",
+                )
+                keep.connect("activate", self._on_keep_locally, paths)
+                items.append(keep)
+            if has_local:
+                evict = Nautilus.MenuItem(
+                    name="NcrsMenuProvider::EvictLocally",
+                    label="Don't Keep Locally",
+                    tip="Remove the local copy and free disk space",
+                )
+                evict.connect("activate", self._on_evict_locally, paths)
+                items.append(evict)
 
             view_web = Nautilus.MenuItem(
                 name="NcrsMenuProvider::ViewInWeb",
@@ -320,8 +367,9 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
                 tip="Open this file in the Nextcloud web interface",
             )
             view_web.connect("activate", self._on_view_in_web, paths)
+            items.append(view_web)
 
-            return [keep, view_web]
+            return items
         except Exception:
             _log_error("get_file_items")
             return []
@@ -343,8 +391,23 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             try:
                 for path in paths:
                     _send_command(f"KEEP {path}")
+                for path in paths:
+                    GLib.idle_add(_invalidate_path, path)
+                for path in paths:
+                    _POOL.submit(_poll_keep_done, path)
             except Exception:
                 _log_error("_on_keep_locally")
+        _POOL.submit(_do)
+
+    def _on_evict_locally(self, _menu_item, paths):
+        def _do():
+            try:
+                for path in paths:
+                    _send_command(f"EVICT {path}")
+                for path in paths:
+                    GLib.idle_add(_invalidate_path, path)
+            except Exception:
+                _log_error("_on_evict_locally")
         _POOL.submit(_do)
 
     def get_background_items(self, *args):

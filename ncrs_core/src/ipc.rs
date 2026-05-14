@@ -13,6 +13,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
+const QUERY_ENCODE: &AsciiSet = &CONTROLS
+    .add(b' ').add(b'#').add(b'%').add(b'&').add(b'+').add(b'=').add(b'?');
 
 trait MutexExt<T> {
     fn safe_lock(&self) -> std::sync::MutexGuard<'_, T>;
@@ -25,6 +29,7 @@ impl<T> MutexExt<T> for Mutex<T> {
 }
 
 pub type KeepCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
+pub type EvictCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type PrefetchCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type SharedSet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
 pub type FileIdMap = Arc<Mutex<std::collections::HashMap<PathBuf, u64>>>;
@@ -35,6 +40,7 @@ pub struct FileDetail {
     pub owner_id: Option<String>,
     pub owner_display_name: Option<String>,
     pub size: u64,
+    pub is_dir: bool,
 }
 
 pub type FileDetailMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileDetail>>>;
@@ -74,10 +80,28 @@ impl FileStatus {
 /// Thread-safe store of path → status, updated by the FUSE layer.
 pub type StatusMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileStatus>>>;
 
+fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>, dir: &Path) -> &'static str {
+    let own = sm.get(dir).copied();
+    if own == Some(FileStatus::Downloading) {
+        return "downloading";
+    }
+    let mut total = 0usize;
+    let mut local = 0usize;
+    for (p, s) in sm.iter() {
+        if p.parent() == Some(dir) {
+            total += 1;
+            if *s == FileStatus::Local { local += 1; }
+        }
+    }
+    if total > 0 && local == total { "local" }
+    else if local > 0 { "partial" }
+    else { own.unwrap_or(FileStatus::Remote).as_str() }
+}
+
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, username: String, base_url: String, keep_cb: Option<KeepCallback>, prefetch_cb: Option<PrefetchCallback>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, username: String, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -108,8 +132,9 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let uname = username.clone();
             let burl = base_url.clone();
             let cb = keep_cb.clone();
+            let ev = evict_cb.clone();
             let pf = prefetch_cb.clone();
-            std::thread::spawn(move || handle_client(stream, mount, map, shared, fids, details, dirty, uname, burl, cb, pf));
+            std::thread::spawn(move || handle_client(stream, mount, map, shared, fids, details, dirty, uname, burl, cb, ev, pf));
         }
     });
 }
@@ -137,6 +162,7 @@ fn handle_client(
     username: String,
     base_url: String,
     keep_cb: Option<KeepCallback>,
+    evict_cb: Option<EvictCallback>,
     prefetch_cb: Option<PrefetchCallback>,
 ) {
     let mut write_half = match stream.try_clone() {
@@ -155,12 +181,14 @@ fn handle_client(
         let reply = if let Some(path_str) = trimmed.strip_prefix("STATUS ") {
             match strip_mount(Path::new(path_str), &mount_point) {
                 Some(remote) => {
-                    let status = status_map
-                        .safe_lock()
-                        .get(&remote)
-                        .copied()
-                        .unwrap_or(FileStatus::Remote)
-                        .as_str();
+                    let detail = detail_map.safe_lock().get(&remote).cloned();
+                    let sm = status_map.safe_lock();
+                    let status = if detail.as_ref().map_or(false, |d| d.is_dir) {
+                        dir_status_from_children(&sm, &remote)
+                    } else {
+                        sm.get(&remote).copied().unwrap_or(FileStatus::Remote).as_str()
+                    };
+                    drop(sm);
                     let shared = shared_set.safe_lock().contains(&remote);
                     if shared {
                         format!("{},shared", status)
@@ -173,12 +201,17 @@ fn handle_client(
         } else if let Some(path_str) = trimmed.strip_prefix("DETAIL ") {
             match strip_mount(Path::new(path_str), &mount_point) {
                 Some(remote) => {
-                    let status = status_map.safe_lock()
-                        .get(&remote).copied().unwrap_or(FileStatus::Remote).as_str();
                     let is_shared = shared_set.safe_lock().contains(&remote);
                     let has_detail = detail_map.safe_lock().contains_key(&remote);
                     let detail = detail_map.safe_lock().get(&remote).cloned()
                         .unwrap_or_default();
+                    let sm = status_map.safe_lock();
+                    let status = if detail.is_dir {
+                        dir_status_from_children(&sm, &remote)
+                    } else {
+                        sm.get(&remote).copied().unwrap_or(FileStatus::Remote).as_str()
+                    };
+                    drop(sm);
                     let sharing = if !is_shared {
                         ""
                     } else {
@@ -202,11 +235,18 @@ fn handle_client(
         } else if let Some(path_str) = trimmed.strip_prefix("WEBURL ") {
             match strip_mount(Path::new(path_str), &mount_point) {
                 Some(remote) => {
-                    let parent = remote.parent().unwrap_or(Path::new("/"));
-                    let dir = parent.to_string_lossy();
+                    let is_dir = detail_map.safe_lock().get(&remote)
+                        .map_or(false, |d| d.is_dir);
+                    let dir_path = if is_dir {
+                        remote.to_string_lossy().to_string()
+                    } else {
+                        remote.parent().unwrap_or(Path::new("/"))
+                            .to_string_lossy().to_string()
+                    };
+                    let encoded = utf8_percent_encode(&dir_path, QUERY_ENCODE).to_string();
                     match fileid_map.safe_lock().get(&remote) {
-                        Some(fid) => format!("{}/apps/files/?dir={}&fileid={}", base_url, dir, fid),
-                        None => format!("{}/apps/files/?dir={}", base_url, dir),
+                        Some(fid) => format!("{}/apps/files/files/{}?dir={}", base_url, fid, encoded),
+                        None => format!("{}/apps/files/files?dir={}", base_url, encoded),
                     }
                 }
                 None => "error: path not under mount".to_string(),
@@ -242,12 +282,31 @@ fn handle_client(
         } else if let Some(path_str) = trimmed.strip_prefix("KEEP ") {
             match (strip_mount(Path::new(path_str), &mount_point), &keep_cb) {
                 (Some(remote), Some(cb)) => {
+                    status_map.safe_lock().insert(remote.clone(), FileStatus::Downloading);
+                    dirty_set.safe_lock().insert(remote.clone());
                     let cb = cb.clone();
+                    let sm = status_map.clone();
+                    let ds = dirty_set.clone();
+                    let r = remote.clone();
                     std::thread::spawn(move || {
                         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
                             log::error!("KEEP callback panicked: {:?}", e);
                         }
+                        if sm.safe_lock().get(&r).copied() == Some(FileStatus::Downloading) {
+                            sm.safe_lock().insert(r.clone(), FileStatus::Local);
+                        }
+                        ds.safe_lock().insert(r);
                     });
+                    "ok".to_string()
+                }
+                (None, _) => "error: path not under mount".to_string(),
+                (_, None) => "error: not supported".to_string(),
+            }
+        } else if let Some(path_str) = trimmed.strip_prefix("EVICT ") {
+            match (strip_mount(Path::new(path_str), &mount_point), &evict_cb) {
+                (Some(remote), Some(cb)) => {
+                    cb(remote.clone());
+                    dirty_set.safe_lock().insert(remote);
                     "ok".to_string()
                 }
                 (None, _) => "error: path not under mount".to_string(),

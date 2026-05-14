@@ -713,6 +713,7 @@ pub struct NextCloudFs {
     fileids: ipc::FileIdMap,
     details: ipc::FileDetailMap,
     ipc_populated: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    deferred_readdir: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     conn: Arc<ConnInfo>,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     next_fh: Arc<Mutex<u64>>,
@@ -780,6 +781,7 @@ impl NextCloudFs {
             fileids,
             details,
             ipc_populated: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_readdir: Arc::new(Mutex::new(std::collections::HashSet::new())),
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
@@ -815,6 +817,21 @@ impl NextCloudFs {
         let dirty = self.dirty.clone();
         Arc::new(move |remote_path| {
             keep_locally_recursive(&conn, &net, &cache, &status, &dirty, remote_path);
+        })
+    }
+
+    pub fn evict_callback(&self) -> ipc::EvictCallback {
+        let cache = self.cache.clone();
+        let status = self.status.clone();
+        Arc::new(move |remote_path| {
+            let local = {
+                let mut c = cache.safe_lock();
+                c.file_cache.remove(&remote_path).map(|e| e.local_path)
+            };
+            if let Some(local_path) = local {
+                let _ = std::fs::remove_file(&local_path);
+            }
+            status.safe_lock().insert(remote_path, FileStatus::Remote);
         })
     }
 
@@ -867,6 +884,7 @@ impl Filesystem for NextCloudFs {
                     owner_id: entry.owner_id.clone(),
                     owner_display_name: entry.owner_display_name.clone(),
                     size: entry.size,
+                    is_dir: entry.is_dir,
                 });
                 if !entry.is_dir {
                     self.status.safe_lock().entry(target_path).or_insert(FileStatus::Remote);
@@ -1121,6 +1139,7 @@ impl Filesystem for NextCloudFs {
         let details = self.details.clone();
         let dirty = self.dirty.clone();
         let ipc_populated = self.ipc_populated.clone();
+        let deferred_readdir = self.deferred_readdir.clone();
         let conn = self.conn.clone();
 
         thread::spawn(move || {
@@ -1133,6 +1152,94 @@ impl Filesystem for NextCloudFs {
                     reply.ok();
                     return;
                 }
+            }
+
+            let should_defer = deferred_readdir.safe_lock().remove(&path);
+            let has_data = {
+                let c = cache.safe_lock();
+                c.dir_cache.contains_key(&path) || c.pending_dirs.contains_key(&path)
+            };
+            if should_defer && !has_data {
+                log::info!("READDIR_DEFERRED {} — returning empty, bg PROPFIND", path.display());
+                let conn2 = conn.clone();
+                let cache2 = cache.clone();
+                let path2 = path.clone();
+                let shared2 = shared.clone();
+                let fileids2 = fileids.clone();
+                let details2 = details.clone();
+                let status2 = status.clone();
+                let dirty2 = dirty.clone();
+                let ipc_populated2 = ipc_populated.clone();
+                thread::spawn(move || {
+                    match get_or_list_dir(&conn2, &cache2, path2.clone()) {
+                        Ok((entries, self_entry)) => {
+                            if !ipc_populated2.safe_lock().contains(&path2) {
+                                {
+                                    let mut c = cache2.safe_lock();
+                                    let mut sh = shared2.safe_lock();
+                                    let mut fi = fileids2.safe_lock();
+                                    let mut dt = details2.safe_lock();
+                                    let mut st = status2.safe_lock();
+                                    if let Some(ref se) = self_entry {
+                                        if se.is_shared { sh.insert(path2.clone()); }
+                                        if let Some(fid) = se.fileid { fi.insert(path2.clone(), fid); }
+                                        dt.insert(path2.clone(), ipc::FileDetail {
+                                            permissions: se.permissions.clone(),
+                                            owner_id: se.owner_id.clone(),
+                                            owner_display_name: se.owner_display_name.clone(),
+                                            size: se.size,
+                                            is_dir: se.is_dir,
+                                        });
+                                    }
+                                    for entry in entries.iter() {
+                                        let name = match entry.path.file_name().and_then(|n| n.to_str()) {
+                                            Some(n) => n,
+                                            None => continue,
+                                        };
+                                        let ep = path2.join(name);
+                                        c.allocate_inode(ep.clone());
+                                        if entry.is_shared { sh.insert(ep.clone()); }
+                                        if let Some(fid) = entry.fileid { fi.insert(ep.clone(), fid); }
+                                        dt.insert(ep.clone(), ipc::FileDetail {
+                                            permissions: entry.permissions.clone(),
+                                            owner_id: entry.owner_id.clone(),
+                                            owner_display_name: entry.owner_display_name.clone(),
+                                            size: entry.size,
+                                            is_dir: entry.is_dir,
+                                        });
+                                        if !entry.is_dir {
+                                            let rel = ep.strip_prefix("/").unwrap_or(&ep);
+                                            let local_path = c.cache_dir.join(rel);
+                                            if local_path.exists() {
+                                                st.insert(ep.clone(), FileStatus::Local);
+                                                c.file_cache.entry(ep).or_insert(FileCacheEntry {
+                                                    local_path,
+                                                    remote_modified: entry.modified,
+                                                });
+                                            } else {
+                                                st.entry(ep).or_insert(FileStatus::Remote);
+                                            }
+                                        }
+                                    }
+                                }
+                                {
+                                    let mut d = dirty2.safe_lock();
+                                    d.insert(path2.clone());
+                                    for entry in entries.iter() {
+                                        if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
+                                            d.insert(path2.join(name));
+                                        }
+                                    }
+                                }
+                                ipc_populated2.safe_lock().insert(path2.clone());
+                                log::info!("READDIR_DEFERRED {} completed: {} entries", path2.display(), entries.len());
+                            }
+                        }
+                        Err(e) => log::warn!("bg readdir {}: {}", path2.display(), e),
+                    }
+                });
+                reply.ok();
+                return;
             }
 
             match get_or_list_dir(&conn, &cache, path.clone()) {
@@ -1159,6 +1266,7 @@ impl Filesystem for NextCloudFs {
                                 owner_id: se.owner_id.clone(),
                                 owner_display_name: se.owner_display_name.clone(),
                                 size: se.size,
+                                is_dir: se.is_dir,
                             });
                         }
 
@@ -1180,9 +1288,20 @@ impl Filesystem for NextCloudFs {
                                 owner_id: entry.owner_id.clone(),
                                 owner_display_name: entry.owner_display_name.clone(),
                                 size: entry.size,
+                                is_dir: entry.is_dir,
                             });
                             if !entry.is_dir {
-                                st.entry(entry_path.clone()).or_insert(FileStatus::Remote);
+                                let rel = entry_path.strip_prefix("/").unwrap_or(&entry_path);
+                                let local_path = c.cache_dir.join(rel);
+                                if local_path.exists() {
+                                    st.insert(entry_path.clone(), FileStatus::Local);
+                                    c.file_cache.entry(entry_path.clone()).or_insert(FileCacheEntry {
+                                        local_path,
+                                        remote_modified: entry.modified,
+                                    });
+                                } else {
+                                    st.entry(entry_path.clone()).or_insert(FileStatus::Remote);
+                                }
                                 thumb_candidates.push((entry_path, entry.modified, entry.has_preview, entry.fileid));
                             }
                         }
@@ -1214,6 +1333,18 @@ impl Filesystem for NextCloudFs {
                             break;
                         }
                     }
+
+                    if offset == 0 {
+                        let mut dr = deferred_readdir.safe_lock();
+                        for entry in entries.iter() {
+                            if entry.is_dir {
+                                if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
+                                    dr.insert(path.join(name));
+                                }
+                            }
+                        }
+                    }
+
                     reply.ok();
 
                     if offset == 0 && !thumb_candidates.is_empty() {
@@ -1282,10 +1413,11 @@ fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Resu
 pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
     let filesystem = NextCloudFs::new(options.clone())?;
     let keep_cb = filesystem.keep_callback();
+    let evict_cb = filesystem.evict_callback();
     let prefetch_cb = filesystem.prefetch_callback();
     let base_url = notifications::base_url(&options.url);
     let username = options.username.clone().unwrap_or_default();
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, base_url, Some(keep_cb), Some(prefetch_cb));
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb));
 
     let fuse_options = vec![
         MountOption::RO,
