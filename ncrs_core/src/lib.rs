@@ -1,6 +1,7 @@
 pub mod config;
 pub mod ipc;
 pub mod notifications;
+pub mod notify_push;
 pub mod preview;
 pub mod propfind;
 pub mod search;
@@ -251,7 +252,7 @@ fn open_file_timeout(
 
 // ── Cache layer ───────────────────────────────────────────────────────────────
 
-struct FsCache {
+pub(crate) struct FsCache {
     inodes: HashMap<u64, PathBuf>,
     paths: HashMap<PathBuf, u64>,
     next_inode: u64,
@@ -979,6 +980,10 @@ impl NextCloudFs {
         self.conn.http.clone()
     }
 
+    pub(crate) fn cache_ref(&self) -> Arc<Mutex<FsCache>> {
+        self.cache.clone()
+    }
+
     pub fn keep_callback(&self) -> ipc::KeepCallback {
         let conn = self.conn.clone();
         let net = self.net.clone();
@@ -1673,6 +1678,18 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
                 }
             }
         });
+    }
+
+    if !options.offline {
+        notify_push::start(
+            filesystem.conn_http(),
+            notifications::base_url(&options.url),
+            options.username.clone().unwrap_or_default(),
+            options.password.clone().unwrap_or_default(),
+            filesystem.cache_ref(),
+            filesystem.dirty_set(),
+            offline_flag,
+        );
     }
 
     let fuse_options = vec![
