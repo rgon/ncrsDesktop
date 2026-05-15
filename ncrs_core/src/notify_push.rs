@@ -121,8 +121,11 @@ fn run_loop(
                 url
             }
             Err(e) => {
-                log::warn!("notify_push: {}", e);
-                return;
+                log::warn!("notify_push: discovery failed: {}", e);
+                log::info!("notify_push: retrying in {:?}", reconnect_delay);
+                std::thread::sleep(reconnect_delay);
+                reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+                continue;
             }
         };
 
