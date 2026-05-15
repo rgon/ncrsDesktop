@@ -135,7 +135,6 @@ struct FileCacheEntry {
 struct StreamState {
     data: Vec<u8>,
     done: bool,
-    cancelled: bool,
 }
 
 struct ReadAheadBuf {
@@ -973,7 +972,7 @@ impl NextCloudFs {
             http,
             http_read,
             throttle: Arc::new(Throttle::new(max_req)),
-            read_throttle: Arc::new(Throttle::new(max_req)),
+            read_throttle: Arc::new(Throttle::new(3)),
             is_offline,
             optimistic_listing: options.optimistic_listing,
             notify_push_connected: Arc::new(AtomicBool::new(false)),
@@ -1302,14 +1301,11 @@ impl Filesystem for NextCloudFs {
                                     return;
                                 }
                                 if guard.done {
-                                    if guard.cancelled {
-                                        reply.error(EIO);
-                                        return;
-                                    }
                                     let end = start + guard.data.len() as u64;
                                     if off < end {
                                         let s = (off - start) as usize;
-                                        reply.data(&guard.data[s..]);
+                                        let e = std::cmp::min(s + sz, guard.data.len());
+                                        reply.data(&guard.data[s..e]);
                                     } else {
                                         reply.data(&[]);
                                     }
@@ -1372,19 +1368,10 @@ impl Filesystem for NextCloudFs {
                         Ok(first) => {
                             reply.data(&first);
                             let shared = Arc::new((
-                                Mutex::new(StreamState { data: first, done: false, cancelled: false }),
+                                Mutex::new(StreamState { data: first, done: false }),
                                 Condvar::new(),
                             ));
-                            // Cancel any previous download for this fh
                             open_files.safe_lock().entry(fh).and_modify(|of| {
-                                if let Some(ref old) = of.buf {
-                                    let (ref old_mtx, ref old_cv) = *old.stream;
-                                    let mut old_ss = old_mtx.lock().unwrap();
-                                    old_ss.cancelled = true;
-                                    old_ss.done = true;
-                                    drop(old_ss);
-                                    old_cv.notify_all();
-                                }
                                 of.buf = Some(ReadAheadBuf {
                                     start: off,
                                     stream: Arc::clone(&shared),
@@ -1393,16 +1380,23 @@ impl Filesystem for NextCloudFs {
                             });
                             let (ref mtx, ref cv) = *shared;
                             let mut chunk = [0u8; 256 * 1024];
+                            let mut since_check = 0usize;
                             loop {
                                 use std::io::Read;
                                 match resp.read(&mut chunk) {
                                     Ok(0) => break,
                                     Ok(n) => {
-                                        let mut ss = mtx.lock().unwrap();
-                                        if ss.cancelled { break; }
-                                        ss.data.extend_from_slice(&chunk[..n]);
-                                        drop(ss);
+                                        mtx.lock().unwrap().data.extend_from_slice(&chunk[..n]);
                                         cv.notify_all();
+                                        since_check += n;
+                                        if since_check >= 2 * 1024 * 1024 {
+                                            since_check = 0;
+                                            let superseded = open_files.safe_lock()
+                                                .get(&fh)
+                                                .and_then(|of| of.buf.as_ref())
+                                                .map_or(true, |b| !Arc::ptr_eq(&b.stream, &shared));
+                                            if superseded { break; }
+                                        }
                                     }
                                     Err(_) => break,
                                 }
