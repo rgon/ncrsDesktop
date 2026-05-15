@@ -4,7 +4,7 @@
     import { invoke } from "@tauri-apps/api/core";
     import { onMount } from "svelte";
     import Icon from './Icon.svelte';
-    import { mdiMagnify, mdiClose, mdiArrowLeft } from '@mdi/js';
+    import { mdiMagnify, mdiClose, mdiArrowLeft, mdiOpenInNew } from '@mdi/js';
 
     // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -15,6 +15,7 @@
         thumbnail_url: string;
         icon: string;
         rounded: boolean;
+        local_path: string | null;
     }
 
     interface SearchResultGroup {
@@ -123,7 +124,16 @@
         searched = true;
     }
 
-    async function openResult(url: string) {
+    async function openResult(entry: SearchEntry) {
+        if (entry.local_path) {
+            await invoke("reveal_in_file_manager", { path: entry.local_path });
+        } else if (entry.resource_url) {
+            await invoke("open_link", { url: entry.resource_url });
+        }
+    }
+
+    async function viewOnline(e: MouseEvent, url: string) {
+        e.stopPropagation();
         if (url) await invoke("open_link", { url });
     }
 
@@ -202,8 +212,8 @@
                     </h3>
                     {#each group.entries as entry}
                     <button
-                        class="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-base-200 text-left cursor-pointer transition-colors"
-                        onclick={() => openResult(entry.resource_url)}
+                        class="group w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-base-200 text-left cursor-pointer transition-colors"
+                        onclick={() => openResult(entry)}
                     >
                         {#if entry.icon}
                         <img
@@ -219,6 +229,15 @@
                             <p class="text-xs text-gray-400 truncate">{entry.subline}</p>
                             {/if}
                         </div>
+                        {#if entry.resource_url}
+                        <button
+                            class="btn btn-ghost btn-xs btn-square opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
+                            onclick={(e) => viewOnline(e, entry.resource_url)}
+                            title="View in Nextcloud Web"
+                        >
+                            <Icon class="w-3.5 h-3.5" path={mdiOpenInNew} />
+                        </button>
+                        {/if}
                     </button>
                     {/each}
                 </div>

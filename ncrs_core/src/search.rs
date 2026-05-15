@@ -31,6 +31,8 @@ pub struct SearchEntry {
     pub icon: String,
     #[serde(default)]
     pub rounded: bool,
+    #[serde(default, skip_deserializing)]
+    pub local_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

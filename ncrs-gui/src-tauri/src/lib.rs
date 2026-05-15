@@ -121,6 +121,11 @@ fn open_link(url: String, app: AppHandle) {
 }
 
 #[tauri::command]
+fn reveal_in_file_manager(path: String, app: AppHandle) {
+    app.opener().reveal_item_in_dir(&path).ok();
+}
+
+#[tauri::command]
 async fn fetch_search_providers(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<SearchProvider>, String> {
@@ -158,12 +163,59 @@ async fn search_nextcloud(
     let user = opts.username.unwrap_or_default();
     let pass = opts.password.unwrap_or_default();
     let http3 = opts.http3;
+    let mount_point = opts.mount_point.clone();
 
-    tokio::task::spawn_blocking(move || {
+    let mut groups = tokio::task::spawn_blocking(move || {
         ncrs_core::search::search_filtered(&base, &user, &pass, &term, http3, &provider_ids)
     })
     .await
-    .map_err(|e| format!("search task failed: {}", e))?
+    .map_err(|e| format!("search task failed: {}", e))??;
+
+    for group in &mut groups {
+        if group.provider_id == "files" {
+            for entry in &mut group.entries {
+                if let Some(dir) = extract_dir_param(&entry.resource_url) {
+                    let file_path = if dir == "/" {
+                        format!("/{}", entry.title)
+                    } else {
+                        format!("{}/{}", dir, entry.title)
+                    };
+                    let rel = file_path.strip_prefix('/').unwrap_or(&file_path);
+                    entry.local_path = Some(mount_point.join(rel).to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
+    Ok(groups)
+}
+
+fn extract_dir_param(url: &str) -> Option<String> {
+    let query = url.split('?').nth(1)?;
+    for pair in query.split('&') {
+        if let Some(val) = pair.strip_prefix("dir=") {
+            let decoded = val.replace("+", " ");
+            let mut out = Vec::new();
+            let bytes = decoded.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' && i + 2 < bytes.len() {
+                    if let Ok(byte) = u8::from_str_radix(
+                        std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                        16,
+                    ) {
+                        out.push(byte);
+                        i += 3;
+                        continue;
+                    }
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            return Some(String::from_utf8_lossy(&out).into_owned());
+        }
+    }
+    None
 }
 
 // ── Tray helpers ──────────────────────────────────────────────────────────────
@@ -238,6 +290,7 @@ pub fn run() {
             get_notifications,
             dismiss_notification,
             open_link,
+            reveal_in_file_manager,
             fetch_search_providers,
             search_nextcloud,
         ])
