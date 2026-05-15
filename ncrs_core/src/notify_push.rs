@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tungstenite::{connect, Message};
 
@@ -70,10 +70,9 @@ fn discover_ws_url(
 
 fn invalidate_all_dirs(cache: &Mutex<crate::FsCache>, dirty: &DirtySet) {
     let mut c = cache.safe_lock();
-    let expired = Instant::now() - crate::DIR_CACHE_TTL - Duration::from_secs(1);
     let mut paths = Vec::new();
     for (path, entry) in c.dir_cache.iter_mut() {
-        entry.at = expired;
+        entry.invalidated = true;
         entry.refreshing = false;
         paths.push(path.clone());
     }
@@ -92,9 +91,10 @@ pub(crate) fn start(
     cache: Arc<Mutex<crate::FsCache>>,
     dirty: DirtySet,
     is_offline: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        run_loop(&client, &base_url, &username, &password, &cache, &dirty, &is_offline);
+        run_loop(&client, &base_url, &username, &password, &cache, &dirty, &is_offline, &connected);
     });
 }
 
@@ -106,10 +106,13 @@ fn run_loop(
     cache: &Arc<Mutex<crate::FsCache>>,
     dirty: &DirtySet,
     is_offline: &Arc<AtomicBool>,
+    connected: &AtomicBool,
 ) {
     let mut reconnect_delay = Duration::from_secs(1);
 
     loop {
+        connected.store(false, Ordering::Relaxed);
+
         if is_offline.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(5));
             continue;
@@ -129,7 +132,7 @@ fn run_loop(
             }
         };
 
-        match connect_and_listen(&ws_url, username, password, cache, dirty) {
+        match connect_and_listen(&ws_url, username, password, cache, dirty, connected) {
             Ok(()) => {
                 log::info!("notify_push: connection closed cleanly");
                 reconnect_delay = Duration::from_secs(1);
@@ -151,6 +154,7 @@ fn connect_and_listen(
     password: &str,
     cache: &Arc<Mutex<crate::FsCache>>,
     dirty: &DirtySet,
+    connected: &AtomicBool,
 ) -> Result<(), String> {
     let (mut socket, _response) = connect(ws_url).map_err(|e| format!("WebSocket connect: {}", e))?;
 
@@ -168,6 +172,7 @@ fn connect_and_listen(
     match &auth_msg {
         Message::Text(t) if *t == "authenticated" => {
             log::info!("notify_push: authenticated successfully");
+            connected.store(true, Ordering::Relaxed);
         }
         Message::Text(t) if t.starts_with("err:") => {
             return Err(format!("auth failed: {}", t));
@@ -203,6 +208,11 @@ fn handle_event(event: &str, cache: &Arc<Mutex<crate::FsCache>>, dirty: &DirtySe
         }
         "notify_notification" => {
             log::info!("notify_push: notification event");
+            std::thread::spawn(|| {
+                let _ = std::process::Command::new("notify-send")
+                    .args(["--app-name=ncrs", "--icon=nextcloud", "Nextcloud", "You have a new notification"])
+                    .output();
+            });
         }
         "notify_activity" => {
             log::debug!("notify_push: activity event");

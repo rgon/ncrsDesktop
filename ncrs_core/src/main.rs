@@ -15,6 +15,10 @@ struct Cli {
     /// Override mount point from config
     #[arg(long, value_name = "PATH")]
     mount_point: Option<PathBuf>,
+
+    /// Disable optimistic directory listing (re-list every 10s instead of relying on notify_push)
+    #[arg(long)]
+    no_optimistic_listing: bool,
 }
 
 fn main() {
@@ -51,6 +55,9 @@ fn main() {
     }
     if cli.offline {
         opts.offline = true;
+    }
+    if cli.no_optimistic_listing {
+        opts.optimistic_listing = false;
     }
 
     if let Err(e) = ncrs_core::mount_ncfs(opts) {

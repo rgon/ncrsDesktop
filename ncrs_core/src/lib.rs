@@ -44,7 +44,20 @@ impl<T> MutexExt<T> for Mutex<T> {
 
 const TTL: Duration = Duration::from_secs(1);
 const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
+const OPTIMISTIC_TTL_CONNECTED: Duration = Duration::from_secs(86400);
+const OPTIMISTIC_TTL_FALLBACK: Duration = Duration::from_secs(300);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn effective_dir_ttl(optimistic_listing: bool, notify_push_connected: &AtomicBool) -> Duration {
+    if !optimistic_listing {
+        return DIR_CACHE_TTL;
+    }
+    if notify_push_connected.load(Ordering::Relaxed) {
+        OPTIMISTIC_TTL_CONNECTED
+    } else {
+        OPTIMISTIC_TTL_FALLBACK
+    }
+}
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const READ_AHEAD: usize = 8 * 1024 * 1024; // 8 MB
 const MAX_POOL_IDLE: usize = 8;
@@ -102,6 +115,7 @@ struct DirCacheEntry {
     etag: Option<String>,
     at: Instant,
     refreshing: bool,
+    invalidated: bool,
 }
 
 struct PendingDir {
@@ -147,7 +161,11 @@ pub struct MountOptions {
     pub max_concurrent_requests: usize,
     #[serde(default)]
     pub offline: bool,
+    #[serde(default = "default_true")]
+    pub optimistic_listing: bool,
 }
+
+fn default_true() -> bool { true }
 
 fn default_max_concurrent() -> usize { 10 }
 
@@ -286,12 +304,13 @@ impl FsCache {
         ino
     }
 
-    fn get_cached_dir(&mut self, path: &Path) -> Option<(Arc<Vec<DavEntry>>, bool)> {
+    fn get_cached_dir(&mut self, path: &Path, ttl: Duration) -> Option<(Arc<Vec<DavEntry>>, bool)> {
         let entry = self.dir_cache.get_mut(path)?;
-        let stale = entry.at.elapsed() >= DIR_CACHE_TTL;
+        let stale = entry.at.elapsed() >= ttl || entry.invalidated;
         let needs_refresh = stale && !entry.refreshing;
         if needs_refresh {
             entry.refreshing = true;
+            entry.invalidated = false;
         }
         Some((Arc::clone(&entry.files), needs_refresh))
     }
@@ -305,13 +324,14 @@ impl FsCache {
     }
 
     fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, self_entry: Option<DavEntry>, files: Vec<DavEntry>) {
-        self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), refreshing: false });
+        self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), refreshing: false, invalidated: false });
     }
 
     fn touch_dir_cache(&mut self, path: &Path) {
         if let Some(entry) = self.dir_cache.get_mut(path) {
             entry.at = Instant::now();
             entry.refreshing = false;
+            entry.invalidated = false;
         }
     }
 
@@ -489,6 +509,7 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
             etag: v.etag,
             at: Instant::now(),
             refreshing: false,
+            invalidated: true,
         });
         count += 1;
     }
@@ -510,9 +531,10 @@ fn get_or_list_dir(
         return Err(format!("{} not available offline", path.display()));
     }
     let t0 = Instant::now();
+    let ttl = effective_dir_ttl(conn.optimistic_listing, &conn.notify_push_connected);
     {
         let mut c = cache.safe_lock();
-        if let Some((files, needs_refresh)) = c.get_cached_dir(&path) {
+        if let Some((files, needs_refresh)) = c.get_cached_dir(&path, ttl) {
             let self_entry = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
             log::info!("LIST_CACHED {} ({} entries, refresh={}) in {:?}", path.display(), files.len(), needs_refresh, t0.elapsed());
             if needs_refresh {
@@ -562,7 +584,7 @@ fn get_or_list_dir(
     let already_pending = {
         let mut c = cache.safe_lock();
         if c.dir_cache.contains_key(&path) {
-            if let Some((files, _)) = c.get_cached_dir(&path) {
+            if let Some((files, _)) = c.get_cached_dir(&path, ttl) {
                 let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
                 return Ok((files, se));
             }
@@ -614,7 +636,7 @@ fn get_or_list_dir(
             if c.dir_cache.contains_key(&path) {
                 let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
                 log::info!("LIST_PROMOTED {} in {:?}", path.display(), t0.elapsed());
-                return c.get_cached_dir(&path)
+                return c.get_cached_dir(&path, ttl)
                     .map(|(f, _)| (f, se))
                     .ok_or_else(|| format!("PROPFIND returned empty for {}", path.display()));
             }
@@ -642,7 +664,7 @@ fn get_or_list_dir(
     };
     if should_promote {
         let se = c.promote_pending(&path);
-        if let Some((files, _)) = c.get_cached_dir(&path) {
+        if let Some((files, _)) = c.get_cached_dir(&path, ttl) {
             return Ok((files, se));
         }
     } else {
@@ -774,8 +796,8 @@ fn keep_locally_recursive(
 
 fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
     {
-        let mut c = cache.safe_lock();
-        if c.get_cached_dir(path).is_some() || c.pending_dirs.contains_key(path) {
+        let c = cache.safe_lock();
+        if c.get_cached_dir_readonly(path).is_some() || c.pending_dirs.contains_key(path) {
             return;
         }
     }
@@ -861,6 +883,8 @@ struct ConnInfo {
     password: String,
     mount_point: PathBuf,
     http: reqwest::blocking::Client,
+    optimistic_listing: bool,
+    notify_push_connected: Arc<AtomicBool>,
     http_read: reqwest::blocking::Client,
     throttle: Arc<Throttle>,
     is_offline: Arc<AtomicBool>,
@@ -940,6 +964,8 @@ impl NextCloudFs {
             http_read,
             throttle: Arc::new(Throttle::new(max_req)),
             is_offline,
+            optimistic_listing: options.optimistic_listing,
+            notify_push_connected: Arc::new(AtomicBool::new(false)),
         });
 
         Ok(NextCloudFs {
@@ -999,6 +1025,10 @@ impl NextCloudFs {
 
     pub fn is_offline_flag(&self) -> Arc<AtomicBool> {
         self.conn.is_offline.clone()
+    }
+
+    pub fn notify_push_connected_flag(&self) -> Arc<AtomicBool> {
+        self.conn.notify_push_connected.clone()
     }
 
     pub fn conn_http(&self) -> reqwest::blocking::Client {
@@ -1063,8 +1093,8 @@ impl Filesystem for NextCloudFs {
         }
 
         let mut c = self.cache.safe_lock();
-        let entries = match c.get_cached_dir(&parent_path) {
-            Some((files, _)) => files,
+        let entries = match c.get_cached_dir_readonly(&parent_path) {
+            Some(files) => files,
             None => {
                 reply.error(ENOENT);
                 return;
@@ -1519,9 +1549,9 @@ impl Filesystem for NextCloudFs {
 
                                 if aggressive_prefetch {
                                     let mut child_thumbs: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
-                                    let mut c = cache_pf.safe_lock();
+                                    let c = cache_pf.safe_lock();
                                     for dir in &child_dirs {
-                                        if let Some((entries, _)) = c.get_cached_dir(dir) {
+                                        if let Some(entries) = c.get_cached_dir_readonly(dir) {
                                             for entry in entries.iter() {
                                                 if !entry.is_dir && entry.has_preview {
                                                     if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
@@ -2145,6 +2175,7 @@ pub fn mount_ncfs(options: MountOptions) -> Result<(), String> {
             filesystem.cache_ref(),
             filesystem.dirty_set(),
             offline_flag,
+            filesystem.notify_push_connected_flag(),
         );
     }
 
@@ -2236,6 +2267,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let aggressive_prefetch = doc["aggressive_prefetch"].as_bool().unwrap_or(false);
     let http3 = doc["http3"].as_bool().unwrap_or(false);
     let max_concurrent_requests = doc["max_concurrent_requests"].as_i64().unwrap_or(10) as usize;
+    let optimistic_listing = doc["optimistic_listing"].as_bool().unwrap_or(true);
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing })
 }
