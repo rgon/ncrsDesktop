@@ -135,6 +135,7 @@ struct FileCacheEntry {
 struct StreamState {
     data: Vec<u8>,
     done: bool,
+    cancelled: bool,
 }
 
 struct ReadAheadBuf {
@@ -1301,7 +1302,10 @@ impl Filesystem for NextCloudFs {
                                     return;
                                 }
                                 if guard.done {
-                                    // Download finished but didn't reach our offset — partial read
+                                    if guard.cancelled {
+                                        reply.error(EIO);
+                                        return;
+                                    }
                                     let end = start + guard.data.len() as u64;
                                     if off < end {
                                         let s = (off - start) as usize;
@@ -1368,10 +1372,19 @@ impl Filesystem for NextCloudFs {
                         Ok(first) => {
                             reply.data(&first);
                             let shared = Arc::new((
-                                Mutex::new(StreamState { data: first, done: false }),
+                                Mutex::new(StreamState { data: first, done: false, cancelled: false }),
                                 Condvar::new(),
                             ));
+                            // Cancel any previous download for this fh
                             open_files.safe_lock().entry(fh).and_modify(|of| {
+                                if let Some(ref old) = of.buf {
+                                    let (ref old_mtx, ref old_cv) = *old.stream;
+                                    let mut old_ss = old_mtx.lock().unwrap();
+                                    old_ss.cancelled = true;
+                                    old_ss.done = true;
+                                    drop(old_ss);
+                                    old_cv.notify_all();
+                                }
                                 of.buf = Some(ReadAheadBuf {
                                     start: off,
                                     stream: Arc::clone(&shared),
@@ -1385,7 +1398,10 @@ impl Filesystem for NextCloudFs {
                                 match resp.read(&mut chunk) {
                                     Ok(0) => break,
                                     Ok(n) => {
-                                        mtx.lock().unwrap().data.extend_from_slice(&chunk[..n]);
+                                        let mut ss = mtx.lock().unwrap();
+                                        if ss.cancelled { break; }
+                                        ss.data.extend_from_slice(&chunk[..n]);
+                                        drop(ss);
                                         cv.notify_all();
                                     }
                                     Err(_) => break,
