@@ -1408,6 +1408,29 @@ impl Filesystem for NextCloudFs {
                 }
             }
 
+            // Continuation pages (offset > 0): serve directly from cache, skip all heavy work.
+            if offset > 0 {
+                let skip = (offset - 2) as usize;
+                let c = cache.safe_lock();
+                if let Some(entries) = c.get_cached_dir_readonly(&path) {
+                    for (i, entry) in entries.iter().enumerate().skip(skip) {
+                        let name = match entry.path.file_name().and_then(|n| n.to_str()) {
+                            Some(n) => n,
+                            None => continue,
+                        };
+                        let entry_path = path.join(name);
+                        let entry_ino = c.get_inode(&entry_path).unwrap_or(1);
+                        let kind =
+                            if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
+                        if reply.add(entry_ino, (i + 3) as i64, kind, name) {
+                            break;
+                        }
+                    }
+                }
+                reply.ok();
+                return;
+            }
+
             deferred_readdir.safe_lock().remove(&path);
 
             let t_readdir = Instant::now();
@@ -1489,10 +1512,9 @@ impl Filesystem for NextCloudFs {
                         log::info!("READDIR {} populated IPC maps: {} entries, self_entry={}", path.display(), entries.len(), self_entry.is_some());
                     }
 
-                    let skip = if offset > 2 { (offset - 2) as usize } else { 0 };
                     {
                         let c = cache.safe_lock();
-                        for (i, entry) in entries.iter().enumerate().skip(skip) {
+                        for (i, entry) in entries.iter().enumerate() {
                             let name = match entry.path.file_name().and_then(|n| n.to_str()) {
                                 Some(n) => n,
                                 None => continue,
@@ -1507,7 +1529,7 @@ impl Filesystem for NextCloudFs {
                         }
                     }
 
-                    if offset == 0 {
+                    {
                         let mut dr = deferred_readdir.safe_lock();
                         for entry in entries.iter() {
                             if entry.is_dir {
