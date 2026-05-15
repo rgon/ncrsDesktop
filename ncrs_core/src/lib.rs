@@ -132,9 +132,14 @@ struct FileCacheEntry {
     remote_modified: Option<SystemTime>,
 }
 
+struct StreamState {
+    data: Vec<u8>,
+    done: bool,
+}
+
 struct ReadAheadBuf {
     start: u64,
-    buf: Arc<(Mutex<Vec<u8>>, Condvar)>,
+    stream: Arc<(Mutex<StreamState>, Condvar)>,
     target_len: u64,
 }
 
@@ -1269,30 +1274,41 @@ impl Filesystem for NextCloudFs {
                     }
                 }
                 if let Some(ref ra) = of.buf {
-                    let (ref mtx, ref _cv) = *ra.buf;
-                    let data = mtx.lock().unwrap();
-                    let available = ra.start + data.len() as u64;
+                    let (ref mtx, ref _cv) = *ra.stream;
+                    let ss = mtx.lock().unwrap();
+                    let available = ra.start + ss.data.len() as u64;
                     if off >= ra.start && off + sz as u64 <= available {
                         let s = (off - ra.start) as usize;
-                        reply.data(&data[s..s + sz]);
-                        drop(data);
+                        reply.data(&ss.data[s..s + sz]);
+                        drop(ss);
                         drop(files);
                         return;
                     }
                     // Data within target range but not yet downloaded — wait in thread
-                    if off >= ra.start && off + sz as u64 <= ra.start + ra.target_len {
-                        let shared = Arc::clone(&ra.buf);
+                    if off >= ra.start && off + sz as u64 <= ra.start + ra.target_len && !ss.done {
+                        let shared = Arc::clone(&ra.stream);
                         let start = ra.start;
-                        drop(data);
+                        drop(ss);
                         drop(files);
                         thread::spawn(move || {
                             let (ref mtx, ref cv) = *shared;
                             let mut guard = mtx.lock().unwrap();
-                            let deadline = Instant::now() + DOWNLOAD_TIMEOUT;
+                            let deadline = Instant::now() + Duration::from_secs(30);
                             loop {
-                                if start + guard.len() as u64 >= off + sz as u64 {
+                                if start + guard.data.len() as u64 >= off + sz as u64 {
                                     let s = (off - start) as usize;
-                                    reply.data(&guard[s..s + sz]);
+                                    reply.data(&guard.data[s..s + sz]);
+                                    return;
+                                }
+                                if guard.done {
+                                    // Download finished but didn't reach our offset — partial read
+                                    let end = start + guard.data.len() as u64;
+                                    if off < end {
+                                        let s = (off - start) as usize;
+                                        reply.data(&guard.data[s..]);
+                                    } else {
+                                        reply.data(&[]);
+                                    }
                                     return;
                                 }
                                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1303,7 +1319,7 @@ impl Filesystem for NextCloudFs {
                                 }
                                 let (g, result) = cv.wait_timeout(guard, remaining).unwrap();
                                 guard = g;
-                                if result.timed_out() {
+                                if result.timed_out() && !guard.done {
                                     log::warn!("read wait timeout at offset {}", off);
                                     reply.error(EIO);
                                     return;
@@ -1312,7 +1328,7 @@ impl Filesystem for NextCloudFs {
                         });
                         return;
                     }
-                    drop(data);
+                    drop(ss);
                 }
             }
         }
@@ -1351,11 +1367,14 @@ impl Filesystem for NextCloudFs {
                     match read_exact_from_stream(&mut resp, sz) {
                         Ok(first) => {
                             reply.data(&first);
-                            let shared = Arc::new((Mutex::new(first), Condvar::new()));
+                            let shared = Arc::new((
+                                Mutex::new(StreamState { data: first, done: false }),
+                                Condvar::new(),
+                            ));
                             open_files.safe_lock().entry(fh).and_modify(|of| {
                                 of.buf = Some(ReadAheadBuf {
                                     start: off,
-                                    buf: Arc::clone(&shared),
+                                    stream: Arc::clone(&shared),
                                     target_len: fetch as u64,
                                 });
                             });
@@ -1366,13 +1385,17 @@ impl Filesystem for NextCloudFs {
                                 match resp.read(&mut chunk) {
                                     Ok(0) => break,
                                     Ok(n) => {
-                                        mtx.lock().unwrap().extend_from_slice(&chunk[..n]);
+                                        mtx.lock().unwrap().data.extend_from_slice(&chunk[..n]);
                                         cv.notify_all();
                                     }
                                     Err(_) => break,
                                 }
                             }
-                            let total_bytes = mtx.lock().unwrap().len();
+                            let mut ss = mtx.lock().unwrap();
+                            ss.done = true;
+                            let total_bytes = ss.data.len();
+                            drop(ss);
+                            cv.notify_all();
                             let total_ms = t0.elapsed().as_millis();
                             if total_ms > 0 {
                                 let mbps = total_bytes as f64 / 1_048_576.0 / (total_ms as f64 / 1000.0);
