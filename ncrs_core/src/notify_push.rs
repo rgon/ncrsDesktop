@@ -68,18 +68,11 @@ fn discover_ws_url(
         .ok_or_else(|| "notify_push capability not found (app not installed?)".into())
 }
 
-fn invalidate_all_dirs(cache: &Mutex<crate::FsCache>, dirty: &DirtySet) {
+fn invalidate_all_dirs(cache: &Mutex<crate::FsCache>, _dirty: &DirtySet) {
     let mut c = cache.safe_lock();
-    let mut paths = Vec::new();
-    for (path, entry) in c.dir_cache.iter_mut() {
+    for (_path, entry) in c.dir_cache.iter_mut() {
         entry.invalidated = true;
         entry.refreshing = false;
-        paths.push(path.clone());
-    }
-    drop(c);
-    let mut d = dirty.safe_lock();
-    for p in paths {
-        d.insert(p);
     }
 }
 
