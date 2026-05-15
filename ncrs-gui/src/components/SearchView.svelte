@@ -35,17 +35,21 @@
     let loading = $state(false);
     let searched = $state(false);
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    let searchGen = 0;
 
     // ── Handlers ──────────────────────────────────────────────────────────────
 
     function handleInput() {
         if (debounceTimer) clearTimeout(debounceTimer);
-        if (query.length < 2) {
+        if (query.length < 3) {
             results = [];
             searched = false;
+            loading = false;
             return;
         }
-        debounceTimer = setTimeout(doSearch, 350);
+        searchGen++;
+        loading = true;
+        debounceTimer = setTimeout(doSearch, 500);
     }
 
     function handleKeydown(e: KeyboardEvent) {
@@ -54,6 +58,8 @@
                 query = "";
                 results = [];
                 searched = false;
+                loading = false;
+                searchGen++;
             } else {
                 onclose?.();
             }
@@ -61,11 +67,14 @@
     }
 
     async function doSearch() {
-        if (query.length < 2) return;
-        loading = true;
+        if (query.length < 3) return;
+        const gen = searchGen;
         try {
-            results = await invoke<SearchResultGroup[]>("search_nextcloud", { term: query });
+            const r = await invoke<SearchResultGroup[]>("search_nextcloud", { term: query });
+            if (gen !== searchGen) return;
+            results = r;
         } catch (e) {
+            if (gen !== searchGen) return;
             console.error("search failed:", e);
             results = [];
         }
@@ -81,6 +90,8 @@
         query = "";
         results = [];
         searched = false;
+        loading = false;
+        searchGen++;
     }
 </script>
 
@@ -116,13 +127,18 @@
 
     <!-- Results area -->
     <div class="overflow-y-auto flex-1 p-2">
-        {#if loading}
+        {#if loading && results.length === 0}
             <div class="flex justify-center p-6">
                 <span class="loading loading-spinner loading-sm text-gray-400"></span>
             </div>
-        {:else if searched && results.length === 0}
+        {:else if searched && !loading && results.length === 0}
             <p class="text-center text-gray-400 text-sm p-6">No results for "{query}"</p>
         {:else}
+            {#if loading}
+                <div class="flex justify-center py-1">
+                    <span class="loading loading-spinner loading-xs text-gray-400"></span>
+                </div>
+            {/if}
             {#each results as group (group.provider_id)}
                 <div class="mb-2">
                     <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wide px-2 pt-2 pb-1">

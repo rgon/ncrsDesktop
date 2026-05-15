@@ -121,8 +121,8 @@ fn open_link(url: String, app: AppHandle) {
 }
 
 #[tauri::command]
-fn search_nextcloud(
-    state: State<Arc<AppState>>,
+async fn search_nextcloud(
+    state: State<'_, Arc<AppState>>,
     term: String,
 ) -> Result<Vec<SearchResultGroup>, String> {
     let opts = state
@@ -136,12 +136,11 @@ fn search_nextcloud(
     let pass = opts.password.unwrap_or_default();
     let http3 = opts.http3;
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(ncrs_core::search::search_all(&base, &user, &pass, &term, http3));
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(30))
-        .unwrap_or_else(|_| Err("search timeout".to_string()))
+    tokio::task::spawn_blocking(move || {
+        ncrs_core::search::search_all(&base, &user, &pass, &term, http3)
+    })
+    .await
+    .map_err(|e| format!("search task failed: {}", e))?
 }
 
 // ── Tray helpers ──────────────────────────────────────────────────────────────
