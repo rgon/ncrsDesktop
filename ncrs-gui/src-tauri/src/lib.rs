@@ -13,7 +13,7 @@ use tauri::async_runtime::spawn;
 use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration};
 
-use ncrs_core::{mount_ncfs, notifications::NcNotification, search::SearchResultGroup, MountOptions, SyncState};
+use ncrs_core::{mount_ncfs, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, MountOptions, SyncState};
 
 // ── Shared app state ─────────────────────────────────────────────────────────
 
@@ -121,9 +121,32 @@ fn open_link(url: String, app: AppHandle) {
 }
 
 #[tauri::command]
+async fn fetch_search_providers(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<SearchProvider>, String> {
+    let opts = state
+        .mount_options
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "not connected".to_string())?;
+    let base = ncrs_core::notifications::base_url(&opts.url);
+    let user = opts.username.unwrap_or_default();
+    let pass = opts.password.unwrap_or_default();
+    let http3 = opts.http3;
+
+    tokio::task::spawn_blocking(move || {
+        ncrs_core::search::fetch_providers(&base, &user, &pass, http3)
+    })
+    .await
+    .map_err(|e| format!("fetch providers failed: {}", e))?
+}
+
+#[tauri::command]
 async fn search_nextcloud(
     state: State<'_, Arc<AppState>>,
     term: String,
+    provider_ids: Vec<String>,
 ) -> Result<Vec<SearchResultGroup>, String> {
     let opts = state
         .mount_options
@@ -137,7 +160,7 @@ async fn search_nextcloud(
     let http3 = opts.http3;
 
     tokio::task::spawn_blocking(move || {
-        ncrs_core::search::search_all(&base, &user, &pass, &term, http3)
+        ncrs_core::search::search_filtered(&base, &user, &pass, &term, http3, &provider_ids)
     })
     .await
     .map_err(|e| format!("search task failed: {}", e))?
@@ -215,6 +238,7 @@ pub fn run() {
             get_notifications,
             dismiss_notification,
             open_link,
+            fetch_search_providers,
             search_nextcloud,
         ])
         .setup(move |app| {

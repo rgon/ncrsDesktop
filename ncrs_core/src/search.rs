@@ -148,8 +148,23 @@ pub fn search_all(
     term: &str,
     http3: bool,
 ) -> Result<Vec<SearchResultGroup>, String> {
+    search_filtered(base, username, password, term, http3, &[])
+}
+
+/// Search selected providers (or all if `provider_ids` is empty).
+pub fn search_filtered(
+    base: &str,
+    username: &str,
+    password: &str,
+    term: &str,
+    http3: bool,
+    provider_ids: &[String],
+) -> Result<Vec<SearchResultGroup>, String> {
     let mut providers = fetch_providers(base, username, password, http3)?;
     providers.sort_by_key(|p| p.order);
+    if !provider_ids.is_empty() {
+        providers.retain(|p| provider_ids.contains(&p.id));
+    }
 
     let mut results: Vec<SearchResultGroup> = Vec::new();
 

@@ -2,6 +2,7 @@
     import type { HTMLAttributes } from "svelte/elements";
 
     import { invoke } from "@tauri-apps/api/core";
+    import { onMount } from "svelte";
     import Icon from './Icon.svelte';
     import { mdiMagnify, mdiClose, mdiArrowLeft } from '@mdi/js';
 
@@ -22,6 +23,13 @@
         entries: SearchEntry[];
     }
 
+    interface SearchProvider {
+        id: string;
+        name: string;
+        icon: string;
+        order: number;
+    }
+
     interface Props extends HTMLAttributes<HTMLElement> {
         onclose?: () => void;
     }
@@ -36,6 +44,19 @@
     let searched = $state(false);
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
     let searchGen = 0;
+
+    let providers = $state<SearchProvider[]>([]);
+    let selectedProviders = $state<Set<string>>(new Set());
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    onMount(async () => {
+        try {
+            providers = await invoke<SearchProvider[]>("fetch_search_providers");
+        } catch (e) {
+            console.error("fetch providers failed:", e);
+        }
+    });
 
     // ── Handlers ──────────────────────────────────────────────────────────────
 
@@ -66,11 +87,31 @@
         }
     }
 
+    function toggleProvider(id: string) {
+        const next = new Set(selectedProviders);
+        if (next.has(id)) {
+            next.delete(id);
+        } else {
+            next.add(id);
+        }
+        selectedProviders = next;
+        if (query.length >= 3) {
+            searchGen++;
+            loading = true;
+            if (debounceTimer) clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(doSearch, 200);
+        }
+    }
+
     async function doSearch() {
         if (query.length < 3) return;
         const gen = searchGen;
+        const ids = [...selectedProviders];
         try {
-            const r = await invoke<SearchResultGroup[]>("search_nextcloud", { term: query });
+            const r = await invoke<SearchResultGroup[]>("search_nextcloud", {
+                term: query,
+                providerIds: ids,
+            });
             if (gen !== searchGen) return;
             results = r;
         } catch (e) {
@@ -124,6 +165,21 @@
             {/if}
         </div>
     </div>
+
+    <!-- Provider filter chips -->
+    {#if providers.length > 0}
+    <div class="flex flex-wrap gap-1 px-3 py-2 border-b border-gray-200">
+        {#each providers as p (p.id)}
+            <button
+                class="badge badge-sm cursor-pointer select-none transition-colors
+                    {selectedProviders.size === 0 || selectedProviders.has(p.id) ? 'badge-primary' : 'badge-ghost opacity-50'}"
+                onclick={() => toggleProvider(p.id)}
+            >
+                {p.name}
+            </button>
+        {/each}
+    </div>
+    {/if}
 
     <!-- Results area -->
     <div class="overflow-y-auto flex-1 p-2">
