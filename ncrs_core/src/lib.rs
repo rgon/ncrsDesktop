@@ -415,7 +415,28 @@ struct PersistedDirEntry {
     files: Vec<DavEntry>,
 }
 
-fn save_dir_cache(cache: &Mutex<FsCache>) {
+use std::sync::atomic::AtomicU64;
+
+static SAVE_SCHEDULED: AtomicU64 = AtomicU64::new(0);
+const SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
+
+fn schedule_save_dir_cache(cache: &Arc<Mutex<FsCache>>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let prev = SAVE_SCHEDULED.swap(now, Ordering::Relaxed);
+    if now.saturating_sub(prev) < 2000 {
+        return;
+    }
+    let cache = cache.clone();
+    thread::spawn(move || {
+        thread::sleep(SAVE_DEBOUNCE);
+        save_dir_cache_now(&cache);
+    });
+}
+
+fn save_dir_cache_now(cache: &Mutex<FsCache>) {
     let c = cache.safe_lock();
     let path = c.cache_dir.join(DIR_CACHE_FILE);
     let map: HashMap<String, PersistedDirEntry> = c.dir_cache.iter()
@@ -1357,93 +1378,7 @@ impl Filesystem for NextCloudFs {
                 }
             }
 
-            let should_defer = deferred_readdir.safe_lock().remove(&path);
-            let has_data = {
-                let c = cache.safe_lock();
-                c.dir_cache.contains_key(&path) || c.pending_dirs.contains_key(&path)
-            };
-            if should_defer && !has_data {
-                log::info!("READDIR_DEFERRED {} — returning empty, bg PROPFIND", path.display());
-                let conn2 = conn.clone();
-                let cache2 = cache.clone();
-                let path2 = path.clone();
-                let shared2 = shared.clone();
-                let fileids2 = fileids.clone();
-                let details2 = details.clone();
-                let status2 = status.clone();
-                let dirty2 = dirty.clone();
-                let ipc_populated2 = ipc_populated.clone();
-                thread::spawn(move || {
-                    match get_or_list_dir(&conn2, &cache2, path2.clone()) {
-                        Ok((entries, self_entry)) => {
-                            if !ipc_populated2.safe_lock().contains(&path2) {
-                                {
-                                    let mut c = cache2.safe_lock();
-                                    let mut sh = shared2.safe_lock();
-                                    let mut fi = fileids2.safe_lock();
-                                    let mut dt = details2.safe_lock();
-                                    let mut st = status2.safe_lock();
-                                    if let Some(ref se) = self_entry {
-                                        if se.is_shared { sh.insert(path2.clone()); }
-                                        if let Some(fid) = se.fileid { fi.insert(path2.clone(), fid); }
-                                        dt.insert(path2.clone(), ipc::FileDetail {
-                                            permissions: se.permissions.clone(),
-                                            owner_id: se.owner_id.clone(),
-                                            owner_display_name: se.owner_display_name.clone(),
-                                            size: se.size,
-                                            is_dir: se.is_dir,
-                                        });
-                                    }
-                                    for entry in entries.iter() {
-                                        let name = match entry.path.file_name().and_then(|n| n.to_str()) {
-                                            Some(n) => n,
-                                            None => continue,
-                                        };
-                                        let ep = path2.join(name);
-                                        c.allocate_inode(ep.clone());
-                                        if entry.is_shared { sh.insert(ep.clone()); }
-                                        if let Some(fid) = entry.fileid { fi.insert(ep.clone(), fid); }
-                                        dt.insert(ep.clone(), ipc::FileDetail {
-                                            permissions: entry.permissions.clone(),
-                                            owner_id: entry.owner_id.clone(),
-                                            owner_display_name: entry.owner_display_name.clone(),
-                                            size: entry.size,
-                                            is_dir: entry.is_dir,
-                                        });
-                                        if !entry.is_dir {
-                                            let rel = ep.strip_prefix("/").unwrap_or(&ep);
-                                            let local_path = c.cache_dir.join(rel);
-                                            if local_path.exists() {
-                                                st.insert(ep.clone(), FileStatus::Local);
-                                                c.file_cache.entry(ep).or_insert(FileCacheEntry {
-                                                    local_path,
-                                                    remote_modified: entry.modified,
-                                                });
-                                            } else {
-                                                st.entry(ep).or_insert(FileStatus::Remote);
-                                            }
-                                        }
-                                    }
-                                }
-                                {
-                                    let mut d = dirty2.safe_lock();
-                                    d.insert(path2.clone());
-                                    for entry in entries.iter() {
-                                        if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
-                                            d.insert(path2.join(name));
-                                        }
-                                    }
-                                }
-                                ipc_populated2.safe_lock().insert(path2.clone());
-                                log::info!("READDIR_DEFERRED {} completed: {} entries", path2.display(), entries.len());
-                            }
-                        }
-                        Err(e) => log::warn!("bg readdir {}: {}", path2.display(), e),
-                    }
-                });
-                reply.ok();
-                return;
-            }
+            deferred_readdir.safe_lock().remove(&path);
 
             let t_readdir = Instant::now();
             match get_or_list_dir(&conn, &cache, path.clone()) {
@@ -1555,8 +1490,7 @@ impl Filesystem for NextCloudFs {
 
                     log::info!("READDIR {} reply.ok() at {:?}", path.display(), t_readdir.elapsed());
                     reply.ok();
-                    save_dir_cache(&cache);
-                    log::info!("READDIR {} save_dir_cache done at {:?}", path.display(), t_readdir.elapsed());
+                    schedule_save_dir_cache(&cache);
 
                     if offset == 0 {
                         let child_dirs: Vec<PathBuf> = entries.iter()
@@ -1581,7 +1515,7 @@ impl Filesystem for NextCloudFs {
                                         let _ = h.join();
                                     }
                                 }
-                                save_dir_cache(&cache_pf);
+                                schedule_save_dir_cache(&cache_pf);
 
                                 if aggressive_prefetch {
                                     let mut child_thumbs: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
