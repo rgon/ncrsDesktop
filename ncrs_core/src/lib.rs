@@ -1361,7 +1361,8 @@ impl Filesystem for NextCloudFs {
 
         thread::spawn(move || {
             let fetch = std::cmp::max(sz, READ_AHEAD);
-            match do_range_read_stream(&conn, &path, off, fetch) {
+            let use_throttle = fetch > sz;
+            match do_range_read_stream(&conn, &path, off, fetch, use_throttle) {
                 Ok((mut resp, _permit)) => {
                     let t0 = Instant::now();
                     match read_exact_from_stream(&mut resp, sz) {
@@ -2242,16 +2243,18 @@ fn webdav_file_url(base: &str, remote_path: &Path) -> String {
 }
 
 /// Perform a range read, returning the response object for streaming.
+/// Only acquires a read_throttle permit for large fetches (read-ahead).
 fn do_range_read_stream<'a>(
     conn: &'a ConnInfo,
     path: &Path,
     offset: u64,
     size: usize,
-) -> Result<(reqwest::blocking::Response, ThrottleGuard<'a>), String> {
+    throttle: bool,
+) -> Result<(reqwest::blocking::Response, Option<ThrottleGuard<'a>>), String> {
     if conn.is_offline.load(Ordering::Relaxed) {
         return Err("file not available offline".into());
     }
-    let permit = conn.read_throttle.acquire();
+    let permit = if throttle { Some(conn.read_throttle.acquire()) } else { None };
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
     let resp = conn.http_read
