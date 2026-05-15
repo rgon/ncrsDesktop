@@ -1246,8 +1246,6 @@ impl Filesystem for NextCloudFs {
             }
         };
 
-        log::debug!("[{}] READ {} offset={} size={}", self.log_user, path.display(), offset, size);
-
         let off = offset as u64;
         let sz = size as usize;
 
@@ -2129,7 +2127,7 @@ fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Resu
         return Err("file not available offline".into());
     }
     let _permit = conn.throttle.acquire();
-    log::debug!("RANGE_READ {} offset={} size={}", path.display(), offset, size);
+    let t0 = Instant::now();
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
     let resp = conn.http_read
@@ -2141,7 +2139,13 @@ fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Resu
         .map_err(|e| e.to_string())?;
     let status = resp.status();
     if status == reqwest::StatusCode::PARTIAL_CONTENT || status.is_success() {
-        resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+        let data = resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())?;
+        let elapsed = t0.elapsed();
+        let mb = data.len() as f64 / (1024.0 * 1024.0);
+        let mbps = if elapsed.as_secs_f64() > 0.0 { mb / elapsed.as_secs_f64() } else { 0.0 };
+        log::info!("RANGE_READ {} offset={} got={:.1}MB in {:.0}ms ({:.1} MB/s)",
+            path.display(), offset, mb, elapsed.as_millis(), mbps);
+        Ok(data)
     } else {
         Err(format!("range read returned {}", status))
     }
