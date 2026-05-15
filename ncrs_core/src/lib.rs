@@ -1552,26 +1552,34 @@ impl Filesystem for NextCloudFs {
 
                     let already_populated = ipc_populated.safe_lock().contains(&path);
                     if !already_populated {
-                        let mut c = cache.safe_lock();
-                        let mut sh = shared.safe_lock();
-                        let mut fi = fileids.safe_lock();
-                        let mut dt = details.safe_lock();
-                        let mut st = status.safe_lock();
+                        // Collect entry paths and allocate inodes (short cache lock)
+                        let cache_dir = {
+                            let mut c = cache.safe_lock();
+                            for entry in entries.iter() {
+                                if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
+                                    c.allocate_inode(path.join(name));
+                                }
+                            }
+                            c.cache_dir.clone()
+                        };
+
+                        // Build IPC data without holding any locks
+                        let mut shared_paths = Vec::new();
+                        let mut fileid_paths = Vec::new();
+                        let mut detail_entries = Vec::new();
+                        let mut status_entries = Vec::new();
+                        let mut cache_entries = Vec::new();
 
                         if let Some(ref se) = self_entry {
-                            if se.is_shared {
-                                sh.insert(path.clone());
-                            }
-                            if let Some(fid) = se.fileid {
-                                fi.insert(path.clone(), fid);
-                            }
-                            dt.insert(path.clone(), ipc::FileDetail {
+                            if se.is_shared { shared_paths.push(path.clone()); }
+                            if let Some(fid) = se.fileid { fileid_paths.push((path.clone(), fid)); }
+                            detail_entries.push((path.clone(), ipc::FileDetail {
                                 permissions: se.permissions.clone(),
                                 owner_id: se.owner_id.clone(),
                                 owner_display_name: se.owner_display_name.clone(),
                                 size: se.size,
                                 is_dir: se.is_dir,
-                            });
+                            }));
                         }
 
                         for entry in entries.iter() {
@@ -1580,36 +1588,40 @@ impl Filesystem for NextCloudFs {
                                 None => continue,
                             };
                             let entry_path = path.join(name);
-                            c.allocate_inode(entry_path.clone());
-                            if entry.is_shared {
-                                sh.insert(entry_path.clone());
-                            }
-                            if let Some(fid) = entry.fileid {
-                                fi.insert(entry_path.clone(), fid);
-                            }
-                            dt.insert(entry_path.clone(), ipc::FileDetail {
+                            if entry.is_shared { shared_paths.push(entry_path.clone()); }
+                            if let Some(fid) = entry.fileid { fileid_paths.push((entry_path.clone(), fid)); }
+                            detail_entries.push((entry_path.clone(), ipc::FileDetail {
                                 permissions: entry.permissions.clone(),
                                 owner_id: entry.owner_id.clone(),
                                 owner_display_name: entry.owner_display_name.clone(),
                                 size: entry.size,
                                 is_dir: entry.is_dir,
-                            });
+                            }));
                             if !entry.is_dir {
                                 let rel = entry_path.strip_prefix("/").unwrap_or(&entry_path);
-                                let local_path = c.cache_dir.join(rel);
+                                let local_path = cache_dir.join(rel);
                                 if local_path.exists() {
-                                    st.insert(entry_path.clone(), FileStatus::Local);
-                                    c.file_cache.entry(entry_path.clone()).or_insert(FileCacheEntry {
+                                    status_entries.push((entry_path.clone(), FileStatus::Local));
+                                    cache_entries.push((entry_path.clone(), FileCacheEntry {
                                         local_path,
                                         remote_modified: entry.modified,
-                                    });
+                                    }));
                                 } else {
-                                    st.entry(entry_path.clone()).or_insert(FileStatus::Remote);
+                                    status_entries.push((entry_path.clone(), FileStatus::Remote));
                                 }
                                 thumb_candidates.push((entry_path, entry.modified, entry.has_preview, entry.fileid));
                             }
                         }
 
+                        // Batch-insert into IPC maps (each lock held briefly)
+                        { let mut sh = shared.safe_lock(); for p in shared_paths { sh.insert(p); } }
+                        { let mut fi = fileids.safe_lock(); for (p, fid) in fileid_paths { fi.insert(p, fid); } }
+                        { let mut dt = details.safe_lock(); for (p, d) in detail_entries { dt.insert(p, d); } }
+                        { let mut st = status.safe_lock(); for (p, s) in &status_entries { st.insert(p.clone(), *s); } }
+                        {
+                            let mut c = cache.safe_lock();
+                            for (p, fc) in cache_entries { c.file_cache.entry(p).or_insert(fc); }
+                        }
                         {
                             let mut d = dirty.safe_lock();
                             d.insert(path.clone());
