@@ -134,8 +134,8 @@ struct FileCacheEntry {
 
 struct ReadAheadBuf {
     start: u64,
-    data: Vec<u8>,
-    prefetching: bool,
+    buf: Arc<(Mutex<Vec<u8>>, Condvar)>,
+    target_len: u64,
 }
 
 struct OpenFile {
@@ -1268,37 +1268,50 @@ impl Filesystem for NextCloudFs {
                     }
                 }
                 if let Some(ref ra) = of.buf {
-                    let buf_end = ra.start + ra.data.len() as u64;
-                    if off >= ra.start && off + sz as u64 <= buf_end {
+                    let (ref mtx, ref _cv) = *ra.buf;
+                    let data = mtx.lock().unwrap();
+                    let available = ra.start + data.len() as u64;
+                    if off >= ra.start && off + sz as u64 <= available {
                         let s = (off - ra.start) as usize;
-                        reply.data(&ra.data[s..s + sz]);
-                        let consumed_frac = (off + sz as u64 - ra.start) as f64 / ra.data.len() as f64;
-                        if consumed_frac >= 0.75 && !ra.prefetching && ra.data.len() >= READ_AHEAD / 2 {
-                            let next_off = buf_end;
-                            let prefetch_conn = self.conn.clone();
-                            let prefetch_path = path.clone();
-                            let prefetch_files = self.open_files.clone();
-                            drop(files);
-                            self.open_files.safe_lock().entry(fh).and_modify(|of| {
-                                if let Some(ref mut b) = of.buf { b.prefetching = true; }
-                            });
-                            thread::spawn(move || {
-                                match do_range_read_stream(&prefetch_conn, &prefetch_path, next_off, READ_AHEAD) {
-                                    Ok((mut resp, _permit)) => {
-                                        let data = drain_stream_to_vec(&mut resp, &[]);
-                                        if !data.is_empty() {
-                                            log::info!("prefetch {}B at offset {}", data.len(), next_off);
-                                            prefetch_files.safe_lock().entry(fh).and_modify(|of| {
-                                                of.buf = Some(ReadAheadBuf { start: next_off, data, prefetching: false });
-                                            });
-                                        }
-                                    }
-                                    Err(e) => log::debug!("prefetch failed: {}", e),
-                                }
-                            });
-                        }
+                        reply.data(&data[s..s + sz]);
+                        drop(data);
+                        drop(files);
                         return;
                     }
+                    // Data within target range but not yet downloaded — wait in thread
+                    if off >= ra.start && off + sz as u64 <= ra.start + ra.target_len {
+                        let shared = Arc::clone(&ra.buf);
+                        let start = ra.start;
+                        drop(data);
+                        drop(files);
+                        thread::spawn(move || {
+                            let (ref mtx, ref cv) = *shared;
+                            let mut guard = mtx.lock().unwrap();
+                            let deadline = Instant::now() + DOWNLOAD_TIMEOUT;
+                            loop {
+                                if start + guard.len() as u64 >= off + sz as u64 {
+                                    let s = (off - start) as usize;
+                                    reply.data(&guard[s..s + sz]);
+                                    return;
+                                }
+                                let remaining = deadline.saturating_duration_since(Instant::now());
+                                if remaining.is_zero() {
+                                    log::warn!("read wait timeout at offset {}", off);
+                                    reply.error(EIO);
+                                    return;
+                                }
+                                let (g, result) = cv.wait_timeout(guard, remaining).unwrap();
+                                guard = g;
+                                if result.timed_out() {
+                                    log::warn!("read wait timeout at offset {}", off);
+                                    reply.error(EIO);
+                                    return;
+                                }
+                            }
+                        });
+                        return;
+                    }
+                    drop(data);
                 }
             }
         }
@@ -1336,19 +1349,34 @@ impl Filesystem for NextCloudFs {
                     let t0 = Instant::now();
                     match read_exact_from_stream(&mut resp, sz) {
                         Ok(first) => {
-                            let first_ms = t0.elapsed().as_millis();
                             reply.data(&first);
-                            let data = drain_stream_to_vec(&mut resp, &first);
+                            let shared = Arc::new((Mutex::new(first), Condvar::new()));
+                            open_files.safe_lock().entry(fh).and_modify(|of| {
+                                of.buf = Some(ReadAheadBuf {
+                                    start: off,
+                                    buf: Arc::clone(&shared),
+                                    target_len: fetch as u64,
+                                });
+                            });
+                            let (ref mtx, ref cv) = *shared;
+                            let mut chunk = [0u8; 256 * 1024];
+                            loop {
+                                use std::io::Read;
+                                match resp.read(&mut chunk) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        mtx.lock().unwrap().extend_from_slice(&chunk[..n]);
+                                        cv.notify_all();
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            let total_bytes = mtx.lock().unwrap().len();
                             let total_ms = t0.elapsed().as_millis();
-                            let total_bytes = data.len();
                             if total_ms > 0 {
                                 let mbps = total_bytes as f64 / 1_048_576.0 / (total_ms as f64 / 1000.0);
-                                log::info!("stream read {}B first={}ms total={}ms {:.1}MB/s", total_bytes, first_ms, total_ms, mbps);
+                                log::info!("stream read {}B total={}ms {:.1}MB/s", total_bytes, total_ms, mbps);
                             }
-                            open_files
-                                .safe_lock()
-                                .entry(fh)
-                                .and_modify(|of| of.buf = Some(ReadAheadBuf { start: off, data, prefetching: false }));
                         }
                         Err(e) => {
                             log::warn!("stream read first bytes failed: {}", e);
@@ -2210,19 +2238,6 @@ fn read_exact_from_stream(resp: &mut reqwest::blocking::Response, need: usize) -
     Ok(buf)
 }
 
-fn drain_stream_to_vec(resp: &mut reqwest::blocking::Response, prepend: &[u8]) -> Vec<u8> {
-    use std::io::Read;
-    let mut data = prepend.to_vec();
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        match resp.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => data.extend_from_slice(&chunk[..n]),
-            Err(_) => break,
-        }
-    }
-    data
-}
 
 // ── Mount ─────────────────────────────────────────────────────────────────────
 
