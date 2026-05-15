@@ -59,7 +59,7 @@ fn effective_dir_ttl(optimistic_listing: bool, notify_push_connected: &AtomicBoo
     }
 }
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-const READ_AHEAD: usize = 8 * 1024 * 1024; // 8 MB
+const READ_AHEAD: usize = 64 * 1024 * 1024; // 64 MB
 const MAX_POOL_IDLE: usize = 8;
 
 const PATH_ENCODE: &AsciiSet = &CONTROLS
@@ -135,6 +135,7 @@ struct FileCacheEntry {
 struct ReadAheadBuf {
     start: u64,
     data: Vec<u8>,
+    prefetching: bool,
 }
 
 struct OpenFile {
@@ -1268,6 +1269,31 @@ impl Filesystem for NextCloudFs {
                     if off >= ra.start && off + sz as u64 <= buf_end {
                         let s = (off - ra.start) as usize;
                         reply.data(&ra.data[s..s + sz]);
+                        let consumed_frac = (off + sz as u64 - ra.start) as f64 / ra.data.len() as f64;
+                        if consumed_frac >= 0.75 && !ra.prefetching && ra.data.len() >= READ_AHEAD / 2 {
+                            let next_off = buf_end;
+                            let prefetch_conn = self.conn.clone();
+                            let prefetch_path = path.clone();
+                            let prefetch_files = self.open_files.clone();
+                            drop(files);
+                            self.open_files.safe_lock().entry(fh).and_modify(|of| {
+                                if let Some(ref mut b) = of.buf { b.prefetching = true; }
+                            });
+                            thread::spawn(move || {
+                                match do_range_read_stream(&prefetch_conn, &prefetch_path, next_off, READ_AHEAD) {
+                                    Ok(mut resp) => {
+                                        let data = drain_stream_to_vec(&mut resp, &[]);
+                                        if !data.is_empty() {
+                                            log::info!("prefetch {}B at offset {}", data.len(), next_off);
+                                            prefetch_files.safe_lock().entry(fh).and_modify(|of| {
+                                                of.buf = Some(ReadAheadBuf { start: next_off, data, prefetching: false });
+                                            });
+                                        }
+                                    }
+                                    Err(e) => log::debug!("prefetch failed: {}", e),
+                                }
+                            });
+                        }
                         return;
                     }
                 }
@@ -1319,7 +1345,7 @@ impl Filesystem for NextCloudFs {
                             open_files
                                 .safe_lock()
                                 .entry(fh)
-                                .and_modify(|of| of.buf = Some(ReadAheadBuf { start: off, data }));
+                                .and_modify(|of| of.buf = Some(ReadAheadBuf { start: off, data, prefetching: false }));
                         }
                         Err(e) => {
                             log::warn!("stream read first bytes failed: {}", e);
