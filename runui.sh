@@ -8,6 +8,9 @@ mkdir -p "$DEST"
 cp shell_integration/nautilus/syncstate.py "$DEST/"
 nautilus -q 2>/dev/null || true
 
+# GNOME Shell search provider
+bash shell_integration/gnome-search/install.sh
+
 cd ncrs-gui
 RUST_LOG=info pnpm run tauri dev
 # cargo run --bin ncrs-gui
