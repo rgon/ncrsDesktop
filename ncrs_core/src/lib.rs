@@ -1302,14 +1302,30 @@ impl Filesystem for NextCloudFs {
 
         thread::spawn(move || {
             let fetch = std::cmp::max(sz, READ_AHEAD);
-            match do_range_read(&conn, &path, off, fetch) {
-                Ok(data) => {
-                    let end = std::cmp::min(sz, data.len());
-                    reply.data(&data[..end]);
-                    open_files
-                        .safe_lock()
-                        .entry(fh)
-                        .and_modify(|of| of.buf = Some(ReadAheadBuf { start: off, data }));
+            match do_range_read_stream(&conn, &path, off, fetch) {
+                Ok(mut resp) => {
+                    let t0 = Instant::now();
+                    match read_exact_from_stream(&mut resp, sz) {
+                        Ok(first) => {
+                            let first_ms = t0.elapsed().as_millis();
+                            reply.data(&first);
+                            let data = drain_stream_to_vec(&mut resp, &first);
+                            let total_ms = t0.elapsed().as_millis();
+                            let total_bytes = data.len();
+                            if total_ms > 0 {
+                                let mbps = total_bytes as f64 / 1_048_576.0 / (total_ms as f64 / 1000.0);
+                                log::info!("stream read {}B first={}ms total={}ms {:.1}MB/s", total_bytes, first_ms, total_ms, mbps);
+                            }
+                            open_files
+                                .safe_lock()
+                                .entry(fh)
+                                .and_modify(|of| of.buf = Some(ReadAheadBuf { start: off, data }));
+                        }
+                        Err(e) => {
+                            log::warn!("stream read first bytes failed: {}", e);
+                            reply.error(EIO);
+                        }
+                    }
                 }
                 Err(e) => {
                     log::warn!("range read failed, falling back to full download: {}", e);
@@ -2122,12 +2138,16 @@ fn webdav_file_url(base: &str, remote_path: &Path) -> String {
     format!("{}/{}", base.trim_end_matches('/'), encoded)
 }
 
-fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Result<Vec<u8>, String> {
+/// Perform a range read, returning the response object for streaming.
+fn do_range_read_stream(
+    conn: &ConnInfo,
+    path: &Path,
+    offset: u64,
+    size: usize,
+) -> Result<reqwest::blocking::Response, String> {
     if conn.is_offline.load(Ordering::Relaxed) {
         return Err("file not available offline".into());
     }
-    let _permit = conn.throttle.acquire();
-    let t0 = Instant::now();
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
     let resp = conn.http_read
@@ -2139,16 +2159,39 @@ fn do_range_read(conn: &ConnInfo, path: &Path, offset: u64, size: usize) -> Resu
         .map_err(|e| e.to_string())?;
     let status = resp.status();
     if status == reqwest::StatusCode::PARTIAL_CONTENT || status.is_success() {
-        let data = resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())?;
-        let elapsed = t0.elapsed();
-        let mb = data.len() as f64 / (1024.0 * 1024.0);
-        let mbps = if elapsed.as_secs_f64() > 0.0 { mb / elapsed.as_secs_f64() } else { 0.0 };
-        log::info!("RANGE_READ {} offset={} got={:.1}MB in {:.0}ms ({:.1} MB/s)",
-            path.display(), offset, mb, elapsed.as_millis(), mbps);
-        Ok(data)
+        Ok(resp)
     } else {
         Err(format!("range read returned {}", status))
     }
+}
+
+fn read_exact_from_stream(resp: &mut reqwest::blocking::Response, need: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut buf = vec![0u8; need];
+    let mut filled = 0;
+    while filled < need {
+        match resp.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+fn drain_stream_to_vec(resp: &mut reqwest::blocking::Response, prepend: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut data = prepend.to_vec();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match resp.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => data.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    data
 }
 
 // ── Mount ─────────────────────────────────────────────────────────────────────
