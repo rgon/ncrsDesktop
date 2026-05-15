@@ -888,6 +888,7 @@ struct ConnInfo {
     notify_push_connected: Arc<AtomicBool>,
     http_read: reqwest::blocking::Client,
     throttle: Arc<Throttle>,
+    read_throttle: Arc<Throttle>,
     is_offline: Arc<AtomicBool>,
 }
 
@@ -940,7 +941,8 @@ impl NextCloudFs {
         let mut http_builder = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(16);
         let mut read_builder = reqwest::blocking::Client::builder()
-            .pool_max_idle_per_host(4);
+            .pool_max_idle_per_host(8)
+            .tcp_nodelay(true);
         if options.http3 {
             log::info!("HTTP/3 (QUIC) enabled");
             http_builder = http_builder.http3_prior_knowledge();
@@ -964,6 +966,7 @@ impl NextCloudFs {
             http,
             http_read,
             throttle: Arc::new(Throttle::new(max_req)),
+            read_throttle: Arc::new(Throttle::new(max_req)),
             is_offline,
             optimistic_listing: options.optimistic_listing,
             notify_push_connected: Arc::new(AtomicBool::new(false)),
@@ -1281,7 +1284,7 @@ impl Filesystem for NextCloudFs {
                             });
                             thread::spawn(move || {
                                 match do_range_read_stream(&prefetch_conn, &prefetch_path, next_off, READ_AHEAD) {
-                                    Ok(mut resp) => {
+                                    Ok((mut resp, _permit)) => {
                                         let data = drain_stream_to_vec(&mut resp, &[]);
                                         if !data.is_empty() {
                                             log::info!("prefetch {}B at offset {}", data.len(), next_off);
@@ -1329,7 +1332,7 @@ impl Filesystem for NextCloudFs {
         thread::spawn(move || {
             let fetch = std::cmp::max(sz, READ_AHEAD);
             match do_range_read_stream(&conn, &path, off, fetch) {
-                Ok(mut resp) => {
+                Ok((mut resp, _permit)) => {
                     let t0 = Instant::now();
                     match read_exact_from_stream(&mut resp, sz) {
                         Ok(first) => {
@@ -2165,15 +2168,16 @@ fn webdav_file_url(base: &str, remote_path: &Path) -> String {
 }
 
 /// Perform a range read, returning the response object for streaming.
-fn do_range_read_stream(
-    conn: &ConnInfo,
+fn do_range_read_stream<'a>(
+    conn: &'a ConnInfo,
     path: &Path,
     offset: u64,
     size: usize,
-) -> Result<reqwest::blocking::Response, String> {
+) -> Result<(reqwest::blocking::Response, ThrottleGuard<'a>), String> {
     if conn.is_offline.load(Ordering::Relaxed) {
         return Err("file not available offline".into());
     }
+    let permit = conn.read_throttle.acquire();
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
     let resp = conn.http_read
@@ -2185,7 +2189,7 @@ fn do_range_read_stream(
         .map_err(|e| e.to_string())?;
     let status = resp.status();
     if status == reqwest::StatusCode::PARTIAL_CONTENT || status.is_success() {
-        Ok(resp)
+        Ok((resp, permit))
     } else {
         Err(format!("range read returned {}", status))
     }
