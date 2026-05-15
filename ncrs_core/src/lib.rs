@@ -687,7 +687,7 @@ fn ensure_file_cached(
         let c = cache.safe_lock();
         let entry = c.file_cache.get(&remote_path);
         let maybe_local = entry
-            .filter(|e| e.local_path.exists())
+            .filter(|e| e.local_path.metadata().map_or(false, |m| m.len() > 0))
             .map(|e| e.local_path.clone());
         let cached_mod = entry.and_then(|e| e.remote_modified);
         let current_mod = c.remote_modified_for(&remote_path);
@@ -711,6 +711,7 @@ fn ensure_file_cached(
     let file =
         std::fs::File::create(&local_path).map_err(|e| format!("create cache file: {}", e))?;
     if let Err(e) = open_file_timeout(net, throttle, remote_path.clone(), file) {
+        let _ = std::fs::remove_file(&local_path);
         status.safe_lock().insert(remote_path.clone(), FileStatus::Remote);
         dirty.safe_lock().insert(remote_path);
         return Err(e);
@@ -1188,7 +1189,7 @@ impl Filesystem for NextCloudFs {
             let local = c
                 .file_cache
                 .get(&path)
-                .filter(|e| e.local_path.exists())
+                .filter(|e| e.local_path.metadata().map_or(false, |m| m.len() > 0))
                 .map(|e| e.local_path.clone());
             let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
             let etag = c.get_cached_dir_readonly(&parent).and_then(|files| {
@@ -1319,7 +1320,7 @@ impl Filesystem for NextCloudFs {
         // Check file_cache synchronously too.
         {
             let cached_local = self.cache.safe_lock().file_cache.get(&path)
-                .filter(|fc| fc.local_path.exists())
+                .filter(|fc| fc.local_path.metadata().map_or(false, |m| m.len() > 0))
                 .map(|fc| fc.local_path.clone());
             if let Some(ref local) = cached_local {
                 if let Ok(f) = std::fs::File::open(local) {
