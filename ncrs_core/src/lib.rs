@@ -459,6 +459,20 @@ impl FsCache {
         });
     }
 
+    // Promote any pending streaming fetch to dir_cache, then return the subdir paths.
+    // Used by background prefetch to discover the next wave of directories to pre-fetch.
+    fn subdir_paths_for_prefetch(&mut self, path: &Path) -> Vec<PathBuf> {
+        if self.pending_dirs.contains_key(path) {
+            self.promote_pending(path);
+        }
+        self.dir_cache.get(path)
+            .map(|e| e.files.iter()
+                .filter(|f| f.is_dir)
+                .filter_map(|f| f.path.file_name().and_then(|n| n.to_str()).map(|n| path.join(n)))
+                .collect())
+            .unwrap_or_default()
+    }
+
     fn promote_pending(&mut self, path: &Path) -> Option<DavEntry> {
         if let Some(mut pending) = self.pending_dirs.remove(path) {
             while let Ok(entry) = pending.rx.try_recv() {
@@ -1008,10 +1022,24 @@ fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
     }
 }
 
+// How many levels of subdirectory prefetch to chain after a readdir.
+// depth=0 means: fetch the dir itself, no further chaining.
+// depth=1 means: also kick off prefetch for discovered subdirs.
+// Only chains when the directory has ≤ PREFETCH_CHAIN_THRESHOLD subdirs,
+// to avoid overwhelming the server for huge directories like chat archives.
+const PREFETCH_CHAIN_DEPTH: u32 = 1;
+const PREFETCH_CHAIN_THRESHOLD: usize = 60;
+
 // Start a background streaming PROPFIND for `path` without blocking.
 // Uses pending_dirs so any concurrent READDIR joins the in-flight fetch
-// instead of starting a duplicate request.
-fn start_background_propfind(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, path: PathBuf) {
+// rather than starting a duplicate request. When `chain_depth > 0` and the
+// directory is small, kicks off prefetches for its subdirs after completion.
+fn start_background_propfind(
+    conn: &Arc<ConnInfo>,
+    cache: &Arc<Mutex<FsCache>>,
+    path: PathBuf,
+    chain_depth: u32,
+) {
     {
         let c = cache.safe_lock();
         if c.dir_cache.contains_key(&path) || c.pending_dirs.contains_key(&path) {
@@ -1025,15 +1053,31 @@ fn start_background_propfind(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, 
     let conn2 = conn.clone();
     let cache2 = cache.clone();
     thread::spawn(move || {
-        let _permit = conn2.throttle.acquire();
-        match propfind::propfind_list_streaming(
-            &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
-            &path, PROPFIND_TIMEOUT, entry_tx, self_tx,
-        ) {
+        let result = {
+            let _permit = conn2.throttle.acquire();
+            propfind::propfind_list_streaming(
+                &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
+                &path, PROPFIND_TIMEOUT, entry_tx, self_tx,
+            )
+            // _permit (throttle slot) released here, before chaining children
+        };
+        match result {
             Ok(etag) => { let _ = etag_tx.send(etag); }
             Err(e) => {
                 log::debug!("bg propfind {}: {}", path.display(), e);
                 let _ = etag_tx.send(None);
+                schedule_save_dir_cache(&cache2);
+                return;
+            }
+        }
+        // Chain: kick off next-level prefetches now that our slot is free.
+        // Skipped for large dirs to avoid spawning hundreds of threads.
+        if chain_depth > 0 {
+            let children = cache2.safe_lock().subdir_paths_for_prefetch(&path);
+            if children.len() <= PREFETCH_CHAIN_THRESHOLD {
+                for child in children {
+                    start_background_propfind(&conn2, &cache2, child, chain_depth - 1);
+                }
             }
         }
         schedule_save_dir_cache(&cache2);
@@ -1904,7 +1948,7 @@ impl Filesystem for NextCloudFs {
                     if offset == 0 {
                         for entry in entries.iter().filter(|e| e.is_dir) {
                             if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
-                                start_background_propfind(&conn, &cache, path.join(name));
+                                start_background_propfind(&conn, &cache, path.join(name), PREFETCH_CHAIN_DEPTH);
                             }
                         }
                     }
