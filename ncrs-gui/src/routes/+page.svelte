@@ -9,7 +9,7 @@
     import {
         mdiFolder, mdiAppsBox, mdiPlus, mdiAccountCog,
         mdiChevronDown, mdiClose, mdiMagnify, mdiBell,
-        mdiBellOutline,
+        mdiBellOutline, mdiAlertCircleOutline, mdiSwapHorizontal,
     } from '@mdi/js';
 
     import { onMount } from 'svelte';
@@ -17,6 +17,8 @@
     import SetStatusView from './SetStatusView.svelte';
     import SyncProgressView from './SyncProgressView.svelte';
     import SearchView from '../components/SearchView.svelte';
+    import ErrorsView from '../components/ErrorsView.svelte';
+    import ConflictsView from '../components/ConflictsView.svelte';
 
     // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -48,13 +50,38 @@
         actions: NcAction[];
     }
 
+    interface SyncError {
+        path: string;
+        kind: string | { ServerError: number };
+        message: string;
+        timestamp_ms: number;
+    }
+
+    interface TransferProgress {
+        path: string;
+        direction: "Download" | "Upload";
+        bytes_done: number;
+        total_bytes: number;
+    }
+
+    interface ConflictRecord {
+        id: number;
+        kind: Record<string, unknown>;
+        timestamp_ms: number;
+        resolved: boolean;
+    }
+
     // ── State ─────────────────────────────────────────────────────────────────
 
-    type View = "notifications" | "search";
+    type View = "notifications" | "search" | "errors" | "conflicts";
 
     let userInfo = $state<UserInfo | null>(null);
     let syncState = $state<string>("idle");
     let notifications = $state<NcNotification[]>([]);
+    let errors = $state<SyncError[]>([]);
+    let transfers = $state<TransferProgress[]>([]);
+    let conflicts = $state<ConflictRecord[]>([]);
+    let pendingMutations = $state(0);
     let avatarError = $state(false);
     let activeView = $state<View>("notifications");
 
@@ -96,6 +123,19 @@
         userInfo = await invoke<UserInfo | null>("get_user_info");
         syncState = await invoke<string>("get_sync_state");
         notifications = await invoke<NcNotification[]>("get_notifications");
+        errors = await invoke<SyncError[]>("get_errors");
+        transfers = await invoke<TransferProgress[]>("get_transfers");
+        conflicts = await invoke<ConflictRecord[]>("get_conflicts");
+    }
+
+    async function clearErrors() {
+        await invoke("clear_errors");
+        errors = [];
+    }
+
+    async function resolveConflict(id: number) {
+        await invoke("resolve_conflict", { id });
+        conflicts = conflicts.filter(c => c.id !== id);
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -109,6 +149,22 @@
 
         const unlistenNotifs = listen<NcNotification[]>("notifications-updated", (e) => {
             notifications = e.payload;
+        });
+
+        const unlistenErrors = listen<SyncError[]>("sync-errors-updated", (e) => {
+            errors = e.payload;
+        });
+
+        const unlistenTransfers = listen<TransferProgress[]>("transfers-updated", (e) => {
+            transfers = e.payload;
+        });
+
+        const unlistenJournal = listen<number>("journal-updated", (e) => {
+            pendingMutations = e.payload;
+        });
+
+        const unlistenConflicts = listen<ConflictRecord[]>("conflicts-updated", (e) => {
+            conflicts = e.payload;
         });
 
         const clickOutListener = (event: MouseEvent) => {
@@ -125,6 +181,10 @@
         return () => {
             unlistenSync.then(f => f());
             unlistenNotifs.then(f => f());
+            unlistenErrors.then(f => f());
+            unlistenTransfers.then(f => f());
+            unlistenJournal.then(f => f());
+            unlistenConflicts.then(f => f());
             document.removeEventListener("click", clickOutListener);
             document.removeEventListener("keydown", escKeyListener);
         };
@@ -202,8 +262,27 @@
                 <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Open Containing Folder" onclick={openFolder}>
                     <Icon class="w-6 h-6" path={mdiFolder} />
                 </button>
-                <button class="btn btn-ghost btn-sm rounded-btn" aria-label="Activity">
-                    <Icon class="w-6 h-6" path={mdiAppsBox} />
+                <button
+                    class="btn btn-ghost btn-sm rounded-btn relative"
+                    class:btn-active={activeView === "errors"}
+                    aria-label="Sync Errors"
+                    onclick={() => { activeView = activeView === "errors" ? "notifications" : "errors"; }}
+                >
+                    <Icon class="w-6 h-6" path={mdiAlertCircleOutline} />
+                    {#if errors.length > 0}
+                        <span class="badge badge-error badge-xs absolute top-0.5 right-0.5">{errors.length}</span>
+                    {/if}
+                </button>
+                <button
+                    class="btn btn-ghost btn-sm rounded-btn relative"
+                    class:btn-active={activeView === "conflicts"}
+                    aria-label="Conflicts"
+                    onclick={() => { activeView = activeView === "conflicts" ? "notifications" : "conflicts"; }}
+                >
+                    <Icon class="w-6 h-6" path={mdiSwapHorizontal} />
+                    {#if conflicts.length > 0}
+                        <span class="badge badge-warning badge-xs absolute top-0.5 right-0.5">{conflicts.length}</span>
+                    {/if}
                 </button>
                 <button
                     class="btn btn-ghost btn-sm rounded-btn relative"
@@ -220,14 +299,18 @@
         </div>
 
         <!-- Sync status bar -->
-        <SyncProgressView {syncState} />
+        <SyncProgressView {syncState} {transfers} />
 
-        <!-- Content area: search or notifications -->
+        <!-- Content area: search, errors, or notifications -->
         {#if activeView === "search"}
             <SearchView
                 class="flex flex-col flex-grow overflow-hidden"
                 onclose={() => { activeView = "notifications"; }}
             />
+        {:else if activeView === "errors"}
+            <ErrorsView {errors} onclear={clearErrors} />
+        {:else if activeView === "conflicts"}
+            <ConflictsView {conflicts} {pendingMutations} onresolve={resolveConflict} />
         {:else}
             <div class="overflow-y-auto p-2 flex-grow">
                 {#if notifications.length === 0}
