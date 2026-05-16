@@ -110,8 +110,15 @@ impl Throttle {
 
     pub fn acquire(&self) -> ThrottleGuard<'_> {
         let mut count = self.state.lock().unwrap();
-        while *count >= self.max {
-            count = self.cv.wait(count).unwrap();
+        if *count >= self.max {
+            let t = Instant::now();
+            while *count >= self.max {
+                count = self.cv.wait(count).unwrap();
+            }
+            let waited = t.elapsed();
+            if waited.as_millis() > 5 {
+                log::debug!("throttle: waited {:?} for slot (in_flight={})", waited, *count);
+            }
         }
         *count += 1;
         ThrottleGuard { throttle: self }
@@ -393,6 +400,7 @@ pub(crate) struct FsCache {
     pending_dirs: HashMap<PathBuf, PendingDir>,
     pub(crate) file_cache: HashMap<PathBuf, FileCacheEntry>,
     cache_dir: PathBuf,
+    pub(crate) pending_notify: Arc<(Mutex<()>, Condvar)>,
 }
 
 impl FsCache {
@@ -488,6 +496,7 @@ impl FsCache {
             }
             let self_entry = pending.self_entry.take();
             self.put_dir_cache(path.to_path_buf(), pending.etag, self_entry.clone(), pending.entries);
+            self.pending_notify.1.notify_all();
             self_entry
         } else {
             None
@@ -501,17 +510,22 @@ impl FsCache {
                 pending.self_entry = Some(se);
             }
         }
+        let mut got_new = false;
         loop {
             match pending.rx.try_recv() {
-                Ok(entry) => pending.entries.push(entry),
+                Ok(entry) => { pending.entries.push(entry); got_new = true; }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.promote_pending(path);
+                    // promote_pending already calls notify_all
                     return self.dir_cache.get(path).map(|e| e.files.to_vec());
                 }
             }
         }
         if !pending.entries.is_empty() {
+            if got_new {
+                self.pending_notify.1.notify_all();
+            }
             Some(pending.entries.clone())
         } else {
             None
@@ -792,6 +806,7 @@ fn get_or_list_dir(
 
             let conn2 = conn.clone();
             let path2 = path.clone();
+            let pending_notify2 = c.pending_notify.clone();
             std::thread::spawn(move || {
                 let _permit = conn2.throttle.acquire();
                 match propfind::propfind_list_streaming(
@@ -806,6 +821,8 @@ fn get_or_list_dir(
                         let _ = etag_tx.send(None);
                     }
                 }
+                // Wake any threads waiting in get_or_list_dir for this path.
+                pending_notify2.1.notify_all();
             });
             false
         }, was_inv)
@@ -816,11 +833,14 @@ fn get_or_list_dir(
 
     // Block until first entries arrive or PROPFIND completes/times out.
     let deadline = Instant::now() + PROPFIND_TIMEOUT;
+    let mut poll_iters = 0u32;
+    let pending_notify = cache.safe_lock().pending_notify.clone();
     loop {
         {
             let mut c = cache.safe_lock();
             if let Some(snapshot) = c.get_pending_snapshot(&path) {
                 if !snapshot.is_empty() && !was_invalidated {
+                    if poll_iters > 2 { log::debug!("LIST_STREAM_WAIT {} iters before stream", poll_iters); }
                     log::info!("LIST_STREAM {} ({} entries) in {:?}", path.display(), snapshot.len(), t0.elapsed());
                     let se = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
                     return Ok((Arc::new(snapshot), se));
@@ -828,6 +848,7 @@ fn get_or_list_dir(
             }
             if c.dir_cache.get(&path).map_or(false, |e| !e.invalidated) {
                 let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
+                if poll_iters > 2 { log::debug!("LIST_PROMOTED_WAIT {} iters for {}", poll_iters, path.display()); }
                 log::info!("LIST_PROMOTED {} in {:?}", path.display(), t0.elapsed());
                 return c.get_cached_dir(&path, ttl)
                     .map(|(f, _)| (f, se))
@@ -837,7 +858,11 @@ fn get_or_list_dir(
         if Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        poll_iters += 1;
+        // Wait on condvar instead of fixed sleep so we wake immediately when
+        // a pending PROPFIND delivers its first entries or completes.
+        let guard = pending_notify.0.lock().unwrap();
+        let _ = pending_notify.1.wait_timeout(guard, Duration::from_millis(50)).unwrap();
     }
 
     // Timeout: drain pending channel, only cache if entries arrived or sender finished
@@ -1192,7 +1217,6 @@ pub struct NextCloudFs {
     shared: ipc::SharedSet,
     fileids: ipc::FileIdMap,
     details: ipc::FileDetailMap,
-    deferred_readdir: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     conn: Arc<ConnInfo>,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     next_fh: Arc<Mutex<u64>>,
@@ -1202,6 +1226,7 @@ pub struct NextCloudFs {
     notifier_slot: fuse_notify::NotifierSlot,
     ghost_entries: GhostMap,
     log_user: String,
+    aggressive_prefetch: bool,
 }
 
 impl NextCloudFs {
@@ -1288,6 +1313,7 @@ impl NextCloudFs {
                     pending_dirs: HashMap::new(),
                     file_cache: HashMap::new(),
                     cache_dir,
+                    pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
                 }));
                 load_dir_cache(&c);
                 c
@@ -1297,7 +1323,6 @@ impl NextCloudFs {
             shared,
             fileids,
             details,
-            deferred_readdir: Arc::new(Mutex::new(std::collections::HashSet::new())),
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
@@ -1307,6 +1332,7 @@ impl NextCloudFs {
             notifier_slot: Arc::new(Mutex::new(None)),
             ghost_entries: Arc::new(Mutex::new(HashMap::new())),
             log_user: options.log_user,
+            aggressive_prefetch: options.aggressive_prefetch,
         })
     }
 
@@ -1896,8 +1922,8 @@ impl Filesystem for NextCloudFs {
         let fileids = self.fileids.clone();
         let details = self.details.clone();
         let dirty = self.dirty.clone();
-        let deferred_readdir = self.deferred_readdir.clone();
         let conn = self.conn.clone();
+        let aggressive_prefetch = self.aggressive_prefetch;
 
         thread::spawn(move || {
             if offset == 0 {
@@ -1934,18 +1960,15 @@ impl Filesystem for NextCloudFs {
                 return;
             }
 
-            deferred_readdir.safe_lock().remove(&path);
-
             let t_readdir = Instant::now();
             match get_or_list_dir(&conn, &cache, path.clone()) {
                 Ok((entries, self_entry)) => {
                     log::info!("READDIR {} get_or_list_dir returned {} entries in {:?}", path.display(), entries.len(), t_readdir.elapsed());
 
-                    // Kick off background PROPFINDs for child dirs immediately.
-                    // Starting before reply work maximises the head start; any
-                    // incoming READDIR for a child will join the in-flight fetch
-                    // rather than waiting for a cold start.
-                    if offset == 0 {
+                    // Kick off background PROPFINDs for child dirs (opt-in via
+                    // aggressive_prefetch; off by default until the serialisation
+                    // issues in proactive_refresh / poll loop are fixed).
+                    if aggressive_prefetch && offset == 0 {
                         for entry in entries.iter().filter(|e| e.is_dir) {
                             if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
                                 start_background_propfind(&conn, &cache, path.join(name), PREFETCH_CHAIN_DEPTH);
@@ -2044,13 +2067,11 @@ impl Filesystem for NextCloudFs {
                             for (p, fc) in cache_entries { c.file_cache.entry(p).or_insert(fc); }
                         }
                         {
-                            let mut d = dirty.safe_lock();
-                            d.insert(path.clone());
-                            for entry in entries.iter() {
-                                if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
-                                    d.insert(path.join(name));
-                                }
-                            }
+                            // Insert only the directory itself; children get their own
+                            // dirty notifications via notify_push when they change.
+                            // Inserting all N children here floods the CHANGES queue and
+                            // triggers a cascade of GIO attribute invalidations in Nautilus.
+                            dirty.safe_lock().insert(path.clone());
                         }
                     }
 
@@ -2067,17 +2088,6 @@ impl Filesystem for NextCloudFs {
                                 if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
                             if reply.add(entry_ino, (i + 3) as i64, kind, name) {
                                 break;
-                            }
-                        }
-                    }
-
-                    {
-                        let mut dr = deferred_readdir.safe_lock();
-                        for entry in entries.iter() {
-                            if entry.is_dir {
-                                if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
-                                    dr.insert(path.join(name));
-                                }
                             }
                         }
                     }
@@ -3133,6 +3143,7 @@ mod tests {
             pending_dirs: HashMap::new(),
             file_cache: HashMap::new(),
             cache_dir: PathBuf::from("/tmp/ncrs-test-cache"),
+            pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
         }
     }
 

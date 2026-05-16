@@ -124,6 +124,7 @@ pub(crate) struct OldDirSnapshot {
 struct InvalidateResult {
     dirs: Vec<(PathBuf, OldDirSnapshot)>,
     ids_recognized: bool,
+    active_listings: usize,
 }
 
 fn invalidate_dirs_for_fileids(
@@ -207,6 +208,7 @@ fn invalidate_dirs_for_fileids(
     let invalidated_inodes: Vec<u64> = invalidated.iter()
         .filter_map(|(p, _)| c.get_inode(p))
         .collect();
+    let active_listings = c.pending_dirs.len();
     drop(c);
 
     {
@@ -231,40 +233,40 @@ fn invalidate_dirs_for_fileids(
         log::info!("notify_push: file_id {:?} → no cached dirs matched", ids);
     }
 
-    InvalidateResult { dirs: invalidated, ids_recognized: matched_dirs > 0 }
+    InvalidateResult { dirs: invalidated, ids_recognized: matched_dirs > 0, active_listings }
 }
 
-fn proactive_refresh(
-    dirs: Vec<(PathBuf, OldDirSnapshot)>,
-    client: &reqwest::blocking::Client,
-    webdav_url: &str,
-    username: &str,
-    password: &str,
-    cache: &Arc<Mutex<crate::FsCache>>,
-    dirty: &DirtySet,
-    throttle: &Throttle,
-    notifier_slot: &fuse_notify::NotifierSlot,
-    debounce: &DebounceMap,
-    ghost_entries: &GhostMap,
-    file_change_queue: &FileChangeQueue,
+fn refresh_one_dir(
+    dir_path: PathBuf,
+    old_snap: OldDirSnapshot,
+    client: reqwest::blocking::Client,
+    webdav_url: String,
+    username: String,
+    password: String,
+    cache: Arc<Mutex<crate::FsCache>>,
+    dirty: DirtySet,
+    throttle: Arc<Throttle>,
+    notifier_slot: fuse_notify::NotifierSlot,
+    debounce: DebounceMap,
+    ghost_entries: GhostMap,
+    file_change_queue: FileChangeQueue,
 ) {
     let now = Instant::now();
-    for (dir_path, old_snap) in dirs {
-        {
-            let db = debounce.safe_lock();
-            if let Some(state) = db.get(&dir_path) {
-                let cooldown = if state.had_changes { REFRESH_DEBOUNCE } else { REFRESH_DEBOUNCE_NO_CHANGE };
-                if now.duration_since(state.last_refresh) < cooldown {
-                    log::debug!("notify_push: skipping refresh for {} (debounce, had_changes={})", dir_path.display(), state.had_changes);
-                    continue;
-                }
+    {
+        let db = debounce.safe_lock();
+        if let Some(state) = db.get(&dir_path) {
+            let cooldown = if state.had_changes { REFRESH_DEBOUNCE } else { REFRESH_DEBOUNCE_NO_CHANGE };
+            if now.duration_since(state.last_refresh) < cooldown {
+                log::debug!("notify_push: skipping refresh for {} (debounce, had_changes={})", dir_path.display(), state.had_changes);
+                return;
             }
         }
+    }
 
-        let _permit = throttle.acquire();
-        let result = propfind::propfind_list(
-            client, webdav_url, username, password, &dir_path, PROPFIND_TIMEOUT,
-        );
+    let _permit = throttle.acquire();
+    let result = propfind::propfind_list(
+        &client, &webdav_url, &username, &password, &dir_path, PROPFIND_TIMEOUT,
+    );
 
         match result {
             Ok((etag, self_entry, fresh_files)) => {
@@ -421,7 +423,7 @@ fn proactive_refresh(
                 }
 
                 if cache_moved {
-                    crate::save_file_cache(cache);
+                    crate::save_file_cache(&cache);
                 }
 
                 drop(c);
@@ -478,7 +480,44 @@ fn proactive_refresh(
                 log::warn!("notify_push: proactive refresh {} failed: {}", dir_path.display(), e);
             }
         }
-    }
+}
+
+fn proactive_refresh(
+    dirs: Vec<(PathBuf, OldDirSnapshot)>,
+    client: &reqwest::blocking::Client,
+    webdav_url: &str,
+    username: &str,
+    password: &str,
+    cache: &Arc<Mutex<crate::FsCache>>,
+    dirty: &DirtySet,
+    throttle: &Arc<Throttle>,
+    notifier_slot: &fuse_notify::NotifierSlot,
+    debounce: &DebounceMap,
+    ghost_entries: &GhostMap,
+    file_change_queue: &FileChangeQueue,
+) {
+    let n = dirs.len();
+    log::info!("proactive_refresh: starting {} dirs in parallel", n);
+    let t_pr = Instant::now();
+    let handles: Vec<_> = dirs.into_iter().map(|(dir_path, old_snap)| {
+        let client = client.clone();
+        let webdav_url = webdav_url.to_owned();
+        let username = username.to_owned();
+        let password = password.to_owned();
+        let cache = Arc::clone(cache);
+        let dirty = Arc::clone(dirty);
+        let throttle = Arc::clone(throttle);
+        let notifier_slot = Arc::clone(notifier_slot);
+        let debounce = Arc::clone(debounce);
+        let ghosts = Arc::clone(ghost_entries);
+        let fcq = Arc::clone(file_change_queue);
+        std::thread::spawn(move || {
+            refresh_one_dir(dir_path, old_snap, client, webdav_url, username, password,
+                            cache, dirty, throttle, notifier_slot, debounce, ghosts, fcq);
+        })
+    }).collect();
+    for h in handles { let _ = h.join(); }
+    log::info!("proactive_refresh: done {} dirs in {:?}", n, t_pr.elapsed());
 }
 
 fn resolve_and_invalidate(
@@ -729,24 +768,28 @@ fn handle_event(
                         );
                     });
                 } else if !result.dirs.is_empty() {
-                    let client = client.clone();
-                    let webdav_url = webdav_url.to_owned();
-                    let username = username.to_owned();
-                    let password = password.to_owned();
-                    let cache = Arc::clone(cache);
-                    let dirty = Arc::clone(dirty);
-                    let throttle = Arc::clone(throttle);
-                    let notifier_slot = Arc::clone(notifier_slot);
-                    let debounce = Arc::clone(debounce);
-                    let ghosts = Arc::clone(ghost_entries);
-                    let fcq = Arc::clone(file_change_queue);
-                    std::thread::spawn(move || {
-                        proactive_refresh(
-                            result.dirs, &client, &webdav_url, &username, &password,
-                            &cache, &dirty, &throttle, &notifier_slot, &debounce,
-                            &ghosts, &fcq,
-                        );
-                    });
+                    if result.active_listings > 0 {
+                        log::debug!("notify_push: skipping proactive_refresh ({} active dir fetches — traversal in progress)", result.active_listings);
+                    } else {
+                        let client = client.clone();
+                        let webdav_url = webdav_url.to_owned();
+                        let username = username.to_owned();
+                        let password = password.to_owned();
+                        let cache = Arc::clone(cache);
+                        let dirty = Arc::clone(dirty);
+                        let throttle = Arc::clone(throttle);
+                        let notifier_slot = Arc::clone(notifier_slot);
+                        let debounce = Arc::clone(debounce);
+                        let ghosts = Arc::clone(ghost_entries);
+                        let fcq = Arc::clone(file_change_queue);
+                        std::thread::spawn(move || {
+                            proactive_refresh(
+                                result.dirs, &client, &webdav_url, &username, &password,
+                                &cache, &dirty, &throttle, &notifier_slot, &debounce,
+                                &ghosts, &fcq,
+                            );
+                        });
+                    }
                 }
             }
             Err(e) => {
