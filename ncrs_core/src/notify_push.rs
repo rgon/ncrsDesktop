@@ -263,6 +263,30 @@ fn refresh_one_dir(
         }
     }
 
+    // ETag pre-check (Depth:0, no throttle — tiny request).
+    // Nextcloud sends notify_file_id for every directory we read (atime update),
+    // but ETags only change on content mutations. If ETag is unchanged this is a
+    // self-notification loop; skip the full Depth:1 listing entirely.
+    let cached_etag = cache.safe_lock().cached_dir_etag(&dir_path);
+    if cached_etag.is_some() {
+        match propfind::propfind_etag(&client, &webdav_url, &username, &password, &dir_path, PROPFIND_TIMEOUT) {
+            Ok(current_etag) if current_etag == cached_etag => {
+                log::debug!("proactive_refresh {}: ETag unchanged {:?}, skipping (self-notify suppressed)", dir_path.display(), cached_etag);
+                debounce.safe_lock().insert(dir_path, DebounceState {
+                    last_refresh: Instant::now(),
+                    had_changes: false,
+                });
+                return;
+            }
+            Ok(ref current_etag) => {
+                log::debug!("proactive_refresh {}: ETag changed {:?} → {:?}, proceeding", dir_path.display(), cached_etag, current_etag);
+            }
+            Err(e) => {
+                log::debug!("proactive_refresh {}: ETag check failed ({}), proceeding with full refresh", dir_path.display(), e);
+            }
+        }
+    }
+
     let _permit = throttle.acquire();
     let result = propfind::propfind_list(
         &client, &webdav_url, &username, &password, &dir_path, PROPFIND_TIMEOUT,
