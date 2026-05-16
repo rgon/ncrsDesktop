@@ -97,7 +97,7 @@ pub fn mkcol(
     password: &str,
     path: &Path,
 ) -> Result<(), WriteError> {
-    let url = dav_url(base_url, username, path);
+    let url = format!("{}/", dav_url(base_url, username, path).trim_end_matches('/'));
     let resp = client
         .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &url)
         .timeout(WRITE_TIMEOUT)
@@ -134,7 +134,7 @@ pub fn delete(
 
     let status = resp.status().as_u16();
     match status {
-        200 | 204 => Ok(()),
+        200 | 204 | 404 => Ok(()),
         423 => Err(WriteError::Locked),
         _ => Err(WriteError::Server(
             status,

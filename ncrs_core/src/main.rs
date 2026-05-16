@@ -60,7 +60,7 @@ fn main() {
         opts.optimistic_listing = false;
     }
 
-    if let Err(e) = ncrs_core::mount_ncfs(opts) {
+    if let Err(e) = ncrs_core::mount_ncfs(opts, None, None, None) {
         eprintln!("ncrs: {}", e);
         std::process::exit(1);
     }
