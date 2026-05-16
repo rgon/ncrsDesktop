@@ -13,7 +13,7 @@ use tauri::async_runtime::spawn;
 use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration};
 
-use ncrs_core::{mount_ncfs, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, MountOptions, SyncState};
+use ncrs_core::{mount_ncfs, mutation_journal::{self, SharedJournal, JournalEntry, ConflictRecord}, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, ErrorLog, MountOptions, SyncError, SyncState, TransferMap, TransferProgress};
 
 // ── Shared app state ─────────────────────────────────────────────────────────
 
@@ -21,14 +21,22 @@ pub struct AppState {
     pub sync_state: Mutex<SyncState>,
     pub mount_options: Mutex<Option<MountOptions>>,
     pub notifications: Mutex<Vec<NcNotification>>,
+    pub error_log: ErrorLog,
+    pub transfer_map: TransferMap,
+    pub journal: SharedJournal,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let tmp_dir = std::env::temp_dir().join("ncrs_default_journal");
+        let _ = std::fs::create_dir_all(&tmp_dir);
         AppState {
             sync_state: Mutex::new(SyncState::Idle),
             mount_options: Mutex::new(None),
             notifications: Mutex::new(Vec::new()),
+            error_log: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            transfer_map: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            journal: Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&tmp_dir))),
         }
     }
 }
@@ -123,6 +131,36 @@ fn open_link(url: String, app: AppHandle) {
 #[tauri::command]
 fn reveal_in_file_manager(path: String, app: AppHandle) {
     app.opener().reveal_item_in_dir(&path).ok();
+}
+
+#[tauri::command]
+fn get_errors(state: State<Arc<AppState>>) -> Vec<SyncError> {
+    state.error_log.lock().unwrap().iter().cloned().collect()
+}
+
+#[tauri::command]
+fn clear_errors(state: State<Arc<AppState>>) {
+    state.error_log.lock().unwrap().clear();
+}
+
+#[tauri::command]
+fn get_transfers(state: State<Arc<AppState>>) -> Vec<TransferProgress> {
+    state.transfer_map.lock().unwrap().values().cloned().collect()
+}
+
+#[tauri::command]
+fn get_pending_mutations(state: State<Arc<AppState>>) -> Vec<JournalEntry> {
+    state.journal.lock().unwrap().entries().iter().cloned().collect()
+}
+
+#[tauri::command]
+fn get_conflicts(state: State<Arc<AppState>>) -> Vec<ConflictRecord> {
+    state.journal.lock().unwrap().unresolved_conflicts().into_iter().cloned().collect()
+}
+
+#[tauri::command]
+fn resolve_conflict(state: State<Arc<AppState>>, id: u64) {
+    state.journal.lock().unwrap().resolve_conflict(id);
 }
 
 #[tauri::command]
@@ -291,6 +329,12 @@ pub fn run() {
             dismiss_notification,
             open_link,
             reveal_in_file_manager,
+            get_errors,
+            clear_errors,
+            get_transfers,
+            get_pending_mutations,
+            get_conflicts,
+            resolve_conflict,
             fetch_search_providers,
             search_nextcloud,
         ])
@@ -388,9 +432,12 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
 
     *state.mount_options.lock().unwrap() = Some(opts.clone());
 
-    // FUSE mount thread
+    // FUSE mount thread — share error_log and transfer_map with the core
     let fuse_opts = opts.clone();
-    thread::spawn(move || match mount_ncfs(fuse_opts) {
+    let error_log = state.error_log.clone();
+    let transfer_map = state.transfer_map.clone();
+    let journal = state.journal.clone();
+    thread::spawn(move || match mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal)) {
         Ok(()) => log::info!("FUSE unmounted cleanly"),
         Err(e) => log::error!("FUSE error: {}", e),
     });
@@ -419,6 +466,76 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
                 Err(e) => log::warn!("notification poll panicked: {}", e),
             }
             sleep(Duration::from_secs(30)).await;
+        }
+    });
+
+    // Error log polling — check every 2s, emit event + desktop notification on new errors
+    let err_state = state.clone();
+    let err_app = app.clone();
+    spawn(async move {
+        let mut prev_count = 0usize;
+        loop {
+            sleep(Duration::from_secs(2)).await;
+            let errors: Vec<SyncError> = err_state.error_log.lock().unwrap().iter().cloned().collect();
+            let count = errors.len();
+            if count != prev_count {
+                if count > prev_count {
+                    for err in errors.iter().skip(prev_count) {
+                        err_app.notification()
+                            .builder()
+                            .title("ncRS: Sync Error")
+                            .body(&format!("{}: {}", err.path.display(), err.message))
+                            .show()
+                            .ok();
+                    }
+                }
+                err_app.emit("sync-errors-updated", &errors).ok();
+                prev_count = count;
+            }
+        }
+    });
+
+    // Transfer progress polling — 500ms when active, 2s when idle
+    let xfer_state = state.clone();
+    let xfer_app = app.clone();
+    spawn(async move {
+        let mut was_active = false;
+        loop {
+            let transfers: Vec<TransferProgress> = xfer_state.transfer_map.lock().unwrap().values().cloned().collect();
+            let active = !transfers.is_empty();
+            if active || was_active {
+                xfer_app.emit("transfers-updated", &transfers).ok();
+            }
+            was_active = active;
+            if active {
+                sleep(Duration::from_millis(500)).await;
+            } else {
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    });
+
+    // Journal + conflicts polling
+    let jrnl_state = state.clone();
+    let jrnl_app = app.clone();
+    spawn(async move {
+        let mut prev_pending = 0usize;
+        let mut prev_conflicts = 0usize;
+        loop {
+            sleep(Duration::from_secs(2)).await;
+            let j = jrnl_state.journal.lock().unwrap();
+            let pending = j.len();
+            let conflicts: Vec<ConflictRecord> = j.unresolved_conflicts().into_iter().cloned().collect();
+            let conflict_count = conflicts.len();
+            drop(j);
+            if pending != prev_pending {
+                jrnl_app.emit("journal-updated", pending).ok();
+                prev_pending = pending;
+            }
+            if conflict_count != prev_conflicts {
+                jrnl_app.emit("conflicts-updated", &conflicts).ok();
+                prev_conflicts = conflict_count;
+            }
         }
     });
 
