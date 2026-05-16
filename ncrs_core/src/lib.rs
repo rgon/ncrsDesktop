@@ -1008,6 +1008,38 @@ fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
     }
 }
 
+// Start a background streaming PROPFIND for `path` without blocking.
+// Uses pending_dirs so any concurrent READDIR joins the in-flight fetch
+// instead of starting a duplicate request.
+fn start_background_propfind(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, path: PathBuf) {
+    {
+        let c = cache.safe_lock();
+        if c.dir_cache.contains_key(&path) || c.pending_dirs.contains_key(&path) {
+            return;
+        }
+    }
+    let (entry_tx, entry_rx) = mpsc::channel();
+    let (etag_tx, etag_rx) = mpsc::channel();
+    let (self_tx, self_rx) = mpsc::channel();
+    cache.safe_lock().start_pending(path.clone(), entry_rx, etag_rx, self_rx);
+    let conn2 = conn.clone();
+    let cache2 = cache.clone();
+    thread::spawn(move || {
+        let _permit = conn2.throttle.acquire();
+        match propfind::propfind_list_streaming(
+            &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
+            &path, PROPFIND_TIMEOUT, entry_tx, self_tx,
+        ) {
+            Ok(etag) => { let _ = etag_tx.send(etag); }
+            Err(e) => {
+                log::debug!("bg propfind {}: {}", path.display(), e);
+                let _ = etag_tx.send(None);
+            }
+        }
+        schedule_save_dir_cache(&cache2);
+    });
+}
+
 // ── FileAttr helpers ──────────────────────────────────────────────────────────
 
 pub(crate) fn make_file_attr(inode: u64, entry: &DavEntry) -> FileAttr {
@@ -1126,7 +1158,6 @@ pub struct NextCloudFs {
     notifier_slot: fuse_notify::NotifierSlot,
     ghost_entries: GhostMap,
     log_user: String,
-    aggressive_prefetch: bool,
 }
 
 impl NextCloudFs {
@@ -1231,7 +1262,6 @@ impl NextCloudFs {
             journal: journal_arc,
             notifier_slot: Arc::new(Mutex::new(None)),
             ghost_entries: Arc::new(Mutex::new(HashMap::new())),
-            aggressive_prefetch: options.aggressive_prefetch,
             log_user: options.log_user,
         })
     }
@@ -1824,7 +1854,6 @@ impl Filesystem for NextCloudFs {
         let dirty = self.dirty.clone();
         let deferred_readdir = self.deferred_readdir.clone();
         let conn = self.conn.clone();
-        let aggressive_prefetch = self.aggressive_prefetch;
 
         thread::spawn(move || {
             if offset == 0 {
@@ -1867,6 +1896,19 @@ impl Filesystem for NextCloudFs {
             match get_or_list_dir(&conn, &cache, path.clone()) {
                 Ok((entries, self_entry)) => {
                     log::info!("READDIR {} get_or_list_dir returned {} entries in {:?}", path.display(), entries.len(), t_readdir.elapsed());
+
+                    // Kick off background PROPFINDs for child dirs immediately.
+                    // Starting before reply work maximises the head start; any
+                    // incoming READDIR for a child will join the in-flight fetch
+                    // rather than waiting for a cold start.
+                    if offset == 0 {
+                        for entry in entries.iter().filter(|e| e.is_dir) {
+                            if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
+                                start_background_propfind(&conn, &cache, path.join(name));
+                            }
+                        }
+                    }
+
                     let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
 
                     {
@@ -2001,32 +2043,6 @@ impl Filesystem for NextCloudFs {
                     schedule_save_dir_cache(&cache);
 
                     if offset == 0 {
-                        let child_dirs: Vec<PathBuf> = entries.iter()
-                            .filter(|e| e.is_dir)
-                            .filter_map(|e| e.path.file_name().and_then(|n| n.to_str()).map(|n| path.join(n)))
-                            .collect();
-                        if aggressive_prefetch && !child_dirs.is_empty() {
-                            let conn_pf = conn.clone();
-                            let cache_pf = cache.clone();
-                            thread::spawn(move || {
-                                log::info!("PREFETCH_CHILDREN {} dirs from {}", path.display(), child_dirs.len());
-                                for chunk in child_dirs.chunks(10) {
-                                    let handles: Vec<_> = chunk.iter().map(|dir| {
-                                        let c = conn_pf.clone();
-                                        let ca = cache_pf.clone();
-                                        let d = dir.clone();
-                                        thread::spawn(move || {
-                                            let _ = get_or_list_dir(&c, &ca, d);
-                                        })
-                                    }).collect();
-                                    for h in handles {
-                                        let _ = h.join();
-                                    }
-                                }
-                                schedule_save_dir_cache(&cache_pf);
-                            });
-                        }
-
                         if !thumb_candidates.is_empty() {
                             let conn2 = conn.clone();
                             thread::spawn(move || {
