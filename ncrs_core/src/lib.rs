@@ -467,6 +467,11 @@ impl FsCache {
         });
     }
 
+    fn start_pending_and_notify(&mut self, path: PathBuf, rx: mpsc::Receiver<DavEntry>, etag_rx: mpsc::Receiver<Option<String>>, self_rx: mpsc::Receiver<DavEntry>) -> Arc<(Mutex<()>, Condvar)> {
+        self.start_pending(path, rx, etag_rx, self_rx);
+        self.pending_notify.clone()
+    }
+
     // Promote any pending streaming fetch to dir_cache, then return the subdir paths.
     // Used by background prefetch to discover the next wave of directories to pre-fetch.
     fn subdir_paths_for_prefetch(&mut self, path: &Path) -> Vec<PathBuf> {
@@ -1038,7 +1043,7 @@ fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
         }
     }
     log::info!("PREFETCH_LIST {}", path.display());
-    let _permit = conn.throttle.acquire();
+    let _permit = conn.prefetch_throttle.acquire();
     match propfind::propfind_list(&conn.http, &conn.webdav_url, &conn.username, &conn.password, path, PROPFIND_TIMEOUT) {
         Ok((etag, self_entry, files)) => {
             cache.safe_lock().put_dir_cache(path.to_path_buf(), etag, self_entry, files);
@@ -1074,27 +1079,30 @@ fn start_background_propfind(
     let (entry_tx, entry_rx) = mpsc::channel();
     let (etag_tx, etag_rx) = mpsc::channel();
     let (self_tx, self_rx) = mpsc::channel();
-    cache.safe_lock().start_pending(path.clone(), entry_rx, etag_rx, self_rx);
+    let pending_notify2 = cache.safe_lock().start_pending_and_notify(path.clone(), entry_rx, etag_rx, self_rx);
     let conn2 = conn.clone();
     let cache2 = cache.clone();
     thread::spawn(move || {
         let result = {
-            let _permit = conn2.throttle.acquire();
+            let _permit = conn2.prefetch_throttle.acquire();
             propfind::propfind_list_streaming(
                 &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
                 &path, PROPFIND_TIMEOUT, entry_tx, self_tx,
             )
-            // _permit (throttle slot) released here, before chaining children
+            // _permit (prefetch throttle slot) released here, before chaining children
         };
         match result {
             Ok(etag) => { let _ = etag_tx.send(etag); }
             Err(e) => {
                 log::debug!("bg propfind {}: {}", path.display(), e);
                 let _ = etag_tx.send(None);
+                pending_notify2.1.notify_all();
                 schedule_save_dir_cache(&cache2);
                 return;
             }
         }
+        // Wake threads waiting in get_or_list_dir for this path.
+        pending_notify2.1.notify_all();
         // Chain: kick off next-level prefetches now that our slot is free.
         // Skipped for large dirs to avoid spawning hundreds of threads.
         if chain_depth > 0 {
@@ -1186,6 +1194,7 @@ struct ConnInfo {
     http_read: reqwest::blocking::Client,
     throttle: Arc<Throttle>,
     read_throttle: Arc<Throttle>,
+    prefetch_throttle: Arc<Throttle>,
     is_offline: Arc<AtomicBool>,
     active_streams: Arc<AtomicUsize>,
     deferred_invalidation: Arc<AtomicBool>,
@@ -1290,6 +1299,7 @@ impl NextCloudFs {
             http_read,
             throttle: Arc::new(Throttle::new(max_req)),
             read_throttle: Arc::new(Throttle::new(3)),
+            prefetch_throttle: Arc::new(Throttle::new(5)),
             is_offline,
             optimistic_listing: options.optimistic_listing,
             notify_push_connected: Arc::new(AtomicBool::new(false)),
