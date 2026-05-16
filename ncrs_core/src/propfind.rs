@@ -108,6 +108,87 @@ pub fn propfind_etag(
     Ok(dir_etag)
 }
 
+pub fn resolve_fileids(
+    client: &reqwest::blocking::Client,
+    webdav_url: &str,
+    username: &str,
+    password: &str,
+    file_ids: &[u64],
+    timeout: Duration,
+) -> Result<Vec<PathBuf>, String> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parsed = url::Url::parse(webdav_url)
+        .map_err(|e| format!("bad webdav_url: {}", e))?;
+    let dav_root = {
+        let path = parsed.path();
+        let idx = path.find("/files/").unwrap_or(path.len());
+        format!("{}://{}{}/", parsed.scheme(), parsed.host_str().unwrap_or(""), &path[..idx])
+    };
+    let scope = {
+        let path = parsed.path().trim_end_matches('/');
+        let idx = path.find("/files/").unwrap_or(0);
+        path[idx..].to_string()
+    };
+
+    let where_clause = if file_ids.len() == 1 {
+        format!(
+            "<d:eq><d:prop><oc:fileid/></d:prop><d:literal>{}</d:literal></d:eq>",
+            file_ids[0]
+        )
+    } else {
+        let eqs: Vec<String> = file_ids.iter().map(|id| {
+            format!("<d:eq><d:prop><oc:fileid/></d:prop><d:literal>{}</d:literal></d:eq>", id)
+        }).collect();
+        format!("<d:or>{}</d:or>", eqs.join(""))
+    };
+
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:searchrequest xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:basicsearch>
+    <d:select><d:prop><oc:fileid/></d:prop></d:select>
+    <d:from><d:scope><d:href>{scope}</d:href><d:depth>infinity</d:depth></d:scope></d:from>
+    <d:where>{where_clause}</d:where>
+    <d:orderby/>
+  </d:basicsearch>
+</d:searchrequest>"#,
+        scope = scope,
+        where_clause = where_clause,
+    );
+
+    log::debug!("SEARCH resolve_fileids {:?} at {}", file_ids, dav_root);
+
+    let resp = client
+        .request(reqwest::Method::from_bytes(b"SEARCH").unwrap(), &dav_root)
+        .timeout(timeout)
+        .header("Content-Type", "text/xml")
+        .basic_auth(username, Some(password))
+        .body(body)
+        .send()
+        .map_err(|e| format!("SEARCH resolve_fileids: {}", e))?;
+
+    let status = resp.status();
+    if status != reqwest::StatusCode::MULTI_STATUS && !status.is_success() {
+        return Err(format!("SEARCH resolve_fileids returned {}", status));
+    }
+
+    let reader = std::io::BufReader::new(resp);
+    let (_, self_entry, entries) = parse_multistatus_stream(reader, webdav_url)?;
+
+    let mut paths: Vec<PathBuf> = entries.into_iter().map(|e| e.path).collect();
+    if let Some(se) = self_entry {
+        if se.path != PathBuf::from("/") {
+            paths.push(se.path);
+        }
+    }
+
+    log::info!("SEARCH resolve_fileids {:?} → {:?}", file_ids, paths);
+    Ok(paths)
+}
+
 fn build_url(webdav_url: &str, path: &std::path::Path) -> String {
     let base = webdav_url.trim_end_matches('/');
     let rel = path.strip_prefix("/").unwrap_or(path);
