@@ -48,16 +48,21 @@ SOCKET_TIMEOUT = 2.0  # seconds
 
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
 
+# Nextcloud oc:permissions flag letters → human labels.
+# G = readable, W = writable, C = can create, D = can delete,
+# N = can rename (within parent), V = can move (to different parent),
+# R = can reshare with others, S = this item has been shared,
+# M = mounted (external storage or federated share), K = can lock.
 _PERM_FLAGS = {
-    "R": "Read",
     "G": "Read",
     "W": "Write",
     "C": "Create",
     "D": "Delete",
-    "N": "Rename/Move",
+    "N": "Rename",
     "V": "Move",
-    "M": "Modify",
-    "S": "Share",
+    "R": "Reshare",
+    "S": "Shared",
+    "M": "Mounted",
     "K": "Lock",
 }
 
