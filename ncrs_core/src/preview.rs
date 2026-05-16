@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 const PREVIEW_SIZE: u32 = 128;
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-const THUMB_BATCH: usize = 4;
+const THUMB_BATCH: usize = 2;
 
 const PREVIEWABLE: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic",
@@ -158,6 +160,7 @@ pub fn prefetch_directory_thumbnails(
     password: &str,
     mount_point: &Path,
     entries: &[(PathBuf, Option<SystemTime>, bool, Option<u64>)],
+    active_streams: &Arc<AtomicUsize>,
 ) {
     let previewable: Vec<_> = entries.iter()
         .filter(|(_, _, has_preview, _)| *has_preview)
@@ -165,7 +168,10 @@ pub fn prefetch_directory_thumbnails(
 
     for (i, chunk) in previewable.chunks(THUMB_BATCH).enumerate() {
         if i > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        while active_streams.load(Ordering::Relaxed) > 0 {
+            std::thread::sleep(Duration::from_millis(500));
         }
         std::thread::scope(|s| {
             for (path, mtime, _, fileid) in chunk {
