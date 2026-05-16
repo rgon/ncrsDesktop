@@ -1119,6 +1119,35 @@ fn start_background_propfind(
 
 // ── FileAttr helpers ──────────────────────────────────────────────────────────
 
+// Map Nextcloud oc:permissions flags to POSIX mode bits.
+// G=read, W=write(file), C=create(dir), D=delete, N=rename, V=move.
+// Directories always have execute set so the kernel can traverse them.
+fn perms_to_mode(permissions: Option<&str>, is_dir: bool) -> u16 {
+    let perms = match permissions {
+        Some(p) if !p.is_empty() => p,
+        _ => return if is_dir { 0o755 } else { 0o644 },
+    };
+    let r = perms.contains('G');
+    let w = if is_dir {
+        perms.contains('C') || perms.contains('D') || perms.contains('N') || perms.contains('V')
+    } else {
+        perms.contains('W')
+    };
+    if is_dir {
+        match (r, w) {
+            (true,  true)  => 0o755,
+            (true,  false) => 0o555,
+            _              => 0o000,
+        }
+    } else {
+        match (r, w) {
+            (true,  true)  => 0o644,
+            (true,  false) => 0o444,
+            _              => 0o000,
+        }
+    }
+}
+
 pub(crate) fn make_file_attr(inode: u64, entry: &DavEntry) -> FileAttr {
     let modified = entry.modified.unwrap_or(UNIX_EPOCH);
     FileAttr {
@@ -1130,7 +1159,7 @@ pub(crate) fn make_file_attr(inode: u64, entry: &DavEntry) -> FileAttr {
         ctime: modified,
         crtime: modified,
         kind: if entry.is_dir { FileType::Directory } else { FileType::RegularFile },
-        perm: if entry.is_dir { 0o755 } else { 0o644 },
+        perm: perms_to_mode(entry.permissions.as_deref(), entry.is_dir),
         nlink: if entry.is_dir { 2 } else { 1 },
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
