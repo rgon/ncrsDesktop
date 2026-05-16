@@ -6,7 +6,12 @@
 ///   DETAIL <absolute-local-path>\n   → status\tsharing\tperms\towner\tsize
 ///   SEARCH <term>\n                  → JSON array of SearchResultGroup
 ///   WEBURL <absolute-local-path>\n   → Nextcloud web URL for the file
+///   ERRORS\n                         → JSON array of SyncError
+///   TRANSFERS\n                      → JSON array of TransferProgress
+///   JOURNAL\n                        → JSON array of pending JournalEntry
+///   CONFLICTS\n                      → JSON array of unresolved ConflictRecord
 ///   CHANGES\n                        → tab-separated changed paths
+///   FILE_CHANGES\n                    → tab-separated A:/path or D:/path entries
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -48,6 +53,24 @@ pub struct FileDetail {
 
 pub type FileDetailMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileDetail>>>;
 pub type DirtySet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
+
+#[derive(Clone)]
+pub enum FileChangeKind {
+    Added,
+    Removed,
+    Modified,
+    DirAdded,
+    DirRemoved,
+    Renamed { from: PathBuf },
+}
+
+#[derive(Clone)]
+pub struct FileChange {
+    pub kind: FileChangeKind,
+    pub path: PathBuf,
+}
+
+pub type FileChangeQueue = Arc<Mutex<Vec<FileChange>>>;
 
 pub fn socket_path() -> PathBuf {
     std::env::var("XDG_RUNTIME_DIR")
@@ -104,7 +127,7 @@ fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>,
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, username: String, password: String, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, username: String, password: String, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -145,10 +168,14 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let cb = keep_cb.clone();
             let ev = evict_cb.clone();
             let pf = prefetch_cb.clone();
+            let elog = error_log.clone();
+            let tmap = transfer_map.clone();
+            let jrnl = journal.clone();
+            let fcq = file_change_queue.clone();
             let active = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, dirty, uname, passwd, burl, cb, ev, pf);
+                handle_client(stream, mount, map, shared, fids, details, dirty, uname, passwd, burl, cb, ev, pf, elog, tmap, jrnl, fcq);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -181,6 +208,10 @@ fn handle_client(
     keep_cb: Option<KeepCallback>,
     evict_cb: Option<EvictCallback>,
     prefetch_cb: Option<PrefetchCallback>,
+    error_log: crate::ErrorLog,
+    transfer_map: crate::TransferMap,
+    journal: crate::mutation_journal::SharedJournal,
+    file_change_queue: FileChangeQueue,
 ) {
     let mut write_half = match stream.try_clone() {
         Ok(s) => s,
@@ -296,6 +327,33 @@ fn handle_client(
                     .collect::<Vec<_>>()
                     .join("\t")
             }
+        } else if trimmed == "FILE_CHANGES" {
+            let changes: Vec<FileChange> = {
+                let mut q = file_change_queue.safe_lock();
+                q.drain(..).collect()
+            };
+            if changes.is_empty() {
+                String::new()
+            } else {
+                changes.iter()
+                    .map(|c| {
+                        let rel = c.path.strip_prefix("/").unwrap_or(&c.path);
+                        let abs = mount_point.join(rel);
+                        match &c.kind {
+                            FileChangeKind::Added => format!("A:{}", abs.display()),
+                            FileChangeKind::Removed => format!("D:{}", abs.display()),
+                            FileChangeKind::Modified => format!("M:{}", abs.display()),
+                            FileChangeKind::DirAdded => format!("DA:{}", abs.display()),
+                            FileChangeKind::DirRemoved => format!("DD:{}", abs.display()),
+                            FileChangeKind::Renamed { from } => {
+                                let from_rel = from.strip_prefix("/").unwrap_or(from);
+                                format!("R:{}\x1e{}", mount_point.join(from_rel).display(), abs.display())
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            }
         } else if let Some(path_str) = trimmed.strip_prefix("KEEP ") {
             match (strip_mount(Path::new(path_str), &mount_point), &keep_cb) {
                 (Some(remote), Some(cb)) => {
@@ -355,6 +413,20 @@ fn handle_client(
                     }
                 }
             }
+        } else if trimmed == "ERRORS" {
+            let errors: Vec<crate::SyncError> = error_log.safe_lock().iter().cloned().collect();
+            serde_json::to_string(&errors).unwrap_or_else(|_| "[]".to_string())
+        } else if trimmed == "TRANSFERS" {
+            let transfers: Vec<crate::TransferProgress> = transfer_map.safe_lock().values().cloned().collect();
+            serde_json::to_string(&transfers).unwrap_or_else(|_| "[]".to_string())
+        } else if trimmed == "JOURNAL" {
+            let j = journal.safe_lock();
+            let entries: Vec<&crate::mutation_journal::JournalEntry> = j.entries().iter().collect();
+            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+        } else if trimmed == "CONFLICTS" {
+            let j = journal.safe_lock();
+            let conflicts = j.unresolved_conflicts();
+            serde_json::to_string(&conflicts).unwrap_or_else(|_| "[]".to_string())
         } else if let Some(msg) = trimmed.strip_prefix("LOG ") {
             log::info!("[nautilus] {}", msg);
             "ok".to_string()

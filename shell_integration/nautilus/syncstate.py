@@ -27,6 +27,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -44,9 +45,8 @@ _EMBLEM_SHARED  = "emblem-shared"       # people / shared
 _EMBLEM_PARTIAL = "emblem-downloads"     # partial download (some files local)
 
 SOCKET_TIMEOUT = 2.0  # seconds
-_MAX_RECV = 4096
 
-_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="ncrs-nautilus")
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
 
 _PERM_FLAGS = {
     "R": "Read",
@@ -89,47 +89,61 @@ def _load_mount_point(config_path: str | None = None) -> str | None:
     return None
 
 
-def _log_to_daemon(msg: str) -> None:
-    """Send a log message to the ncrs daemon (fire-and-forget)."""
-    sp = _sock_path()
-    if not os.path.exists(sp):
-        return
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(0.2)
-            s.connect(sp)
-            s.sendall(f"LOG {msg}\n".encode())
-            s.recv(64)
-    except (OSError, socket.timeout):
-        pass
+class _PersistentConn:
+    __slots__ = ('_sock', '_rfile')
 
+    def __init__(self):
+        self._sock = None
+        self._rfile = None
 
-def _send_command(cmd: str, max_recv: int = _MAX_RECV) -> str:
-    sp = _sock_path()
-    if not os.path.exists(sp):
-        return "error: daemon not running"
-    t0 = time.monotonic()
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    def _ensure(self):
+        if self._sock is not None:
+            return
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
             s.settimeout(SOCKET_TIMEOUT)
-            s.connect(sp)
-            s.sendall(f"{cmd}\n".encode())
-            buf = b""
-            while b"\n" not in buf and len(buf) < max_recv:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-            result = buf.decode(errors="replace").strip()
-            elapsed = (time.monotonic() - t0) * 1000
-            if elapsed > 50 and not cmd.startswith("LOG "):
-                _log_to_daemon(f"{cmd}: {elapsed:.0f}ms")
-            return result
-    except (OSError, socket.timeout):
-        elapsed = (time.monotonic() - t0) * 1000
-        if not cmd.startswith("LOG "):
-            _log_to_daemon(f"{cmd}: TIMEOUT ({elapsed:.0f}ms)")
-        return "error: socket timeout"
+            s.connect(_sock_path())
+        except OSError:
+            s.close()
+            raise
+        self._sock = s
+        self._rfile = s.makefile('rb')
+
+    def send(self, cmd: str) -> str:
+        for attempt in range(2):
+            try:
+                self._ensure()
+                self._sock.sendall(f"{cmd}\n".encode())
+                line = self._rfile.readline()
+                if not line:
+                    raise ConnectionError("closed")
+                return line.decode(errors="replace").strip()
+            except (OSError, ConnectionError):
+                self._close()
+                if attempt > 0:
+                    return "error: connection failed"
+        return "error: connection failed"
+
+    def _close(self):
+        for obj in (self._rfile, self._sock):
+            if obj is not None:
+                try:
+                    obj.close()
+                except OSError:
+                    pass
+        self._sock = None
+        self._rfile = None
+
+
+_local = threading.local()
+
+
+def _send_command(cmd: str) -> str:
+    conn = getattr(_local, 'conn', None)
+    if conn is None:
+        conn = _PersistentConn()
+        _local.conn = conn
+    return conn.send(cmd)
 
 
 def _human_perms(raw: str) -> str:
@@ -160,6 +174,46 @@ def _invalidate_path(path: str) -> bool:
         fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(path))
         if fi is not None:
             fi.invalidate_extension_info()
+    except Exception:
+        pass
+    return GLib.SOURCE_REMOVE
+
+
+def _reload_nautilus_windows() -> bool:
+    """Trigger a reload on all Nautilus windows via DBus (equivalent to F5)."""
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        result = bus.call_sync(
+            "org.gnome.Nautilus",
+            "/org/gnome/Nautilus/window",
+            "org.freedesktop.DBus.Introspectable",
+            "Introspect",
+            None,
+            GLib.VariantType.new("(s)"),
+            Gio.DBusCallFlags.NONE,
+            500,
+            None,
+        )
+        xml = result.get_child_value(0).get_string()
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml)
+        for node in root.findall("node"):
+            win_id = node.get("name")
+            if win_id and win_id.isdigit():
+                try:
+                    bus.call_sync(
+                        "org.gnome.Nautilus",
+                        f"/org/gnome/Nautilus/window/{win_id}",
+                        "org.gtk.Actions",
+                        "Activate",
+                        GLib.Variant("(sava{sv})", ("reload", [], {})),
+                        None,
+                        Gio.DBusCallFlags.NONE,
+                        500,
+                        None,
+                    )
+                except Exception:
+                    pass
     except Exception:
         pass
     return GLib.SOURCE_REMOVE
@@ -246,23 +300,55 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
 
     def _do_poll_changes(self):
         try:
+            # Targeted VFS ops for inotify generation
+            fc_resp = _send_command("FILE_CHANGES")
+            affected_parents = set()
+            if fc_resp and not fc_resp.startswith("error"):
+                for entry in fc_resp.split("\t"):
+                    if ":" not in entry:
+                        continue
+                    kind, path = entry.split(":", 1)
+                    try:
+                        if kind == "A":
+                            fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+                            os.close(fd)
+                            affected_parents.add(os.path.dirname(path))
+                        elif kind == "D":
+                            os.unlink(path)
+                            affected_parents.add(os.path.dirname(path))
+                        elif kind == "M":
+                            os.utime(path)
+                        elif kind == "DA":
+                            os.mkdir(path, 0o755)
+                            affected_parents.add(os.path.dirname(path))
+                        elif kind == "DD":
+                            os.rmdir(path)
+                            affected_parents.add(os.path.dirname(path))
+                        elif kind == "R":
+                            old_path, new_path = path.split("\x1e", 1)
+                            os.rename(old_path, new_path)
+                            affected_parents.add(os.path.dirname(old_path))
+                            affected_parents.add(os.path.dirname(new_path))
+                    except OSError:
+                        pass
+
+            if affected_parents:
+                GLib.idle_add(_reload_nautilus_windows)
+
+            # Overlay icon refresh
             resp = _send_command("CHANGES")
             if not resp or resp.startswith("error"):
                 return
             paths = resp.split("\t")
-            _log_to_daemon(f"CHANGES got {len(paths)} dirty paths")
 
             def _invalidate():
-                found = 0
                 for p in paths:
                     try:
                         fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(p))
                         if fi is not None:
                             fi.invalidate_extension_info()
-                            found += 1
                     except Exception:
                         pass
-                _log_to_daemon(f"CHANGES invalidated {found}/{len(paths)} file infos")
                 return GLib.SOURCE_REMOVE
 
             GLib.idle_add(_invalidate)
@@ -488,7 +574,7 @@ class _SearchDialog(Gtk.Window):
 
     def _do_search(self, term):
         try:
-            resp = _send_command(f"SEARCH {term}", max_recv=65536)
+            resp = _send_command(f"SEARCH {term}")
             if resp.startswith("error"):
                 GLib.idle_add(self._show_error, resp)
                 return
