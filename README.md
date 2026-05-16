@@ -14,20 +14,26 @@ FIX:
 ```
 GOALS:
 + [x] Real vFS on linux: not downloading everything then serving it. Uses the built-in nextcloud thumbnailer for a rich experience
-+ [ ] webdav with QUICK/HTTP3 support for speed
++ [x] webdav with QUICK/HTTP3 support for speed
++ [x] streaming-download VFS support: play back large 4K videos locally without issues.
++ [ ] notify-push immediate new file notifications when opening a browser
+    + [ ] fix delete
+    + [ ] fix infinite loop
+    + [ ] fix other CRUD
++ [ ] fix notify-push performance regression
++ [ ] fix permissions probably wrong (hddstore media says read, modify), hddstore bulk says nothing
 + [ ] Feature parity with the NC file explorer (share, file options, view who shared, keep remote permissions etc)
     + add/remove from favorites
     + details
     + rename/move or copy
     + send/share (same as details view)
     + 'sync'
-+ [ ] Can we hook into the search function (in FUSE or nautilus) to use the built-in nextcloud search?
 
 + [ ] No dumb 'Some files could not be synced' - Filename contains trailing spaces -> saving will immediately cause a filesystem error
 + [ ] Dash app has feature parity with the Android/iOS app (in driver)
 + [ ] Performs as good in a heavy enterprise than in a new personal cloud
 + [ ] Enterprise OAuth2 login with authd-shared token for automatic login for multi-user computers and zero touch provisioning to new machines
-+ [ ] Abstract file explorer API implementation - concrete cosumers (nautilus, demo web GUI, etc)
++ [ ] refactor abstract file explorer API implementation - concrete cosumers (nautilus, demo web GUI, etc)
 ```
 
 ## Feature Goals:
@@ -39,6 +45,13 @@ GOALS:
 | Virtual Files             | ❌ (Experimental, bad approach which doesn't work with shell/file pickers etc)                | ✅ (remote only)                     | ✅   |
 | Dynamically cache files/keep part locally | ❌                | ❌ (No internet = no files) | ✅   |
 | HPB Support/Speed         | ❓ (Not explicitly stated, generally good sync performance) | ❌ | ✅ |
+
+## Server tips
+Server-side recommendation: If you have shell access to your Nextcloud server, you shall enable background thumbnail pre-generation with occ preview:pre-generate. 
+
+This makes the server generate thumbnails during idle time rather than on-demand, which would eliminate the congestion entirely for directories that have been indexed.
+
+If not, disable thumbnails with the ncrs cli flag.
 
 ## Usage
 
@@ -134,7 +147,7 @@ docker compose -f docker/docker-compose.yml down
 	+ [x] save state machine
 	+ [x] multiple icons given sync machine
 	+ [x] pause & edit state menu
-	+ [ ] open in top position: cannot get this to work in Gnome. WORKED AROUND given all my target users have a single OS! -> review multi-platform support
+	+ [x] open in top position: cannot get this to work in Gnome. WORKED AROUND given all my target users have a single OS! -> review multi-platform support
 
 + [x] import fuse mount
 + [x] fix tokio error
@@ -147,32 +160,23 @@ docker compose -f docker/docker-compose.yml down
 
 ----
 
-+ [ ] rust fuse mvp?
++ [ ] rust fuse impl?
 	fuser = { version = "0.13.0", features = ["serializable"] }
 	https://github.com/cberner/fuser
 	or:
 	https://github.com/ubnt-intrepid/polyfuse
-	
-	STEPS:
-	+ [ ] create fuse with 4 folders that say /fuse/burns/pyro/spark
-	+ [ ] login via webdav
-	+ [ ] file directory map with fuse
-	+ [ ] fetch files with fuse
-	+ [ ] when fetching, check version number some way
-	+ [ ] simple login ui with tauri, 2 crates/modules
-	----- LEAVE HERE
-+ [ ]https://xethub.com/blog/nfs-fuse-why-we-built-nfs-server-rust 
+    + [ ]https://xethub.com/blog/nfs-fuse-why-we-built-nfs-server-rust
++ [ ] simple login ui with tauri, 2 crates/modules
+
++ [ ] cross-platform review: what do we need to change?
 ----
-
-+ [ ] Webdav implementation
-+ [ ] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
-
-+ [ ] Functional tauri menu UI:
-	+ [x] get avatar: https://github.com/nextcloud/desktop/blob/cd44540a5a30c1e639edc8082228d211a3d9a34b/src/libsync/networkjobs.cpp#L787C1-L787C148
-		yourcloud.domain/remote.php/dav/avatars/userID/256.png
++ [ ] QOL:
+    + [ ] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
 	+ [ ] View user login info/status: HPB Connection, DAV Connection. Turn orange if HPB NOK.
-	+ [ ] Access mounted folder
+	-- tauri settings
 	+ [ ] main Settings:
+    	+ [ ] edit configuration/save yaml - ensure it can be provisioned
+
 		+ [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
 		-- cache
 		+ [ ] cache options: max size, algorithm: FIFO/LIFO
@@ -186,18 +190,18 @@ docker compose -f docker/docker-compose.yml down
 		+ ask for login flow in browser: https://github.com/traxys/nextcloud-passwords-client
 		+ save as yaml, lock yaml file permissions
 	+ [ ] Set status! Online/offline etc
-	----
-	WEB API:
-	+ [ ] fetch notifications
-	+ [ ] edit configuration/save yaml
-	+ [ ] open local folder
 
 + [ ] network error handling: EAGAIN|ETIMEDOUT https://pubs.opengroup.org/onlinepubs/009695399/functions/read.html
-+ [ ] Systemd service
-+ [ ] systemd service installer
-+ [ ] release: snap/appimage/flatpak/what? but only in Github Actions
-+ [ ] Icon mode: sync status || avatar and user status, errors
-+ [ ] Nextcloud integration with clock-in clock-out!! (DUMB spanish regulation) -> separate app? Same app that fetches conn info? Generate png icon with status?
+
++ [ ] RELEASE:
+    + [ ] Systemd service
+    + [ ] systemd service installer
+    + [ ] release: snap/appimage/flatpak/what? but only in Github Actions
+
++ [ ] UX:
+    + [ ] Icon mode: sync status || avatar and user status, errors
+    + [ ] implement 'desktop apps'?
+    + [ ] Nextcloud integration with clock-in clock-out!! (DUMB spanish regulation) -> separate app? Same app that fetches conn info? Generate png icon with status?
 
 ### Functionality/Service TODO
 + [x] Tray icon
