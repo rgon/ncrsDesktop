@@ -179,45 +179,6 @@ def _invalidate_path(path: str) -> bool:
     return GLib.SOURCE_REMOVE
 
 
-def _reload_nautilus_windows() -> bool:
-    """Trigger a reload on all Nautilus windows via DBus (equivalent to F5)."""
-    try:
-        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        result = bus.call_sync(
-            "org.gnome.Nautilus",
-            "/org/gnome/Nautilus/window",
-            "org.freedesktop.DBus.Introspectable",
-            "Introspect",
-            None,
-            GLib.VariantType.new("(s)"),
-            Gio.DBusCallFlags.NONE,
-            500,
-            None,
-        )
-        xml = result.get_child_value(0).get_string()
-        import xml.etree.ElementTree as ET
-        root = ET.fromstring(xml)
-        for node in root.findall("node"):
-            win_id = node.get("name")
-            if win_id and win_id.isdigit():
-                try:
-                    bus.call_sync(
-                        "org.gnome.Nautilus",
-                        f"/org/gnome/Nautilus/window/{win_id}",
-                        "org.gtk.Actions",
-                        "Activate",
-                        GLib.Variant("(sava{sv})", ("reload", [], {})),
-                        None,
-                        Gio.DBusCallFlags.NONE,
-                        500,
-                        None,
-                    )
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return GLib.SOURCE_REMOVE
-
 
 def _poll_keep_done(path: str) -> None:
     try:
@@ -300,9 +261,8 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
 
     def _do_poll_changes(self):
         try:
-            # Targeted VFS ops for inotify generation
+            # Targeted VFS ops to generate kernel inotify events
             fc_resp = _send_command("FILE_CHANGES")
-            affected_parents = set()
             if fc_resp and not fc_resp.startswith("error"):
                 for entry in fc_resp.split("\t"):
                     if ":" not in entry:
@@ -312,28 +272,19 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                         if kind == "A":
                             fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
                             os.close(fd)
-                            affected_parents.add(os.path.dirname(path))
                         elif kind == "D":
                             os.unlink(path)
-                            affected_parents.add(os.path.dirname(path))
                         elif kind == "M":
                             os.utime(path)
                         elif kind == "DA":
                             os.mkdir(path, 0o755)
-                            affected_parents.add(os.path.dirname(path))
                         elif kind == "DD":
                             os.rmdir(path)
-                            affected_parents.add(os.path.dirname(path))
                         elif kind == "R":
                             old_path, new_path = path.split("\x1e", 1)
                             os.rename(old_path, new_path)
-                            affected_parents.add(os.path.dirname(old_path))
-                            affected_parents.add(os.path.dirname(new_path))
                     except OSError:
                         pass
-
-            if affected_parents:
-                GLib.idle_add(_reload_nautilus_windows)
 
             # Overlay icon refresh
             resp = _send_command("CHANGES")
