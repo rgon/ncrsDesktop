@@ -308,6 +308,67 @@ fi
 
 stop_ncrs
 
+# ── Test 6: Conflict — local edit + concurrent external edit ─────
+run_test "Conflict — local and external concurrent edit"
+
+dav_delete "conflict.txt" || true
+
+dav_put "conflict.txt" "server_v1"
+
+start_ncrs
+
+# Wait until the file appears in the FUSE listing (dir_cache populated with ETag)
+for _i in $(seq 1 20); do
+    [ -f "$MOUNT/conflict.txt" ] && break
+    sleep 1
+done
+
+go_offline
+sleep 1
+
+# Local edit while offline — journals a Put with the cached ETag as If-Match
+echo "local_edit" > "$MOUNT/conflict.txt" && sync
+sleep 1
+
+if journal_has "Put"; then
+    pass "Journal recorded local Put"
+else
+    fail "Journal missing Put entry"
+fi
+
+# External edit: advance the server's ETag so the journaled If-Match will fail
+dav_put "conflict.txt" "server_v2"
+
+go_online
+wait_synced
+
+# Server file must contain the external edit (server wins)
+server_content=$(dav_get "conflict.txt" || echo "")
+if echo "$server_content" | grep -q "server_v2"; then
+    pass "Server retains external edit after conflict"
+else
+    fail "Server content wrong after conflict: got '$server_content'"
+fi
+
+# A conflicted copy must have been uploaded for the local edit
+if curl -sf -u testuser:testpass \
+    -X PROPFIND -H "Depth: 1" \
+    "$(dav_url "")" \
+    --data '<d:propfind xmlns:d="DAV:"><d:prop><d:displayname/></d:prop></d:propfind>' \
+    2>/dev/null | grep -q "conflicted copy"; then
+    pass "Conflicted copy uploaded to server"
+else
+    fail "No conflicted copy found on server"
+fi
+
+if journal_empty; then
+    pass "Journal drained after conflict resolution"
+else
+    fail "Journal still has entries after conflict"
+fi
+
+stop_ncrs
+
 # ── Summary ───────────────────────────────────────────────────
 echo ""
 echo "=================================="
