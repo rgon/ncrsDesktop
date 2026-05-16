@@ -155,6 +155,11 @@ fn invalidate_dirs_for_fileids(
         .collect();
 
     let mut invalidated: Vec<(PathBuf, OldDirSnapshot)> = Vec::new();
+    // Dirs fetched recently whose cache entry we deliberately do NOT mark
+    // invalidated — kernel inval is suppressed to prevent a re-read loop.
+    // proactive_refresh will ETag-check them and call notify_inval_inode only
+    // if the content actually changed.
+    let mut freshly_fetched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut id_resolutions: Vec<String> = Vec::new();
     let mut matched_dirs = 0usize;
     let mut debounced_dirs = 0usize;
@@ -201,11 +206,27 @@ fn invalidate_dirs_for_fileids(
         let is_dir: HashMap<PathBuf, bool> = entry.files.iter()
             .map(|f| (f.path.clone(), f.is_dir))
             .collect();
-        entry.invalidated = true;
-        entry.refreshing = false;
+
+        // Suppress kernel dentry invalidation for dirs we fetched very recently.
+        // Nextcloud fires notify_file_id on every PROPFIND we perform; without this
+        // guard, that forces Nautilus to re-readdir the directory, which starts
+        // another PROPFIND, which fires another event — a tight self-notify loop.
+        // Keeping `invalidated=false` means FUSE readdir keeps serving the cache.
+        // proactive_refresh will still ETag-check and call notify_inval_inode if
+        // the content actually changed within this window.
+        let just_fetched = !entry.invalidated && entry.at.elapsed() < Duration::from_secs(5);
+        if just_fetched {
+            log::debug!("notify_push: suppressing kernel inval for {} (fetched {}ms ago)", dir_path.display(), entry.at.elapsed().as_millis());
+            freshly_fetched.insert(dir_path.clone());
+        } else {
+            entry.invalidated = true;
+            entry.refreshing = false;
+        }
         invalidated.push((dir_path.clone(), OldDirSnapshot { names, etags, fileids, is_dir }));
     }
+    // Only push kernel dentry invalidation for dirs not in the freshly_fetched set.
     let invalidated_inodes: Vec<u64> = invalidated.iter()
+        .filter(|(p, _)| !freshly_fetched.contains(p))
         .filter_map(|(p, _)| c.get_inode(p))
         .collect();
     let active_listings = c.pending_dirs.len();
@@ -227,8 +248,8 @@ fn invalidate_dirs_for_fileids(
     }
 
     if matched_dirs > 0 {
-        log::info!("notify_push: file_id {:?} → [{}] → {} dirs invalidated, {} debounced",
-            ids, id_resolutions.join(", "), invalidated.len(), debounced_dirs);
+        log::info!("notify_push: file_id {:?} → [{}] → {} dirs invalidated, {} debounced, {} self-notify suppressed",
+            ids, id_resolutions.join(", "), invalidated.len() - freshly_fetched.len(), debounced_dirs, freshly_fetched.len());
     } else {
         log::info!("notify_push: file_id {:?} → no cached dirs matched", ids);
     }
@@ -272,6 +293,8 @@ fn refresh_one_dir(
         match propfind::propfind_etag(&client, &webdav_url, &username, &password, &dir_path, PROPFIND_TIMEOUT) {
             Ok(current_etag) if current_etag == cached_etag => {
                 log::debug!("proactive_refresh {}: ETag unchanged {:?}, skipping (self-notify suppressed)", dir_path.display(), cached_etag);
+                // Reset invalidated flag so FUSE readdir keeps serving cached data.
+                cache.safe_lock().touch_dir_cache(&dir_path);
                 debounce.safe_lock().insert(dir_path, DebounceState {
                     last_refresh: Instant::now(),
                     had_changes: false,
