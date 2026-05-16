@@ -1,0 +1,25 @@
+services:
+  webdav:
+    build: ./webdav
+    networks:
+      - testnet
+
+  ncrs-test:
+    build:
+      context: ../../
+      dockerfile: tests/e2e/ncrs-test/Dockerfile
+    depends_on:
+      - webdav
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+    devices:
+      - /dev/fuse:/dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    networks:
+      - testnet
+    command: /tests/run_tests.sh
+
+networks:
+  testnet:
