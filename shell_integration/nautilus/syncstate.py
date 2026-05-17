@@ -38,11 +38,12 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
 # ── Emblem names (standard XDG / FreeDesktop icon names) ─────────────────────
-_EMBLEM_LOCAL   = "emblem-default"       # green tick
-_EMBLEM_REMOTE  = "emblem-downloads"    # cloud / down-arrow
-_EMBLEM_SYNCED  = "emblem-synchronizing" # circular arrows
-_EMBLEM_SHARED  = "emblem-shared"       # people / shared
-_EMBLEM_PARTIAL = "emblem-downloads"     # partial download (some files local)
+_EMBLEM_LOCAL     = "emblem-default"        # green tick
+_EMBLEM_REMOTE    = "emblem-downloads"     # cloud / down-arrow
+_EMBLEM_SYNCED    = "emblem-synchronizing" # circular arrows
+_EMBLEM_SHARED    = "emblem-shared"        # people / shared
+_EMBLEM_PARTIAL   = "emblem-downloads"     # partial download (some files local)
+_EMBLEM_UPLOADING = "emblem-synchronizing" # circular arrows — upload in progress
 
 SOCKET_TIMEOUT = 2.0  # seconds
 
@@ -267,6 +268,7 @@ _SYNC_LABELS = {
     "synced": "Synced",
     "remote": "Remote",
     "downloading": "Downloading",
+    "uploading": "Uploading",
     "partial": "Partial",
     "unknown": "",
 }
@@ -358,6 +360,8 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 file_info.add_emblem(_EMBLEM_SYNCED)
             elif sync == "downloading":
                 file_info.add_emblem(_EMBLEM_REMOTE)
+            elif sync == "uploading":
+                file_info.add_emblem(_EMBLEM_UPLOADING)
             elif sync == "partial":
                 file_info.add_emblem(_EMBLEM_PARTIAL)
             if sharing:

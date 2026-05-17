@@ -88,16 +88,18 @@ pub enum FileStatus {
     Synced,
     Remote,
     Downloading,
+    Uploading,
     Unknown,
 }
 
 impl FileStatus {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             FileStatus::Local => "local",
             FileStatus::Synced => "synced",
             FileStatus::Remote => "remote",
             FileStatus::Downloading => "downloading",
+            FileStatus::Uploading => "uploading",
             FileStatus::Unknown => "unknown",
         }
     }
@@ -111,14 +113,23 @@ fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>,
     if own == Some(FileStatus::Downloading) {
         return "downloading";
     }
+    if own == Some(FileStatus::Uploading) {
+        return "uploading";
+    }
     let mut total = 0usize;
     let mut local = 0usize;
+    let mut uploading = 0usize;
     for (p, s) in sm.iter() {
         if p.parent() == Some(dir) {
             total += 1;
-            if *s == FileStatus::Local { local += 1; }
+            match s {
+                FileStatus::Local | FileStatus::Synced => local += 1,
+                FileStatus::Uploading => uploading += 1,
+                _ => {}
+            }
         }
     }
+    if uploading > 0 { return "uploading"; }
     if total > 0 && local == total { "local" }
     else if local > 0 { "partial" }
     else { own.unwrap_or(FileStatus::Remote).as_str() }

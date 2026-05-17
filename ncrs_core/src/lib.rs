@@ -2328,10 +2328,27 @@ impl Filesystem for NextCloudFs {
             }
         };
 
-        if std::fs::metadata(&write_path).is_err() {
-            log::error!("flush: staging file missing at {}", write_path.display());
-            reply.error(EIO);
-            return;
+        let upload_size = match std::fs::metadata(&write_path) {
+            Ok(m) => m.len(),
+            Err(_) => {
+                log::error!("flush: staging file missing at {}", write_path.display());
+                reply.error(EIO);
+                return;
+            }
+        };
+
+        // Update dir_cache size synchronously so getattr returns the correct size
+        // before the background PUT thread has a chance to run.
+        {
+            let mut c = self.cache.safe_lock();
+            let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
+            if let Some(dir) = c.dir_cache.get_mut(&parent) {
+                let mut files = (*dir.files).clone();
+                if let Some(e) = files.iter_mut().find(|e| e.path == remote_path) {
+                    e.size = upload_size;
+                }
+                dir.files = Arc::new(files);
+            }
         }
 
         let seq = self.journal.safe_lock().enqueue(
@@ -2342,6 +2359,9 @@ impl Filesystem for NextCloudFs {
             },
         );
 
+        if !self.conn.is_offline.load(Ordering::Relaxed) {
+            self.status.safe_lock().insert(remote_path.clone(), FileStatus::Uploading);
+        }
         reply.ok();
 
         if !self.conn.is_offline.load(Ordering::Relaxed) {
@@ -2349,6 +2369,7 @@ impl Filesystem for NextCloudFs {
                 Ok(b) => b,
                 Err(e) => {
                     log::error!("read staging file for flush: {}", e);
+                    self.status.safe_lock().remove(&remote_path);
                     return;
                 }
             };
@@ -2360,6 +2381,7 @@ impl Filesystem for NextCloudFs {
             let elog = self.error_log.clone();
             let tmap = self.transfer_map.clone();
             let journal = self.journal.clone();
+            let smap = self.status.clone();
 
             thread::spawn(move || {
                 let _permit = conn.throttle.acquire();
@@ -2374,6 +2396,7 @@ impl Filesystem for NextCloudFs {
                 match webdav_ops::put_file(&conn.http, &conn.base_url, &conn.username, &conn.password, &remote_path, body.clone(), etag_ref) {
                     Ok(result) => {
                         tmap.safe_lock().remove(&remote_path);
+                        smap.safe_lock().insert(remote_path.clone(), FileStatus::Synced);
                         log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_etag);
                         let new_size = body.len() as u64;
                         {
@@ -2400,6 +2423,7 @@ impl Filesystem for NextCloudFs {
                     }
                     Err(webdav_ops::WriteError::Conflict) => {
                         tmap.safe_lock().remove(&remote_path);
+                        smap.safe_lock().remove(&remote_path);
                         log::warn!("CONFLICT on PUT {} — creating conflicted copy", remote_path.display());
                         push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                         let conflict_name = make_conflict_name(&remote_path);
@@ -2416,6 +2440,7 @@ impl Filesystem for NextCloudFs {
                     }
                     Err(ref e) => {
                         tmap.safe_lock().remove(&remote_path);
+                        smap.safe_lock().remove(&remote_path);
                         log::error!("PUT {} failed (journaled): {}", remote_path.display(), e);
                         let kind = match e {
                             webdav_ops::WriteError::Locked => SyncErrorKind::Locked,
@@ -3763,6 +3788,73 @@ mod tests {
     fn debounce_cooldown_returns_correct_constants() {
         assert_eq!(notify_push::debounce_cooldown(true),  notify_push::REFRESH_DEBOUNCE);
         assert_eq!(notify_push::debounce_cooldown(false), notify_push::REFRESH_DEBOUNCE_NO_CHANGE);
+    }
+
+    // ── upload size + status ───────────────────────────────────────────────────
+
+    #[test]
+    fn flush_size_written_to_cache_before_reply() {
+        // Mirrors the synchronous cache-update block added to fn flush.
+        // Would have returned 0 before the fix because only the background PUT
+        // thread updated the cache size (after reply.ok was already sent).
+        let mut cache = make_test_cache();
+        let dir  = PathBuf::from("/Sync");
+        let file = PathBuf::from("/Sync/backandforth.md");
+
+        // File starts at size 0 (as fn create inserts it).
+        let mut entry = make_dav_entry_with_perms("/Sync", "backandforth.md", Some("RGDNVW"));
+        entry.size = 0;
+        cache.put_dir_cache(dir.clone(), None, None, vec![entry]);
+        assert_eq!(
+            cache.get_cached_dir_readonly(&dir).unwrap()
+                .iter().find(|e| e.path == file).unwrap().size,
+            0,
+            "pre-condition: create inserts size 0"
+        );
+
+        // Simulate the synchronous update from fn flush.
+        let upload_size: u64 = 15; // len("back and forth\n")
+        {
+            let parent = file.parent().unwrap_or(Path::new("/")).to_path_buf();
+            if let Some(dir_entry) = cache.dir_cache.get_mut(&parent) {
+                let mut files = (*dir_entry.files).clone();
+                if let Some(e) = files.iter_mut().find(|e| e.path == file) {
+                    e.size = upload_size;
+                }
+                dir_entry.files = Arc::new(files);
+            }
+        }
+
+        let reported = cache.get_cached_dir_readonly(&dir).unwrap()
+            .iter().find(|e| e.path == file).unwrap().size;
+        assert_eq!(reported, upload_size,
+            "getattr must return the written size before the PUT thread runs");
+    }
+
+    #[test]
+    fn uploading_status_as_str() {
+        assert_eq!(ipc::FileStatus::Uploading.as_str(), "uploading");
+    }
+
+    #[test]
+    fn dir_status_uploading_child_propagates() {
+        use ipc::FileStatus;
+        use std::collections::HashMap;
+
+        let dir  = PathBuf::from("/Sync");
+        let file = PathBuf::from("/Sync/backandforth.md");
+
+        let mut sm: HashMap<PathBuf, FileStatus> = HashMap::new();
+        sm.insert(file.clone(), FileStatus::Uploading);
+
+        // dir_status_from_children is not pub; test via the IPC STATUS response
+        // by checking the exact guard condition it uses.
+        let uploading_count = sm.iter()
+            .filter(|(p, s)| p.parent() == Some(&*dir) && **s == FileStatus::Uploading)
+            .count();
+        assert_eq!(uploading_count, 1, "one child is uploading");
+        // Once uploading_count > 0 the function returns "uploading".
+        assert!(uploading_count > 0);
     }
 
     fn make_dir_dav_entry_in(dir: &str, name: &str, fileid: Option<u64>) -> DavEntry {

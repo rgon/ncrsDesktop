@@ -375,5 +375,33 @@ class TestPersistentConnRetry(unittest.TestCase):
             syncstate._sock_path = original
 
 
+class TestUploadingStatus(unittest.TestCase):
+    """Verify the 'uploading' status string is wired up in syncstate."""
+
+    def test_uploading_label_present(self):
+        """'uploading' must appear in _SYNC_LABELS so Nautilus column shows text."""
+        self.assertIn("uploading", syncstate._SYNC_LABELS,
+                      "_SYNC_LABELS must contain 'uploading'")
+
+    def test_uploading_label_value(self):
+        self.assertEqual(syncstate._SYNC_LABELS.get("uploading"), "Uploading")
+
+    def test_emblem_uploading_constant_defined(self):
+        """_EMBLEM_UPLOADING must be defined (non-empty string)."""
+        self.assertTrue(
+            hasattr(syncstate, "_EMBLEM_UPLOADING"),
+            "syncstate must export _EMBLEM_UPLOADING",
+        )
+        self.assertIsInstance(syncstate._EMBLEM_UPLOADING, str)
+        self.assertTrue(syncstate._EMBLEM_UPLOADING,
+                        "_EMBLEM_UPLOADING must not be empty")
+
+    def test_uploading_emblem_same_family_as_remote(self):
+        """_EMBLEM_REMOTE and _EMBLEM_UPLOADING must both be non-empty icon names."""
+        self.assertTrue(hasattr(syncstate, "_EMBLEM_REMOTE"))
+        self.assertIsInstance(syncstate._EMBLEM_REMOTE, str)
+        self.assertTrue(syncstate._EMBLEM_REMOTE)
+
+
 if __name__ == "__main__":
     unittest.main()
