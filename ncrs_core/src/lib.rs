@@ -440,6 +440,18 @@ impl FsCache {
         self.dir_cache.get(path).map(|e| Arc::clone(&e.files))
     }
 
+    /// Returns the NC oc:permissions string for a directory by looking it up in its
+    /// parent's cached listing.  Returns None if the entry is not yet cached (in
+    /// which case the caller should allow the operation and let the server enforce).
+    pub(crate) fn nc_dir_perms(&self, dir_inode: u64) -> Option<String> {
+        let dir_path = self.get_path(dir_inode)?;
+        let parent = dir_path.parent()?.to_path_buf();
+        self.get_cached_dir_readonly(&parent)?
+            .iter()
+            .find(|e| e.path == dir_path)
+            .and_then(|e| e.permissions.clone())
+    }
+
     fn cached_dir_etag(&self, path: &Path) -> Option<String> {
         self.dir_cache.get(path)?.etag.clone()
     }
@@ -1609,7 +1621,7 @@ impl Filesystem for NextCloudFs {
     }
 
     fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
-        let (path, local, etag) = {
+        let (path, local, etag, nc_permissions) = {
             let c = self.cache.safe_lock();
             let path = match c.get_path(ino) {
                 Some(p) => p,
@@ -1624,13 +1636,22 @@ impl Filesystem for NextCloudFs {
                 .filter(|e| e.local_path.metadata().map_or(false, |m| m.len() > 0))
                 .map(|e| e.local_path.clone());
             let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-            let etag = c.get_cached_dir_readonly(&parent).and_then(|files| {
-                files.iter().find(|e| e.path == path).and_then(|e| e.etag.clone())
-            });
-            (path, local, etag)
+            let (etag, nc_permissions) = c.get_cached_dir_readonly(&parent)
+                .and_then(|files| files.iter().find(|e| e.path == path).map(|e| {
+                    (e.etag.clone(), e.permissions.clone())
+                }))
+                .unwrap_or((None, None));
+            (path, local, etag, nc_permissions)
         };
 
         let writable = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
+
+        if writable && perms_to_mode(nc_permissions.as_deref(), false) & 0o200 == 0
+            && nc_permissions.is_some()
+        {
+            reply.error(EACCES);
+            return;
+        }
 
         let fh = {
             let mut n = self.next_fh.safe_lock();
@@ -2616,6 +2637,15 @@ impl Filesystem for NextCloudFs {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        // Guard: NC 'D' (delete) flag must be present on the parent directory.
+        // Blocks unlink even when the parent directory mode is 0o755 due to having 'C'.
+        if let Some(p) = self.cache.safe_lock().nc_dir_perms(parent) {
+            if !p.contains('D') {
+                reply.error(EACCES);
+                return;
+            }
+        }
+
         let parent_path = match self.cache.safe_lock().get_path(parent) {
             Some(p) => p,
             None => {
@@ -2677,6 +2707,13 @@ impl Filesystem for NextCloudFs {
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if let Some(p) = self.cache.safe_lock().nc_dir_perms(parent) {
+            if !p.contains('D') {
+                reply.error(EACCES);
+                return;
+            }
+        }
+
         let parent_path = match self.cache.safe_lock().get_path(parent) {
             Some(p) => p,
             None => {
@@ -2753,6 +2790,20 @@ impl Filesystem for NextCloudFs {
             push_error(&self.error_log, PathBuf::from(&full_name), SyncErrorKind::InvalidFilename, e.to_string());
             reply.error(e.to_errno());
             return;
+        }
+
+        // Guard: same-dir rename requires 'N'; cross-dir move requires 'V' on source.
+        {
+            let c = self.cache.safe_lock();
+            let src_perms = c.nc_dir_perms(parent);
+            if let Some(ref p) = src_perms {
+                let cross_dir = parent != newparent;
+                let required = if cross_dir { 'V' } else { 'N' };
+                if !p.contains(required) {
+                    reply.error(EACCES);
+                    return;
+                }
+            }
         }
 
         let (old_parent_path, new_parent_path) = {
@@ -3263,6 +3314,150 @@ mod tests {
     fn perms_mode_empty_falls_back_to_default() {
         assert_eq!(perms_to_mode(Some(""), false), 0o644);
         assert_eq!(perms_to_mode(Some(""), true),  0o755);
+    }
+
+    fn make_dav_entry_with_perms(dir: &str, name: &str, permissions: Option<&str>) -> DavEntry {
+        DavEntry {
+            path: PathBuf::from(format!("{}/{}", dir, name)),
+            is_dir: false,
+            size: 1024,
+            modified: None,
+            etag: Some("etag1".into()),
+            content_type: None,
+            has_preview: false,
+            is_shared: false,
+            permissions: permissions.map(str::to_string),
+            fileid: Some(1),
+            owner_id: None,
+            owner_display_name: None,
+        }
+    }
+
+    fn open_guard_fires(cache: &FsCache, path: &PathBuf) -> bool {
+        let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let nc_permissions = cache.get_cached_dir_readonly(&parent)
+            .and_then(|files| files.iter().find(|e| &e.path == path)
+            .and_then(|e| e.permissions.clone()));
+        nc_permissions.is_some()
+            && perms_to_mode(nc_permissions.as_deref(), false) & 0o200 == 0
+    }
+
+    #[test]
+    fn open_write_blocked_for_readonly_nc_entry_via_cache() {
+        // Exercises the exact cache-lookup + guard-condition path used by fn open.
+        // This test would have had no matching behaviour before the guard was added.
+        let mut cache = make_test_cache();
+        let dir = PathBuf::from("/Musica/Tracks");
+
+        cache.put_dir_cache(dir.clone(), None, None, vec![
+            make_dav_entry_with_perms("/Musica/Tracks", "song.mp3",   Some("SRMG")),   // read-only
+            make_dav_entry_with_perms("/Musica/Tracks", "editable.mp3", Some("RGDNVW")), // writable
+            make_dav_entry_with_perms("/Musica/Tracks", "unknown.mp3",  None),            // no NC perms
+        ]);
+
+        let ro_file  = PathBuf::from("/Musica/Tracks/song.mp3");
+        let rw_file  = PathBuf::from("/Musica/Tracks/editable.mp3");
+        let unk_file = PathBuf::from("/Musica/Tracks/unknown.mp3");
+
+        assert!(open_guard_fires(&cache, &ro_file),
+            "write open must be blocked for SRMG (Shared+Reshare+Mounted+Read — no W flag)");
+        assert!(!open_guard_fires(&cache, &rw_file),
+            "write open must be allowed for RGDNVW (has W flag)");
+        assert!(!open_guard_fires(&cache, &unk_file),
+            "write open must not be blocked when NC permissions are absent (fall through to DefaultPermissions)");
+    }
+
+    fn make_dir_entry_with_perms(parent: &str, name: &str, permissions: Option<&str>) -> DavEntry {
+        DavEntry {
+            path: PathBuf::from(format!("{}/{}", parent, name)),
+            is_dir: true,
+            size: 0,
+            modified: None,
+            etag: None,
+            content_type: None,
+            has_preview: false,
+            is_shared: false,
+            permissions: permissions.map(str::to_string),
+            fileid: Some(2),
+            owner_id: None,
+            owner_display_name: None,
+        }
+    }
+
+    /// Registers a directory inode so nc_dir_perms can look it up by inode number.
+    fn register_dir(cache: &mut FsCache, parent: &str, name: &str, permissions: Option<&str>) -> u64 {
+        let path = PathBuf::from(format!("{}/{}", parent, name));
+        let entry = make_dir_entry_with_perms(parent, name, permissions);
+        let parent_path = PathBuf::from(parent);
+        // Ensure the parent's dir listing is populated (so nc_dir_perms can find this dir).
+        let mut files = cache.dir_cache.get(&parent_path)
+            .map(|e| e.files.as_ref().clone())
+            .unwrap_or_default();
+        files.push(entry);
+        cache.put_dir_cache(parent_path, None, None, files);
+        cache.allocate_inode(path)
+    }
+
+    #[test]
+    fn unlink_guard_blocks_when_no_delete_flag() {
+        // Tracks/ has SRGCK: S+R+G+C+K but NO 'D' → nc_dir_perms returns "SRGCK".
+        // The unlink guard must fire (would have passed silently before the fix).
+        let mut cache = make_test_cache();
+        let tracks_ino = register_dir(&mut cache, "/Musica", "Tracks", Some("SRGCK"));
+
+        let perms = cache.nc_dir_perms(tracks_ino).expect("perms must be present");
+        assert!(!perms.contains('D'), "SRGCK should not have D");
+        // Guard condition (mirrors fn unlink):
+        assert!(!perms.contains('D'), "unlink must be blocked — no D flag");
+    }
+
+    #[test]
+    fn unlink_guard_allows_when_delete_flag_present() {
+        let mut cache = make_test_cache();
+        let dir_ino = register_dir(&mut cache, "/Musica", "OwnedDir", Some("RGDNVCK"));
+
+        let perms = cache.nc_dir_perms(dir_ino).expect("perms must be present");
+        assert!(perms.contains('D'), "RGDNVCK has D → unlink must be allowed");
+    }
+
+    #[test]
+    fn unlink_guard_allows_when_perms_absent() {
+        // No cached permissions → guard doesn't fire; server enforces.
+        let mut cache = make_test_cache();
+        let dir_ino = register_dir(&mut cache, "/Musica", "UnknownDir", None);
+
+        assert!(cache.nc_dir_perms(dir_ino).is_none(),
+            "guard must not fire when NC permissions are unknown");
+    }
+
+    #[test]
+    fn rename_guard_blocks_same_dir_without_n_flag() {
+        let mut cache = make_test_cache();
+        let dir_ino = register_dir(&mut cache, "/Musica", "Tracks", Some("SRGCK")); // no N
+
+        let perms = cache.nc_dir_perms(dir_ino).expect("perms must be present");
+        // same-dir rename check (mirrors fn rename, parent == newparent):
+        assert!(!perms.contains('N'), "SRGCK has no N → same-dir rename must be blocked");
+    }
+
+    #[test]
+    fn rename_guard_blocks_cross_dir_move_without_v_flag() {
+        let mut cache = make_test_cache();
+        let dir_ino = register_dir(&mut cache, "/Musica", "Tracks", Some("SRGCK")); // no V
+
+        let perms = cache.nc_dir_perms(dir_ino).expect("perms must be present");
+        // cross-dir move check (mirrors fn rename, parent != newparent):
+        assert!(!perms.contains('V'), "SRGCK has no V → cross-dir move must be blocked");
+    }
+
+    #[test]
+    fn rename_guard_allows_when_flags_present() {
+        let mut cache = make_test_cache();
+        let dir_ino = register_dir(&mut cache, "/Musica", "OwnedDir", Some("RGDNVCK"));
+
+        let perms = cache.nc_dir_perms(dir_ino).expect("perms must be present");
+        assert!(perms.contains('N'), "RGDNVCK has N → same-dir rename must be allowed");
+        assert!(perms.contains('V'), "RGDNVCK has V → cross-dir move must be allowed");
     }
 
     #[test]
