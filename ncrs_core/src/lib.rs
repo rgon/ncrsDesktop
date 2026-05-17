@@ -2361,6 +2361,7 @@ impl Filesystem for NextCloudFs {
 
         if !self.conn.is_offline.load(Ordering::Relaxed) {
             self.status.safe_lock().insert(remote_path.clone(), FileStatus::Uploading);
+            self.dirty.safe_lock().insert(remote_path.clone());
         }
         reply.ok();
 
@@ -2417,6 +2418,7 @@ impl Filesystem for NextCloudFs {
                             of.dirty = false;
                             of.original_etag = result.new_etag;
                         }
+                        dirty.safe_lock().insert(remote_path.clone());
                         dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
                         journal.safe_lock().remove(seq);
                         let _ = std::fs::remove_file(&write_path);
@@ -2434,6 +2436,7 @@ impl Filesystem for NextCloudFs {
                         if let Some(of) = open_files.safe_lock().get_mut(&fh) {
                             of.dirty = false;
                         }
+                        dirty.safe_lock().insert(remote_path.clone());
                         dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
                         journal.safe_lock().remove(seq);
                         let _ = std::fs::remove_file(&write_path);
@@ -2452,6 +2455,7 @@ impl Filesystem for NextCloudFs {
                         };
                         push_error(&elog, remote_path.clone(), kind, e.to_string());
                         journal.safe_lock().mark_failed(seq, e.to_string());
+                        dirty.safe_lock().insert(remote_path.clone());
                     }
                 }
             });
@@ -3855,6 +3859,35 @@ mod tests {
         assert_eq!(uploading_count, 1, "one child is uploading");
         // Once uploading_count > 0 the function returns "uploading".
         assert!(uploading_count > 0);
+    }
+
+    #[test]
+    fn flush_background_dirties_file_path_on_success() {
+        // The background PUT thread must insert the file path (not just the parent)
+        // so that Nautilus's 2-second CHANGES poll picks it up and clears the emblem.
+        let dirty: ipc::DirtySet = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let file   = PathBuf::from("/Sync/backandforth.md");
+        let parent = PathBuf::from("/Sync");
+
+        dirty.safe_lock().insert(file.clone());
+        dirty.safe_lock().insert(parent.clone());
+
+        let paths: std::collections::HashSet<PathBuf> = dirty.safe_lock().drain().collect();
+        assert!(paths.contains(&file),   "file path must be in dirty set");
+        assert!(paths.contains(&parent), "parent dir must also be in dirty set");
+    }
+
+    #[test]
+    fn flush_background_dirties_file_path_on_error() {
+        // Same check for the error arm — only the file path is inserted (no parent insert
+        // in that arm), which is enough for Nautilus to invalidate the file's emblem.
+        let dirty: ipc::DirtySet = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let file = PathBuf::from("/Sync/backandforth.md");
+
+        dirty.safe_lock().insert(file.clone());
+
+        let paths: std::collections::HashSet<PathBuf> = dirty.safe_lock().drain().collect();
+        assert!(paths.contains(&file), "file path must be in dirty set after error");
     }
 
     fn make_dir_dav_entry_in(dir: &str, name: &str, fileid: Option<u64>) -> DavEntry {
