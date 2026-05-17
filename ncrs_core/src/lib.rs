@@ -196,6 +196,11 @@ pub struct MountOptions {
     pub offline: bool,
     #[serde(default = "default_true")]
     pub optimistic_listing: bool,
+    /// Keep a local cache copy of files after they are written and uploaded.
+    /// When true the post-upload emblem is a green checkmark (Local); when false
+    /// the staging copy is discarded and no emblem is shown (Synced).
+    #[serde(default)]
+    pub auto_keep_locally_modified_files: bool,
 }
 
 fn default_true() -> bool { true }
@@ -1277,6 +1282,7 @@ pub struct NextCloudFs {
     ghost_entries: GhostMap,
     log_user: String,
     aggressive_prefetch: bool,
+    auto_keep_locally_modified_files: bool,
 }
 
 impl NextCloudFs {
@@ -1384,6 +1390,7 @@ impl NextCloudFs {
             ghost_entries: Arc::new(Mutex::new(HashMap::new())),
             log_user: options.log_user,
             aggressive_prefetch: options.aggressive_prefetch,
+            auto_keep_locally_modified_files: options.auto_keep_locally_modified_files,
         })
     }
 
@@ -2414,6 +2421,7 @@ impl Filesystem for NextCloudFs {
             let tmap = self.transfer_map.clone();
             let journal = self.journal.clone();
             let smap = self.status.clone();
+            let auto_keep = self.auto_keep_locally_modified_files;
 
             thread::spawn(move || {
                 let _permit = conn.throttle.acquire();
@@ -2428,7 +2436,6 @@ impl Filesystem for NextCloudFs {
                 match webdav_ops::put_file(&conn.http, &conn.base_url, &conn.username, &conn.password, &remote_path, body.clone(), etag_ref) {
                     Ok(result) => {
                         tmap.safe_lock().remove(&remote_path);
-                        smap.safe_lock().insert(remote_path.clone(), FileStatus::Synced);
                         log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_etag);
                         let new_size = body.len() as u64;
                         {
@@ -2449,12 +2456,35 @@ impl Filesystem for NextCloudFs {
                         }
                         if let Some(of) = open_files.safe_lock().get_mut(&fh) {
                             of.dirty = false;
-                            of.original_etag = result.new_etag;
+                            of.original_etag = result.new_etag.clone();
                         }
+                        if auto_keep {
+                            // Keep a local copy so the file is available offline.
+                            let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
+                            let cache_path = cache.safe_lock().cache_dir.join(rel);
+                            let mut kept = false;
+                            if let Some(parent) = cache_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if std::fs::write(&cache_path, &body).is_ok() {
+                                cache.safe_lock().file_cache.insert(remote_path.clone(), FileCacheEntry {
+                                    local_path: cache_path,
+                                    remote_modified: Some(SystemTime::now()),
+                                    etag: result.new_etag,
+                                });
+                                smap.safe_lock().insert(remote_path.clone(), FileStatus::Local);
+                                kept = true;
+                            }
+                            if !kept {
+                                smap.safe_lock().insert(remote_path.clone(), FileStatus::Synced);
+                            }
+                        } else {
+                            smap.safe_lock().insert(remote_path.clone(), FileStatus::Synced);
+                        }
+                        let _ = std::fs::remove_file(&write_path);
                         dirty.safe_lock().insert(remote_path.clone());
                         dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
                         journal.safe_lock().remove(seq);
-                        let _ = std::fs::remove_file(&write_path);
                     }
                     Err(webdav_ops::WriteError::Conflict) => {
                         tmap.safe_lock().remove(&remote_path);
@@ -3274,8 +3304,9 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let http3 = doc["http3"].as_bool().unwrap_or(false);
     let max_concurrent_requests = doc["max_concurrent_requests"].as_i64().unwrap_or(10) as usize;
     let optimistic_listing = doc["optimistic_listing"].as_bool().unwrap_or(true);
+    let auto_keep_locally_modified_files = doc["auto_keep_locally_modified_files"].as_bool().unwrap_or(false);
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files })
 }
 
 #[cfg(test)]

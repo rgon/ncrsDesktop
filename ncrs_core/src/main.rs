@@ -19,6 +19,11 @@ struct Cli {
     /// Disable optimistic directory listing (re-list every 10s instead of relying on notify_push)
     #[arg(long)]
     no_optimistic_listing: bool,
+
+    /// Keep a local cache copy of every file after it is written and uploaded.
+    /// When set, the post-upload emblem is a green checkmark; otherwise no emblem is shown.
+    #[arg(long)]
+    auto_keep_locally_modified_files: bool,
 }
 
 fn main() {
@@ -58,6 +63,9 @@ fn main() {
     }
     if cli.no_optimistic_listing {
         opts.optimistic_listing = false;
+    }
+    if cli.auto_keep_locally_modified_files {
+        opts.auto_keep_locally_modified_files = true;
     }
 
     if let Err(e) = ncrs_core::mount_ncfs(opts, None, None, None) {

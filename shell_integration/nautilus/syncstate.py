@@ -40,7 +40,7 @@ from gi.repository import Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 # ── Emblem names (standard XDG / FreeDesktop icon names) ─────────────────────
 _EMBLEM_LOCAL     = "emblem-default"        # green tick
 _EMBLEM_REMOTE    = "emblem-downloads"     # cloud / down-arrow
-_EMBLEM_SYNCED    = "emblem-default"        # green tick — successfully synced
+_EMBLEM_SYNCED    = "emblem-default"        # green tick — reserved for future use (synced status emits no emblem)
 _EMBLEM_SHARED    = "emblem-shared"        # people / shared
 _EMBLEM_PARTIAL   = "emblem-downloads"     # partial download (some files local)
 _EMBLEM_UPLOADING = "emblem-synchronizing" # circular arrows — upload in progress
@@ -357,7 +357,7 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             if sync == "local":
                 file_info.add_emblem(_EMBLEM_LOCAL)
             elif sync == "synced":
-                file_info.add_emblem(_EMBLEM_SYNCED)
+                pass  # uploaded, no local copy — no emblem (auto_keep off); Local shows the green tick
             elif sync == "downloading":
                 file_info.add_emblem(_EMBLEM_REMOTE)
             elif sync == "uploading":
