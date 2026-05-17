@@ -84,9 +84,9 @@ def _load_mount_point(config_path: str | None = None) -> str | None:
     try:
         with open(config_path) as f:
             for line in f:
-                stripped = line.strip()
-                if stripped.startswith("mount_point:"):
-                    val = stripped[len("mount_point:"):].strip().strip('"').strip("'")
+                key, sep, rest = line.strip().partition(":")
+                if sep and key.strip() == "mount_point":
+                    val = rest.strip().strip('"').strip("'")
                     if val:
                         return val.rstrip("/")
     except (OSError, ValueError):
@@ -141,6 +141,27 @@ class _PersistentConn:
 
 
 _local = threading.local()
+
+
+def query_status(path: str, sock_path: str | None = None) -> str:
+    """Return the sync status for *path* by querying the daemon socket.
+
+    Accepts an optional *sock_path* override for use in tests.  Returns
+    ``'unknown'`` on any connection or timeout error.
+    """
+    effective_path = sock_path if sock_path is not None else _sock_path()
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(SOCKET_TIMEOUT)
+        s.connect(effective_path)
+        with s:
+            s.sendall(f"STATUS {path}\n".encode())
+            line = s.makefile("rb").readline()
+            if not line:
+                return "unknown"
+            return line.decode(errors="replace").strip()
+    except (OSError, ConnectionError):
+        return "unknown"
 
 
 def _send_command(cmd: str) -> str:

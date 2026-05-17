@@ -1122,7 +1122,7 @@ fn start_background_propfind(
 // Map Nextcloud oc:permissions flags to POSIX mode bits.
 // G=read, W=write(file), C=create(dir), D=delete, N=rename, V=move.
 // Directories always have execute set so the kernel can traverse them.
-fn perms_to_mode(permissions: Option<&str>, is_dir: bool) -> u16 {
+pub(crate) fn perms_to_mode(permissions: Option<&str>, is_dir: bool) -> u16 {
     let perms = match permissions {
         Some(p) if !p.is_empty() => p,
         _ => return if is_dir { 0o755 } else { 0o644 },
@@ -3057,6 +3057,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let fuse_options = vec![
         MountOption::FSName("ncrs".to_string()),
         MountOption::AutoUnmount,
+        MountOption::DefaultPermissions,
     ];
 
     let mp_str = options.mount_point.to_string_lossy().to_string();
@@ -3211,6 +3212,57 @@ mod tests {
         let notifier = Arc::new(fuse_notify::FuseNotifier::new(write_file));
         let slot: fuse_notify::NotifierSlot = Arc::new(Mutex::new(Some(notifier)));
         (slot, read_file)
+    }
+
+    // ── perms_to_mode ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn perms_mode_full_rw_file() {
+        assert_eq!(perms_to_mode(Some("RGDNVW"), false), 0o644);
+    }
+
+    #[test]
+    fn perms_mode_full_rw_dir() {
+        assert_eq!(perms_to_mode(Some("RGDNVCK"), true), 0o755);
+    }
+
+    #[test]
+    fn perms_mode_readonly_file() {
+        assert_eq!(perms_to_mode(Some("G"), false), 0o444);
+    }
+
+    #[test]
+    fn perms_mode_readonly_dir() {
+        assert_eq!(perms_to_mode(Some("G"), true), 0o555);
+    }
+
+    #[test]
+    fn perms_mode_reshare_mounted_read_file() {
+        // S=Shared, R=Reshare, M=Mounted, G=Read — the Hddstore Media case
+        assert_eq!(perms_to_mode(Some("SRMG"), false), 0o444);
+    }
+
+    #[test]
+    fn perms_mode_reshare_mounted_read_dir() {
+        assert_eq!(perms_to_mode(Some("SRMG"), true), 0o555);
+    }
+
+    #[test]
+    fn perms_mode_no_read_is_zero() {
+        assert_eq!(perms_to_mode(Some("W"),   false), 0o000);
+        assert_eq!(perms_to_mode(Some("CDN"), true),  0o000);
+    }
+
+    #[test]
+    fn perms_mode_none_falls_back_to_default() {
+        assert_eq!(perms_to_mode(None, false), 0o644);
+        assert_eq!(perms_to_mode(None, true),  0o755);
+    }
+
+    #[test]
+    fn perms_mode_empty_falls_back_to_default() {
+        assert_eq!(perms_to_mode(Some(""), false), 0o644);
+        assert_eq!(perms_to_mode(Some(""), true),  0o755);
     }
 
     #[test]
@@ -3443,106 +3495,40 @@ mod tests {
     }
 
     #[test]
-    fn proactive_refresh_populates_ghosts_and_file_changes() {
-        let mut cache = make_test_cache();
-        let sync_dir = PathBuf::from("/Sync");
-        cache.allocate_inode(sync_dir.clone());
+    fn proactive_refresh_classifies_removals_and_additions() {
+        // Old: old.txt + keep.txt; New: keep.txt + new.txt
+        // Expected diff: removed=[old.txt], added=[new.txt], no renames.
+        // make_dav_entry_in always sets etag = "etag1". Use matching etag for
+        // keep.txt in the old snapshot so compute_dir_diff doesn't flag it as modified.
+        let old_snap = notify_push::OldDirSnapshot {
+            names: vec![PathBuf::from("/Sync/old.txt"), PathBuf::from("/Sync/keep.txt")],
+            etags: [
+                (PathBuf::from("/Sync/old.txt"),  Some("etag1".into())),
+                (PathBuf::from("/Sync/keep.txt"), Some("etag1".into())),
+            ].into_iter().collect(),
+            fileids: [
+                (PathBuf::from("/Sync/old.txt"),  100u64),
+                (PathBuf::from("/Sync/keep.txt"), 101u64),
+            ].into_iter().collect(),
+            is_dir: [
+                (PathBuf::from("/Sync/old.txt"),  false),
+                (PathBuf::from("/Sync/keep.txt"), false),
+            ].into_iter().collect(),
+        };
 
-        // Old state: has "old.txt" and "keep.txt"
-        let old_file = make_dav_entry_in("/Sync", "old.txt", Some(100));
-        let keep_file = make_dav_entry_in("/Sync", "keep.txt", Some(101));
-        cache.put_dir_cache(sync_dir.clone(), None, None, vec![old_file.clone(), keep_file.clone()]);
-        cache.allocate_inode(PathBuf::from("/Sync/old.txt"));
-        cache.allocate_inode(PathBuf::from("/Sync/keep.txt"));
+        let fresh_files = vec![
+            make_dav_entry_in("/Sync", "keep.txt", Some(101)),
+            make_dav_entry_in("/Sync", "new.txt",  Some(102)),
+        ];
 
-        let cache = Arc::new(Mutex::new(cache));
-        let ghosts = make_ghost_map();
-        let fcq = make_file_change_queue();
+        let diff = notify_push::compute_dir_diff(&old_snap, &fresh_files);
 
-        let new_file = make_dav_entry_in("/Sync", "new.txt", Some(102));
-
-        // We can't call proactive_refresh directly because it does PROPFIND.
-        // Instead, simulate its ghost-population logic.
-        {
-            let mut c = cache.safe_lock();
-            let removed = vec![PathBuf::from("/Sync/old.txt")];
-            let added = vec![PathBuf::from("/Sync/new.txt")];
-
-            // VisibleDelete ghost for removed
-            {
-                let old_entries = c.get_cached_dir_readonly(&sync_dir);
-                let mut g = ghosts.safe_lock();
-                for p in &removed {
-                    if let Some(old_entry) = old_entries.as_ref()
-                        .and_then(|entries| entries.iter().find(|e| &e.path == p))
-                    {
-                        let ino = c.get_inode(p).unwrap_or(1);
-                        let attr = make_file_attr(ino, old_entry);
-                        g.insert(p.clone(), GhostEntry {
-                            kind: GhostKind::VisibleDelete { attr },
-                            created_at: Instant::now(),
-                            rename_pair_id: None,
-                        });
-                    }
-                }
-            }
-
-            // Update cache
-            c.put_dir_cache(sync_dir.clone(), None, None, vec![keep_file.clone(), new_file.clone()]);
-
-            // HiddenAdd ghost for added
-            {
-                let mut g = ghosts.safe_lock();
-                for p in &added {
-                    g.insert(p.clone(), GhostEntry {
-                        kind: GhostKind::HiddenAdd,
-                        created_at: Instant::now(),
-                        rename_pair_id: None,
-                    });
-                }
-            }
-
-            // Populate file change queue
-            {
-                let mut q = fcq.safe_lock();
-                for p in &added {
-                    q.push(ipc::FileChange {
-                        kind: ipc::FileChangeKind::Added,
-                        path: p.clone(),
-                    });
-                }
-                for p in &removed {
-                    q.push(ipc::FileChange {
-                        kind: ipc::FileChangeKind::Removed,
-                        path: p.clone(),
-                    });
-                }
-            }
-        }
-
-        // Verify ghosts
-        let g = ghosts.safe_lock();
-        assert!(matches!(
-            g.get(&PathBuf::from("/Sync/old.txt")).unwrap().kind,
-            GhostKind::VisibleDelete { .. }
-        ), "removed file should have VisibleDelete ghost");
-
-        assert!(matches!(
-            g.get(&PathBuf::from("/Sync/new.txt")).unwrap().kind,
-            GhostKind::HiddenAdd
-        ), "added file should have HiddenAdd ghost");
-
-        assert!(g.get(&PathBuf::from("/Sync/keep.txt")).is_none(),
-            "unchanged file should not have a ghost");
-        drop(g);
-
-        // Verify file change queue
-        let q = fcq.safe_lock();
-        assert_eq!(q.len(), 2);
-        assert!(q.iter().any(|c| matches!(c.kind, ipc::FileChangeKind::Added)
-            && c.path == PathBuf::from("/Sync/new.txt")));
-        assert!(q.iter().any(|c| matches!(c.kind, ipc::FileChangeKind::Removed)
-            && c.path == PathBuf::from("/Sync/old.txt")));
+        assert_eq!(diff.removed, vec![PathBuf::from("/Sync/old.txt")],
+            "old.txt should be removed");
+        assert_eq!(diff.added, vec![PathBuf::from("/Sync/new.txt")],
+            "new.txt should be added");
+        assert!(diff.renames.is_empty(), "no renames: fileids differ");
+        assert!(diff.modified.is_empty(), "keep.txt etag unchanged");
     }
 
     #[test]
@@ -3570,45 +3556,18 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_debounce_uses_short_delay_after_changes() {
-        let debounce: Arc<Mutex<HashMap<PathBuf, notify_push::DebounceState>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let path = PathBuf::from("/Sync");
-
-        debounce.safe_lock().insert(path.clone(), notify_push::DebounceState {
-            last_refresh: Instant::now(),
-            had_changes: true,
-        });
-
-        let db = debounce.safe_lock();
-        let state = db.get(&path).unwrap();
-        let cooldown = if state.had_changes {
-            notify_push::REFRESH_DEBOUNCE
-        } else {
-            notify_push::REFRESH_DEBOUNCE_NO_CHANGE
-        };
-        assert_eq!(cooldown, Duration::from_secs(3));
+    fn debounce_cooldown_is_shorter_after_changes_than_after_idle() {
+        let active = notify_push::debounce_cooldown(true);
+        let idle   = notify_push::debounce_cooldown(false);
+        assert!(active < idle,
+            "cooldown after changes ({:?}) must be shorter than after idle ({:?})",
+            active, idle);
     }
 
     #[test]
-    fn adaptive_debounce_uses_long_delay_after_no_changes() {
-        let debounce: Arc<Mutex<HashMap<PathBuf, notify_push::DebounceState>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let path = PathBuf::from("/Sync");
-
-        debounce.safe_lock().insert(path.clone(), notify_push::DebounceState {
-            last_refresh: Instant::now(),
-            had_changes: false,
-        });
-
-        let db = debounce.safe_lock();
-        let state = db.get(&path).unwrap();
-        let cooldown = if state.had_changes {
-            notify_push::REFRESH_DEBOUNCE
-        } else {
-            notify_push::REFRESH_DEBOUNCE_NO_CHANGE
-        };
-        assert_eq!(cooldown, Duration::from_secs(30));
+    fn debounce_cooldown_returns_correct_constants() {
+        assert_eq!(notify_push::debounce_cooldown(true),  notify_push::REFRESH_DEBOUNCE);
+        assert_eq!(notify_push::debounce_cooldown(false), notify_push::REFRESH_DEBOUNCE_NO_CHANGE);
     }
 
     fn make_dir_dav_entry_in(dir: &str, name: &str, fileid: Option<u64>) -> DavEntry {
@@ -3767,153 +3726,65 @@ mod tests {
 
     #[test]
     fn proactive_refresh_detects_rename_by_fileid() {
-        let mut cache = make_test_cache();
-        let sync_dir = PathBuf::from("/Sync");
-        cache.allocate_inode(sync_dir.clone());
-
-        let old_file = make_dav_entry_in("/Sync", "original.txt", Some(500));
-        let keep_file = make_dav_entry_in("/Sync", "keep.txt", Some(501));
-        cache.put_dir_cache(sync_dir.clone(), None, None, vec![old_file.clone(), keep_file.clone()]);
-        cache.allocate_inode(PathBuf::from("/Sync/original.txt"));
-        cache.allocate_inode(PathBuf::from("/Sync/keep.txt"));
-
-        let cache = Arc::new(Mutex::new(cache));
-        let ghosts = make_ghost_map();
-        let fcq = make_file_change_queue();
-
-        // New listing: original.txt renamed to renamed.txt (same fileid 500)
-        let renamed_file = make_dav_entry_in("/Sync", "renamed.txt", Some(500));
-
-        // Simulate the rename detection logic from proactive_refresh
+        // Old: original.txt (fid=500) + keep.txt (fid=501)
+        // New: keep.txt (fid=501) + renamed.txt (fid=500)
+        // Expected: rename original→renamed detected; no true removals or adds.
         let old_snap = notify_push::OldDirSnapshot {
             names: vec![PathBuf::from("/Sync/original.txt"), PathBuf::from("/Sync/keep.txt")],
             etags: [
                 (PathBuf::from("/Sync/original.txt"), Some("etag1".into())),
-                (PathBuf::from("/Sync/keep.txt"), Some("etag1".into())),
+                (PathBuf::from("/Sync/keep.txt"),    Some("etag1".into())),
             ].into_iter().collect(),
             fileids: [
-                (PathBuf::from("/Sync/original.txt"), 500),
-                (PathBuf::from("/Sync/keep.txt"), 501),
+                (PathBuf::from("/Sync/original.txt"), 500u64),
+                (PathBuf::from("/Sync/keep.txt"),    501u64),
             ].into_iter().collect(),
             is_dir: [
                 (PathBuf::from("/Sync/original.txt"), false),
-                (PathBuf::from("/Sync/keep.txt"), false),
+                (PathBuf::from("/Sync/keep.txt"),    false),
             ].into_iter().collect(),
         };
 
-        let fresh_files = vec![keep_file.clone(), renamed_file.clone()];
-        let new_names: std::collections::HashSet<PathBuf> = fresh_files.iter().map(|f| f.path.clone()).collect();
-        let old_set: std::collections::HashSet<PathBuf> = old_snap.names.iter().cloned().collect();
+        let fresh_files = vec![
+            make_dav_entry_in("/Sync", "keep.txt",    Some(501)),
+            make_dav_entry_in("/Sync", "renamed.txt", Some(500)),
+        ];
 
-        let raw_removed: Vec<PathBuf> = old_set.difference(&new_names).cloned().collect();
-        let raw_added: Vec<PathBuf> = new_names.difference(&old_set).cloned().collect();
+        let diff = notify_push::compute_dir_diff(&old_snap, &fresh_files);
 
-        let new_fids: HashMap<u64, PathBuf> = fresh_files.iter()
-            .filter_map(|f| f.fileid.map(|fid| (fid, f.path.clone())))
-            .collect();
-        let added_set: std::collections::HashSet<&PathBuf> = raw_added.iter().collect();
-
-        let mut renames: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
-        let mut true_removed: Vec<PathBuf> = Vec::new();
-
-        for p in &raw_removed {
-            if let Some(&old_fid) = old_snap.fileids.get(p) {
-                if let Some(new_path) = new_fids.get(&old_fid) {
-                    if added_set.contains(new_path) {
-                        let is_dir = old_snap.is_dir.get(p).copied().unwrap_or(false);
-                        renames.push((p.clone(), new_path.clone(), is_dir));
-                        continue;
-                    }
-                }
-            }
-            true_removed.push(p.clone());
-        }
-
-        assert_eq!(renames.len(), 1, "should detect one rename");
-        assert_eq!(renames[0].0, PathBuf::from("/Sync/original.txt"));
-        assert_eq!(renames[0].1, PathBuf::from("/Sync/renamed.txt"));
-        assert!(!renames[0].2, "should not be a directory");
-        assert!(true_removed.is_empty(), "no true removals");
-
-        // Check ghost population for the rename
-        {
-            let c = cache.safe_lock();
-            let old_entries = c.get_cached_dir_readonly(&sync_dir);
-            let mut g = ghosts.safe_lock();
-            for (old_path, new_path, _) in &renames {
-                let pair_id = 1u64;
-                if let Some(old_entry) = old_entries.as_ref()
-                    .and_then(|entries| entries.iter().find(|e| &e.path == old_path))
-                {
-                    let ino = c.get_inode(old_path).unwrap_or(1);
-                    let attr = make_file_attr(ino, old_entry);
-                    g.insert(old_path.clone(), GhostEntry {
-                        kind: GhostKind::VisibleDelete { attr },
-                        created_at: Instant::now(),
-                        rename_pair_id: Some(pair_id),
-                    });
-                    g.insert(new_path.clone(), GhostEntry {
-                        kind: GhostKind::HiddenAdd,
-                        created_at: Instant::now(),
-                        rename_pair_id: Some(pair_id),
-                    });
-                }
-            }
-        }
-
-        let g = ghosts.safe_lock();
-        let from_ghost = g.get(&PathBuf::from("/Sync/original.txt")).unwrap();
-        let to_ghost = g.get(&PathBuf::from("/Sync/renamed.txt")).unwrap();
-        assert!(matches!(from_ghost.kind, GhostKind::VisibleDelete { .. }));
-        assert!(matches!(to_ghost.kind, GhostKind::HiddenAdd));
-        assert_eq!(from_ghost.rename_pair_id, to_ghost.rename_pair_id);
-        assert!(from_ghost.rename_pair_id.is_some());
-        drop(g);
-
-        // Populate file change queue with Renamed
-        {
-            let mut q = fcq.safe_lock();
-            for (old_path, new_path, _) in &renames {
-                q.push(ipc::FileChange {
-                    kind: ipc::FileChangeKind::Renamed { from: old_path.clone() },
-                    path: new_path.clone(),
-                });
-            }
-        }
-
-        let q = fcq.safe_lock();
-        assert_eq!(q.len(), 1);
-        assert!(matches!(&q[0].kind, ipc::FileChangeKind::Renamed { from } if *from == PathBuf::from("/Sync/original.txt")));
-        assert_eq!(q[0].path, PathBuf::from("/Sync/renamed.txt"));
+        assert_eq!(diff.renames.len(), 1, "should detect one rename");
+        assert_eq!(diff.renames[0].0, PathBuf::from("/Sync/original.txt"));
+        assert_eq!(diff.renames[0].1, PathBuf::from("/Sync/renamed.txt"));
+        assert!(!diff.renames[0].2, "original.txt is not a directory");
+        assert!(diff.removed.is_empty(), "original.txt was renamed, not deleted");
+        assert!(diff.added.is_empty(),   "renamed.txt is a rename target, not a new add");
     }
 
     #[test]
     fn proactive_refresh_distinguishes_dir_vs_file() {
-        let fcq = make_file_change_queue();
-
+        // Empty old state; two new entries arrive: a file and a directory.
+        let old_snap = notify_push::OldDirSnapshot {
+            names:   vec![],
+            etags:   HashMap::new(),
+            fileids: HashMap::new(),
+            is_dir:  HashMap::new(),
+        };
         let file_entry = make_dav_entry_in("/Sync", "newfile.txt", Some(200));
-        let dir_entry = make_dir_dav_entry_in("/Sync", "newdir", Some(201));
+        let dir_entry  = make_dir_dav_entry_in("/Sync", "newdir", Some(201));
         let fresh_files = vec![file_entry, dir_entry];
 
-        let added = vec![PathBuf::from("/Sync/newfile.txt"), PathBuf::from("/Sync/newdir")];
+        let diff = notify_push::compute_dir_diff(&old_snap, &fresh_files);
+
+        assert_eq!(diff.added.len(), 2);
+        assert!(diff.removed.is_empty());
+        assert!(diff.renames.is_empty());
+
         let added_is_dir: HashMap<PathBuf, bool> = fresh_files.iter()
-            .filter(|f| added.contains(&f.path))
+            .filter(|f| diff.added.contains(&f.path))
             .map(|f| (f.path.clone(), f.is_dir))
             .collect();
-
-        {
-            let mut q = fcq.safe_lock();
-            for p in &added {
-                let is_dir = added_is_dir.get(p).copied().unwrap_or(false);
-                let kind = if is_dir { ipc::FileChangeKind::DirAdded } else { ipc::FileChangeKind::Added };
-                q.push(ipc::FileChange { kind, path: p.clone() });
-            }
-        }
-
-        let q = fcq.safe_lock();
-        assert_eq!(q.len(), 2);
-        assert!(matches!(q.iter().find(|c| c.path == PathBuf::from("/Sync/newfile.txt")).unwrap().kind, ipc::FileChangeKind::Added));
-        assert!(matches!(q.iter().find(|c| c.path == PathBuf::from("/Sync/newdir")).unwrap().kind, ipc::FileChangeKind::DirAdded));
+        assert_eq!(added_is_dir.get(&PathBuf::from("/Sync/newfile.txt")), Some(&false));
+        assert_eq!(added_is_dir.get(&PathBuf::from("/Sync/newdir")),      Some(&true));
     }
 
     #[test]

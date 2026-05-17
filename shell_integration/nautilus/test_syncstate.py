@@ -33,22 +33,49 @@ class _GObjectBase:
     """Minimal GObject stand-in."""
     def __init__(self, *a, **kw): pass
 
-class _InfoProvider:  pass
-class _MenuProvider:  pass
+class _InfoProvider:    pass
+class _MenuProvider:    pass
+class _ColumnProvider:  pass
 
 _GLib_stub = types.SimpleNamespace(
     SOURCE_REMOVE=False,
     idle_add=lambda f, *a: None,
+    timeout_add_seconds=lambda *a: None,
+    markup_escape_text=lambda s: s,
 )
 _GObject_stub = types.SimpleNamespace(GObject=_GObjectBase)
 _Nautilus_stub = types.SimpleNamespace(
     InfoProvider=_InfoProvider,
     MenuProvider=_MenuProvider,
+    ColumnProvider=_ColumnProvider,
     OperationResult=types.SimpleNamespace(COMPLETE=0, IN_PROGRESS=1, FAILED=2),
     info_provider_update_complete_invoke=lambda *a: None,
+    Column=lambda **kw: None,
+    MenuItem=lambda **kw: types.SimpleNamespace(connect=lambda *a: None),
+    FileInfo=types.SimpleNamespace(lookup=lambda *a: None),
+)
+_Gio_stub = types.SimpleNamespace(
+    File=types.SimpleNamespace(new_for_path=lambda p: None),
+)
+_Gtk_stub = types.SimpleNamespace(
+    Window=_GObjectBase,
+    Box=_GObjectBase,
+    Button=_GObjectBase,
+    Entry=_GObjectBase,
+    Label=_GObjectBase,
+    ScrolledWindow=_GObjectBase,
+    Spinner=_GObjectBase,
+    Orientation=types.SimpleNamespace(VERTICAL=0, HORIZONTAL=1),
+    Align=types.SimpleNamespace(START=0),
 )
 
-for _name, _stub in (("GLib", _GLib_stub), ("GObject", _GObject_stub), ("Nautilus", _Nautilus_stub)):
+for _name, _stub in (
+    ("GLib", _GLib_stub),
+    ("GObject", _GObject_stub),
+    ("Nautilus", _Nautilus_stub),
+    ("Gio", _Gio_stub),
+    ("Gtk", _Gtk_stub),
+):
     if not hasattr(repo, _name):
         setattr(repo, _name, _stub)
 
@@ -208,6 +235,144 @@ class TestLoadMountPoint(unittest.TestCase):
         with open(cfg, "w") as f:
             f.write('mount_point: ""\n')
         self.assertIsNone(syncstate._load_mount_point(cfg))
+
+    def test_no_mount_point_key_returns_none(self):
+        cfg = os.path.join(self.tmpdir, "config.yaml")
+        with open(cfg, "w") as f:
+            f.write('url: "https://cloud.example.com"\nusername: alice\n')
+        self.assertIsNone(syncstate._load_mount_point(cfg))
+
+    def test_similar_key_not_matched(self):
+        """mount_point_override: must NOT match the mount_point: parser."""
+        cfg = os.path.join(self.tmpdir, "config.yaml")
+        with open(cfg, "w") as f:
+            f.write('mount_point_override: "/other"\n')
+        self.assertIsNone(syncstate._load_mount_point(cfg))
+
+    def test_xdg_config_home_env_path(self):
+        """Default path uses XDG_CONFIG_HOME when set."""
+        cfg_dir = os.path.join(self.tmpdir, "ncrs")
+        os.makedirs(cfg_dir)
+        cfg = os.path.join(cfg_dir, "config.yaml")
+        with open(cfg, "w") as f:
+            f.write('mount_point: "/home/user/cloud"\n')
+        old = os.environ.get("XDG_CONFIG_HOME")
+        try:
+            os.environ["XDG_CONFIG_HOME"] = self.tmpdir
+            result = syncstate._load_mount_point()   # no explicit path → uses env
+            self.assertEqual(result, "/home/user/cloud")
+        finally:
+            if old is None:
+                os.environ.pop("XDG_CONFIG_HOME", None)
+            else:
+                os.environ["XDG_CONFIG_HOME"] = old
+
+
+class TestHumanPerms(unittest.TestCase):
+
+    def test_known_flags(self):
+        result = syncstate._human_perms("RGWCD")
+        labels = result.split(", ")
+        self.assertIn("Read", labels)
+        self.assertIn("Write", labels)
+        self.assertIn("Create", labels)
+        self.assertIn("Delete", labels)
+
+    def test_empty_string(self):
+        self.assertEqual(syncstate._human_perms(""), "")
+
+    def test_unknown_flag_falls_through_to_raw(self):
+        """A string of entirely unknown chars should return the raw string."""
+        result = syncstate._human_perms("XYZ")
+        self.assertEqual(result, "XYZ")
+
+    def test_duplicate_flags_not_repeated(self):
+        """Repeated flag chars must not produce duplicate labels."""
+        result = syncstate._human_perms("GGW")
+        labels = result.split(", ")
+        self.assertEqual(labels.count("Read"), 1, "Read should appear only once")
+
+    def test_shared_flag(self):
+        result = syncstate._human_perms("S")
+        self.assertIn("Shared", result)
+
+
+class TestHumanSize(unittest.TestCase):
+
+    def test_bytes(self):
+        self.assertEqual(syncstate._human_size(0), "0 B")
+        self.assertEqual(syncstate._human_size(1023), "1023 B")
+
+    def test_kib_boundary(self):
+        self.assertEqual(syncstate._human_size(1024), "1.0 KiB")
+
+    def test_mib(self):
+        self.assertEqual(syncstate._human_size(1024 * 1024), "1.0 MiB")
+
+    def test_gib(self):
+        self.assertEqual(syncstate._human_size(1024 ** 3), "1.0 GiB")
+
+    def test_fractional(self):
+        result = syncstate._human_size(1536)   # 1.5 KiB
+        self.assertEqual(result, "1.5 KiB")
+
+
+class TestPersistentConnRetry(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="ncrs_conn_test_")
+        self.sock_path = os.path.join(self.tmpdir, "ncrs.sock")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_reconnects_after_server_closes_connection(self):
+        """
+        _PersistentConn must reconnect and succeed if the server closes the
+        connection after the first reply (e.g., daemon restart).
+        """
+        request_count = [0]
+
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.sock_path)
+        srv.listen(5)
+        srv.settimeout(3)
+
+        def _serve():
+            try:
+                while True:
+                    try:
+                        conn, _ = srv.accept()
+                    except socket.timeout:
+                        break
+                    request_count[0] += 1
+                    data = b""
+                    while b"\n" not in data:
+                        chunk = conn.recv(256)
+                        if not chunk:
+                            break
+                        data += chunk
+                    conn.sendall(b"synced\n")
+                    conn.close()   # close after first reply → forces reconnect
+            finally:
+                srv.close()
+
+        threading.Thread(target=_serve, daemon=True).start()
+
+        # Monkey-patch the socket path so _PersistentConn connects to our server.
+        original = syncstate._sock_path
+        syncstate._sock_path = lambda: self.sock_path
+        try:
+            conn = syncstate._PersistentConn()
+            first  = conn.send("STATUS /a")
+            second = conn.send("STATUS /b")  # triggers reconnect
+            self.assertEqual(first,  "synced")
+            self.assertEqual(second, "synced")
+            self.assertGreaterEqual(request_count[0], 2,
+                "server should have received at least 2 connections")
+        finally:
+            syncstate._sock_path = original
 
 
 if __name__ == "__main__":

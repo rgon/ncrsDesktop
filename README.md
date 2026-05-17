@@ -16,11 +16,39 @@ GOALS:
 + [x] Real vFS on linux: not downloading everything then serving it. Uses the built-in nextcloud thumbnailer for a rich experience
 + [x] webdav with QUICK/HTTP3 support for speed
 + [x] streaming-download VFS support: play back large 4K videos locally without issues.
+
++ [ ] review tests
+
 + [ ] notify-push immediate new file notifications when opening a browser
-    + [ ] fix delete
+    + [ ] auto-update, without needing to reload, working even if nautilus is in the background
+    + [ ] implement CRUD
+    + [ ] test with synced file
+    + [ ] test moving
     + [ ] fix infinite loop
     + [ ] fix other CRUD
 + [ ] fix notify-push performance regression
+    + ● ---
+    Now for the sequential loading / batching issue — this one has a different
+    root cause that needs to be clear:
+    
+    Why batching happens: Nautilus calls readdir one directory at a time and
+    blocks waiting for each result before issuing the next. Our FUSE handler
+    blocks on that PROPFIND (~400ms). So with 55 top-level dirs: 55 × 400ms = ~22
+    seconds, strictly sequential. The 10-slot throttle is completely unused —
+    there's never more than 1 PROPFIND outstanding.
+    
+    The "batch" appearance comes from two things:
+    1. Dirs already in the on-disk cache (714 dirs cached) appear instantly;
+    uncached dirs take 400ms each
+    2. The notify_push loop was causing some dirs to be re-listed in bursts (now
+    fixed)
+    
+    The only way to parallelize is to have the child directories already cached
+    before Nautilus asks for them. That's aggressive_prefetch — when / readdir
+    returns 55 children, immediately start background PROPFINDs for all 55 using
+
++ [ ] test write to a file, check in nextcloud
+    + [ ] test time of update: open file, modify externally, expect gedit to detect it when saving
 + [ ] fix permissions probably wrong (hddstore media says read, modify), hddstore bulk says nothing
 + [ ] Feature parity with the NC file explorer (share, file options, view who shared, keep remote permissions etc)
     + add/remove from favorites

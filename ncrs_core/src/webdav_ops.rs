@@ -3,6 +3,15 @@ use std::time::Duration;
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
+// RFC 3986 unreserved characters that must NOT be percent-encoded in path segments.
+// percent_encoding::NON_ALPHANUMERIC encodes everything including . - _ ~ which is
+// over-aggressive. Start from NON_ALPHANUMERIC and carve out the unreserved set.
+const PATH_COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
 #[derive(Debug)]
 pub struct PutResult {
     pub new_etag: Option<String>,
@@ -34,7 +43,7 @@ fn dav_url(base_url: &str, username: &str, path: &Path) -> String {
             std::path::Component::Normal(s) => {
                 Some(percent_encoding::utf8_percent_encode(
                     &s.to_string_lossy(),
-                    percent_encoding::NON_ALPHANUMERIC,
+                    PATH_COMPONENT,
                 ).to_string())
             }
             _ => None,
@@ -44,7 +53,7 @@ fn dav_url(base_url: &str, username: &str, path: &Path) -> String {
     format!(
         "{}/remote.php/dav/files/{}/{}",
         base_url.trim_end_matches('/'),
-        percent_encoding::utf8_percent_encode(username, percent_encoding::NON_ALPHANUMERIC),
+        percent_encoding::utf8_percent_encode(username, PATH_COMPONENT),
         encoded,
     )
 }
@@ -171,5 +180,57 @@ pub fn move_resource(
             status,
             resp.text().unwrap_or_default(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn dav_url_simple_path() {
+        let url = dav_url("https://cloud.example.com", "alice", Path::new("/Documents/report.pdf"));
+        assert_eq!(url, "https://cloud.example.com/remote.php/dav/files/alice/Documents/report.pdf");
+    }
+
+    #[test]
+    fn dav_url_path_with_spaces() {
+        let url = dav_url("https://cloud.example.com", "alice", Path::new("/My Documents/file name.txt"));
+        assert!(url.contains("My%20Documents"), "spaces in dir should be percent-encoded");
+        assert!(url.contains("file%20name.txt"), "spaces in filename should be percent-encoded");
+    }
+
+    #[test]
+    fn dav_url_non_ascii_filename() {
+        let url = dav_url("https://cloud.example.com", "alice", Path::new("/Fotos/été.jpg"));
+        assert!(!url.contains("été"), "non-ASCII chars must be percent-encoded");
+        assert!(url.starts_with("https://cloud.example.com/remote.php/dav/files/alice/"));
+    }
+
+    #[test]
+    fn dav_url_special_chars_in_path() {
+        let url = dav_url("https://cloud.example.com", "alice", Path::new("/dir/file&name.txt"));
+        assert!(url.contains("%26"), "& must be percent-encoded");
+    }
+
+    #[test]
+    fn dav_url_multi_level_path() {
+        let url = dav_url("https://cloud.example.com", "alice", Path::new("/a/b/c/deep.txt"));
+        assert!(url.ends_with("/remote.php/dav/files/alice/a/b/c/deep.txt"));
+    }
+
+    #[test]
+    fn dav_url_base_url_trailing_slash_stripped() {
+        let url_with    = dav_url("https://cloud.example.com/", "alice", Path::new("/file.txt"));
+        let url_without = dav_url("https://cloud.example.com",  "alice", Path::new("/file.txt"));
+        assert_eq!(url_with, url_without,
+            "trailing slash on base_url should not produce a double slash");
+    }
+
+    #[test]
+    fn dav_url_username_with_special_chars() {
+        let url = dav_url("https://cloud.example.com", "alice@domain", Path::new("/file.txt"));
+        assert!(url.contains("alice%40domain"), "@ in username must be percent-encoded");
     }
 }

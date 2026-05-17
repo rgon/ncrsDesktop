@@ -15,8 +15,15 @@ go_offline()  { iptables -A OUTPUT -d "$WEBDAV_IP" -j DROP 2>/dev/null || true; 
 go_online()   { iptables -D OUTPUT -d "$WEBDAV_IP" -j DROP 2>/dev/null || true; }
 
 wait_synced() {
-    # Wait for connectivity monitor (5s offline check) + replay
-    sleep 8
+    # Poll until the journal drains (all offline mutations replayed).
+    # Timeout after 30s — the connectivity monitor fires after ~5s.
+    local i
+    for i in $(seq 1 30); do
+        journal_empty && return 0
+        sleep 1
+    done
+    echo "  WARN: wait_synced timed out after 30s"
+    return 1
 }
 
 dav_url() { echo "http://$WEBDAV_HOST/remote.php/dav/files/testuser/$1"; }
@@ -45,12 +52,31 @@ dav_gone() {
     [ "$status" = "404" ]
 }
 
+# Query the live IPC socket so we don't depend on the on-disk JSON format.
+_ipc() {
+    printf "%s\n" "$1" | socat - "UNIX-CONNECT:${XDG_RUNTIME_DIR:-/tmp}/ncrs.sock" 2>/dev/null | head -1
+}
+
 journal_has() {
-    [ -f "$JOURNAL" ] && grep -q "$1" "$JOURNAL"
+    local op="$1"
+    local reply
+    reply=$(_ipc "JOURNAL")
+    echo "${reply:-[]}" | python3 -c "
+import json,sys
+data=sys.stdin.read().strip()
+try:
+    entries=json.loads(data)
+    ops=[list(e['op'].keys())[0] if isinstance(e.get('op'),dict) else '' for e in entries]
+    sys.exit(0 if '$op' in ops else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null
 }
 
 journal_empty() {
-    [ ! -f "$JOURNAL" ] || [ "$(cat "$JOURNAL")" = "[]" ]
+    local reply
+    reply=$(_ipc "JOURNAL")
+    [ "${reply:-[]}" = "[]" ]
 }
 
 start_ncrs() {
@@ -250,6 +276,12 @@ sleep 1
 rm "$MOUNT/ephemeral.txt" 2>/dev/null || true
 sleep 1
 
+if journal_has "Unlink"; then
+    pass "Journal recorded Unlink before replay"
+else
+    fail "Journal missing Unlink entry before replay"
+fi
+
 go_online
 wait_synced
 
@@ -350,12 +382,24 @@ else
     fail "Server content wrong after conflict: got '$server_content'"
 fi
 
-# A conflicted copy must have been uploaded for the local edit
-if curl -sf -u testuser:testpass \
+# A conflicted copy must have been uploaded for the local edit.
+# We check via PROPFIND status 200/207 on any file whose name contains
+# "conflicted" — avoids coupling to the exact display-name XML format.
+conflicted_found=0
+while IFS= read -r name; do
+    case "$name" in
+        *conflicted*) conflicted_found=1; break ;;
+    esac
+done < <(curl -sf -u testuser:testpass \
     -X PROPFIND -H "Depth: 1" \
     "$(dav_url "")" \
-    --data '<d:propfind xmlns:d="DAV:"><d:prop><d:displayname/></d:prop></d:propfind>' \
-    2>/dev/null | grep -q "conflicted copy"; then
+    --data '<d:propfind xmlns:d="DAV:"><d:prop><d:href/></d:prop></d:propfind>' \
+    2>/dev/null | python3 -c "
+import sys, re
+for m in re.finditer(r'<[^:>]*:?href[^>]*>([^<]+)<', sys.stdin.read()):
+    print(m.group(1))
+" 2>/dev/null)
+if [ "$conflicted_found" -eq 1 ]; then
     pass "Conflicted copy uploaded to server"
 else
     fail "No conflicted copy found on server"
@@ -365,6 +409,104 @@ if journal_empty; then
     pass "Journal drained after conflict resolution"
 else
     fail "Journal still has entries after conflict"
+fi
+
+stop_ncrs
+
+# ── Test 7: Offline rename ────────────────────────────────────
+run_test "Offline rename"
+
+dav_delete "original.txt" || true
+dav_put "original.txt" "rename_content"
+
+start_ncrs
+
+for _i in $(seq 1 20); do
+    [ -f "$MOUNT/original.txt" ] && break
+    sleep 1
+done
+
+go_offline
+sleep 1
+
+mv "$MOUNT/original.txt" "$MOUNT/renamed.txt" 2>/dev/null || true
+sleep 1
+
+if journal_has "Rename"; then
+    pass "Journal recorded Rename entry"
+else
+    fail "Journal missing Rename entry"
+fi
+
+go_online
+wait_synced
+
+if dav_exists "renamed.txt"; then
+    content=$(dav_get "renamed.txt" || echo "")
+    if echo "$content" | grep -q "rename_content"; then
+        pass "Renamed file present on server with correct content"
+    else
+        fail "Renamed file content mismatch: $content"
+    fi
+else
+    fail "Renamed file not found on server"
+fi
+
+if dav_gone "original.txt"; then
+    pass "Original file gone from server after rename"
+else
+    fail "Original file still present on server"
+fi
+
+if journal_empty; then
+    pass "Journal empty after rename replay"
+else
+    fail "Journal still has entries after rename"
+fi
+
+stop_ncrs
+
+# ── Test 8: Offline overwrite — ETag matches (happy path) ─────
+run_test "Offline overwrite — ETag matches on replay"
+
+dav_delete "overwrite.txt" || true
+dav_put "overwrite.txt" "original_content"
+
+start_ncrs
+
+for _i in $(seq 1 20); do
+    [ -f "$MOUNT/overwrite.txt" ] && break
+    sleep 1
+done
+
+go_offline
+sleep 1
+
+# Overwrite while offline; ncrs journals a Put with the cached ETag as If-Match.
+echo "updated_content" > "$MOUNT/overwrite.txt" && sync
+sleep 1
+
+if journal_has "Put"; then
+    pass "Journal recorded Put with ETag guard"
+else
+    fail "Journal missing Put entry"
+fi
+
+# Server file stays at original_content — ETag unchanged, so replay succeeds.
+go_online
+wait_synced
+
+server_content=$(dav_get "overwrite.txt" || echo "")
+if echo "$server_content" | grep -q "updated_content"; then
+    pass "Server has updated content after ETag-matched replay"
+else
+    fail "Server content wrong after replay: got '$server_content'"
+fi
+
+if journal_empty; then
+    pass "Journal empty after overwrite replay"
+else
+    fail "Journal still has entries after overwrite"
 fi
 
 stop_ncrs

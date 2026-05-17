@@ -16,6 +16,10 @@ const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const REFRESH_DEBOUNCE: Duration = Duration::from_secs(3);
 pub(crate) const REFRESH_DEBOUNCE_NO_CHANGE: Duration = Duration::from_secs(30);
 
+pub(crate) fn debounce_cooldown(had_changes: bool) -> Duration {
+    if had_changes { REFRESH_DEBOUNCE } else { REFRESH_DEBOUNCE_NO_CHANGE }
+}
+
 pub(crate) struct DebounceState {
     pub last_refresh: Instant,
     pub had_changes: bool,
@@ -121,6 +125,57 @@ pub(crate) struct OldDirSnapshot {
     pub is_dir: HashMap<PathBuf, bool>,
 }
 
+pub(crate) struct DirDiff {
+    pub removed: Vec<PathBuf>,
+    pub added: Vec<PathBuf>,
+    pub modified: Vec<PathBuf>,
+    pub renames: Vec<(PathBuf, PathBuf, bool)>,
+}
+
+pub(crate) fn compute_dir_diff(old_snap: &OldDirSnapshot, fresh_files: &[propfind::DavEntry]) -> DirDiff {
+    use std::collections::HashSet;
+    let new_names: HashSet<&PathBuf> = fresh_files.iter().map(|f| &f.path).collect();
+    let old_set: HashSet<&PathBuf> = old_snap.names.iter().collect();
+
+    let raw_removed: Vec<PathBuf> = old_set.difference(&new_names).map(|p| (*p).clone()).collect();
+    let raw_added: Vec<PathBuf> = new_names.difference(&old_set).map(|p| (*p).clone()).collect();
+
+    let modified: Vec<PathBuf> = fresh_files.iter().filter_map(|f| {
+        if f.is_dir { return None; }
+        let old_etag = old_snap.etags.get(&f.path)?;
+        if old_etag.as_deref() != f.etag.as_deref() {
+            Some(f.path.clone())
+        } else {
+            None
+        }
+    }).collect();
+
+    let new_fids: HashMap<u64, &PathBuf> = fresh_files.iter()
+        .filter_map(|f| f.fileid.map(|fid| (fid, &f.path)))
+        .collect();
+    let added_set: HashSet<&PathBuf> = raw_added.iter().collect();
+    let mut renames: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+    let mut removed: Vec<PathBuf> = Vec::new();
+
+    for p in &raw_removed {
+        if let Some(&old_fid) = old_snap.fileids.get(p) {
+            if let Some(&new_path) = new_fids.get(&old_fid) {
+                if added_set.contains(new_path) {
+                    let is_dir = old_snap.is_dir.get(p).copied().unwrap_or(false);
+                    renames.push((p.clone(), new_path.clone(), is_dir));
+                    continue;
+                }
+            }
+        }
+        removed.push(p.clone());
+    }
+
+    let rename_targets: HashSet<PathBuf> = renames.iter().map(|(_, to, _)| to.clone()).collect();
+    let added: Vec<PathBuf> = raw_added.into_iter().filter(|p| !rename_targets.contains(p)).collect();
+
+    DirDiff { removed, added, modified, renames }
+}
+
 struct InvalidateResult {
     dirs: Vec<(PathBuf, OldDirSnapshot)>,
     ids_recognized: bool,
@@ -139,7 +194,7 @@ fn invalidate_dirs_for_fileids(
         let db = debounce.safe_lock();
         db.iter()
             .filter(|(_, state)| {
-                let cooldown = if state.had_changes { REFRESH_DEBOUNCE } else { REFRESH_DEBOUNCE_NO_CHANGE };
+                let cooldown = debounce_cooldown(state.had_changes);
                 now.duration_since(state.last_refresh) < cooldown
             })
             .map(|(p, _)| p.clone())
@@ -317,71 +372,28 @@ fn refresh_one_dir(
 
         match result {
             Ok((etag, self_entry, fresh_files)) => {
-                let new_names: std::collections::HashSet<&PathBuf> =
-                    fresh_files.iter().map(|f| &f.path).collect();
-                let old_set: std::collections::HashSet<&PathBuf> =
-                    old_snap.names.iter().collect();
-
-                let raw_removed: Vec<&PathBuf> = old_set.difference(&new_names).copied().collect();
-                let raw_added: Vec<&PathBuf> = new_names.difference(&old_set).copied().collect();
-
-                let modified: Vec<&Path> = fresh_files.iter().filter_map(|f| {
-                    if f.is_dir { return None; }
-                    let old_etag = old_snap.etags.get(&f.path)?;
-                    if old_etag.as_deref() != f.etag.as_deref() {
-                        Some(f.path.as_path())
-                    } else {
-                        None
-                    }
-                }).collect();
-
-                // Detect renames by matching fileids between removed and added
+                let diff = compute_dir_diff(&old_snap, &fresh_files);
                 static RENAME_PAIR_COUNTER: AtomicU64 = AtomicU64::new(1);
-                let new_fids: HashMap<u64, &PathBuf> = fresh_files.iter()
-                    .filter_map(|f| f.fileid.map(|fid| (fid, &f.path)))
-                    .collect();
-                let added_set: std::collections::HashSet<&PathBuf> = raw_added.iter().copied().collect();
-                let mut renames: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
-                let mut removed: Vec<&PathBuf> = Vec::new();
 
-                for p in &raw_removed {
-                    if let Some(&old_fid) = old_snap.fileids.get(*p) {
-                        if let Some(&new_path) = new_fids.get(&old_fid) {
-                            if added_set.contains(new_path) {
-                                let is_dir = old_snap.is_dir.get(*p).copied().unwrap_or(false);
-                                renames.push(((*p).clone(), new_path.clone(), is_dir));
-                                log::info!("notify_push: rename detected {} → {} (fileid={})", p.display(), new_path.display(), old_fid);
-                                continue;
-                            }
-                        }
-                    }
-                    removed.push(p);
+                if !diff.removed.is_empty() {
+                    log::info!("notify_push: {} removed from {}: {:?}", diff.removed.len(), dir_path.display(), diff.removed);
+                }
+                if !diff.added.is_empty() {
+                    log::info!("notify_push: {} added to {}: {:?}", diff.added.len(), dir_path.display(), diff.added);
+                }
+                if !diff.modified.is_empty() {
+                    log::info!("notify_push: {} file(s) modified in {}: {:?}", diff.modified.len(), dir_path.display(), diff.modified);
                 }
 
-                let rename_targets: std::collections::HashSet<PathBuf> = renames.iter().map(|(_, to, _)| to.clone()).collect();
-                let added: Vec<&PathBuf> = raw_added.into_iter()
-                    .filter(|p| !rename_targets.contains(*p))
-                    .collect();
-
-                if !removed.is_empty() {
-                    log::info!("notify_push: {} removed from {}: {:?}", removed.len(), dir_path.display(), removed);
-                }
-                if !added.is_empty() {
-                    log::info!("notify_push: {} added to {}: {:?}", added.len(), dir_path.display(), added);
-                }
-                if !modified.is_empty() {
-                    log::info!("notify_push: {} file(s) modified in {}: {:?}", modified.len(), dir_path.display(), modified);
-                }
-
-                let listing_changed = !added.is_empty() || !removed.is_empty() || !renames.is_empty();
-                let had_changes = listing_changed || !modified.is_empty();
+                let listing_changed = !diff.added.is_empty() || !diff.removed.is_empty() || !diff.renames.is_empty();
+                let had_changes = listing_changed || !diff.modified.is_empty();
 
                 let mut c = cache.safe_lock();
                 let parent_ino = c.get_inode(&dir_path).unwrap_or(1);
 
                 // Move file_cache entries for renames before put_dir_cache
                 let mut cache_moved = false;
-                for (old_path, new_path, is_dir) in &renames {
+                for (old_path, new_path, is_dir) in &diff.renames {
                     if !is_dir {
                         if let Some(entry) = c.file_cache.remove(old_path) {
                             c.file_cache.insert(new_path.clone(), entry);
@@ -397,13 +409,13 @@ fn refresh_one_dir(
                     let mut ghosts = ghost_entries.safe_lock();
 
                     // Ghosts for true removals
-                    for p in &removed {
+                    for p in &diff.removed {
                         if let Some(old_entry) = old_entries.as_ref()
-                            .and_then(|entries| entries.iter().find(|e| &e.path == *p))
+                            .and_then(|entries| entries.iter().find(|e| &e.path == p))
                         {
                             let ino = c.get_inode(p).unwrap_or(1);
                             let attr = crate::make_file_attr(ino, old_entry);
-                            ghosts.insert((*p).clone(), GhostEntry {
+                            ghosts.insert(p.clone(), GhostEntry {
                                 kind: GhostKind::VisibleDelete { attr },
                                 created_at: Instant::now(),
                                 rename_pair_id: None,
@@ -413,7 +425,7 @@ fn refresh_one_dir(
                     }
 
                     // Paired ghosts for renames
-                    for (old_path, new_path, _) in &renames {
+                    for (old_path, new_path, _) in &diff.renames {
                         let pair_id = RENAME_PAIR_COUNTER.fetch_add(1, Ordering::Relaxed);
                         if let Some(old_entry) = old_entries.as_ref()
                             .and_then(|entries| entries.iter().find(|e| &e.path == old_path))
@@ -435,22 +447,17 @@ fn refresh_one_dir(
                     }
                 }
 
-                let delete_targets: Vec<(u64, String)> = removed.iter().filter_map(|p| {
+                let delete_targets: Vec<(u64, String)> = diff.removed.iter().filter_map(|p| {
                     let child_ino = c.get_inode(p).unwrap_or(0);
                     p.file_name().map(|n| (child_ino, n.to_string_lossy().into_owned()))
                 }).collect();
-                let modified_inodes: Vec<u64> = modified.iter()
+                let modified_inodes: Vec<u64> = diff.modified.iter()
                     .filter_map(|p| c.get_inode(p))
                     .collect();
 
-                // Collect owned paths before put_dir_cache moves fresh_files
-                let added_owned: Vec<PathBuf> = added.iter().map(|p| (*p).clone()).collect();
-                let removed_owned: Vec<PathBuf> = removed.iter().map(|p| (*p).clone()).collect();
-                let modified_owned: Vec<PathBuf> = modified.iter().map(|p| p.to_path_buf()).collect();
-
                 // Build is_dir map for added entries before fresh_files is moved
                 let added_is_dir: HashMap<PathBuf, bool> = fresh_files.iter()
-                    .filter(|f| added_owned.contains(&f.path))
+                    .filter(|f| diff.added.contains(&f.path))
                     .map(|f| (f.path.clone(), f.is_dir))
                     .collect();
 
@@ -459,7 +466,7 @@ fn refresh_one_dir(
                 // Create HiddenAdd ghosts AFTER put_dir_cache (file is now in cache)
                 {
                     let mut ghosts = ghost_entries.safe_lock();
-                    for p in &added_owned {
+                    for p in &diff.added {
                         ghosts.insert(p.clone(), GhostEntry {
                             kind: GhostKind::HiddenAdd,
                             created_at: Instant::now(),
@@ -476,22 +483,22 @@ fn refresh_one_dir(
                 drop(c);
 
                 // Populate file change queue for Nautilus extension
-                if !added_owned.is_empty() || !removed_owned.is_empty() || !modified_owned.is_empty() || !renames.is_empty() {
+                if !diff.added.is_empty() || !diff.removed.is_empty() || !diff.modified.is_empty() || !diff.renames.is_empty() {
                     let mut q = file_change_queue.safe_lock();
-                    for p in &added_owned {
+                    for p in &diff.added {
                         let is_dir = added_is_dir.get(p).copied().unwrap_or(false);
                         let kind = if is_dir { FileChangeKind::DirAdded } else { FileChangeKind::Added };
                         q.push(FileChange { kind, path: p.clone() });
                     }
-                    for p in &removed_owned {
+                    for p in &diff.removed {
                         let is_dir = old_snap.is_dir.get(p).copied().unwrap_or(false);
                         let kind = if is_dir { FileChangeKind::DirRemoved } else { FileChangeKind::Removed };
                         q.push(FileChange { kind, path: p.clone() });
                     }
-                    for p in &modified_owned {
+                    for p in &diff.modified {
                         q.push(FileChange { kind: FileChangeKind::Modified, path: p.clone() });
                     }
-                    for (old_path, new_path, _) in &renames {
+                    for (old_path, new_path, _) in &diff.renames {
                         q.push(FileChange {
                             kind: FileChangeKind::Renamed { from: old_path.clone() },
                             path: new_path.clone(),
