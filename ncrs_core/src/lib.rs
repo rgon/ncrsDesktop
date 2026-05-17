@@ -19,10 +19,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
-use libc::{EACCES, EIO, ENOENT};
+
 use remotefs::RemoteFs;
 use remotefs_webdav::WebDAVFs;
 use ipc::{FileStatus, StatusMap};
@@ -310,13 +311,13 @@ impl FsNetwork {
 
 }
 
-fn error_to_errno(err: &str) -> i32 {
+fn error_to_errno(err: &str) -> Errno {
     if err.contains("401") || err.contains("403") || err.contains("Unauthorized") || err.contains("Forbidden") {
-        EACCES
+        Errno::EACCES
     } else if err.contains("404") || err.contains("Not Found") {
-        ENOENT
+        Errno::ENOENT
     } else {
-        EIO
+        Errno::EIO
     }
 }
 
@@ -1168,7 +1169,7 @@ pub(crate) fn perms_to_mode(permissions: Option<&str>, is_dir: bool) -> u16 {
 pub(crate) fn make_file_attr(inode: u64, entry: &DavEntry) -> FileAttr {
     let modified = entry.modified.unwrap_or(UNIX_EPOCH);
     FileAttr {
-        ino: inode,
+        ino: INodeNo(inode),
         size: entry.size,
         blocks: (entry.size + 511) / 512,
         atime: modified,
@@ -1188,7 +1189,7 @@ pub(crate) fn make_file_attr(inode: u64, entry: &DavEntry) -> FileAttr {
 
 fn make_dir_attr(inode: u64) -> FileAttr {
     FileAttr {
-        ino: inode,
+        ino: INodeNo(inode),
         size: 0,
         blocks: 0,
         atime: UNIX_EPOCH,
@@ -1208,7 +1209,7 @@ fn make_dir_attr(inode: u64) -> FileAttr {
 
 fn root_attr() -> FileAttr {
     FileAttr {
-        ino: 1,
+        ino: INodeNo(1),
         size: 0,
         blocks: 0,
         atime: UNIX_EPOCH,
@@ -1504,13 +1505,13 @@ impl NextCloudFs {
 }
 
 impl Filesystem for NextCloudFs {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let (parent_path, name_str) = {
             let c = self.cache.safe_lock();
-            match (c.get_path(parent), name.to_str()) {
+            match (c.get_path(parent.0), name.to_str()) {
                 (Some(p), Some(n)) => (p, n.to_string()),
                 _ => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -1524,8 +1525,8 @@ impl Filesystem for NextCloudFs {
                 .map(|g| g.kind)
             {
                 match kind {
-                    GhostKind::HiddenAdd => { reply.error(ENOENT); return; }
-                    GhostKind::VisibleDelete { attr } => { reply.entry(&Duration::ZERO, &attr, 0); return; }
+                    GhostKind::HiddenAdd => { reply.error(Errno::ENOENT); return; }
+                    GhostKind::VisibleDelete { attr } => { reply.entry(&Duration::ZERO, &attr, Generation(0)); return; }
                 }
             }
             ghosts.remove(&full_path);
@@ -1540,7 +1541,7 @@ impl Filesystem for NextCloudFs {
         let entries = match c.get_cached_dir_readonly(&parent_path) {
             Some(files) => files,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -1568,23 +1569,23 @@ impl Filesystem for NextCloudFs {
                 if !entry.is_dir {
                     self.status.safe_lock().entry(target_path).or_insert(FileStatus::Remote);
                 }
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, Generation(0));
                 return;
             }
         }
-        reply.error(ENOENT);
+        reply.error(Errno::ENOENT);
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        if ino == 1 {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        if ino.0 == 1 {
             reply.attr(&TTL, &root_attr());
             return;
         }
 
-        let path = match self.cache.safe_lock().get_path(ino) {
+        let path = match self.cache.safe_lock().get_path(ino.0) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -1610,9 +1611,9 @@ impl Filesystem for NextCloudFs {
             None => {
                 if c.dir_cache.contains_key(&path) || path == Path::new("/") {
                     drop(c);
-                    reply.attr(&TTL, &make_dir_attr(ino));
+                    reply.attr(&TTL, &make_dir_attr(ino.0));
                 } else {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                 }
                 return;
             }
@@ -1620,20 +1621,20 @@ impl Filesystem for NextCloudFs {
 
         for entry in entries.iter() {
             if entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == file_name {
-                reply.attr(&TTL, &make_file_attr(ino, entry));
+                reply.attr(&TTL, &make_file_attr(ino.0, entry));
                 return;
             }
         }
-        reply.error(ENOENT);
+        reply.error(Errno::ENOENT);
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let (path, local, etag, nc_permissions) = {
             let c = self.cache.safe_lock();
-            let path = match c.get_path(ino) {
+            let path = match c.get_path(ino.0) {
                 Some(p) => p,
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             };
@@ -1651,12 +1652,12 @@ impl Filesystem for NextCloudFs {
             (path, local, etag, nc_permissions)
         };
 
-        let writable = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
+        let writable = flags.0 & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
 
         if writable && perms_to_mode(nc_permissions.as_deref(), false) & 0o200 == 0
             && nc_permissions.is_some()
         {
-            reply.error(EACCES);
+            reply.error(Errno::EACCES);
             return;
         }
 
@@ -1689,35 +1690,35 @@ impl Filesystem for NextCloudFs {
                 original_etag: etag,
             },
         );
-        reply.opened(fh, 0);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock: Option<u64>,
+        _flags: OpenFlags,
+        _lock: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let path = match self.cache.safe_lock().get_path(ino) {
+        let path = match self.cache.safe_lock().get_path(ino.0) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
-        let off = offset as u64;
+        let off = offset;
         let sz = size as usize;
 
         // Serve from open-file state synchronously (no thread spawn).
         {
             let files = self.open_files.safe_lock();
-            if let Some(of) = files.get(&fh) {
+            if let Some(of) = files.get(&fh.0) {
                 if let Some(ref local) = of.local {
                     if let Ok(f) = std::fs::File::open(local) {
                         let mut buf = vec![0u8; sz];
@@ -1769,14 +1770,14 @@ impl Filesystem for NextCloudFs {
                                 let remaining = deadline.saturating_duration_since(Instant::now());
                                 if remaining.is_zero() {
                                     log::warn!("read wait timeout at offset {}", off);
-                                    reply.error(EIO);
+                                    reply.error(Errno::EIO);
                                     return;
                                 }
                                 let (g, result) = cv.wait_timeout(guard, remaining).unwrap();
                                 guard = g;
                                 if result.timed_out() && !guard.done {
                                     log::warn!("read wait timeout at offset {}", off);
-                                    reply.error(EIO);
+                                    reply.error(Errno::EIO);
                                     return;
                                 }
                             }
@@ -1799,7 +1800,7 @@ impl Filesystem for NextCloudFs {
                     if let Ok(n) = f.read_at(&mut buf, off) {
                         buf.truncate(n);
                         reply.data(&buf);
-                        self.open_files.safe_lock().entry(fh).and_modify(|of| of.local = Some(local.clone()));
+                        self.open_files.safe_lock().entry(fh.0).and_modify(|of| of.local = Some(local.clone()));
                         return;
                     }
                 }
@@ -1848,7 +1849,7 @@ impl Filesystem for NextCloudFs {
                                 Mutex::new(StreamState { data: first, done: false }),
                                 Condvar::new(),
                             ));
-                            open_files.safe_lock().entry(fh).and_modify(|of| {
+                            open_files.safe_lock().entry(fh.0).and_modify(|of| {
                                 of.buf = Some(ReadAheadBuf {
                                     start: off,
                                     stream: Arc::clone(&shared),
@@ -1874,7 +1875,7 @@ impl Filesystem for NextCloudFs {
                                                 }
                                             }
                                             let superseded = open_files.safe_lock()
-                                                .get(&fh)
+                                                .get(&fh.0)
                                                 .and_then(|of| of.buf.as_ref())
                                                 .map_or(true, |b| !Arc::ptr_eq(&b.stream, &shared));
                                             if superseded { break; }
@@ -1898,7 +1899,7 @@ impl Filesystem for NextCloudFs {
                         Err(e) => {
                             log::warn!("stream read first bytes failed: {}", e);
                             push_error(&elog, path.clone(), SyncErrorKind::NetworkError, format!("download failed: {}", e));
-                            reply.error(EIO);
+                            reply.error(Errno::EIO);
                         }
                     }
                 }
@@ -1912,7 +1913,7 @@ impl Filesystem for NextCloudFs {
                                     Ok(n) => {
                                         buf.truncate(n);
                                         reply.data(&buf);
-                                        open_files.safe_lock().entry(fh).and_modify(
+                                        open_files.safe_lock().entry(fh.0).and_modify(
                                             |of| of.local = Some(local),
                                         );
                                         return;
@@ -1920,7 +1921,7 @@ impl Filesystem for NextCloudFs {
                                     Err(_) => {}
                                 }
                             }
-                            reply.error(EIO);
+                            reply.error(Errno::EIO);
                         }
                         Err(e2) => {
                             log::error!("fallback download failed {}: {}", path.display(), e2);
@@ -1934,45 +1935,45 @@ impl Filesystem for NextCloudFs {
     }
 
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
         let mut files = self.open_files.safe_lock();
-        if let Some(of) = files.get(&fh) {
+        if let Some(of) = files.get(&fh.0) {
             if of.dirty {
                 if let Some(ref wp) = of.write_path {
-                    log::warn!("release: fh {} still dirty, staging file preserved at {}", fh, wp.display());
+                    log::warn!("release: fh {} still dirty, staging file preserved at {}", fh.0, wp.display());
                 }
             }
         }
-        files.remove(&fh);
+        files.remove(&fh.0);
         reply.ok();
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let (path, parent_ino) = {
             let c = self.cache.safe_lock();
-            let path = match c.get_path(ino) {
+            let path = match c.get_path(ino.0) {
                 Some(p) => p,
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             };
-            let parent_ino = if ino == 1 {
+            let parent_ino = if ino.0 == 1 {
                 1
             } else {
                 let parent = path.parent().unwrap_or(Path::new("/"));
@@ -1998,7 +1999,7 @@ impl Filesystem for NextCloudFs {
                     reply.ok();
                     return;
                 }
-                if reply.add(parent_ino, 2, FileType::Directory, "..") {
+                if reply.add(INodeNo(parent_ino), 2, FileType::Directory, "..") {
                     reply.ok();
                     return;
                 }
@@ -2018,7 +2019,7 @@ impl Filesystem for NextCloudFs {
                         let entry_ino = c.get_inode(&entry_path).unwrap_or(1);
                         let kind =
                             if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                        if reply.add(entry_ino, (i + 3) as i64, kind, name) {
+                        if reply.add(INodeNo(entry_ino), (i + 3) as u64, kind, name) {
                             break;
                         }
                     }
@@ -2184,7 +2185,7 @@ impl Filesystem for NextCloudFs {
                             let entry_ino = c.get_inode(&entry_path).unwrap_or(1);
                             let kind =
                                 if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                            if reply.add(entry_ino, (i + 3) as i64, kind, name) {
+                            if reply.add(INodeNo(entry_ino), (i + 3) as u64, kind, name) {
                                 break;
                             }
                         }
@@ -2221,9 +2222,9 @@ impl Filesystem for NextCloudFs {
     }
 
     fn setattr(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
+        ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -2231,20 +2232,21 @@ impl Filesystem for NextCloudFs {
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<u64>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         if let Some(new_size) = size {
             if let Some(fh) = fh {
+                let fh_raw = fh.0;
                 let mut files = self.open_files.safe_lock();
-                if let Some(of) = files.get_mut(&fh) {
+                if let Some(of) = files.get_mut(&fh_raw) {
                     let wp = of.write_path.get_or_insert_with(|| {
                         let cache_dir = self.cache.safe_lock().cache_dir.clone();
-                        cache_dir.join(format!("write_{}", fh))
+                        cache_dir.join(format!("write_{}", fh_raw))
                     });
                     if !wp.exists() {
                         if let Some(ref local) = of.local {
@@ -2260,7 +2262,7 @@ impl Filesystem for NextCloudFs {
                 }
             }
             let c = self.cache.safe_lock();
-            let path = c.get_path(ino);
+            let path = c.get_path(ino.0);
             let entry = path.as_ref().and_then(|p| {
                 let parent = p.parent().unwrap_or(Path::new("/")).to_path_buf();
                 c.get_cached_dir_readonly(&parent).and_then(|files| {
@@ -2269,49 +2271,49 @@ impl Filesystem for NextCloudFs {
             });
             drop(c);
             let mut attr = match entry {
-                Some(ref e) => make_file_attr(ino, e),
-                None => make_dir_attr(ino),
+                Some(ref e) => make_file_attr(ino.0, e),
+                None => make_dir_attr(ino.0),
             };
             attr.size = new_size;
             reply.attr(&TTL, &attr);
         } else {
-            self.getattr(_req, ino, reply);
+            self.getattr(_req, ino, None, reply);
         }
     }
 
     fn write(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let path = match self.cache.safe_lock().get_path(ino) {
+        let path = match self.cache.safe_lock().get_path(ino.0) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
         log::debug!("[{}] WRITE {} offset={} len={}", self.log_user, path.display(), offset, data.len());
 
         let mut files = self.open_files.safe_lock();
-        let of = match files.get_mut(&fh) {
+        let of = match files.get_mut(&fh.0) {
             Some(of) => of,
             None => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
 
         let wp = of.write_path.get_or_insert_with(|| {
             let cache_dir = self.cache.safe_lock().cache_dir.clone();
-            cache_dir.join(format!("write_{}", fh))
+            cache_dir.join(format!("write_{}", fh.0))
         });
         if !wp.exists() {
             if let Some(ref local) = of.local {
@@ -2324,28 +2326,28 @@ impl Filesystem for NextCloudFs {
         let wp_clone = wp.clone();
         match std::fs::OpenOptions::new().write(true).create(true).open(&wp_clone) {
             Ok(f) => {
-                match f.write_at(data, offset as u64) {
+                match f.write_at(data, offset) {
                     Ok(n) => {
                         of.dirty = true;
                         reply.written(n as u32);
                     }
                     Err(e) => {
                         log::error!("write to staging file: {}", e);
-                        reply.error(EIO);
+                        reply.error(Errno::EIO);
                     }
                 }
             }
             Err(e) => {
                 log::error!("open staging file: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
-    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
         let (remote_path, write_path, original_etag) = {
             let files = self.open_files.safe_lock();
-            match files.get(&fh) {
+            match files.get(&fh.0) {
                 Some(of) if of.dirty => (
                     of.remote_path.clone(),
                     of.write_path.clone(),
@@ -2370,7 +2372,7 @@ impl Filesystem for NextCloudFs {
             Ok(m) => m.len(),
             Err(_) => {
                 log::error!("flush: staging file missing at {}", write_path.display());
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -2454,7 +2456,7 @@ impl Filesystem for NextCloudFs {
                                 dir.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
                             }
                         }
-                        if let Some(of) = open_files.safe_lock().get_mut(&fh) {
+                        if let Some(of) = open_files.safe_lock().get_mut(&fh.0) {
                             of.dirty = false;
                             of.original_etag = result.new_etag.clone();
                         }
@@ -2496,7 +2498,7 @@ impl Filesystem for NextCloudFs {
                             Ok(_) => log::info!("conflicted copy uploaded as {}", conflict_name.display()),
                             Err(e) => log::error!("failed to upload conflict copy: {}", e),
                         }
-                        if let Some(of) = open_files.safe_lock().get_mut(&fh) {
+                        if let Some(of) = open_files.safe_lock().get_mut(&fh.0) {
                             of.dirty = false;
                         }
                         dirty.safe_lock().insert(remote_path.clone());
@@ -2526,18 +2528,18 @@ impl Filesystem for NextCloudFs {
     }
 
     fn create(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let parent_path = match self.cache.safe_lock().get_path(parent) {
+        let parent_path = match self.cache.safe_lock().get_path(parent.0) {
             Some(p) => p,
-            None => { reply.error(ENOENT); return; }
+            None => { reply.error(Errno::ENOENT); return; }
         };
         let file_name = name.to_string_lossy().to_string();
         let full_path = parent_path.join(&file_name);
@@ -2561,7 +2563,7 @@ impl Filesystem for NextCloudFs {
                                     dirty: false, original_etag: None,
                                 });
                                 log::info!("ghost create: {} (inotify trigger)", full_path.display());
-                                reply.created(&TTL, &attr, 0, fh, 0);
+                                reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
                                 return;
                             }
                         }
@@ -2573,7 +2575,7 @@ impl Filesystem for NextCloudFs {
         if let Err(e) = filename_validation::validate(name) {
             log::warn!("create rejected: {}", e);
             push_error(&self.error_log, PathBuf::from(&file_name), SyncErrorKind::InvalidFilename, e.to_string());
-            reply.error(e.to_errno());
+            reply.error(Errno::from_i32(e.to_errno()));
             return;
         }
 
@@ -2630,13 +2632,13 @@ impl Filesystem for NextCloudFs {
         );
 
         let attr = make_file_attr(ino, &new_entry);
-        reply.created(&TTL, &attr, 0, fh, 0);
+        reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
     }
 
     fn mkdir(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
@@ -2646,14 +2648,14 @@ impl Filesystem for NextCloudFs {
             log::warn!("mkdir rejected: {}", e);
             let full_name = name.to_string_lossy().into_owned();
             push_error(&self.error_log, PathBuf::from(&full_name), SyncErrorKind::InvalidFilename, e.to_string());
-            reply.error(e.to_errno());
+            reply.error(Errno::from_i32(e.to_errno()));
             return;
         }
 
-        let parent_path = match self.cache.safe_lock().get_path(parent) {
+        let parent_path = match self.cache.safe_lock().get_path(parent.0) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -2668,7 +2670,7 @@ impl Filesystem for NextCloudFs {
                     if let GhostKind::HiddenAdd = ghost.kind {
                         let ino = self.cache.safe_lock().allocate_inode(remote_path.clone());
                         log::info!("ghost mkdir: {} (inotify trigger)", remote_path.display());
-                        reply.entry(&TTL, &make_dir_attr(ino), 0);
+                        reply.entry(&TTL, &make_dir_attr(ino), Generation(0));
                         return;
                     }
                 }
@@ -2701,7 +2703,7 @@ impl Filesystem for NextCloudFs {
             ino
         };
         self.dirty.safe_lock().insert(parent_path);
-        reply.entry(&TTL, &make_dir_attr(ino), 0);
+        reply.entry(&TTL, &make_dir_attr(ino), Generation(0));
 
         let seq = self.journal.safe_lock().enqueue(
             mutation_journal::MutationOp::MkDir { path: remote_path.clone() },
@@ -2728,20 +2730,20 @@ impl Filesystem for NextCloudFs {
         }
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         // Guard: NC 'D' (delete) flag must be present on the parent directory.
         // Blocks unlink even when the parent directory mode is 0o755 due to having 'C'.
-        if let Some(p) = self.cache.safe_lock().nc_dir_perms(parent) {
+        if let Some(p) = self.cache.safe_lock().nc_dir_perms(parent.0) {
             if !p.contains('D') {
-                reply.error(EACCES);
+                reply.error(Errno::EACCES);
                 return;
             }
         }
 
-        let parent_path = match self.cache.safe_lock().get_path(parent) {
+        let parent_path = match self.cache.safe_lock().get_path(parent.0) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -2798,18 +2800,18 @@ impl Filesystem for NextCloudFs {
         }
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        if let Some(p) = self.cache.safe_lock().nc_dir_perms(parent) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if let Some(p) = self.cache.safe_lock().nc_dir_perms(parent.0) {
             if !p.contains('D') {
-                reply.error(EACCES);
+                reply.error(Errno::EACCES);
                 return;
             }
         }
 
-        let parent_path = match self.cache.safe_lock().get_path(parent) {
+        let parent_path = match self.cache.safe_lock().get_path(parent.0) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -2867,32 +2869,32 @@ impl Filesystem for NextCloudFs {
     }
 
     fn rename(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         if let Err(e) = filename_validation::validate(newname) {
             log::warn!("rename rejected: {}", e);
             let full_name = newname.to_string_lossy().into_owned();
             push_error(&self.error_log, PathBuf::from(&full_name), SyncErrorKind::InvalidFilename, e.to_string());
-            reply.error(e.to_errno());
+            reply.error(Errno::from_i32(e.to_errno()));
             return;
         }
 
         // Guard: same-dir rename requires 'N'; cross-dir move requires 'V' on source.
         {
             let c = self.cache.safe_lock();
-            let src_perms = c.nc_dir_perms(parent);
+            let src_perms = c.nc_dir_perms(parent.0);
             if let Some(ref p) = src_perms {
-                let cross_dir = parent != newparent;
+                let cross_dir = parent.0 != newparent.0;
                 let required = if cross_dir { 'V' } else { 'N' };
                 if !p.contains(required) {
-                    reply.error(EACCES);
+                    reply.error(Errno::EACCES);
                     return;
                 }
             }
@@ -2900,10 +2902,10 @@ impl Filesystem for NextCloudFs {
 
         let (old_parent_path, new_parent_path) = {
             let c = self.cache.safe_lock();
-            match (c.get_path(parent), c.get_path(newparent)) {
+            match (c.get_path(parent.0), c.get_path(newparent.0)) {
                 (Some(a), Some(b)) => (a, b),
                 _ => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -3215,7 +3217,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         options.mount_point.display()
     );
 
-    let mut session = fuser::Session::new(filesystem, &options.mount_point, &fuse_options)
+    let fuse_config = {
+        let mut c = Config::default();
+        c.mount_options = fuse_options;
+        c
+    };
+    let session = fuser::Session::new(filesystem, &options.mount_point, &fuse_config)
         .map_err(|e| format!("FUSE session init failed: {}", e))?;
 
     if let Some(fd) = fuse_notify::find_fuse_fd() {
@@ -3233,7 +3240,9 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         log::warn!("Could not find /dev/fuse fd — kernel notifications disabled");
     }
 
-    session.run().map_err(|e| format!("FUSE session failed: {}", e))
+    let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;
+    bg.guard.join().map_err(|_| "FUSE session thread panicked".to_string())
+        .and_then(|r| r.map_err(|e| format!("FUSE session failed: {}", e)))
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -3699,7 +3708,7 @@ mod tests {
 
         let now = SystemTime::now();
         let attr = FileAttr {
-            ino: 42, size: 1024, blocks: 2,
+            ino: INodeNo(42), size: 1024, blocks: 2,
             atime: now, mtime: now, ctime: now, crtime: now,
             kind: FileType::RegularFile, perm: 0o644, nlink: 1,
             uid: 1000, gid: 1000,
@@ -3716,7 +3725,7 @@ mod tests {
         let ghost = g.get(&path).unwrap();
         match ghost.kind {
             GhostKind::VisibleDelete { attr: stored } => {
-                assert_eq!(stored.ino, 42);
+                assert_eq!(stored.ino, INodeNo(42));
                 assert_eq!(stored.size, 1024);
             }
             _ => panic!("expected VisibleDelete"),
@@ -3765,7 +3774,7 @@ mod tests {
         let path = PathBuf::from("/Sync/deleted.txt");
         let now = SystemTime::now();
         let attr = FileAttr {
-            ino: 42, size: 0, blocks: 0,
+            ino: INodeNo(42), size: 0, blocks: 0,
             atime: now, mtime: now, ctime: now, crtime: now,
             kind: FileType::RegularFile, perm: 0o644, nlink: 1,
             uid: 1000, gid: 1000, rdev: 0, flags: 0, blksize: 512,
@@ -3999,7 +4008,7 @@ mod tests {
         let path = PathBuf::from("/Sync/olddir");
         let now = SystemTime::now();
         let attr = FileAttr {
-            ino: 50, size: 0, blocks: 0,
+            ino: INodeNo(50), size: 0, blocks: 0,
             atime: now, mtime: now, ctime: now, crtime: now,
             kind: FileType::Directory, perm: 0o755, nlink: 2,
             uid: 1000, gid: 1000, rdev: 0, flags: 0, blksize: 512,
@@ -4027,7 +4036,7 @@ mod tests {
         let to = PathBuf::from("/Sync/new.txt");
         let now = SystemTime::now();
         let attr = FileAttr {
-            ino: 42, size: 100, blocks: 1,
+            ino: INodeNo(42), size: 100, blocks: 1,
             atime: now, mtime: now, ctime: now, crtime: now,
             kind: FileType::RegularFile, perm: 0o644, nlink: 1,
             uid: 1000, gid: 1000, rdev: 0, flags: 0, blksize: 512,
@@ -4077,7 +4086,7 @@ mod tests {
         let to = PathBuf::from("/Sync/new.txt");
         let now = SystemTime::now();
         let attr = FileAttr {
-            ino: 42, size: 100, blocks: 1,
+            ino: INodeNo(42), size: 100, blocks: 1,
             atime: now, mtime: now, ctime: now, crtime: now,
             kind: FileType::RegularFile, perm: 0o644, nlink: 1,
             uid: 1000, gid: 1000, rdev: 0, flags: 0, blksize: 512,
