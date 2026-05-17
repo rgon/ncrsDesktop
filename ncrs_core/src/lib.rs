@@ -3201,6 +3201,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         MountOption::FSName("ncrs".to_string()),
         MountOption::AutoUnmount,
         MountOption::DefaultPermissions,
+        MountOption::CUSTOM("x-gvfs-notrash".to_string()),
     ];
 
     let mp_str = options.mount_point.to_string_lossy().to_string();
