@@ -3201,7 +3201,6 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     let fuse_options = vec![
         MountOption::FSName("ncrs".to_string()),
-        MountOption::AutoUnmount,
         MountOption::DefaultPermissions,
         MountOption::CUSTOM("x-gvfs-notrash".to_string()),
     ];
