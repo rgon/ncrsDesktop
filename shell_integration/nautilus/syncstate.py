@@ -40,7 +40,7 @@ from gi.repository import Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 # ── Emblem names (standard XDG / FreeDesktop icon names) ─────────────────────
 _EMBLEM_LOCAL     = "emblem-default"        # green tick
 _EMBLEM_REMOTE    = "emblem-downloads"     # cloud / down-arrow
-_EMBLEM_SYNCED    = "emblem-synchronizing" # circular arrows
+_EMBLEM_SYNCED    = "emblem-default"        # green tick — successfully synced
 _EMBLEM_SHARED    = "emblem-shared"        # people / shared
 _EMBLEM_PARTIAL   = "emblem-downloads"     # partial download (some files local)
 _EMBLEM_UPLOADING = "emblem-synchronizing" # circular arrows — upload in progress

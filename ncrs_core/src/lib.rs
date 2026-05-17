@@ -2117,10 +2117,36 @@ impl Filesystem for NextCloudFs {
                             dt.retain(|p, _| !is_child_of_dir(p));
                             for (p, d) in detail_entries { dt.insert(p, d); }
                         }
+                        // Collect paths with in-flight or just-completed upload status before
+                        // we clear smap.  These must (a) survive the PROPFIND status reset so
+                        // the upload emblem persists, and (b) be dirtied individually so
+                        // Nautilus re-queries their NC properties from the fresh detail_map.
+                        let upload_paths: Vec<PathBuf> = {
+                            let st = status.safe_lock();
+                            status_entries.iter()
+                                .filter_map(|(p, _)| {
+                                    if matches!(st.get(p),
+                                        Some(FileStatus::Uploading) | Some(FileStatus::Synced))
+                                    {
+                                        Some(p.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        };
                         {
                             let mut st = status.safe_lock();
                             st.retain(|p, _| !is_child_of_dir(p));
-                            for (p, s) in &status_entries { st.insert(p.clone(), *s); }
+                            let upload_set: std::collections::HashSet<&PathBuf> =
+                                upload_paths.iter().collect();
+                            for (p, s) in &status_entries {
+                                // Don't overwrite Uploading/Synced with Remote: those entries
+                                // track in-flight and just-completed uploads.
+                                if !upload_set.contains(p) {
+                                    st.insert(p.clone(), *s);
+                                }
+                            }
                         }
                         {
                             let mut c = cache.safe_lock();
@@ -2132,6 +2158,11 @@ impl Filesystem for NextCloudFs {
                             // Inserting all N children here floods the CHANGES queue and
                             // triggers a cascade of GIO attribute invalidations in Nautilus.
                             dirty.safe_lock().insert(path.clone());
+                            // Additionally dirty recently uploaded files so Nautilus re-queries
+                            // them and picks up NC properties from the freshly populated detail_map.
+                            for p in upload_paths {
+                                dirty.safe_lock().insert(p);
+                            }
                         }
                     }
 
@@ -2411,7 +2442,9 @@ impl Filesystem for NextCloudFs {
                                     entry.modified = Some(SystemTime::now());
                                 }
                                 dir.files = Arc::new(files);
-                                dir.at = Instant::now();
+                                // Expire the cache so the next readdir triggers a PROPFIND
+                                // and populates NC-assigned properties (permissions, fileid, owner).
+                                dir.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
                             }
                         }
                         if let Some(of) = open_files.safe_lock().get_mut(&fh) {
