@@ -10,13 +10,14 @@ GOALS:
 + [x] Real vFS on linux: not downloading everything then serving it. Uses the built-in nextcloud thumbnailer for a rich experience
 + [x] webdav with QUICK/HTTP3 support for speed
 + [x] streaming-download VFS support: play back large 4K videos locally without issues, at network-rate and without pre-downloading the file.
-<<<<<
-+ [ ] optionally caches files: opening a file twice is just 1x network request if enabled, being smart about edits
++ [x] optionally caches files: opening a file twice is just 1x network request if enabled, being smart about edits
     future:
-    + [ ] streaming cache .part
+    + [x] streaming cache .part
+<<<<<
     + [ ] limit the cache size
     + [ ] gui show what's used by cache, kept files
     + [ ] auto-purge cache after N days and/or size
++ [ ] Add cache cleaning options to ncrs: do cleanup passes every so often and set: cache_max_size (default 32GB) and or cache_auto_purge_days (default 10d)
 
 + [x] files high-performance backend (notify-push) full support, files update as fast as possible atomically, to avoid merge errors
 + [x] maps nextcloud permissions to filesystem permissions
@@ -312,3 +313,7 @@ Additional metadata files in the root:
 Config options (in `~/.config/ncrs/config.yaml`):
 - `auto_keep_locally_modified_files: true` -- keep a local copy after uploading a file you edited
 - `auto_keep_cached_files: true` -- promote read-cached files to kept automatically
+- `cache_max_size_bytes: 34359738368` -- max size for `cache/` directory (default 32 GB, 0 = unlimited). Oldest-accessed files are evicted first.
+- `cache_auto_purge_days: 10` -- auto-delete cached files not accessed in N days (default 10, 0 = disabled)
+- `cache_streamed_reads: true` -- promote fully-streamed files to disk cache
+- `read_ahead_bytes: 67108864` -- read-ahead window for streaming reads (default 64 MB)

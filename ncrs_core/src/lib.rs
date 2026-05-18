@@ -210,6 +210,14 @@ pub struct MountOptions {
     /// Cache files to disk when a streaming read covers the entire file.
     #[serde(default)]
     pub cache_streamed_reads: bool,
+    /// Maximum size in bytes for the auto-cache directory. Oldest-accessed files
+    /// are evicted first when this limit is exceeded. 0 = unlimited.
+    #[serde(default = "default_cache_max_size")]
+    pub cache_max_size_bytes: u64,
+    /// Automatically purge cached files older than this many days (by last access
+    /// time). 0 = never purge by age.
+    #[serde(default = "default_cache_purge_days")]
+    pub cache_auto_purge_days: u32,
 }
 
 fn default_true() -> bool { true }
@@ -217,6 +225,10 @@ fn default_true() -> bool { true }
 fn default_max_concurrent() -> usize { 10 }
 
 fn default_read_ahead() -> usize { DEFAULT_READ_AHEAD }
+
+fn default_cache_max_size() -> u64 { 32 * 1024 * 1024 * 1024 } // 32 GB
+
+fn default_cache_purge_days() -> u32 { 10 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SyncState {
@@ -754,6 +766,103 @@ fn load_file_cache(cache: &Mutex<FsCache>) -> HashMap<PathBuf, LoadedCacheEntry>
     }
     log::info!("FILE_CACHE loaded {} entries", result.len());
     result
+}
+
+// ── Cache cleanup ───────────────────────────────────────────────────────────
+
+const CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
+
+fn run_cache_cleanup(
+    cache: &Arc<Mutex<FsCache>>,
+    status: &StatusMap,
+    dirty: &ipc::DirtySet,
+    max_bytes: u64,
+    purge_days: u32,
+) {
+    let auto_cache_dir = cache.safe_lock().auto_cache_dir.clone();
+
+    struct CachedFile {
+        path: PathBuf,
+        remote_path: PathBuf,
+        size: u64,
+        accessed: SystemTime,
+    }
+
+    let mut files: Vec<CachedFile> = Vec::new();
+    let mut total_size: u64 = 0;
+
+    fn walk_dir(dir: &Path, base: &Path, files: &mut Vec<CachedFile>, total: &mut u64) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_dir(&path, base, files, total);
+            } else if let Ok(meta) = entry.metadata() {
+                let size = meta.len();
+                let accessed = meta.accessed().unwrap_or(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+                let rel = path.strip_prefix(base).unwrap_or(&path);
+                let remote_path = PathBuf::from("/").join(rel);
+                *total += size;
+                files.push(CachedFile { path, remote_path, size, accessed });
+            }
+        }
+    }
+
+    walk_dir(&auto_cache_dir, &auto_cache_dir, &mut files, &mut total_size);
+
+    if files.is_empty() {
+        return;
+    }
+
+    let mut evicted = 0usize;
+    let mut freed: u64 = 0;
+
+    if purge_days > 0 {
+        let cutoff = SystemTime::now() - Duration::from_secs(purge_days as u64 * 86400);
+        let mut i = 0;
+        while i < files.len() {
+            if files[i].accessed < cutoff {
+                let f = files.swap_remove(i);
+                if std::fs::remove_file(&f.path).is_ok() {
+                    let mut c = cache.safe_lock();
+                    c.file_cache.remove(&f.remote_path);
+                    drop(c);
+                    status.safe_lock().insert(f.remote_path.clone(), FileStatus::Remote);
+                    dirty.safe_lock().insert(f.remote_path);
+                    total_size -= f.size;
+                    freed += f.size;
+                    evicted += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    if max_bytes > 0 && total_size > max_bytes {
+        files.sort_by_key(|f| f.accessed);
+        for f in files {
+            if total_size <= max_bytes { break; }
+            if std::fs::remove_file(&f.path).is_ok() {
+                let mut c = cache.safe_lock();
+                c.file_cache.remove(&f.remote_path);
+                drop(c);
+                status.safe_lock().insert(f.remote_path.clone(), FileStatus::Remote);
+                dirty.safe_lock().insert(f.remote_path);
+                total_size -= f.size;
+                freed += f.size;
+                evicted += 1;
+            }
+        }
+    }
+
+    if evicted > 0 {
+        save_file_cache(cache);
+        log::info!("CACHE_CLEANUP evicted {} files, freed {:.1}MB", evicted, freed as f64 / 1_048_576.0);
+    }
 }
 
 // ── Shared operation helpers ──────────────────────────────────────────────────
@@ -3488,6 +3597,33 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         }
     }
 
+    // Cache cleanup thread
+    if options.cache_max_size_bytes > 0 || options.cache_auto_purge_days > 0 {
+        let cleanup_cache = filesystem.cache_ref();
+        let cleanup_status = filesystem.status_map();
+        let cleanup_dirty = filesystem.dirty_set();
+        let cleanup_shutdown = filesystem.shutdown_flag();
+        let cleanup_paused = filesystem.paused_flag();
+        let max_bytes = options.cache_max_size_bytes;
+        let purge_days = options.cache_auto_purge_days;
+        thread::spawn(move || {
+            log::info!("CACHE_CLEANUP thread started (max={}GB, purge={}d)",
+                max_bytes as f64 / (1024.0 * 1024.0 * 1024.0), purge_days);
+            run_cache_cleanup(&cleanup_cache, &cleanup_status, &cleanup_dirty, max_bytes, purge_days);
+            loop {
+                let mut slept = Duration::ZERO;
+                while slept < CACHE_CLEANUP_INTERVAL {
+                    if cleanup_shutdown.load(Ordering::Relaxed) { return; }
+                    thread::sleep(Duration::from_secs(10));
+                    slept += Duration::from_secs(10);
+                }
+                if cleanup_shutdown.load(Ordering::Relaxed) { return; }
+                if cleanup_paused.load(Ordering::Relaxed) { continue; }
+                run_cache_cleanup(&cleanup_cache, &cleanup_status, &cleanup_dirty, max_bytes, purge_days);
+            }
+        });
+    }
+
     let fuse_options = build_fuse_options();
 
     let mp_str = options.mount_point.to_string_lossy().to_string();
@@ -3615,8 +3751,10 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let auto_keep_cached_files = doc["auto_keep_cached_files"].as_bool().unwrap_or(false);
     let read_ahead_bytes = doc["read_ahead_bytes"].as_i64().map(|v| v as usize).unwrap_or(DEFAULT_READ_AHEAD);
     let cache_streamed_reads = doc["cache_streamed_reads"].as_bool().unwrap_or(false);
+    let cache_max_size_bytes = doc["cache_max_size_bytes"].as_i64().map(|v| v as u64).unwrap_or_else(default_cache_max_size);
+    let cache_auto_purge_days = doc["cache_auto_purge_days"].as_i64().map(|v| v as u32).unwrap_or_else(default_cache_purge_days);
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days })
 }
 
 #[cfg(test)]
