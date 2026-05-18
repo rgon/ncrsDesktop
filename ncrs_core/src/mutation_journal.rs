@@ -346,10 +346,7 @@ impl MutationJournal {
 // ── Replay ────────────────────────────────────────────────────────────────
 
 pub struct ReplayContext {
-    pub http: reqwest::blocking::Client,
-    pub base_url: String,
-    pub username: String,
-    pub password: String,
+    pub backend: std::sync::Arc<dyn crate::backend::CloudBackend>,
 }
 
 pub(crate) fn replay_journal(
@@ -432,7 +429,7 @@ fn execute_op(
     dirty: &crate::ipc::DirtySet,
     error_log: &crate::ErrorLog,
 ) -> ReplayResult {
-    use crate::webdav_ops::{self, WriteError};
+    use crate::backend::BackendWriteError;
     use crate::MutexExt;
 
     match &entry.op {
@@ -446,15 +443,15 @@ fn execute_op(
                 }
             };
             let etag_ref = if_match_etag.as_deref();
-            match webdav_ops::put_file(&ctx.http, &ctx.base_url, &ctx.username, &ctx.password, remote_path, body.clone(), etag_ref) {
+            match ctx.backend.put_file(remote_path, body.clone(), etag_ref) {
                 Ok(result) => {
-                    log::info!("JOURNAL replay: PUT {} → etag {:?}", remote_path.display(), result.new_etag);
+                    log::info!("JOURNAL replay: PUT {} → token {:?}", remote_path.display(), result.new_change_token);
                     let mut c = cache.safe_lock();
                     let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
                     if let Some(dir) = c.dir_cache.get_mut(&parent) {
                         let mut files = (*dir.files).clone();
                         if let Some(e) = files.iter_mut().find(|e| e.path == *remote_path) {
-                            e.etag = result.new_etag;
+                            e.change_token = result.new_change_token;
                             e.size = body.len() as u64;
                             e.modified = Some(SystemTime::now());
                         }
@@ -464,18 +461,18 @@ fn execute_op(
                     dirty.safe_lock().insert(parent);
                     ReplayResult::Ok
                 }
-                Err(WriteError::Conflict) => {
+                Err(BackendWriteError::Conflict) => {
                     log::warn!("JOURNAL replay: PUT {} conflict — creating conflicted copy", remote_path.display());
                     let conflict_name = crate::make_conflict_name(remote_path);
-                    let _ = webdav_ops::put_file(&ctx.http, &ctx.base_url, &ctx.username, &ctx.password, &conflict_name, body, None);
+                    let _ = ctx.backend.put_file(&conflict_name, body, None);
                     crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                     ReplayResult::Conflict(ConflictKind::EditConflict {
                         local_path: remote_path.clone(),
                         conflicted_copy_path: conflict_name,
                     })
                 }
-                Err(WriteError::Network(e)) => ReplayResult::NetworkError(e),
-                Err(WriteError::Server(404, _)) => {
+                Err(BackendWriteError::Network(e)) => ReplayResult::NetworkError(e),
+                Err(BackendWriteError::Server(404, _)) => {
                     ReplayResult::Conflict(ConflictKind::PermanentFailure {
                         description: format!("PUT {} failed: parent directory not found", remote_path.display()),
                     })
@@ -484,62 +481,62 @@ fn execute_op(
             }
         }
         MutationOp::MkDir { path } => {
-            match webdav_ops::mkcol(&ctx.http, &ctx.base_url, &ctx.username, &ctx.password, path) {
+            match ctx.backend.mkdir(path) {
                 Ok(()) => {
                     log::info!("JOURNAL replay: MKCOL {}", path.display());
                     ReplayResult::Ok
                 }
-                Err(WriteError::Network(e)) => ReplayResult::NetworkError(e),
+                Err(BackendWriteError::Network(e)) => ReplayResult::NetworkError(e),
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
         MutationOp::Unlink { path } => {
-            match webdav_ops::delete(&ctx.http, &ctx.base_url, &ctx.username, &ctx.password, path) {
+            match ctx.backend.delete(path) {
                 Ok(()) => {
                     log::info!("JOURNAL replay: DELETE {}", path.display());
                     ReplayResult::Ok
                 }
-                Err(WriteError::Server(404, _)) => {
+                Err(BackendWriteError::Server(404, _)) => {
                     log::info!("JOURNAL replay: DELETE {} — already gone (idempotent)", path.display());
                     ReplayResult::Idempotent
                 }
-                Err(WriteError::Network(e)) => ReplayResult::NetworkError(e),
+                Err(BackendWriteError::Network(e)) => ReplayResult::NetworkError(e),
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
         MutationOp::RmDir { path } => {
-            match webdav_ops::delete(&ctx.http, &ctx.base_url, &ctx.username, &ctx.password, path) {
+            match ctx.backend.delete(path) {
                 Ok(()) => {
                     log::info!("JOURNAL replay: RMDIR {}", path.display());
                     ReplayResult::Ok
                 }
-                Err(WriteError::Server(404, _)) => {
+                Err(BackendWriteError::Server(404, _)) => {
                     log::info!("JOURNAL replay: RMDIR {} — already gone (idempotent)", path.display());
                     ReplayResult::Idempotent
                 }
-                Err(WriteError::Network(e)) => ReplayResult::NetworkError(e),
+                Err(BackendWriteError::Network(e)) => ReplayResult::NetworkError(e),
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
         MutationOp::Rename { from, to } => {
-            match webdav_ops::move_resource(&ctx.http, &ctx.base_url, &ctx.username, &ctx.password, from, to) {
+            match ctx.backend.rename(from, to) {
                 Ok(()) => {
                     log::info!("JOURNAL replay: MOVE {} → {}", from.display(), to.display());
                     ReplayResult::Ok
                 }
-                Err(WriteError::Server(404, _)) => {
+                Err(BackendWriteError::Server(404, _)) => {
                     ReplayResult::Conflict(ConflictKind::MoveSourceGone {
                         from: from.clone(),
                         to: to.clone(),
                     })
                 }
-                Err(WriteError::Conflict) => {
+                Err(BackendWriteError::Conflict) => {
                     ReplayResult::Conflict(ConflictKind::MoveDestExists {
                         from: from.clone(),
                         to: to.clone(),
                     })
                 }
-                Err(WriteError::Network(e)) => ReplayResult::NetworkError(e),
+                Err(BackendWriteError::Network(e)) => ReplayResult::NetworkError(e),
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }

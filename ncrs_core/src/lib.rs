@@ -1,8 +1,10 @@
+pub mod backend;
 pub mod config;
 pub mod filename_validation;
 pub mod fuse_notify;
 pub mod ipc;
 pub mod mutation_journal;
+pub mod nextcloud;
 pub mod notifications;
 pub mod notify_push;
 pub mod preview;
@@ -24,11 +26,9 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 
-use remotefs::RemoteFs;
-use remotefs_webdav::WebDAVFs;
 use ipc::{FileStatus, StatusMap};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use propfind::DavEntry;
+use backend::RemoteEntry;
 use serde::{Deserialize, Serialize};
 use yaml_rust2::YamlLoader;
 
@@ -63,8 +63,6 @@ fn effective_dir_ttl(optimistic_listing: bool, notify_push_connected: &AtomicBoo
 }
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const READ_AHEAD: usize = 64 * 1024 * 1024; // 64 MB
-const MAX_POOL_IDLE: usize = 8;
-
 const GHOST_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
@@ -137,8 +135,8 @@ impl Drop for ThrottleGuard<'_> {
 // ── Cache data types ──────────────────────────────────────────────────────────
 
 struct DirCacheEntry {
-    files: Arc<Vec<DavEntry>>,
-    self_entry: Option<DavEntry>,
+    files: Arc<Vec<RemoteEntry>>,
+    self_entry: Option<RemoteEntry>,
     etag: Option<String>,
     at: Instant,
     refreshing: bool,
@@ -146,12 +144,12 @@ struct DirCacheEntry {
 }
 
 struct PendingDir {
-    entries: Vec<DavEntry>,
-    rx: mpsc::Receiver<DavEntry>,
+    entries: Vec<RemoteEntry>,
+    rx: mpsc::Receiver<RemoteEntry>,
     etag_rx: mpsc::Receiver<Option<String>>,
-    self_rx: mpsc::Receiver<DavEntry>,
+    self_rx: mpsc::Receiver<RemoteEntry>,
     etag: Option<String>,
-    self_entry: Option<DavEntry>,
+    self_entry: Option<RemoteEntry>,
 }
 
 struct FileCacheEntry {
@@ -284,35 +282,6 @@ pub struct TransferProgress {
 
 pub type TransferMap = Arc<Mutex<HashMap<PathBuf, TransferProgress>>>;
 
-// ── Network layer — each call runs in a sub-thread so the caller can impose a
-//    deadline via recv_timeout without blocking the FUSE session thread. ───────
-
-pub(crate) struct FsNetwork {
-    conns: Mutex<Vec<WebDAVFs>>,
-    url: String,
-    username: String,
-    password: String,
-}
-
-impl FsNetwork {
-    fn checkout(&self) -> Result<WebDAVFs, String> {
-        if let Some(conn) = self.conns.safe_lock().pop() {
-            return Ok(conn);
-        }
-        let mut conn = WebDAVFs::new(&self.username, &self.password, &self.url);
-        conn.connect().map_err(|e| format!("WebDAV connect: {}", e))?;
-        Ok(conn)
-    }
-
-    fn checkin(&self, conn: WebDAVFs) {
-        let mut pool = self.conns.safe_lock();
-        if pool.len() < MAX_POOL_IDLE {
-            pool.push(conn);
-        }
-    }
-
-}
-
 fn error_to_errno(err: &str) -> Errno {
     if err.contains("401") || err.contains("403") || err.contains("Unauthorized") || err.contains("Forbidden") {
         Errno::EACCES
@@ -326,15 +295,14 @@ fn error_to_errno(err: &str) -> Errno {
 fn list_dir_propfind(
     conn: &Arc<ConnInfo>,
     path: PathBuf,
-) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), String> {
+) -> Result<(Option<String>, Option<RemoteEntry>, Vec<RemoteEntry>), String> {
     log::debug!("LIST {}", path.display());
     let (tx, rx) = mpsc::channel();
     let c = conn.clone();
     thread::spawn(move || {
         let _permit = c.throttle.acquire();
-        let _ = tx.send(propfind::propfind_list(
-            &c.http, &c.webdav_url, &c.username, &c.password, &path, PROPFIND_TIMEOUT,
-        ));
+        let _ = tx.send(c.backend.list_dir(&path, PROPFIND_TIMEOUT)
+            .map_err(|e| e.to_string()));
     });
     rx.recv_timeout(PROPFIND_TIMEOUT + Duration::from_secs(1))
         .unwrap_or_else(|_| Err("WebDAV PROPFIND timeout".into()))
@@ -364,34 +332,24 @@ impl std::io::Write for ProgressWriter {
 }
 
 fn open_file_timeout(
-    net: &Arc<FsNetwork>,
-    throttle: &Arc<Throttle>,
+    conn: &Arc<ConnInfo>,
     path: PathBuf,
     dest: std::fs::File,
     transfers: Option<TransferMap>,
 ) -> Result<(), String> {
     log::info!("DOWNLOAD {}", path.display());
     let (tx, rx) = mpsc::channel();
-    let n = net.clone();
-    let throttle = throttle.clone();
+    let c = conn.clone();
     thread::spawn(move || {
-        let _permit = throttle.acquire();
-        let writer: Box<dyn std::io::Write + Send> = if let Some(tm) = transfers {
+        let _permit = c.read_throttle.acquire();
+        let mut writer: Box<dyn std::io::Write + Send> = if let Some(tm) = transfers {
             Box::new(ProgressWriter { inner: dest, path: path.clone(), transfer_map: tm, written: 0 })
         } else {
             Box::new(dest)
         };
-        let result = match n.checkout() {
-            Ok(mut conn) => {
-                let r = conn
-                    .open_file(&path, writer)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string());
-                n.checkin(conn);
-                r
-            }
-            Err(e) => Err(e),
-        };
+        let result = c.backend.download_file(&path, &mut *writer, DOWNLOAD_TIMEOUT)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
         let _ = tx.send(result);
     });
     rx.recv_timeout(DOWNLOAD_TIMEOUT)
@@ -431,7 +389,7 @@ impl FsCache {
         ino
     }
 
-    fn get_cached_dir(&mut self, path: &Path, ttl: Duration) -> Option<(Arc<Vec<DavEntry>>, bool)> {
+    fn get_cached_dir(&mut self, path: &Path, ttl: Duration) -> Option<(Arc<Vec<RemoteEntry>>, bool)> {
         let entry = self.dir_cache.get_mut(path)?;
         if entry.invalidated {
             return None;
@@ -444,7 +402,7 @@ impl FsCache {
         Some((Arc::clone(&entry.files), needs_refresh))
     }
 
-    fn get_cached_dir_readonly(&self, path: &Path) -> Option<Arc<Vec<DavEntry>>> {
+    fn get_cached_dir_readonly(&self, path: &Path) -> Option<Arc<Vec<RemoteEntry>>> {
         self.dir_cache.get(path).map(|e| Arc::clone(&e.files))
     }
 
@@ -457,14 +415,14 @@ impl FsCache {
         self.get_cached_dir_readonly(&parent)?
             .iter()
             .find(|e| e.path == dir_path)
-            .and_then(|e| e.permissions.clone())
+            .and_then(|e| e.ext.str("permissions").map(str::to_string))
     }
 
     fn cached_dir_etag(&self, path: &Path) -> Option<String> {
         self.dir_cache.get(path)?.etag.clone()
     }
 
-    fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, self_entry: Option<DavEntry>, files: Vec<DavEntry>) {
+    fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, self_entry: Option<RemoteEntry>, files: Vec<RemoteEntry>) {
         self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), refreshing: false, invalidated: false });
     }
 
@@ -476,7 +434,7 @@ impl FsCache {
         }
     }
 
-    fn start_pending(&mut self, path: PathBuf, rx: mpsc::Receiver<DavEntry>, etag_rx: mpsc::Receiver<Option<String>>, self_rx: mpsc::Receiver<DavEntry>) {
+    fn start_pending(&mut self, path: PathBuf, rx: mpsc::Receiver<RemoteEntry>, etag_rx: mpsc::Receiver<Option<String>>, self_rx: mpsc::Receiver<RemoteEntry>) {
         self.pending_dirs.insert(path, PendingDir {
             entries: Vec::new(),
             rx,
@@ -487,7 +445,7 @@ impl FsCache {
         });
     }
 
-    fn start_pending_and_notify(&mut self, path: PathBuf, rx: mpsc::Receiver<DavEntry>, etag_rx: mpsc::Receiver<Option<String>>, self_rx: mpsc::Receiver<DavEntry>) -> Arc<(Mutex<()>, Condvar)> {
+    fn start_pending_and_notify(&mut self, path: PathBuf, rx: mpsc::Receiver<RemoteEntry>, etag_rx: mpsc::Receiver<Option<String>>, self_rx: mpsc::Receiver<RemoteEntry>) -> Arc<(Mutex<()>, Condvar)> {
         self.start_pending(path, rx, etag_rx, self_rx);
         self.pending_notify.clone()
     }
@@ -506,7 +464,7 @@ impl FsCache {
             .unwrap_or_default()
     }
 
-    fn promote_pending(&mut self, path: &Path) -> Option<DavEntry> {
+    fn promote_pending(&mut self, path: &Path) -> Option<RemoteEntry> {
         if let Some(mut pending) = self.pending_dirs.remove(path) {
             while let Ok(entry) = pending.rx.try_recv() {
                 pending.entries.push(entry);
@@ -528,7 +486,7 @@ impl FsCache {
         }
     }
 
-    fn get_pending_snapshot(&mut self, path: &Path) -> Option<Vec<DavEntry>> {
+    fn get_pending_snapshot(&mut self, path: &Path) -> Option<Vec<RemoteEntry>> {
         let pending = self.pending_dirs.get_mut(path)?;
         if pending.self_entry.is_none() {
             if let Ok(se) = pending.self_rx.try_recv() {
@@ -577,10 +535,10 @@ impl FsCache {
     }
 
     fn remote_etag_for(&self, path: &Path) -> Option<String> {
-        self.find_entry(path).and_then(|e| e.etag.clone())
+        self.find_entry(path).and_then(|e| e.change_token.clone())
     }
 
-    fn find_entry(&self, path: &Path) -> Option<&propfind::DavEntry> {
+    fn find_entry(&self, path: &Path) -> Option<&RemoteEntry> {
         let parent = path.parent().unwrap_or(Path::new("/"));
         let name = path.file_name()?.to_str()?;
         self.dir_cache
@@ -605,8 +563,8 @@ const DIR_CACHE_FILE: &str = "dir_cache.json";
 #[derive(Serialize, Deserialize)]
 struct PersistedDirEntry {
     etag: Option<String>,
-    self_entry: Option<DavEntry>,
-    files: Vec<DavEntry>,
+    self_entry: Option<RemoteEntry>,
+    files: Vec<RemoteEntry>,
 }
 
 use std::sync::atomic::AtomicU64;
@@ -765,7 +723,7 @@ fn get_or_list_dir(
     conn: &Arc<ConnInfo>,
     cache: &Arc<Mutex<FsCache>>,
     path: PathBuf,
-) -> Result<(Arc<Vec<DavEntry>>, Option<DavEntry>), String> {
+) -> Result<(Arc<Vec<RemoteEntry>>, Option<RemoteEntry>), String> {
     if conn.is_offline.load(Ordering::Relaxed) {
         let c = cache.safe_lock();
         if let Some(entry) = c.dir_cache.get(&path) {
@@ -788,7 +746,7 @@ fn get_or_list_dir(
                     let old_etag = cache.safe_lock().cached_dir_etag(&path);
                     if let Some(ref old) = old_etag {
                         let _permit = conn.throttle.acquire();
-                        match propfind::propfind_etag(&conn.http, &conn.webdav_url, &conn.username, &conn.password, &path, PROPFIND_TIMEOUT) {
+                        match conn.backend.dir_change_token(&path, PROPFIND_TIMEOUT) {
                             Ok(Some(ref new_etag)) if new_etag == old => {
                                 log::debug!("ETAG_MATCH {} — skipping full re-list", path.display());
                                 cache.safe_lock().touch_dir_cache(&path);
@@ -846,8 +804,7 @@ fn get_or_list_dir(
             let pending_notify2 = c.pending_notify.clone();
             std::thread::spawn(move || {
                 let _permit = conn2.throttle.acquire();
-                match propfind::propfind_list_streaming(
-                    &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
+                match conn2.backend.list_dir_streaming(
                     &path2, PROPFIND_TIMEOUT, entry_tx, self_tx,
                 ) {
                     Ok(etag) => {
@@ -930,8 +887,7 @@ fn get_or_list_dir(
 }
 
 pub(crate) fn ensure_file_cached(
-    net: &Arc<FsNetwork>,
-    throttle: &Arc<Throttle>,
+    conn: &Arc<ConnInfo>,
     cache: &Arc<Mutex<FsCache>>,
     status: &StatusMap,
     dirty: &ipc::DirtySet,
@@ -975,7 +931,7 @@ pub(crate) fn ensure_file_cached(
     }
     let file =
         std::fs::File::create(&local_path).map_err(|e| format!("create cache file: {}", e))?;
-    if let Err(e) = open_file_timeout(net, throttle, remote_path.clone(), file, transfers.cloned()) {
+    if let Err(e) = open_file_timeout(conn, remote_path.clone(), file, transfers.cloned()) {
         if let Some(tm) = transfers { tm.safe_lock().remove(&remote_path); }
         if let Err(rm_err) = std::fs::remove_file(&local_path) {
             log::error!("CRITICAL: cannot remove partial download {}: {} — zeroing to prevent serving corrupt data", local_path.display(), rm_err);
@@ -1008,7 +964,6 @@ pub(crate) fn ensure_file_cached(
 
 fn keep_locally_recursive(
     conn: &Arc<ConnInfo>,
-    net: &Arc<FsNetwork>,
     cache: &Arc<Mutex<FsCache>>,
     status: &StatusMap,
     dirty: &ipc::DirtySet,
@@ -1020,7 +975,7 @@ fn keep_locally_recursive(
     let known_dir = cache.safe_lock().is_known_directory(&remote_path);
 
     if known_dir == Some(false) {
-        if let Err(e) = ensure_file_cached(net, &conn.throttle, cache, status, dirty, remote_path.clone(), transfers) {
+        if let Err(e) = ensure_file_cached(conn, cache, status, dirty, remote_path.clone(), transfers) {
             log::warn!("keep failed {}: {}", remote_path.display(), e);
         }
         return;
@@ -1030,7 +985,7 @@ fn keep_locally_recursive(
         Ok(e) => e,
         Err(e) => {
             if known_dir.is_none() {
-                if let Err(e2) = ensure_file_cached(net, &conn.throttle, cache, status, dirty, remote_path.clone(), transfers) {
+                if let Err(e2) = ensure_file_cached(conn, cache, status, dirty, remote_path.clone(), transfers) {
                     log::warn!("keep failed {}: {} / {}", remote_path.display(), e, e2);
                 }
             } else {
@@ -1059,7 +1014,7 @@ fn keep_locally_recursive(
         std::thread::scope(|s| {
             for path in chunk {
                 s.spawn(|| {
-                    if let Err(e) = ensure_file_cached(net, &conn.throttle, cache, status, dirty, path.clone(), transfers) {
+                    if let Err(e) = ensure_file_cached(conn, cache, status, dirty, path.clone(), transfers) {
                         log::warn!("keep failed {}: {}", path.display(), e);
                     }
                 });
@@ -1069,7 +1024,7 @@ fn keep_locally_recursive(
     }
 
     for dir in dirs {
-        keep_locally_recursive(conn, net, cache, status, dirty, dir, transfers);
+        keep_locally_recursive(conn, cache, status, dirty, dir, transfers);
     }
 }
 
@@ -1082,7 +1037,7 @@ fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
     }
     log::info!("PREFETCH_LIST {}", path.display());
     let _permit = conn.prefetch_throttle.acquire();
-    match propfind::propfind_list(&conn.http, &conn.webdav_url, &conn.username, &conn.password, path, PROPFIND_TIMEOUT) {
+    match conn.backend.list_dir(path, PROPFIND_TIMEOUT) {
         Ok((etag, self_entry, files)) => {
             cache.safe_lock().put_dir_cache(path.to_path_buf(), etag, self_entry, files);
         }
@@ -1124,10 +1079,10 @@ fn start_background_propfind(
     thread::spawn(move || {
         let result = {
             let _permit = conn2.prefetch_throttle.acquire();
-            propfind::propfind_list_streaming(
-                &conn2.http, &conn2.webdav_url, &conn2.username, &conn2.password,
+            let r = conn2.backend.list_dir_streaming(
                 &path, PROPFIND_TIMEOUT, entry_tx, self_tx,
-            )
+            );
+            r
             // _permit (prefetch throttle slot) released here, before chaining children
         };
         match result {
@@ -1187,7 +1142,7 @@ pub(crate) fn perms_to_mode(permissions: Option<&str>, is_dir: bool) -> u16 {
     }
 }
 
-pub(crate) fn make_file_attr(inode: u64, entry: &DavEntry) -> FileAttr {
+pub(crate) fn make_file_attr(inode: u64, entry: &RemoteEntry) -> FileAttr {
     let modified = entry.modified.unwrap_or(UNIX_EPOCH);
     FileAttr {
         ino: INodeNo(inode),
@@ -1198,7 +1153,7 @@ pub(crate) fn make_file_attr(inode: u64, entry: &DavEntry) -> FileAttr {
         ctime: modified,
         crtime: modified,
         kind: if entry.is_dir { FileType::Directory } else { FileType::RegularFile },
-        perm: perms_to_mode(entry.permissions.as_deref(), entry.is_dir),
+        perm: perms_to_mode(entry.ext.str("permissions"), entry.is_dir),
         nlink: if entry.is_dir { 2 } else { 1 },
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
@@ -1251,6 +1206,7 @@ fn root_attr() -> FileAttr {
 // ── Filesystem ────────────────────────────────────────────────────────────────
 
 struct ConnInfo {
+    backend: Arc<dyn crate::backend::CloudBackend>,
     base_url: String,
     webdav_url: String,
     username: String,
@@ -1289,7 +1245,6 @@ impl Drop for StreamActiveGuard {
 }
 
 pub struct NextCloudFs {
-    net: Arc<FsNetwork>,
     cache: Arc<Mutex<FsCache>>,
     status: StatusMap,
     dirty: ipc::DirtySet,
@@ -1313,12 +1268,6 @@ impl NextCloudFs {
     pub fn new(options: MountOptions) -> Result<Self, String> {
         let username = options.username.unwrap_or_default();
         let password = options.password.unwrap_or_default();
-        let mut initial = WebDAVFs::new(&username, &password, &options.url);
-        if !options.offline {
-            initial.connect().map_err(|e| format!("WebDAV connect failed: {}", e))?;
-        } else {
-            log::info!("OFFLINE mode: skipping initial WebDAV connection");
-        }
 
         let cache_dir = dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -1360,8 +1309,32 @@ impl NextCloudFs {
         log::info!("HTTP throttle: max {} concurrent requests", max_req);
         let is_offline = Arc::new(AtomicBool::new(options.offline));
 
+        let base_url = notifications::base_url(&options.url);
+        let backend: Arc<dyn crate::backend::CloudBackend> = if options.offline {
+            Arc::new(crate::nextcloud::NextcloudBackend::new_offline(
+                base_url.clone(),
+                options.url.clone(),
+                username.clone(),
+                password.clone(),
+                http.clone(),
+                http_read.clone(),
+                options.http3,
+            ))
+        } else {
+            Arc::new(crate::nextcloud::NextcloudBackend::new(
+                base_url.clone(),
+                options.url.clone(),
+                username.clone(),
+                password.clone(),
+                http.clone(),
+                http_read.clone(),
+                options.http3,
+            )?)
+        };
+
         let conn = Arc::new(ConnInfo {
-            base_url: notifications::base_url(&options.url),
+            backend,
+            base_url,
             webdav_url: options.url.clone(),
             username: username.clone(),
             password: password.clone(),
@@ -1381,12 +1354,6 @@ impl NextCloudFs {
         });
 
         Ok(NextCloudFs {
-            net: Arc::new(FsNetwork {
-                conns: Mutex::new(vec![initial]),
-                url: options.url.clone(),
-                username: username.clone(),
-                password: password.clone(),
-            }),
             cache: {
                 let c = Arc::new(Mutex::new(FsCache {
                     inodes,
@@ -1448,10 +1415,6 @@ impl NextCloudFs {
         self.conn.notify_push_connected.clone()
     }
 
-    pub fn conn_http(&self) -> reqwest::blocking::Client {
-        self.conn.http.clone()
-    }
-
     pub fn active_streams(&self) -> Arc<AtomicUsize> {
         self.conn.active_streams.clone()
     }
@@ -1468,8 +1431,8 @@ impl NextCloudFs {
         self.conn.paused.clone()
     }
 
-    pub(crate) fn net(&self) -> Arc<FsNetwork> {
-        self.net.clone()
+    pub(crate) fn conn(&self) -> Arc<ConnInfo> {
+        self.conn.clone()
     }
 
     pub(crate) fn throttle(&self) -> Arc<Throttle> {
@@ -1502,13 +1465,12 @@ impl NextCloudFs {
 
     pub fn keep_callback(&self) -> ipc::KeepCallback {
         let conn = self.conn.clone();
-        let net = self.net.clone();
         let cache = self.cache.clone();
         let status = self.status.clone();
         let dirty = self.dirty.clone();
         let transfers = self.transfer_map.clone();
         Arc::new(move |remote_path| {
-            keep_locally_recursive(&conn, &net, &cache, &status, &dirty, remote_path, Some(&transfers));
+            keep_locally_recursive(&conn, &cache, &status, &dirty, remote_path, Some(&transfers));
         })
     }
 
@@ -1590,16 +1552,16 @@ impl Filesystem for NextCloudFs {
                 let ino = c.allocate_inode(target_path.clone());
                 let attr = make_file_attr(ino, entry);
                 drop(c);
-                if entry.is_shared {
+                if entry.ext.flag("is_shared") {
                     self.shared.safe_lock().insert(target_path.clone());
                 }
-                if let Some(fid) = entry.fileid {
+                if let Some(fid) = entry.ext.int("fileid") {
                     self.fileids.safe_lock().insert(target_path.clone(), fid);
                 }
                 self.details.safe_lock().insert(target_path.clone(), ipc::FileDetail {
-                    permissions: entry.permissions.clone(),
-                    owner_id: entry.owner_id.clone(),
-                    owner_display_name: entry.owner_display_name.clone(),
+                    permissions: entry.ext.str("permissions").map(str::to_string),
+                    owner_id: entry.ext.str("owner_id").map(str::to_string),
+                    owner_display_name: entry.ext.str("owner_display_name").map(str::to_string),
                     size: entry.size,
                     is_dir: entry.is_dir,
                 });
@@ -1683,7 +1645,7 @@ impl Filesystem for NextCloudFs {
             let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
             let (etag, nc_permissions) = c.get_cached_dir_readonly(&parent)
                 .and_then(|files| files.iter().find(|e| e.path == path).map(|e| {
-                    (e.etag.clone(), e.permissions.clone())
+                    (e.change_token.clone(), e.ext.str("permissions").map(str::to_string))
                 }))
                 .unwrap_or((None, None));
             (path, local, etag, nc_permissions)
@@ -1851,7 +1813,6 @@ impl Filesystem for NextCloudFs {
         // Network fetch — only this path needs a thread.
         let open_files = self.open_files.clone();
         let conn = self.conn.clone();
-        let net = self.net.clone();
         let cache = self.cache.clone();
         let status = self.status.clone();
         let dirty = self.dirty.clone();
@@ -1946,7 +1907,7 @@ impl Filesystem for NextCloudFs {
                 }
                 Err(e) => {
                     log::warn!("range read failed, falling back to full download: {}", e);
-                    match ensure_file_cached(&net, &conn.throttle, &cache, &status, &dirty, path.clone(), Some(&tmap)) {
+                    match ensure_file_cached(&conn, &cache, &status, &dirty, path.clone(), Some(&tmap)) {
                         Ok(local) => {
                             if let Ok(f) = std::fs::File::open(&local) {
                                 let mut buf = vec![0u8; sz];
@@ -2106,12 +2067,12 @@ impl Filesystem for NextCloudFs {
                         let mut cache_entries = Vec::new();
 
                         if let Some(ref se) = self_entry {
-                            if se.is_shared { shared_paths.push(path.clone()); }
-                            if let Some(fid) = se.fileid { fileid_paths.push((path.clone(), fid)); }
+                            if se.ext.flag("is_shared") { shared_paths.push(path.clone()); }
+                            if let Some(fid) = se.ext.int("fileid") { fileid_paths.push((path.clone(), fid)); }
                             detail_entries.push((path.clone(), ipc::FileDetail {
-                                permissions: se.permissions.clone(),
-                                owner_id: se.owner_id.clone(),
-                                owner_display_name: se.owner_display_name.clone(),
+                                permissions: se.ext.str("permissions").map(str::to_string),
+                                owner_id: se.ext.str("owner_id").map(str::to_string),
+                                owner_display_name: se.ext.str("owner_display_name").map(str::to_string),
                                 size: se.size,
                                 is_dir: se.is_dir,
                             }));
@@ -2123,12 +2084,12 @@ impl Filesystem for NextCloudFs {
                                 None => continue,
                             };
                             let entry_path = path.join(name);
-                            if entry.is_shared { shared_paths.push(entry_path.clone()); }
-                            if let Some(fid) = entry.fileid { fileid_paths.push((entry_path.clone(), fid)); }
+                            if entry.ext.flag("is_shared") { shared_paths.push(entry_path.clone()); }
+                            if let Some(fid) = entry.ext.int("fileid") { fileid_paths.push((entry_path.clone(), fid)); }
                             detail_entries.push((entry_path.clone(), ipc::FileDetail {
-                                permissions: entry.permissions.clone(),
-                                owner_id: entry.owner_id.clone(),
-                                owner_display_name: entry.owner_display_name.clone(),
+                                permissions: entry.ext.str("permissions").map(str::to_string),
+                                owner_id: entry.ext.str("owner_id").map(str::to_string),
+                                owner_display_name: entry.ext.str("owner_display_name").map(str::to_string),
                                 size: entry.size,
                                 is_dir: entry.is_dir,
                             }));
@@ -2140,12 +2101,12 @@ impl Filesystem for NextCloudFs {
                                     cache_entries.push((entry_path.clone(), FileCacheEntry {
                                         local_path,
                                         remote_modified: entry.modified,
-                                        etag: entry.etag.clone(),
+                                        etag: entry.change_token.clone(),
                                     }));
                                 } else {
                                     status_entries.push((entry_path.clone(), FileStatus::Remote));
                                 }
-                                thumb_candidates.push((entry_path, entry.modified, entry.has_preview, entry.fileid));
+                                thumb_candidates.push((entry_path, entry.modified, entry.ext.flag("has_preview"), entry.ext.int("fileid")));
                             }
                         }
 
@@ -2497,10 +2458,10 @@ impl Filesystem for NextCloudFs {
                     total_bytes: upload_size,
                 });
                 let etag_ref = original_etag.as_deref();
-                match webdav_ops::put_file(&conn.http, &conn.base_url, &conn.username, &conn.password, &remote_path, body.clone(), etag_ref) {
+                match conn.backend.put_file(&remote_path, body.clone(), etag_ref) {
                     Ok(result) => {
                         tmap.safe_lock().remove(&remote_path);
-                        log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_etag);
+                        log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_change_token);
                         let new_size = body.len() as u64;
                         {
                             let mut c = cache.safe_lock();
@@ -2508,7 +2469,7 @@ impl Filesystem for NextCloudFs {
                             if let Some(dir) = c.dir_cache.get_mut(&parent) {
                                 let mut files = (*dir.files).clone();
                                 if let Some(entry) = files.iter_mut().find(|e| e.path == remote_path) {
-                                    entry.etag = result.new_etag.clone();
+                                    entry.change_token = result.new_change_token.clone();
                                     entry.size = new_size;
                                     entry.modified = Some(SystemTime::now());
                                 }
@@ -2520,7 +2481,7 @@ impl Filesystem for NextCloudFs {
                         }
                         if let Some(of) = open_files.safe_lock().get_mut(&fh.0) {
                             of.dirty = false;
-                            of.original_etag = result.new_etag.clone();
+                            of.original_etag = result.new_change_token.clone();
                         }
                         if auto_keep {
                             // Keep a local copy so the file is available offline.
@@ -2534,7 +2495,7 @@ impl Filesystem for NextCloudFs {
                                 cache.safe_lock().file_cache.insert(remote_path.clone(), FileCacheEntry {
                                     local_path: cache_path,
                                     remote_modified: Some(SystemTime::now()),
-                                    etag: result.new_etag,
+                                    etag: result.new_change_token,
                                 });
                                 smap.safe_lock().insert(remote_path.clone(), FileStatus::Local);
                                 kept = true;
@@ -2550,13 +2511,13 @@ impl Filesystem for NextCloudFs {
                         dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
                         journal.safe_lock().remove(seq);
                     }
-                    Err(webdav_ops::WriteError::Conflict) => {
+                    Err(backend::BackendWriteError::Conflict) => {
                         tmap.safe_lock().remove(&remote_path);
                         smap.safe_lock().remove(&remote_path);
                         log::warn!("CONFLICT on PUT {} — creating conflicted copy", remote_path.display());
                         push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                         let conflict_name = make_conflict_name(&remote_path);
-                        match webdav_ops::put_file(&conn.http, &conn.base_url, &conn.username, &conn.password, &conflict_name, body, None) {
+                        match conn.backend.put_file(&conflict_name, body, None) {
                             Ok(_) => log::info!("conflicted copy uploaded as {}", conflict_name.display()),
                             Err(e) => log::error!("failed to upload conflict copy: {}", e),
                         }
@@ -2573,12 +2534,12 @@ impl Filesystem for NextCloudFs {
                         smap.safe_lock().remove(&remote_path);
                         log::error!("PUT {} failed (journaled): {}", remote_path.display(), e);
                         let kind = match e {
-                            webdav_ops::WriteError::Locked => SyncErrorKind::Locked,
-                            webdav_ops::WriteError::Network(_) => SyncErrorKind::NetworkError,
-                            webdav_ops::WriteError::Server(403, _) => SyncErrorKind::PermissionDenied,
-                            webdav_ops::WriteError::Server(507, _) => SyncErrorKind::QuotaExceeded,
-                            webdav_ops::WriteError::Server(code, _) => SyncErrorKind::ServerError(*code),
-                            _ => SyncErrorKind::UploadFailed,
+                            backend::BackendWriteError::Conflict => SyncErrorKind::UploadFailed,
+                            backend::BackendWriteError::Locked => SyncErrorKind::Locked,
+                            backend::BackendWriteError::Network(_) => SyncErrorKind::NetworkError,
+                            backend::BackendWriteError::Forbidden => SyncErrorKind::PermissionDenied,
+                            backend::BackendWriteError::QuotaExceeded => SyncErrorKind::QuotaExceeded,
+                            backend::BackendWriteError::Server(code, _) => SyncErrorKind::ServerError(*code),
                         };
                         push_error(&elog, remote_path.clone(), kind, e.to_string());
                         journal.safe_lock().mark_failed(seq, e.to_string());
@@ -2661,19 +2622,16 @@ impl Filesystem for NextCloudFs {
         let ino = self.cache.safe_lock().allocate_inode(remote_path.clone());
 
         let now = SystemTime::now();
-        let new_entry = DavEntry {
+        let mut ext = backend::EntryExtensions::default();
+        ext.strings.insert("permissions".into(), "RGDNVW".into());
+        let new_entry = RemoteEntry {
             path: remote_path.clone(),
             is_dir: false,
             size: 0,
             modified: Some(now),
-            etag: None,
+            change_token: None,
             content_type: None,
-            has_preview: false,
-            is_shared: false,
-            permissions: Some("RGDNVW".to_string()),
-            fileid: None,
-            owner_id: None,
-            owner_display_name: None,
+            ext,
         };
 
         {
@@ -2749,19 +2707,16 @@ impl Filesystem for NextCloudFs {
         }
 
         let now = SystemTime::now();
-        let new_entry = DavEntry {
+        let mut ext = backend::EntryExtensions::default();
+        ext.strings.insert("permissions".into(), "RGDNVCK".into());
+        let new_entry = RemoteEntry {
             path: remote_path.clone(),
             is_dir: true,
             size: 0,
             modified: Some(now),
-            etag: None,
+            change_token: None,
             content_type: None,
-            has_preview: false,
-            is_shared: false,
-            permissions: Some("RGDNVCK".to_string()),
-            fileid: None,
-            owner_id: None,
-            owner_display_name: None,
+            ext,
         };
         let ino = {
             let mut c = self.cache.safe_lock();
@@ -2786,7 +2741,7 @@ impl Filesystem for NextCloudFs {
             let elog = self.error_log.clone();
             thread::spawn(move || {
                 let _permit = conn.throttle.acquire();
-                match webdav_ops::mkcol(&conn.http, &conn.base_url, &conn.username, &conn.password, &remote_path) {
+                match conn.backend.mkdir(&remote_path) {
                     Ok(()) => {
                         log::info!("MKCOL {}", remote_path.display());
                         journal.safe_lock().remove(seq);
@@ -2838,7 +2793,7 @@ impl Filesystem for NextCloudFs {
         {
             let mut c = self.cache.safe_lock();
             if let Some(dir) = c.dir_cache.get_mut(&parent_path) {
-                let files: Vec<DavEntry> = dir.files.iter().filter(|e| e.path != remote_path).cloned().collect();
+                let files: Vec<RemoteEntry> = dir.files.iter().filter(|e| e.path != remote_path).cloned().collect();
                 dir.files = Arc::new(files);
             }
         }
@@ -2856,7 +2811,7 @@ impl Filesystem for NextCloudFs {
             let elog = self.error_log.clone();
             thread::spawn(move || {
                 let _permit = conn.throttle.acquire();
-                match webdav_ops::delete(&conn.http, &conn.base_url, &conn.username, &conn.password, &remote_path) {
+                match conn.backend.delete(&remote_path) {
                     Ok(()) => {
                         log::info!("DELETE {}", remote_path.display());
                         journal.safe_lock().remove(seq);
@@ -2906,7 +2861,7 @@ impl Filesystem for NextCloudFs {
         {
             let mut c = self.cache.safe_lock();
             if let Some(dir) = c.dir_cache.get_mut(&parent_path) {
-                let files: Vec<DavEntry> = dir.files.iter().filter(|e| e.path != remote_path).cloned().collect();
+                let files: Vec<RemoteEntry> = dir.files.iter().filter(|e| e.path != remote_path).cloned().collect();
                 dir.files = Arc::new(files);
             }
             c.dir_cache.remove(&remote_path);
@@ -2924,7 +2879,7 @@ impl Filesystem for NextCloudFs {
             let elog = self.error_log.clone();
             thread::spawn(move || {
                 let _permit = conn.throttle.acquire();
-                match webdav_ops::delete(&conn.http, &conn.base_url, &conn.username, &conn.password, &remote_path) {
+                match conn.backend.delete(&remote_path) {
                     Ok(()) => {
                         log::info!("RMDIR {}", remote_path.display());
                         journal.safe_lock().remove(seq);
@@ -3046,7 +3001,7 @@ impl Filesystem for NextCloudFs {
             let elog = self.error_log.clone();
             thread::spawn(move || {
                 let _permit = conn.throttle.acquire();
-                match webdav_ops::move_resource(&conn.http, &conn.base_url, &conn.username, &conn.password, &from, &to) {
+                match conn.backend.rename(&from, &to) {
                     Ok(()) => {
                         log::info!("MOVE {} → {}", from.display(), to.display());
                         journal.safe_lock().remove(seq);
@@ -3138,7 +3093,7 @@ fn boot_validate_root(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>) {
                         continue;
                     }
                     let child_path = entry.path.clone();
-                    let fresh_etag = entry.etag.as_deref();
+                    let fresh_etag = entry.change_token.as_deref();
                     let cached_etag = c.dir_cache.get(&child_path).and_then(|e| e.etag.as_deref());
                     match (fresh_etag, cached_etag) {
                         (Some(f), Some(c_etag)) if f == c_etag => {
@@ -3203,117 +3158,120 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let file_change_queue: ipc::FileChangeQueue = Arc::new(Mutex::new(Vec::new()));
     ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, ipc_password, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone());
 
-    // Connectivity monitor
     let offline_flag = filesystem.is_offline_flag();
-    let replay_journal_ref = filesystem.journal();
-    let replay_cache = filesystem.cache_ref();
-    let replay_dirty = filesystem.dirty_set();
-    let replay_elog = filesystem.error_log();
-    let replay_base_url = notifications::base_url(&options.url);
-    let replay_user = options.username.clone().unwrap_or_default();
-    let replay_pass = options.password.clone().unwrap_or_default();
+    let backend = filesystem.conn.backend.clone();
+    let notifier_slot = filesystem.notifier_slot();
 
     if !options.offline {
         // Replay any journal entries from a previous session
+        let replay_journal_ref = filesystem.journal();
         if !replay_journal_ref.safe_lock().is_empty() {
             let j = replay_journal_ref.clone();
-            let http = filesystem.conn_http();
-            let bu = replay_base_url.clone();
-            let u = replay_user.clone();
-            let p = replay_pass.clone();
-            let c = replay_cache.clone();
-            let d = replay_dirty.clone();
-            let el = replay_elog.clone();
+            let b = backend.clone();
+            let c = filesystem.cache_ref();
+            let d = filesystem.dirty_set();
+            let el = filesystem.error_log();
             thread::spawn(move || {
-                let ctx = mutation_journal::ReplayContext { http, base_url: bu, username: u, password: p };
+                let ctx = mutation_journal::ReplayContext { backend: b };
                 mutation_journal::replay_journal(&j, &ctx, &c, &d, &el);
             });
         }
 
-        let http = filesystem.conn_http();
-        let webdav_url = options.url.clone();
-        let probe_user = options.username.clone().unwrap_or_default();
-        let probe_pass = options.password.clone().unwrap_or_default();
-        let offline = offline_flag.clone();
-        let journal_for_monitor = replay_journal_ref.clone();
-        let cache_for_monitor = replay_cache.clone();
-        let dirty_for_monitor = replay_dirty.clone();
-        let elog_for_monitor = replay_elog.clone();
-        let base_for_monitor = replay_base_url.clone();
-        let user_for_monitor = replay_user.clone();
-        let pass_for_monitor = replay_pass.clone();
-        let shutdown_monitor = filesystem.shutdown_flag();
-        let paused_monitor = filesystem.paused_flag();
-        thread::spawn(move || {
-            loop {
-                if shutdown_monitor.load(Ordering::Relaxed) {
-                    log::info!("CONNECTIVITY monitor: shutdown, exiting");
-                    break;
-                }
-                let currently_offline = offline.load(Ordering::Relaxed);
-                let interval = if currently_offline { Duration::from_secs(5) } else { Duration::from_secs(30) };
-                let mut slept = Duration::ZERO;
-                while slept < interval {
-                    if shutdown_monitor.load(Ordering::Relaxed) { break; }
-                    thread::sleep(Duration::from_secs(1));
-                    slept += Duration::from_secs(1);
-                }
-                if shutdown_monitor.load(Ordering::Relaxed) {
-                    log::info!("CONNECTIVITY monitor: shutdown, exiting");
-                    break;
-                }
-                if paused_monitor.load(Ordering::Relaxed) { continue; }
+        // Connectivity monitor
+        {
+            let backend_monitor = backend.clone();
+            let offline = offline_flag.clone();
+            let journal_for_monitor = filesystem.journal();
+            let cache_for_monitor = filesystem.cache_ref();
+            let dirty_for_monitor = filesystem.dirty_set();
+            let elog_for_monitor = filesystem.error_log();
+            let shutdown_monitor = filesystem.shutdown_flag();
+            let paused_monitor = filesystem.paused_flag();
+            thread::spawn(move || {
+                loop {
+                    if shutdown_monitor.load(Ordering::Relaxed) {
+                        log::info!("CONNECTIVITY monitor: shutdown, exiting");
+                        break;
+                    }
+                    let currently_offline = offline.load(Ordering::Relaxed);
+                    let interval = if currently_offline { Duration::from_secs(5) } else { Duration::from_secs(30) };
+                    let mut slept = Duration::ZERO;
+                    while slept < interval {
+                        if shutdown_monitor.load(Ordering::Relaxed) { break; }
+                        thread::sleep(Duration::from_secs(1));
+                        slept += Duration::from_secs(1);
+                    }
+                    if shutdown_monitor.load(Ordering::Relaxed) {
+                        log::info!("CONNECTIVITY monitor: shutdown, exiting");
+                        break;
+                    }
+                    if paused_monitor.load(Ordering::Relaxed) { continue; }
 
-                let reachable = propfind::propfind_etag(
-                    &http, &webdav_url, &probe_user, &probe_pass,
-                    Path::new("/"), Duration::from_secs(5),
-                ).is_ok();
+                    let reachable = backend_monitor.is_reachable(Duration::from_secs(5));
 
-                let was_offline = offline.swap(!reachable, Ordering::Relaxed);
-                if was_offline && reachable {
-                    log::info!("CONNECTIVITY restored — replaying mutation journal");
-                    let j = journal_for_monitor.clone();
-                    let ctx = mutation_journal::ReplayContext {
-                        http: http.clone(),
-                        base_url: base_for_monitor.clone(),
-                        username: user_for_monitor.clone(),
-                        password: pass_for_monitor.clone(),
-                    };
-                    let c = cache_for_monitor.clone();
-                    let d = dirty_for_monitor.clone();
-                    let el = elog_for_monitor.clone();
-                    thread::spawn(move || {
-                        mutation_journal::replay_journal(&j, &ctx, &c, &d, &el);
-                    });
-                } else if !was_offline && !reachable {
-                    log::warn!("CONNECTIVITY lost — serving from cache");
+                    let was_offline = offline.swap(!reachable, Ordering::Relaxed);
+                    if was_offline && reachable {
+                        log::info!("CONNECTIVITY restored — replaying mutation journal");
+                        let j = journal_for_monitor.clone();
+                        let b = backend_monitor.clone();
+                        let c = cache_for_monitor.clone();
+                        let d = dirty_for_monitor.clone();
+                        let el = elog_for_monitor.clone();
+                        thread::spawn(move || {
+                            let ctx = mutation_journal::ReplayContext { backend: b };
+                            mutation_journal::replay_journal(&j, &ctx, &c, &d, &el);
+                        });
+                    } else if !was_offline && !reachable {
+                        log::warn!("CONNECTIVITY lost — serving from cache");
+                    }
                 }
-            }
-        });
-    }
+            });
+        }
 
-    let notifier_slot = filesystem.notifier_slot();
+        // Change watcher (replaces notify_push::start)
+        {
+            let watcher_backend = backend.clone();
+            let watcher_cache = filesystem.cache_ref();
+            let watcher_dirty = filesystem.dirty_set();
+            let watcher_active = filesystem.active_streams();
+            let watcher_deferred = filesystem.deferred_invalidation();
+            let watcher_throttle = filesystem.throttle();
+            let watcher_notifier = notifier_slot.clone();
+            let watcher_ghosts = filesystem.ghost_entries();
+            let watcher_fcq = file_change_queue.clone();
+            let watcher_paused = filesystem.paused_flag();
+            let watcher_offline = offline_flag.clone();
+            let debounce: notify_push::DebounceMap = Arc::new(Mutex::new(HashMap::new()));
 
-    if !options.offline {
-        notify_push::start(
-            filesystem.conn_http(),
-            notifications::base_url(&options.url),
-            options.url.clone(),
-            options.username.clone().unwrap_or_default(),
-            options.password.clone().unwrap_or_default(),
-            filesystem.cache_ref(),
-            filesystem.dirty_set(),
-            offline_flag,
-            filesystem.notify_push_connected_flag(),
-            filesystem.active_streams(),
-            filesystem.deferred_invalidation(),
-            filesystem.throttle(),
-            notifier_slot.clone(),
-            filesystem.ghost_entries(),
-            file_change_queue,
-            filesystem.shutdown_flag(),
-            filesystem.paused_flag(),
-        );
+            let watcher = backend.start_change_watcher(Box::new(move |event| {
+                if watcher_paused.load(Ordering::Relaxed) { return; }
+                if watcher_offline.load(Ordering::Relaxed) { return; }
+                notify_push::handle_change_event(
+                    event,
+                    &watcher_backend,
+                    &watcher_cache,
+                    &watcher_dirty,
+                    &watcher_active,
+                    &watcher_deferred,
+                    &watcher_throttle,
+                    &watcher_notifier,
+                    &debounce,
+                    &watcher_ghosts,
+                    &watcher_fcq,
+                );
+            }));
+
+            // Sync watcher connection status to the notify_push_connected flag
+            let np_connected = filesystem.notify_push_connected_flag();
+            let watcher_shutdown = filesystem.shutdown_flag();
+            thread::spawn(move || {
+                while !watcher_shutdown.load(Ordering::Relaxed) {
+                    np_connected.store(watcher.is_connected(), Ordering::Relaxed);
+                    thread::sleep(Duration::from_secs(2));
+                }
+                drop(watcher);
+            });
+        }
     }
 
     // Validate root-level dirs at boot via a single PROPFIND /.
@@ -3335,12 +3293,8 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     if !options.offline {
         let saved_etags = load_file_cache(&filesystem.cache_ref());
         if !saved_etags.is_empty() {
-            let http = filesystem.conn_http();
-            let webdav_url = options.url.clone();
-            let boot_user = options.username.clone().unwrap_or_default();
-            let boot_pass = options.password.clone().unwrap_or_default();
-            let net = filesystem.net();
-            let throttle = filesystem.throttle();
+            let boot_backend = backend.clone();
+            let boot_conn = filesystem.conn();
             let cache = filesystem.cache_ref();
             let status = filesystem.status_map();
             let dirty = filesystem.dirty_set();
@@ -3354,12 +3308,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                         log::info!("FILE_CACHE boot validation: shutdown, aborting");
                         break;
                     }
-                    match propfind::propfind_etag(&http, &webdav_url, &boot_user, &boot_pass, remote_path, PROPFIND_TIMEOUT) {
+                    match boot_backend.dir_change_token(remote_path, PROPFIND_TIMEOUT) {
                         Ok(Some(ref new_etag)) if new_etag == old_etag => {}
                         Ok(new_etag) => {
                             log::info!("FILE_CACHE stale: {} (etag {:?} → {:?})", remote_path.display(), old_etag, new_etag);
                             cache.safe_lock().file_cache.remove(remote_path);
-                            match ensure_file_cached(&net, &throttle, &cache, &status, &dirty, remote_path.clone(), Some(&boot_transfers)) {
+                            match ensure_file_cached(&boot_conn, &cache, &status, &dirty, remote_path.clone(), Some(&boot_transfers)) {
                                 Ok(_) => log::info!("FILE_CACHE re-downloaded {}", remote_path.display()),
                                 Err(e) => log::warn!("FILE_CACHE re-download {} failed: {}", remote_path.display(), e),
                             }
@@ -3525,20 +3479,19 @@ mod tests {
         }
     }
 
-    fn make_dav_entry(name: &str, fileid: Option<u64>) -> DavEntry {
-        DavEntry {
+    fn make_dav_entry(name: &str, fileid: Option<u64>) -> RemoteEntry {
+        let mut ext = backend::EntryExtensions::default();
+        if let Some(fid) = fileid {
+            ext.integers.insert("fileid".into(), fid);
+        }
+        RemoteEntry {
             path: PathBuf::from(format!("/{}", name)),
             is_dir: false,
             size: 100,
             modified: None,
-            etag: Some("etag1".into()),
+            change_token: Some("etag1".into()),
             content_type: None,
-            has_preview: false,
-            is_shared: false,
-            permissions: None,
-            fileid,
-            owner_id: None,
-            owner_display_name: None,
+            ext,
         }
     }
 
@@ -3603,20 +3556,20 @@ mod tests {
         assert_eq!(perms_to_mode(Some(""), true),  0o755);
     }
 
-    fn make_dav_entry_with_perms(dir: &str, name: &str, permissions: Option<&str>) -> DavEntry {
-        DavEntry {
+    fn make_dav_entry_with_perms(dir: &str, name: &str, permissions: Option<&str>) -> RemoteEntry {
+        let mut ext = backend::EntryExtensions::default();
+        if let Some(p) = permissions {
+            ext.strings.insert("permissions".into(), p.to_string());
+        }
+        ext.integers.insert("fileid".into(), 1);
+        RemoteEntry {
             path: PathBuf::from(format!("{}/{}", dir, name)),
             is_dir: false,
             size: 1024,
             modified: None,
-            etag: Some("etag1".into()),
+            change_token: Some("etag1".into()),
             content_type: None,
-            has_preview: false,
-            is_shared: false,
-            permissions: permissions.map(str::to_string),
-            fileid: Some(1),
-            owner_id: None,
-            owner_display_name: None,
+            ext,
         }
     }
 
@@ -3624,7 +3577,7 @@ mod tests {
         let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let nc_permissions = cache.get_cached_dir_readonly(&parent)
             .and_then(|files| files.iter().find(|e| &e.path == path)
-            .and_then(|e| e.permissions.clone()));
+            .and_then(|e| e.ext.str("permissions").map(str::to_string)));
         nc_permissions.is_some()
             && perms_to_mode(nc_permissions.as_deref(), false) & 0o200 == 0
     }
@@ -3654,20 +3607,20 @@ mod tests {
             "write open must not be blocked when NC permissions are absent (fall through to DefaultPermissions)");
     }
 
-    fn make_dir_entry_with_perms(parent: &str, name: &str, permissions: Option<&str>) -> DavEntry {
-        DavEntry {
+    fn make_dir_entry_with_perms(parent: &str, name: &str, permissions: Option<&str>) -> RemoteEntry {
+        let mut ext = backend::EntryExtensions::default();
+        if let Some(p) = permissions {
+            ext.strings.insert("permissions".into(), p.to_string());
+        }
+        ext.integers.insert("fileid".into(), 2);
+        RemoteEntry {
             path: PathBuf::from(format!("{}/{}", parent, name)),
             is_dir: true,
             size: 0,
             modified: None,
-            etag: None,
+            change_token: None,
             content_type: None,
-            has_preview: false,
-            is_shared: false,
-            permissions: permissions.map(str::to_string),
-            fileid: Some(2),
-            owner_id: None,
-            owner_display_name: None,
+            ext,
         }
     }
 
@@ -3843,20 +3796,19 @@ mod tests {
         assert_eq!(inodes, vec![1, 2], "should notify both inode 1 (root) and 2 (/docs)");
     }
 
-    fn make_dav_entry_in(dir: &str, name: &str, fileid: Option<u64>) -> DavEntry {
-        DavEntry {
+    fn make_dav_entry_in(dir: &str, name: &str, fileid: Option<u64>) -> RemoteEntry {
+        let mut ext = backend::EntryExtensions::default();
+        if let Some(fid) = fileid {
+            ext.integers.insert("fileid".into(), fid);
+        }
+        RemoteEntry {
             path: PathBuf::from(format!("{}/{}", dir, name)),
             is_dir: false,
             size: 100,
             modified: None,
-            etag: Some("etag1".into()),
+            change_token: Some("etag1".into()),
             content_type: None,
-            has_preview: false,
-            is_shared: false,
-            permissions: None,
-            fileid,
-            owner_id: None,
-            owner_display_name: None,
+            ext,
         }
     }
 
@@ -4148,20 +4100,19 @@ mod tests {
         assert!(paths.contains(&file), "file path must be in dirty set after error");
     }
 
-    fn make_dir_dav_entry_in(dir: &str, name: &str, fileid: Option<u64>) -> DavEntry {
-        DavEntry {
+    fn make_dir_dav_entry_in(dir: &str, name: &str, fileid: Option<u64>) -> RemoteEntry {
+        let mut ext = backend::EntryExtensions::default();
+        if let Some(fid) = fileid {
+            ext.integers.insert("fileid".into(), fid);
+        }
+        RemoteEntry {
             path: PathBuf::from(format!("{}/{}", dir, name)),
             is_dir: true,
             size: 0,
             modified: None,
-            etag: None,
+            change_token: None,
             content_type: None,
-            has_preview: false,
-            is_shared: false,
-            permissions: None,
-            fileid,
-            owner_id: None,
-            owner_display_name: None,
+            ext,
         }
     }
 
@@ -4498,14 +4449,14 @@ mod tests {
                 let mut e = make_dav_entry("unchanged", None);
                 e.path = PathBuf::from("/unchanged");
                 e.is_dir = true;
-                e.etag = Some("etag_a".into());
+                e.change_token = Some("etag_a".into());
                 e
             },
             {
                 let mut e = make_dav_entry("changed", None);
                 e.path = PathBuf::from("/changed");
                 e.is_dir = true;
-                e.etag = Some("etag_b".into());
+                e.change_token = Some("etag_b".into());
                 e
             },
         ]);
@@ -4517,14 +4468,14 @@ mod tests {
                 let mut e = make_dav_entry("unchanged", None);
                 e.path = PathBuf::from("/unchanged");
                 e.is_dir = true;
-                e.etag = Some("etag_a".into());
+                e.change_token = Some("etag_a".into());
                 e
             },
             {
                 let mut e = make_dav_entry("changed", None);
                 e.path = PathBuf::from("/changed");
                 e.is_dir = true;
-                e.etag = Some("etag_NEW".into());
+                e.change_token = Some("etag_NEW".into());
                 e
             },
         ];
@@ -4532,7 +4483,7 @@ mod tests {
         // Simulate what boot_validate_root does with the fresh listing
         for entry in &fresh_root {
             if !entry.is_dir { continue; }
-            let fresh_etag = entry.etag.as_deref();
+            let fresh_etag = entry.change_token.as_deref();
             let cached_etag = cache.dir_cache.get(&entry.path).and_then(|e| e.etag.as_deref());
             match (fresh_etag, cached_etag) {
                 (Some(f), Some(c_etag)) if f == c_etag => {}
