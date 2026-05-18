@@ -62,7 +62,7 @@ fn effective_dir_ttl(optimistic_listing: bool, notify_push_connected: &AtomicBoo
     }
 }
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-const READ_AHEAD: usize = 64 * 1024 * 1024; // 64 MB
+const DEFAULT_READ_AHEAD: usize = 64 * 1024 * 1024; // 64 MB
 const GHOST_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
@@ -204,11 +204,19 @@ pub struct MountOptions {
     /// Automatically promote cached files (from read operations) to kept.
     #[serde(default)]
     pub auto_keep_cached_files: bool,
+    /// Read-ahead window size in bytes for streaming file reads.
+    #[serde(default = "default_read_ahead")]
+    pub read_ahead_bytes: usize,
+    /// Cache files to disk when a streaming read covers the entire file.
+    #[serde(default)]
+    pub cache_streamed_reads: bool,
 }
 
 fn default_true() -> bool { true }
 
 fn default_max_concurrent() -> usize { 10 }
+
+fn default_read_ahead() -> usize { DEFAULT_READ_AHEAD }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SyncState {
@@ -1319,6 +1327,8 @@ pub struct NextCloudFs {
     aggressive_prefetch: bool,
     auto_keep_locally_modified_files: bool,
     auto_keep_cached_files: bool,
+    read_ahead_bytes: usize,
+    cache_streamed_reads: bool,
 }
 
 impl NextCloudFs {
@@ -1469,6 +1479,8 @@ impl NextCloudFs {
             aggressive_prefetch: options.aggressive_prefetch,
             auto_keep_locally_modified_files: options.auto_keep_locally_modified_files,
             auto_keep_cached_files: options.auto_keep_cached_files,
+            read_ahead_bytes: options.read_ahead_bytes,
+            cache_streamed_reads: options.cache_streamed_reads,
         })
     }
 
@@ -1905,9 +1917,12 @@ impl Filesystem for NextCloudFs {
         let tmap = self.transfer_map.clone();
         let notifier_slot = self.notifier_slot.clone();
         let auto_keep_cached = self.auto_keep_cached_files;
+        let read_ahead = self.read_ahead_bytes;
+        let cache_streamed = self.cache_streamed_reads;
+        let file_total_size = self.cache.safe_lock().find_entry(&path).map(|e| e.size).unwrap_or(0);
 
         thread::spawn(move || {
-            let fetch = std::cmp::max(sz, READ_AHEAD);
+            let fetch = std::cmp::max(sz, read_ahead);
             let use_throttle = fetch > sz;
             let _stream_guard = if use_throttle {
                 conn.active_streams.fetch_add(1, Ordering::Relaxed);
@@ -1982,6 +1997,48 @@ impl Filesystem for NextCloudFs {
                             if total_ms > 0 {
                                 let mbps = total_bytes as f64 / 1_048_576.0 / (total_ms as f64 / 1000.0);
                                 log::info!("stream read {}B total={}ms {:.1}MB/s", total_bytes, total_ms, mbps);
+                            }
+                            if cache_streamed
+                                && off == 0
+                                && file_total_size > 0
+                                && total_bytes as u64 >= file_total_size
+                                && cache.safe_lock().file_cache.get(&path).is_none()
+                            {
+                                let ss = mtx.lock().unwrap();
+                                let data = &ss.data[..file_total_size as usize];
+                                let (target_dir, kept) = {
+                                    let c = cache.safe_lock();
+                                    if auto_keep_cached {
+                                        (c.kept_dir.clone(), true)
+                                    } else {
+                                        (c.auto_cache_dir.clone(), false)
+                                    }
+                                };
+                                let rel = path.strip_prefix("/").unwrap_or(&path);
+                                let local_path = target_dir.join(rel);
+                                if let Some(parent) = local_path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                if std::fs::write(&local_path, data).is_ok() {
+                                    let mut c = cache.safe_lock();
+                                    let mod_time = c.remote_modified_for(&path);
+                                    let etag = c.remote_etag_for(&path);
+                                    c.file_cache.insert(path.clone(), FileCacheEntry {
+                                        local_path: local_path.clone(),
+                                        remote_modified: mod_time,
+                                        etag,
+                                        kept,
+                                    });
+                                    drop(c);
+                                    save_file_cache(&cache);
+                                    let file_status = if kept { FileStatus::Kept } else { FileStatus::Cached };
+                                    status.safe_lock().insert(path.clone(), file_status);
+                                    dirty.safe_lock().insert(path.clone());
+                                    log::info!("stream→cache {} ({}B, {})", path.display(), file_total_size, if kept { "kept" } else { "cached" });
+                                    open_files.safe_lock().entry(fh.0).and_modify(|of| {
+                                        of.local = Some(local_path);
+                                    });
+                                }
                             }
                         }
                         Err(e) => {
@@ -3556,8 +3613,10 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let optimistic_listing = doc["optimistic_listing"].as_bool().unwrap_or(true);
     let auto_keep_locally_modified_files = doc["auto_keep_locally_modified_files"].as_bool().unwrap_or(false);
     let auto_keep_cached_files = doc["auto_keep_cached_files"].as_bool().unwrap_or(false);
+    let read_ahead_bytes = doc["read_ahead_bytes"].as_i64().map(|v| v as usize).unwrap_or(DEFAULT_READ_AHEAD);
+    let cache_streamed_reads = doc["cache_streamed_reads"].as_bool().unwrap_or(false);
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads })
 }
 
 #[cfg(test)]
