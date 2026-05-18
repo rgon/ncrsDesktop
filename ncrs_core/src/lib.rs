@@ -219,6 +219,9 @@ pub struct MountOptions {
     /// time). 0 = never purge by age.
     #[serde(default = "default_cache_purge_days")]
     pub cache_auto_purge_days: u32,
+    /// How often (in seconds) to run the cache cleanup pass. Default 3600 (1 hour).
+    #[serde(default = "default_cache_cleanup_interval")]
+    pub cache_cleanup_interval_secs: u64,
 }
 
 fn default_true() -> bool { true }
@@ -230,6 +233,8 @@ fn default_read_ahead() -> usize { DEFAULT_READ_AHEAD }
 fn default_cache_max_size() -> u64 { 32 * 1024 * 1024 * 1024 } // 32 GB
 
 fn default_cache_purge_days() -> u32 { 10 }
+
+fn default_cache_cleanup_interval() -> u64 { 3600 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SyncState {
@@ -789,8 +794,6 @@ fn load_file_cache(cache: &Mutex<FsCache>) -> HashMap<PathBuf, LoadedCacheEntry>
 }
 
 // ── Cache cleanup ───────────────────────────────────────────────────────────
-
-const CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 
 fn run_cache_cleanup(
     cache: &Arc<Mutex<FsCache>>,
@@ -3663,13 +3666,14 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         let cleanup_paused = filesystem.paused_flag();
         let max_bytes = options.cache_max_size_bytes;
         let purge_days = options.cache_auto_purge_days;
+        let cleanup_interval = Duration::from_secs(options.cache_cleanup_interval_secs);
         thread::spawn(move || {
-            log::info!("CACHE_CLEANUP thread started (max={}GB, purge={}d)",
-                max_bytes as f64 / (1024.0 * 1024.0 * 1024.0), purge_days);
+            log::info!("CACHE_CLEANUP thread started (max={}GB, purge={}d, interval={}s)",
+                max_bytes as f64 / (1024.0 * 1024.0 * 1024.0), purge_days, cleanup_interval.as_secs());
             run_cache_cleanup(&cleanup_cache, &cleanup_status, &cleanup_dirty, max_bytes, purge_days);
             loop {
                 let mut slept = Duration::ZERO;
-                while slept < CACHE_CLEANUP_INTERVAL {
+                while slept < cleanup_interval {
                     if cleanup_shutdown.load(Ordering::Relaxed) { return; }
                     thread::sleep(Duration::from_secs(10));
                     slept += Duration::from_secs(10);
@@ -3810,8 +3814,9 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let cache_streamed_reads = doc["cache_streamed_reads"].as_bool().unwrap_or(false);
     let cache_max_size_bytes = doc["cache_max_size_bytes"].as_i64().map(|v| v as u64).unwrap_or_else(default_cache_max_size);
     let cache_auto_purge_days = doc["cache_auto_purge_days"].as_i64().map(|v| v as u32).unwrap_or_else(default_cache_purge_days);
+    let cache_cleanup_interval_secs = doc["cache_cleanup_interval_secs"].as_i64().map(|v| v as u64).unwrap_or_else(default_cache_cleanup_interval);
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs })
 }
 
 #[cfg(test)]
