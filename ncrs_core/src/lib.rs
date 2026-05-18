@@ -1108,7 +1108,7 @@ fn start_background_propfind(
     path: PathBuf,
     chain_depth: u32,
 ) {
-    if conn.shutdown.load(Ordering::Relaxed) { return; }
+    if conn.shutdown.load(Ordering::Relaxed) || conn.paused.load(Ordering::Relaxed) { return; }
     {
         let c = cache.safe_lock();
         if c.dir_cache.contains_key(&path) || c.pending_dirs.contains_key(&path) {
@@ -1267,6 +1267,7 @@ struct ConnInfo {
     active_streams: Arc<AtomicUsize>,
     deferred_invalidation: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 struct StreamActiveGuard {
@@ -1376,6 +1377,7 @@ impl NextCloudFs {
             active_streams: Arc::new(AtomicUsize::new(0)),
             deferred_invalidation: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
         });
 
         Ok(NextCloudFs {
@@ -1460,6 +1462,10 @@ impl NextCloudFs {
 
     pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
         self.conn.shutdown.clone()
+    }
+
+    pub fn paused_flag(&self) -> Arc<AtomicBool> {
+        self.conn.paused.clone()
     }
 
     pub(crate) fn net(&self) -> Arc<FsNetwork> {
@@ -3174,7 +3180,7 @@ fn build_fuse_options() -> Vec<MountOption> {
     ]
 }
 
-pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>) -> Result<(), String> {
+pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>, paused: Option<Arc<AtomicBool>>) -> Result<(), String> {
     let mut filesystem = NextCloudFs::new(options.clone())?;
     if let Some(el) = error_log {
         filesystem.error_log = el;
@@ -3184,6 +3190,9 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     }
     if let Some(j) = journal {
         filesystem.journal = j;
+    }
+    if let Some(p) = paused {
+        Arc::get_mut(&mut filesystem.conn).expect("conn not yet shared").paused = p;
     }
     let keep_cb = filesystem.keep_callback();
     let evict_cb = filesystem.evict_callback();
@@ -3234,6 +3243,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         let user_for_monitor = replay_user.clone();
         let pass_for_monitor = replay_pass.clone();
         let shutdown_monitor = filesystem.shutdown_flag();
+        let paused_monitor = filesystem.paused_flag();
         thread::spawn(move || {
             loop {
                 if shutdown_monitor.load(Ordering::Relaxed) {
@@ -3252,6 +3262,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                     log::info!("CONNECTIVITY monitor: shutdown, exiting");
                     break;
                 }
+                if paused_monitor.load(Ordering::Relaxed) { continue; }
 
                 let reachable = propfind::propfind_etag(
                     &http, &webdav_url, &probe_user, &probe_pass,
@@ -3301,6 +3312,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             filesystem.ghost_entries(),
             file_change_queue,
             filesystem.shutdown_flag(),
+            filesystem.paused_flag(),
         );
     }
 

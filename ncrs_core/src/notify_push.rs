@@ -655,9 +655,10 @@ pub(crate) fn start(
     ghost_entries: GhostMap,
     file_change_queue: FileChangeQueue,
     shutdown: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        run_loop(&client, &base_url, &webdav_url, &username, &password, &cache, &dirty, &is_offline, &connected, &active_streams, &deferred_invalidation, &throttle, &notifier_slot, &ghost_entries, &file_change_queue, &shutdown);
+        run_loop(&client, &base_url, &webdav_url, &username, &password, &cache, &dirty, &is_offline, &connected, &active_streams, &deferred_invalidation, &throttle, &notifier_slot, &ghost_entries, &file_change_queue, &shutdown, &paused);
     });
 }
 
@@ -678,6 +679,7 @@ fn run_loop(
     ghost_entries: &GhostMap,
     file_change_queue: &FileChangeQueue,
     shutdown: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
 ) {
     let debounce: DebounceMap = Arc::new(Mutex::new(HashMap::new()));
     let mut reconnect_delay = Duration::from_secs(1);
@@ -709,7 +711,7 @@ fn run_loop(
             }
         };
 
-        match connect_and_listen(&ws_url, client, webdav_url, username, password, cache, dirty, connected, active_streams, deferred_invalidation, throttle, notifier_slot, &debounce, ghost_entries, file_change_queue, shutdown) {
+        match connect_and_listen(&ws_url, client, webdav_url, username, password, cache, dirty, connected, active_streams, deferred_invalidation, throttle, notifier_slot, &debounce, ghost_entries, file_change_queue, shutdown, paused) {
             Ok(()) => {
                 log::info!("notify_push: connection closed cleanly");
                 reconnect_delay = Duration::from_secs(1);
@@ -747,6 +749,7 @@ fn connect_and_listen(
     ghost_entries: &GhostMap,
     file_change_queue: &FileChangeQueue,
     shutdown: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let (mut socket, _response) = connect(ws_url).map_err(|e| format!("WebSocket connect: {}", e))?;
 
@@ -803,9 +806,10 @@ fn connect_and_listen(
             Ok(msg) => msg,
         };
         match msg {
-            Message::Text(ref t) => {
+            Message::Text(ref t) if !paused.load(Ordering::Relaxed) => {
                 handle_event(t.as_ref(), client, webdav_url, username, password, cache, dirty, active_streams, deferred_invalidation, throttle, notifier_slot, debounce, ghost_entries, file_change_queue);
             }
+            Message::Text(_) => {}
             Message::Close(_) => {
                 log::info!("notify_push: server closed connection");
                 return Ok(());

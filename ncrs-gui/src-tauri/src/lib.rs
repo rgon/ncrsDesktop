@@ -24,6 +24,7 @@ pub struct AppState {
     pub error_log: ErrorLog,
     pub transfer_map: TransferMap,
     pub journal: SharedJournal,
+    pub paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for AppState {
@@ -37,6 +38,7 @@ impl Default for AppState {
             error_log: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             transfer_map: Arc::new(Mutex::new(std::collections::HashMap::new())),
             journal: Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&tmp_dir))),
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -70,6 +72,7 @@ async fn remount(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), 
         }
     }
     *state.sync_state.lock().unwrap() = SyncState::Idle;
+    state.paused.store(false, std::sync::atomic::Ordering::Relaxed);
     app.emit("sync-state-changed", "idle").ok();
     let s = (*state).clone();
     spawn(start_ncfs_daemon(app, s));
@@ -427,6 +430,11 @@ pub fn run() {
                     state.clone()
                 };
 
+                app_state_menu.paused.store(
+                    new_state == SyncState::Paused,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+
                 let icon_path: &'static str = match new_state {
                     SyncState::Idle => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png"),
                     SyncState::Paused => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"),
@@ -461,6 +469,7 @@ pub fn run() {
                 }
 
                 *app_state_menu.sync_state.lock().unwrap() = SyncState::Idle;
+                app_state_menu.paused.store(false, std::sync::atomic::Ordering::Relaxed);
                 app.emit("sync-state-changed", "idle").ok();
 
                 let icon_path = concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png");
@@ -509,8 +518,9 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     let journal = state.journal.clone();
     let fuse_app = app.clone();
     let fuse_state = state.clone();
+    let fuse_paused = state.paused.clone();
     thread::spawn(move || {
-        let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal));
+        let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal), Some(fuse_paused));
         match &result {
             Ok(()) => log::info!("FUSE unmounted cleanly"),
             Err(e) => log::error!("FUSE error: {}", e),
