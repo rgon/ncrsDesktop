@@ -1339,6 +1339,25 @@ impl NextCloudFs {
         std::fs::create_dir_all(&auto_cache_dir)
             .map_err(|e| format!("Cannot create auto-cache dir: {}", e))?;
 
+        let mut stale_count = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("write_") {
+                        if let Ok(meta) = entry.metadata() {
+                            if meta.len() == 0 || !meta.is_file() {
+                                let _ = std::fs::remove_file(entry.path());
+                                stale_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if stale_count > 0 {
+            log::info!("cleaned up {} stale write_* temp files", stale_count);
+        }
+
         let journal_arc: mutation_journal::SharedJournal =
             Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&cache_dir)));
 
