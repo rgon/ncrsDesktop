@@ -511,6 +511,50 @@ fi
 
 stop_ncrs
 
+# ── Test 9: Invalid filenames rejected at FUSE layer ─────────
+run_test "Invalid filenames rejected immediately (trailing space, trailing dot)"
+
+start_ncrs
+
+# File with trailing space — must fail with I/O or permission error
+if echo "bad" > "$MOUNT/trailing_space " 2>/dev/null; then
+    fail "create 'trailing_space ' should have been rejected"
+else
+    pass "create 'trailing_space ' rejected by FUSE"
+fi
+
+# Directory with trailing space
+if mkdir "$MOUNT/bad_dir " 2>/dev/null; then
+    fail "mkdir 'bad_dir ' should have been rejected"
+else
+    pass "mkdir 'bad_dir ' rejected by FUSE"
+fi
+
+# File with trailing dot
+if echo "bad" > "$MOUNT/trailing_dot." 2>/dev/null; then
+    fail "create 'trailing_dot.' should have been rejected"
+else
+    pass "create 'trailing_dot.' rejected by FUSE"
+fi
+
+# Rename to invalid name
+echo "good" > "$MOUNT/valid_rename_src.txt" 2>/dev/null && sync
+sleep 1
+if mv "$MOUNT/valid_rename_src.txt" "$MOUNT/bad_rename " 2>/dev/null; then
+    fail "rename to 'bad_rename ' should have been rejected"
+else
+    pass "rename to 'bad_rename ' rejected by FUSE"
+fi
+
+# None of these should have created journal entries
+if journal_empty; then
+    pass "No journal entries from rejected operations"
+else
+    fail "Journal has entries from operations that should have been rejected"
+fi
+
+stop_ncrs
+
 # ── Summary ───────────────────────────────────────────────────
 echo ""
 echo "=================================="
