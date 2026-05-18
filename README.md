@@ -21,8 +21,12 @@ Performs as good in an actual business than in a recently created personal cloud
 
 ```
 ---------
-+ [ ] customize cache pruning frequency
-+ [ ] add option in our yaml to keep paths by default, without requiring the user to specify them (log an error if not found, but don't panic the application)
++ [x] customize cache pruning frequency
++ [x] add option in our yaml to keep paths by default, without requiring the user to specify them (log an error if not found, but don't panic the application)
++ [ ] allow setting the mount path with ~ and $HOME
++ [ ] auto-create the mountpoint directory if it does not exist
+
+
 + [ ] configuration as cli flags? As yaml? review all.
 + [ ] Enterprise OAuth2 login with authd-shared token for automatic login for multi-user computers and zero touch provisioning to new machines
 + [ ] get from gnome keyring from authd
@@ -305,3 +309,4 @@ Config options (in `~/.config/ncrs/config.yaml`):
 - `cache_streamed_reads: true` -- promote fully-streamed files to disk cache
 - `read_ahead_bytes: 67108864` -- read-ahead window for streaming reads (default 64 MB)
 - `cache_cleanup_interval_secs: 3600` -- how often to run cache pruning (default 3600 = 1 hour)
+- `keep_paths: ["/Documents", "/Photos"]` -- remote paths to auto-keep locally on startup (default empty)

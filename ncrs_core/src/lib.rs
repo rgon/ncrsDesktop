@@ -222,6 +222,9 @@ pub struct MountOptions {
     /// How often (in seconds) to run the cache cleanup pass. Default 3600 (1 hour).
     #[serde(default = "default_cache_cleanup_interval")]
     pub cache_cleanup_interval_secs: u64,
+    /// Remote paths to keep locally on startup (e.g. ["/Documents", "/Photos"]).
+    #[serde(default)]
+    pub keep_paths: Vec<String>,
 }
 
 fn default_true() -> bool { true }
@@ -3627,6 +3630,29 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         }
     }
 
+    // Auto-keep configured paths
+    if !options.keep_paths.is_empty() {
+        let keep_conn = filesystem.conn();
+        let keep_cache = filesystem.cache_ref();
+        let keep_status = filesystem.status_map();
+        let keep_dirty = filesystem.dirty_set();
+        let keep_transfers = filesystem.transfer_map();
+        let keep_shutdown = filesystem.shutdown_flag();
+        let paths: Vec<PathBuf> = options.keep_paths.iter().map(|s| {
+            let s = s.trim();
+            if s.starts_with('/') { PathBuf::from(s) } else { PathBuf::from(format!("/{}", s)) }
+        }).collect();
+        log::info!("AUTO_KEEP: {} configured paths", paths.len());
+        thread::spawn(move || {
+            for p in paths {
+                if keep_shutdown.load(Ordering::Relaxed) { break; }
+                log::info!("AUTO_KEEP: keeping {}", p.display());
+                keep_locally_recursive(&keep_conn, &keep_cache, &keep_status, &keep_dirty, p.clone(), Some(&keep_transfers));
+            }
+            log::info!("AUTO_KEEP: done");
+        });
+    }
+
     // Storage stats update thread
     {
         let stats_cache = filesystem.cache_ref();
@@ -3815,8 +3841,11 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let cache_max_size_bytes = doc["cache_max_size_bytes"].as_i64().map(|v| v as u64).unwrap_or_else(default_cache_max_size);
     let cache_auto_purge_days = doc["cache_auto_purge_days"].as_i64().map(|v| v as u32).unwrap_or_else(default_cache_purge_days);
     let cache_cleanup_interval_secs = doc["cache_cleanup_interval_secs"].as_i64().map(|v| v as u64).unwrap_or_else(default_cache_cleanup_interval);
+    let keep_paths = doc["keep_paths"].as_vec()
+        .map(|v| v.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths })
 }
 
 #[cfg(test)]
