@@ -262,14 +262,19 @@ fn invalidate_dirs_for_fileids(
             .map(|f| (f.path.clone(), f.is_dir))
             .collect();
 
-        // Suppress kernel dentry invalidation for dirs we fetched very recently.
-        // Nextcloud fires notify_file_id on every PROPFIND we perform; without this
-        // guard, that forces Nautilus to re-readdir the directory, which starts
-        // another PROPFIND, which fires another event — a tight self-notify loop.
-        // Keeping `invalidated=false` means FUSE readdir keeps serving the cache.
-        // proactive_refresh will still ETag-check and call notify_inval_inode if
-        // the content actually changed within this window.
-        let just_fetched = !entry.invalidated && entry.at.elapsed() < Duration::from_secs(5);
+        // Nextcloud fires notify_file_id on every PROPFIND we perform
+        // (directory atime update). A notification arriving <1s after we
+        // fetched a directory is almost certainly our own listing, not an
+        // external change. Suppress it to break the re-readdir loop:
+        //   PROPFIND → notify_file_id → invalidate → READDIR → PROPFIND → …
+        // The 1s window is tight enough that real external changes arriving
+        // shortly after our fetch are picked up on the next notify_file_id
+        // cycle (Nextcloud batches events at ~1-2s intervals).
+        // This applies regardless of the invalidated flag — a directory we
+        // just re-fetched after invalidation is equally susceptible.
+        // proactive_refresh will still ETag-check and call notify_inval_inode
+        // if the content actually changed within this window.
+        let just_fetched = entry.at.elapsed() < Duration::from_secs(1);
         if just_fetched {
             log::debug!("notify_push: suppressing kernel inval for {} (fetched {}ms ago)", dir_path.display(), entry.at.elapsed().as_millis());
             freshly_fetched.insert(dir_path.clone());

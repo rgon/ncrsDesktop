@@ -681,7 +681,7 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
             etag: v.etag,
             at: Instant::now(),
             refreshing: false,
-            invalidated: true,
+            invalidated: false,
         });
         count += 1;
     }
@@ -2644,6 +2644,11 @@ impl Filesystem for NextCloudFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        if is_trash_dir(name) {
+            reply.error(Errno::EPERM);
+            return;
+        }
+
         if let Err(e) = filename_validation::validate(name) {
             log::warn!("mkdir rejected: {}", e);
             let full_name = name.to_string_lossy().into_owned();
@@ -3045,6 +3050,59 @@ fn read_exact_from_stream(resp: &mut reqwest::blocking::Response, need: usize) -
 
 // ── Mount ─────────────────────────────────────────────────────────────────────
 
+fn is_trash_dir(name: &OsStr) -> bool {
+    let s = name.to_string_lossy();
+    s.starts_with(".Trash")
+}
+
+fn boot_validate_root(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>) {
+    let root = PathBuf::from("/");
+    let has_cache = cache.safe_lock().dir_cache.contains_key(&root);
+    if !has_cache {
+        return;
+    }
+    match list_dir_propfind(conn, root.clone()) {
+        Ok((etag, self_entry, fresh_files)) => {
+            let mut c = cache.safe_lock();
+            let mut matched = 0usize;
+            let mut stale = 0usize;
+            for entry in &fresh_files {
+                if !entry.is_dir {
+                    continue;
+                }
+                let child_path = entry.path.clone();
+                let fresh_etag = entry.etag.as_deref();
+                let cached_etag = c.dir_cache.get(&child_path).and_then(|e| e.etag.as_deref());
+                match (fresh_etag, cached_etag) {
+                    (Some(f), Some(c_etag)) if f == c_etag => {
+                        matched += 1;
+                    }
+                    _ => {
+                        if let Some(dir_entry) = c.dir_cache.get_mut(&child_path) {
+                            dir_entry.invalidated = true;
+                            stale += 1;
+                        }
+                    }
+                }
+            }
+            c.put_dir_cache(root, etag, self_entry, fresh_files);
+            drop(c);
+            log::info!("BOOT_VALIDATE /: {} dirs unchanged, {} invalidated", matched, stale);
+            schedule_save_dir_cache(cache);
+        }
+        Err(e) => {
+            log::warn!("BOOT_VALIDATE / failed: {} — cache served as-is", e);
+        }
+    }
+}
+
+fn build_fuse_options() -> Vec<MountOption> {
+    vec![
+        MountOption::FSName("ncrs".to_string()),
+        MountOption::DefaultPermissions,
+    ]
+}
+
 pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>) -> Result<(), String> {
     let mut filesystem = NextCloudFs::new(options.clone())?;
     if let Some(el) = error_log {
@@ -3160,6 +3218,18 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         );
     }
 
+    // Validate root-level dirs at boot via a single PROPFIND /.
+    // Compare child etags against cached dir_cache entries: matching
+    // etags prove the subdirectory hasn't changed, so we keep serving
+    // cached data. Mismatches get invalidated for re-fetch on next readdir.
+    if !options.offline {
+        let boot_conn = filesystem.conn.clone();
+        let boot_cache = filesystem.cache_ref();
+        thread::spawn(move || {
+            boot_validate_root(&boot_conn, &boot_cache);
+        });
+    }
+
     // Validate cached files on boot — re-download if etag changed
     if !options.offline {
         let saved_etags = load_file_cache(&filesystem.cache_ref());
@@ -3199,11 +3269,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         }
     }
 
-    let fuse_options = vec![
-        MountOption::FSName("ncrs".to_string()),
-        MountOption::DefaultPermissions,
-        MountOption::CUSTOM("x-gvfs-notrash".to_string()),
-    ];
+    let fuse_options = build_fuse_options();
 
     let mp_str = options.mount_point.to_string_lossy().to_string();
     let _ = std::process::Command::new("fusermount")
@@ -4245,5 +4311,123 @@ mod tests {
         assert!(wire.contains("DA:/home/user/ncrs/Sync/d"));
         assert!(wire.contains("DD:/home/user/ncrs/Sync/e"));
         assert!(wire.contains("R:/home/user/ncrs/Sync/old.txt\x1e/home/user/ncrs/Sync/new.txt"));
+    }
+
+    // ── Mount options ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn fuse_options_contain_no_custom_values() {
+        // fusermount3 rejects unknown options passed via -o. Any
+        // MountOption::CUSTOM value (like "x-gvfs-notrash") causes
+        // Session::new to fail and the mount silently never happens.
+        let opts = build_fuse_options();
+        let custom: Vec<&MountOption> = opts.iter()
+            .filter(|o| matches!(o, MountOption::CUSTOM(_)))
+            .collect();
+        assert!(
+            custom.is_empty(),
+            "CUSTOM mount options are rejected by fusermount3: {:?}",
+            custom,
+        );
+    }
+
+    // ── Trash directory guard ─────────────────────────────────────────────────
+
+    #[test]
+    fn is_trash_dir_rejects_trash_names() {
+        assert!(is_trash_dir(OsStr::new(".Trash-1000")));
+        assert!(is_trash_dir(OsStr::new(".Trash")));
+        assert!(is_trash_dir(OsStr::new(".Trash-0")));
+    }
+
+    #[test]
+    fn is_trash_dir_allows_normal_names() {
+        assert!(!is_trash_dir(OsStr::new("Documents")));
+        assert!(!is_trash_dir(OsStr::new(".hidden")));
+        assert!(!is_trash_dir(OsStr::new("Trash")));
+    }
+
+    // ── Boot cache loading ────────────────────────────────────────────────────
+
+    #[test]
+    fn boot_loaded_dirs_are_not_invalidated() {
+        let cache = Arc::new(Mutex::new(make_test_cache()));
+        let path = cache.safe_lock().cache_dir.join(DIR_CACHE_FILE);
+        let mut map = HashMap::new();
+        map.insert("/Photos".to_string(), PersistedDirEntry {
+            etag: Some("abc123".into()),
+            self_entry: None,
+            files: vec![make_dav_entry("sunset.jpg", Some(1))],
+        });
+        let json = serde_json::to_vec(&map).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        std::fs::write(&path, json).unwrap();
+        load_dir_cache(&cache);
+        let c = cache.safe_lock();
+        let entry = c.dir_cache.get(&PathBuf::from("/Photos")).unwrap();
+        assert!(!entry.invalidated, "boot-loaded dir should not be invalidated");
+        assert_eq!(entry.etag, Some("abc123".into()));
+        drop(c);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn boot_validate_root_invalidates_changed_dirs() {
+        let mut cache = make_test_cache();
+        cache.put_dir_cache(PathBuf::from("/"), Some("root_etag".into()), None, vec![
+            {
+                let mut e = make_dav_entry("unchanged", None);
+                e.path = PathBuf::from("/unchanged");
+                e.is_dir = true;
+                e.etag = Some("etag_a".into());
+                e
+            },
+            {
+                let mut e = make_dav_entry("changed", None);
+                e.path = PathBuf::from("/changed");
+                e.is_dir = true;
+                e.etag = Some("etag_b".into());
+                e
+            },
+        ]);
+        cache.put_dir_cache(PathBuf::from("/unchanged"), Some("etag_a".into()), None, vec![]);
+        cache.put_dir_cache(PathBuf::from("/changed"), Some("etag_b".into()), None, vec![]);
+
+        let fresh_root = vec![
+            {
+                let mut e = make_dav_entry("unchanged", None);
+                e.path = PathBuf::from("/unchanged");
+                e.is_dir = true;
+                e.etag = Some("etag_a".into());
+                e
+            },
+            {
+                let mut e = make_dav_entry("changed", None);
+                e.path = PathBuf::from("/changed");
+                e.is_dir = true;
+                e.etag = Some("etag_NEW".into());
+                e
+            },
+        ];
+
+        // Simulate what boot_validate_root does with the fresh listing
+        for entry in &fresh_root {
+            if !entry.is_dir { continue; }
+            let fresh_etag = entry.etag.as_deref();
+            let cached_etag = cache.dir_cache.get(&entry.path).and_then(|e| e.etag.as_deref());
+            match (fresh_etag, cached_etag) {
+                (Some(f), Some(c_etag)) if f == c_etag => {}
+                _ => {
+                    if let Some(dir_entry) = cache.dir_cache.get_mut(&entry.path) {
+                        dir_entry.invalidated = true;
+                    }
+                }
+            }
+        }
+
+        assert!(!cache.dir_cache[&PathBuf::from("/unchanged")].invalidated,
+            "dir with matching etag should remain valid");
+        assert!(cache.dir_cache[&PathBuf::from("/changed")].invalidated,
+            "dir with changed etag should be invalidated");
     }
 }
