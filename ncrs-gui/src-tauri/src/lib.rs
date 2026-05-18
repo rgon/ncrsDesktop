@@ -5,7 +5,7 @@ use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItem},
     tray::{TrayIconBuilder, TrayIconId},
-    AppHandle, Emitter, EventLoopMessage, Manager, State, WindowEvent,
+    AppHandle, Emitter, EventLoopMessage, Listener, Manager, State, WindowEvent,
     PhysicalSize,
 };
 use tauri_plugin_opener::OpenerExt;
@@ -56,8 +56,24 @@ fn get_sync_state(state: State<Arc<AppState>>) -> String {
         SyncState::Idle => "idle".into(),
         SyncState::Syncing => "syncing".into(),
         SyncState::Paused => "paused".into(),
+        SyncState::Unmounted => "unmounted".into(),
         SyncState::Error(ref e) => format!("error: {}", e),
     }
+}
+
+#[tauri::command]
+async fn remount(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    {
+        let ss = state.sync_state.lock().unwrap();
+        if *ss != SyncState::Unmounted {
+            return Err("Can only remount when unmounted".into());
+        }
+    }
+    *state.sync_state.lock().unwrap() = SyncState::Idle;
+    app.emit("sync-state-changed", "idle").ok();
+    let s = (*state).clone();
+    spawn(start_ncfs_daemon(app, s));
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -262,22 +278,30 @@ fn rerender_tray_menu(
     app: &AppHandle,
     sync_state: &SyncState,
 ) -> Result<tauri::menu::Menu<tauri_runtime_wry::Wry<EventLoopMessage>>, tauri::Error> {
-    let pause_text = match sync_state {
-        SyncState::Idle => "Pause Sync",
-        SyncState::Paused => "Resume Sync",
-        SyncState::Syncing => "Pause Sync",
-        SyncState::Error(_) => "Sync Error",
-    };
-
     let about_i = MenuItem::with_id(app, "about", "Open main Dialog", true, None::<&str>)?;
-    let pause_i = MenuItem::with_id(app, "pause", pause_text, true, None::<&str>)?;
     let settings_i = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Exit Nextcloud", true, None::<&str>)?;
 
-    MenuBuilder::new(app)
+    let mut builder = MenuBuilder::new(app)
         .id("tray-menu")
-        .item(&about_i)
-        .item(&pause_i)
+        .item(&about_i);
+
+    if *sync_state == SyncState::Unmounted {
+        let remount_i = MenuItem::with_id(app, "remount", "Remount", true, None::<&str>)?;
+        builder = builder.item(&remount_i);
+    } else {
+        let pause_text = match sync_state {
+            SyncState::Idle => "Pause Sync",
+            SyncState::Paused => "Resume Sync",
+            SyncState::Syncing => "Pause Sync",
+            SyncState::Unmounted => unreachable!(),
+            SyncState::Error(_) => "Sync Error",
+        };
+        let pause_i = MenuItem::with_id(app, "pause", pause_text, true, None::<&str>)?;
+        builder = builder.item(&pause_i);
+    }
+
+    builder
         .separator()
         .item(&settings_i)
         .item(&quit_i)
@@ -337,8 +361,10 @@ pub fn run() {
             resolve_conflict,
             fetch_search_providers,
             search_nextcloud,
+            remount,
         ])
         .setup(move |app| {
+            let state_listener = app_state_setup.clone();
             spawn(start_ncfs_daemon(app.handle().clone(), app_state_setup));
 
             let initial_state = SyncState::Idle;
@@ -356,6 +382,24 @@ pub fn run() {
                 .unwrap();
 
             tray_id_setup.lock().unwrap().replace(tray.id().clone());
+
+            let tray_id_listener = tray_icon_id.clone();
+            let app_handle_listener = app.handle().clone();
+            app.listen("sync-state-changed", move |event| {
+                if event.payload().trim_matches('"') == "unmounted" {
+                    let tray_id = tray_id_listener.lock().unwrap().clone();
+                    let Some(tray_id) = tray_id else { return };
+                    let ss = state_listener.sync_state.lock().unwrap().clone();
+                    if let Some(tray) = app_handle_listener.tray_by_id(&tray_id) {
+                        let icon_path = concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png");
+                        let _ = tray.set_icon(Some(load_icon(icon_path)));
+                        if let Ok(menu) = rerender_tray_menu(&app_handle_listener, &ss) {
+                            let _ = tray.set_menu(Some(menu));
+                        }
+                    }
+                }
+            });
+
             Ok(())
         })
         .on_window_event(|app, event| {
@@ -387,6 +431,7 @@ pub fn run() {
                     SyncState::Idle => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png"),
                     SyncState::Paused => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"),
                     SyncState::Syncing => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.syncing.png"),
+                    SyncState::Unmounted => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"),
                     SyncState::Error(_) => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.error.png"),
                 };
 
@@ -404,6 +449,29 @@ pub fn run() {
                 }
 
                 app.emit("sync-state-changed", new_state.to_string()).ok();
+            }
+            "remount" => {
+                let tray_id = tray_id_menu.lock().unwrap().clone();
+                let Some(tray_id) = tray_id else { return };
+                let Some(tray) = app.tray_by_id(&tray_id) else { return };
+
+                {
+                    let ss = app_state_menu.sync_state.lock().unwrap();
+                    if *ss != SyncState::Unmounted { return; }
+                }
+
+                *app_state_menu.sync_state.lock().unwrap() = SyncState::Idle;
+                app.emit("sync-state-changed", "idle").ok();
+
+                let icon_path = concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png");
+                let _ = tray.set_icon(Some(load_icon(icon_path)));
+                if let Ok(menu) = rerender_tray_menu(app.app_handle(), &SyncState::Idle) {
+                    let _ = tray.set_menu(Some(menu));
+                }
+
+                let remount_state = app_state_menu.clone();
+                let remount_app = app.app_handle().clone();
+                spawn(start_ncfs_daemon(remount_app, remount_state));
             }
             "settings" => open_main_window(app),
             "quit" => app.exit(0),
@@ -432,14 +500,24 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
 
     *state.mount_options.lock().unwrap() = Some(opts.clone());
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     // FUSE mount thread — share error_log and transfer_map with the core
     let fuse_opts = opts.clone();
     let error_log = state.error_log.clone();
     let transfer_map = state.transfer_map.clone();
     let journal = state.journal.clone();
-    thread::spawn(move || match mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal)) {
-        Ok(()) => log::info!("FUSE unmounted cleanly"),
-        Err(e) => log::error!("FUSE error: {}", e),
+    let fuse_app = app.clone();
+    let fuse_state = state.clone();
+    thread::spawn(move || {
+        let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal));
+        match &result {
+            Ok(()) => log::info!("FUSE unmounted cleanly"),
+            Err(e) => log::error!("FUSE error: {}", e),
+        }
+        *fuse_state.sync_state.lock().unwrap() = SyncState::Unmounted;
+        fuse_app.emit("sync-state-changed", "unmounted").ok();
+        let _ = shutdown_tx.send(true);
     });
 
     // Notification polling — async on Tokio runtime, no dedicated OS thread
@@ -449,9 +527,11 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     let poll_user = opts.username.clone().unwrap_or_default();
     let poll_pass = opts.password.clone().unwrap_or_default();
     let poll_http3 = opts.http3;
+    let notif_shutdown = shutdown_rx.clone();
     spawn(async move {
         let base = ncrs_core::notifications::base_url(&poll_url);
         loop {
+            if *notif_shutdown.borrow() { break; }
             let b = base.clone();
             let u = poll_user.clone();
             let p = poll_pass.clone();
@@ -472,9 +552,11 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     // Error log polling — check every 2s, emit event + desktop notification on new errors
     let err_state = state.clone();
     let err_app = app.clone();
+    let err_shutdown = shutdown_rx.clone();
     spawn(async move {
         let mut prev_count = 0usize;
         loop {
+            if *err_shutdown.borrow() { break; }
             sleep(Duration::from_secs(2)).await;
             let errors: Vec<SyncError> = err_state.error_log.lock().unwrap().iter().cloned().collect();
             let count = errors.len();
@@ -498,9 +580,11 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     // Transfer progress polling — 500ms when active, 2s when idle
     let xfer_state = state.clone();
     let xfer_app = app.clone();
+    let xfer_shutdown = shutdown_rx.clone();
     spawn(async move {
         let mut was_active = false;
         loop {
+            if *xfer_shutdown.borrow() { break; }
             let transfers: Vec<TransferProgress> = xfer_state.transfer_map.lock().unwrap().values().cloned().collect();
             let active = !transfers.is_empty();
             if active || was_active {
@@ -518,10 +602,12 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     // Journal + conflicts polling
     let jrnl_state = state.clone();
     let jrnl_app = app.clone();
+    let jrnl_shutdown = shutdown_rx.clone();
     spawn(async move {
         let mut prev_pending = 0usize;
         let mut prev_conflicts = 0usize;
         loop {
+            if *jrnl_shutdown.borrow() { break; }
             sleep(Duration::from_secs(2)).await;
             let j = jrnl_state.journal.lock().unwrap();
             let pending = j.len();

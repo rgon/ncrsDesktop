@@ -213,6 +213,7 @@ pub enum SyncState {
     Idle,
     Syncing,
     Paused,
+    Unmounted,
     Error(String),
 }
 
@@ -222,6 +223,7 @@ impl std::fmt::Display for SyncState {
             SyncState::Idle => write!(f, "idle"),
             SyncState::Syncing => write!(f, "syncing"),
             SyncState::Paused => write!(f, "paused"),
+            SyncState::Unmounted => write!(f, "unmounted"),
             SyncState::Error(e) => write!(f, "error:{}", e),
         }
     }
@@ -641,9 +643,15 @@ fn save_dir_cache_now(cache: &Mutex<FsCache>) {
         })
         .collect();
     drop(c);
-    if let Ok(json) = serde_json::to_vec(&map) {
-        let _ = std::fs::write(&path, json);
-        log::info!("DIR_CACHE saved {} dirs to {}", map.len(), path.display());
+    match serde_json::to_vec(&map) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                log::error!("DIR_CACHE write failed {}: {} — cache will be cold on restart", path.display(), e);
+            } else {
+                log::info!("DIR_CACHE saved {} dirs to {}", map.len(), path.display());
+            }
+        }
+        Err(e) => log::error!("DIR_CACHE serialize failed: {}", e),
     }
 }
 
@@ -707,9 +715,15 @@ pub(crate) fn save_file_cache(cache: &Mutex<FsCache>) {
         })
         .collect();
     drop(c);
-    if let Ok(json) = serde_json::to_vec(&map) {
-        let _ = std::fs::write(&path, json);
-        log::info!("FILE_CACHE saved {} entries to {}", map.len(), path.display());
+    match serde_json::to_vec(&map) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                log::error!("FILE_CACHE write failed {}: {} — cached files won't survive restart", path.display(), e);
+            } else {
+                log::info!("FILE_CACHE saved {} entries to {}", map.len(), path.display());
+            }
+        }
+        Err(e) => log::error!("FILE_CACHE serialize failed: {}", e),
     }
 }
 
@@ -963,7 +977,13 @@ pub(crate) fn ensure_file_cached(
         std::fs::File::create(&local_path).map_err(|e| format!("create cache file: {}", e))?;
     if let Err(e) = open_file_timeout(net, throttle, remote_path.clone(), file, transfers.cloned()) {
         if let Some(tm) = transfers { tm.safe_lock().remove(&remote_path); }
-        let _ = std::fs::remove_file(&local_path);
+        if let Err(rm_err) = std::fs::remove_file(&local_path) {
+            log::error!("CRITICAL: cannot remove partial download {}: {} — zeroing to prevent serving corrupt data", local_path.display(), rm_err);
+            if let Ok(f) = std::fs::File::create(&local_path) {
+                let _ = f.set_len(0);
+            }
+        }
+        cache.safe_lock().file_cache.remove(&remote_path);
         status.safe_lock().insert(remote_path.clone(), FileStatus::Remote);
         dirty.safe_lock().insert(remote_path);
         return Err(e);
@@ -1088,6 +1108,7 @@ fn start_background_propfind(
     path: PathBuf,
     chain_depth: u32,
 ) {
+    if conn.shutdown.load(Ordering::Relaxed) { return; }
     {
         let c = cache.safe_lock();
         if c.dir_cache.contains_key(&path) || c.pending_dirs.contains_key(&path) {
@@ -1245,6 +1266,7 @@ struct ConnInfo {
     is_offline: Arc<AtomicBool>,
     active_streams: Arc<AtomicUsize>,
     deferred_invalidation: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 }
 
 struct StreamActiveGuard {
@@ -1353,6 +1375,7 @@ impl NextCloudFs {
             notify_push_connected: Arc::new(AtomicBool::new(false)),
             active_streams: Arc::new(AtomicUsize::new(0)),
             deferred_invalidation: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
         });
 
         Ok(NextCloudFs {
@@ -1435,6 +1458,10 @@ impl NextCloudFs {
         self.conn.deferred_invalidation.clone()
     }
 
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        self.conn.shutdown.clone()
+    }
+
     pub(crate) fn net(&self) -> Arc<FsNetwork> {
         self.net.clone()
     }
@@ -1488,7 +1515,9 @@ impl NextCloudFs {
                 c.file_cache.remove(&remote_path).map(|e| e.local_path)
             };
             if let Some(local_path) = local {
-                let _ = std::fs::remove_file(&local_path);
+                if let Err(e) = std::fs::remove_file(&local_path) {
+                    log::warn!("evict: failed to remove cached file {}: {} — orphaned on disk", local_path.display(), e);
+                }
             }
             save_file_cache(&cache);
             status.safe_lock().insert(remote_path, FileStatus::Remote);
@@ -1534,7 +1563,9 @@ impl Filesystem for NextCloudFs {
 
         let is_cached = self.cache.safe_lock().dir_cache.contains_key(&parent_path);
         if !is_cached {
-            let _ = get_or_list_dir(&self.conn, &self.cache, parent_path.clone());
+            if let Err(e) = get_or_list_dir(&self.conn, &self.cache, parent_path.clone()) {
+                log::debug!("lookup: list {} failed (will return ENOENT): {}", parent_path.display(), e);
+            }
         }
 
         let mut c = self.cache.safe_lock();
@@ -1672,7 +1703,11 @@ impl Filesystem for NextCloudFs {
             let cache_dir = self.cache.safe_lock().cache_dir.clone();
             let wp = cache_dir.join(format!("write_{}", fh));
             if let Some(ref local) = local {
-                let _ = std::fs::copy(local, &wp);
+                if let Err(e) = std::fs::copy(local, &wp) {
+                    log::error!("open: failed to seed staging file {} from {}: {}", wp.display(), local.display(), e);
+                    reply.error(Errno::EIO);
+                    return;
+                }
             }
             Some(wp)
         } else {
@@ -2249,14 +2284,30 @@ impl Filesystem for NextCloudFs {
                         cache_dir.join(format!("write_{}", fh_raw))
                     });
                     if !wp.exists() {
-                        if let Some(ref local) = of.local {
-                            let _ = std::fs::copy(local, &wp);
+                        let seed_ok = if let Some(ref local) = of.local {
+                            std::fs::copy(local, &wp).is_ok()
                         } else {
-                            let _ = std::fs::File::create(&wp);
+                            std::fs::File::create(&wp).is_ok()
+                        };
+                        if !seed_ok {
+                            log::error!("setattr: cannot create staging file {}", wp.display());
+                            reply.error(Errno::EIO);
+                            return;
                         }
                     }
-                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&wp) {
-                        let _ = f.set_len(new_size);
+                    match std::fs::OpenOptions::new().write(true).open(&wp) {
+                        Ok(f) => {
+                            if let Err(e) = f.set_len(new_size) {
+                                log::error!("setattr: truncate staging file failed: {}", e);
+                                reply.error(Errno::EIO);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("setattr: open staging file for truncate failed: {}", e);
+                            reply.error(Errno::EIO);
+                            return;
+                        }
                     }
                     of.dirty = true;
                 }
@@ -2316,10 +2367,15 @@ impl Filesystem for NextCloudFs {
             cache_dir.join(format!("write_{}", fh.0))
         });
         if !wp.exists() {
-            if let Some(ref local) = of.local {
-                let _ = std::fs::copy(local, &wp);
+            let seed_ok = if let Some(ref local) = of.local {
+                std::fs::copy(local, &wp).is_ok()
             } else {
-                let _ = std::fs::File::create(&wp);
+                std::fs::File::create(&wp).is_ok()
+            };
+            if !seed_ok {
+                log::error!("write: cannot create staging file {}", wp.display());
+                reply.error(Errno::EIO);
+                return;
             }
         }
 
@@ -2590,7 +2646,11 @@ impl Filesystem for NextCloudFs {
 
         let cache_dir = self.cache.safe_lock().cache_dir.clone();
         let write_path = cache_dir.join(format!("write_{}", fh));
-        let _ = std::fs::File::create(&write_path);
+        if let Err(e) = std::fs::File::create(&write_path) {
+            log::error!("create: cannot create staging file {}: {}", write_path.display(), e);
+            reply.error(Errno::EIO);
+            return;
+        }
 
         let ino = self.cache.safe_lock().allocate_inode(remote_path.clone());
 
@@ -3173,11 +3233,25 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         let base_for_monitor = replay_base_url.clone();
         let user_for_monitor = replay_user.clone();
         let pass_for_monitor = replay_pass.clone();
+        let shutdown_monitor = filesystem.shutdown_flag();
         thread::spawn(move || {
             loop {
+                if shutdown_monitor.load(Ordering::Relaxed) {
+                    log::info!("CONNECTIVITY monitor: shutdown, exiting");
+                    break;
+                }
                 let currently_offline = offline.load(Ordering::Relaxed);
                 let interval = if currently_offline { Duration::from_secs(5) } else { Duration::from_secs(30) };
-                thread::sleep(interval);
+                let mut slept = Duration::ZERO;
+                while slept < interval {
+                    if shutdown_monitor.load(Ordering::Relaxed) { break; }
+                    thread::sleep(Duration::from_secs(1));
+                    slept += Duration::from_secs(1);
+                }
+                if shutdown_monitor.load(Ordering::Relaxed) {
+                    log::info!("CONNECTIVITY monitor: shutdown, exiting");
+                    break;
+                }
 
                 let reachable = propfind::propfind_etag(
                     &http, &webdav_url, &probe_user, &probe_pass,
@@ -3226,6 +3300,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             notifier_slot.clone(),
             filesystem.ghost_entries(),
             file_change_queue,
+            filesystem.shutdown_flag(),
         );
     }
 
@@ -3236,8 +3311,11 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     if !options.offline {
         let boot_conn = filesystem.conn.clone();
         let boot_cache = filesystem.cache_ref();
+        let boot_shutdown = filesystem.shutdown_flag();
         thread::spawn(move || {
-            boot_validate_root(&boot_conn, &boot_cache);
+            if !boot_shutdown.load(Ordering::Relaxed) {
+                boot_validate_root(&boot_conn, &boot_cache);
+            }
         });
     }
 
@@ -3255,10 +3333,15 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let status = filesystem.status_map();
             let dirty = filesystem.dirty_set();
             let boot_transfers = filesystem.transfer_map();
+            let file_shutdown = filesystem.shutdown_flag();
             thread::spawn(move || {
                 log::info!("FILE_CACHE boot validation: checking {} files", saved_etags.len());
                 let mut stale = 0usize;
                 for (remote_path, old_etag) in &saved_etags {
+                    if file_shutdown.load(Ordering::Relaxed) {
+                        log::info!("FILE_CACHE boot validation: shutdown, aborting");
+                        break;
+                    }
                     match propfind::propfind_etag(&http, &webdav_url, &boot_user, &boot_pass, remote_path, PROPFIND_TIMEOUT) {
                         Ok(Some(ref new_etag)) if new_etag == old_etag => {}
                         Ok(new_etag) => {
@@ -3293,6 +3376,8 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         options.mount_point.display()
     );
 
+    let shutdown_flag = filesystem.shutdown_flag();
+
     let fuse_config = {
         let mut c = Config::default();
         c.mount_options = fuse_options;
@@ -3317,8 +3402,19 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     }
 
     let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;
-    bg.guard.join().map_err(|_| "FUSE session thread panicked".to_string())
-        .and_then(|r| r.map_err(|e| format!("FUSE session failed: {}", e)))
+    let result = bg.guard.join().map_err(|panic_payload| {
+        let msg = panic_payload
+            .downcast_ref::<&str>().map(|s| s.to_string())
+            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| format!("{:?}", panic_payload));
+        format!("FUSE session thread panicked: {}", msg)
+    })
+    .and_then(|r| r.map_err(|e| format!("FUSE session failed: {}", e)));
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    log::info!("FUSE session ended — shutdown signal sent to background threads");
+
+    result
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────

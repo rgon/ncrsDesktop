@@ -138,6 +138,10 @@
         conflicts = conflicts.filter(c => c.id !== id);
     }
 
+    async function handleRemount() {
+        await invoke("remount");
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     onMount(() => {
@@ -299,7 +303,7 @@
         </div>
 
         <!-- Sync status bar -->
-        <SyncProgressView {syncState} {transfers} />
+        <SyncProgressView {syncState} {transfers} onremount={handleRemount} />
 
         <!-- Content area: search, errors, or notifications -->
         {#if activeView === "search"}

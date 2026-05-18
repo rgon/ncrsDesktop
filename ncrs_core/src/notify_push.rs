@@ -654,9 +654,10 @@ pub(crate) fn start(
     notifier_slot: fuse_notify::NotifierSlot,
     ghost_entries: GhostMap,
     file_change_queue: FileChangeQueue,
+    shutdown: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        run_loop(&client, &base_url, &webdav_url, &username, &password, &cache, &dirty, &is_offline, &connected, &active_streams, &deferred_invalidation, &throttle, &notifier_slot, &ghost_entries, &file_change_queue);
+        run_loop(&client, &base_url, &webdav_url, &username, &password, &cache, &dirty, &is_offline, &connected, &active_streams, &deferred_invalidation, &throttle, &notifier_slot, &ghost_entries, &file_change_queue, &shutdown);
     });
 }
 
@@ -676,11 +677,17 @@ fn run_loop(
     notifier_slot: &fuse_notify::NotifierSlot,
     ghost_entries: &GhostMap,
     file_change_queue: &FileChangeQueue,
+    shutdown: &Arc<AtomicBool>,
 ) {
     let debounce: DebounceMap = Arc::new(Mutex::new(HashMap::new()));
     let mut reconnect_delay = Duration::from_secs(1);
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            log::info!("notify_push: shutdown, exiting");
+            return;
+        }
+
         connected.store(false, Ordering::Relaxed);
 
         if is_offline.load(Ordering::Relaxed) {
@@ -702,7 +709,7 @@ fn run_loop(
             }
         };
 
-        match connect_and_listen(&ws_url, client, webdav_url, username, password, cache, dirty, connected, active_streams, deferred_invalidation, throttle, notifier_slot, &debounce, ghost_entries, file_change_queue) {
+        match connect_and_listen(&ws_url, client, webdav_url, username, password, cache, dirty, connected, active_streams, deferred_invalidation, throttle, notifier_slot, &debounce, ghost_entries, file_change_queue, shutdown) {
             Ok(()) => {
                 log::info!("notify_push: connection closed cleanly");
                 reconnect_delay = Duration::from_secs(1);
@@ -710,6 +717,11 @@ fn run_loop(
             Err(e) => {
                 log::warn!("notify_push: {}", e);
             }
+        }
+
+        if shutdown.load(Ordering::Relaxed) {
+            log::info!("notify_push: shutdown, exiting");
+            return;
         }
 
         log::info!("notify_push: reconnecting in {:?}", reconnect_delay);
@@ -734,8 +746,17 @@ fn connect_and_listen(
     debounce: &DebounceMap,
     ghost_entries: &GhostMap,
     file_change_queue: &FileChangeQueue,
+    shutdown: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let (mut socket, _response) = connect(ws_url).map_err(|e| format!("WebSocket connect: {}", e))?;
+
+    fn set_ws_read_timeout(socket: &tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, timeout: Option<Duration>) {
+        match socket.get_ref() {
+            tungstenite::stream::MaybeTlsStream::Plain(tcp) => { let _ = tcp.set_read_timeout(timeout); }
+            tungstenite::stream::MaybeTlsStream::Rustls(tls) => { let _ = tls.get_ref().set_read_timeout(timeout); }
+            _ => {}
+        }
+    }
 
     socket
         .send(Message::Text(username.into()))
@@ -766,8 +787,21 @@ fn connect_and_listen(
         .map_err(|e| format!("send listen: {}", e))?;
     log::info!("notify_push: subscribed to notify_file_id");
 
+    set_ws_read_timeout(&socket, Some(Duration::from_secs(5)));
+
     loop {
-        let msg = socket.read().map_err(|e| format!("read: {}", e))?;
+        if shutdown.load(Ordering::Relaxed) {
+            log::info!("notify_push: shutdown, closing websocket");
+            let _ = socket.close(None);
+            return Ok(());
+        }
+        let msg = match socket.read() {
+            Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                continue;
+            }
+            Err(e) => return Err(format!("read: {}", e)),
+            Ok(msg) => msg,
+        };
         match msg {
             Message::Text(ref t) => {
                 handle_event(t.as_ref(), client, webdav_url, username, password, cache, dirty, active_streams, deferred_invalidation, throttle, notifier_slot, debounce, ghost_entries, file_change_queue);

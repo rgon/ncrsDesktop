@@ -14,12 +14,14 @@
         class?: string;
         syncState?: string;
         transfers?: TransferProgress[];
+        onremount?: () => void;
     }
 
     let {
         class: mClass = "",
         syncState = "idle",
         transfers = [],
+        onremount,
         ...restProps
     }: Props = $props();
 
@@ -34,10 +36,11 @@
             return parts.join(", ");
         }
         switch (syncState) {
-            case "syncing": return "Syncing…";
-            case "paused":  return "Sync paused";
-            case "idle":    return "Up to date";
-            default:        return syncState.startsWith("error") ? "Sync error" : syncState;
+            case "syncing":    return "Syncing…";
+            case "paused":     return "Sync paused";
+            case "unmounted":  return "Filesystem unmounted";
+            case "idle":       return "Up to date";
+            default:           return syncState.startsWith("error") ? "Sync error" : syncState;
         }
     });
 
@@ -65,6 +68,9 @@
             {/if}
         </div>
         <span class="ml-4 text-sm">{label()}</span>
+        {#if syncState === "unmounted" && onremount}
+            <button class="btn btn-primary btn-xs ml-2" onclick={onremount}>Remount</button>
+        {/if}
     </div>
 
     {#if hasTransfers}
