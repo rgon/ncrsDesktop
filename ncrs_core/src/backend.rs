@@ -98,6 +98,7 @@ pub struct ChangeEvent {
 
 pub trait ChangeWatcherHandle: Send + Sync + 'static {
     fn is_connected(&self) -> bool;
+    fn set_paused(&self, _paused: bool) {}
 }
 
 pub type ChangeCallback = Box<dyn Fn(ChangeEvent) + Send + Sync + 'static>;

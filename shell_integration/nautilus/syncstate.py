@@ -38,7 +38,8 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
 # ── Emblem names (standard XDG / FreeDesktop icon names) ─────────────────────
-_EMBLEM_LOCAL     = "emblem-default"        # green tick
+_EMBLEM_KEPT      = "emblem-default"        # green tick — user-pinned file
+_EMBLEM_CACHED    = "emblem-generic"        # auto-downloaded file (read cache)
 _EMBLEM_REMOTE    = "emblem-downloads"     # cloud / down-arrow
 _EMBLEM_SYNCED    = "emblem-default"        # green tick — reserved for future use (synced status emits no emblem)
 _EMBLEM_SHARED    = "emblem-shared"        # people / shared
@@ -264,6 +265,8 @@ class NcrsColumnProvider(GObject.GObject, Nautilus.ColumnProvider):
 # ── Info provider ─────────────────────────────────────────────────────────────
 
 _SYNC_LABELS = {
+    "kept": "Kept locally",
+    "cached": "Cached",
     "local": "Local",
     "synced": "Synced",
     "remote": "Remote",
@@ -354,10 +357,14 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             owner = parts[3] if len(parts) > 3 else ""
             size_str = parts[4] if len(parts) > 4 else "0"
 
-            if sync == "local":
-                file_info.add_emblem(_EMBLEM_LOCAL)
+            if sync == "kept":
+                file_info.add_emblem(_EMBLEM_KEPT)
+            elif sync == "cached":
+                file_info.add_emblem(_EMBLEM_CACHED)
+            elif sync == "local":
+                file_info.add_emblem(_EMBLEM_KEPT)
             elif sync == "synced":
-                pass  # uploaded, no local copy — no emblem (auto_keep off); Local shows the green tick
+                pass
             elif sync == "downloading":
                 file_info.add_emblem(_EMBLEM_REMOTE)
             elif sync == "uploading":
@@ -408,7 +415,7 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             has_remote = False
             for path in paths:
                 status = _send_command(f"STATUS {path}").split(",")[0]
-                if status in ("local", "partial"):
+                if status in ("kept", "cached", "local", "partial"):
                     has_local = True
                 else:
                     has_remote = True

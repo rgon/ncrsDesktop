@@ -84,7 +84,8 @@ pub fn socket_path() -> PathBuf {
 /// File-level sync status as seen by the daemon.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
-    Local,
+    Kept,
+    Cached,
     Synced,
     Remote,
     Downloading,
@@ -95,7 +96,8 @@ pub enum FileStatus {
 impl FileStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            FileStatus::Local => "local",
+            FileStatus::Kept => "kept",
+            FileStatus::Cached => "cached",
             FileStatus::Synced => "synced",
             FileStatus::Remote => "remote",
             FileStatus::Downloading => "downloading",
@@ -118,19 +120,23 @@ fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>,
     }
     let mut total = 0usize;
     let mut local = 0usize;
+    let mut all_kept = true;
     let mut uploading = 0usize;
     for (p, s) in sm.iter() {
         if p.parent() == Some(dir) {
             total += 1;
             match s {
-                FileStatus::Local | FileStatus::Synced => local += 1,
+                FileStatus::Kept | FileStatus::Synced => local += 1,
+                FileStatus::Cached => { local += 1; all_kept = false; }
                 FileStatus::Uploading => uploading += 1,
-                _ => {}
+                _ => { all_kept = false; }
             }
         }
     }
     if uploading > 0 { return "uploading"; }
-    if total > 0 && local == total { "local" }
+    if total > 0 && local == total {
+        if all_kept { "kept" } else { "cached" }
+    }
     else if local > 0 { "partial" }
     else { own.unwrap_or(FileStatus::Remote).as_str() }
 }
@@ -379,7 +385,7 @@ fn handle_client(
                             log::error!("KEEP callback panicked: {:?}", e);
                         }
                         if sm.safe_lock().get(&r).copied() == Some(FileStatus::Downloading) {
-                            sm.safe_lock().insert(r.clone(), FileStatus::Local);
+                            sm.safe_lock().insert(r.clone(), FileStatus::Kept);
                         }
                         ds.safe_lock().insert(r);
                     });

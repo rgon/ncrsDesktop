@@ -249,15 +249,15 @@ fn parse_multistatus_stream<R: std::io::BufRead>(
     Ok((dir_etag, self_entry, entries))
 }
 
-pub fn propfind_list_streaming(
+pub fn propfind_list_streaming<E: From<DavEntry> + Send>(
     client: &reqwest::blocking::Client,
     webdav_url: &str,
     username: &str,
     password: &str,
     path: &std::path::Path,
     timeout: Duration,
-    tx: std::sync::mpsc::Sender<DavEntry>,
-    self_tx: std::sync::mpsc::Sender<DavEntry>,
+    tx: std::sync::mpsc::Sender<E>,
+    self_tx: std::sync::mpsc::Sender<E>,
 ) -> Result<Option<String>, String> {
     let url = build_url(webdav_url, path);
     let t0 = Instant::now();
@@ -306,11 +306,11 @@ pub fn propfind_list_streaming(
         };
         if is_first {
             dir_etag = resp.etag;
-            let _ = self_tx.send(entry);
+            let _ = self_tx.send(E::from(entry));
             is_first = false;
         } else {
             count += 1;
-            if tx.send(entry).is_err() {
+            if tx.send(E::from(entry)).is_err() {
                 break;
             }
         }

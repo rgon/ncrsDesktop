@@ -5,63 +5,62 @@ FIX:
 + [x] proper & performant-enough read
 + [x] re-starting ncrs story
 
-+ [ ] emulate no network access, showing the local cached copy --emulate-no-network-in 15s
-
-+ [ ] writes:
-    + [ ] basic file write: local cache-public upload?
-    + [ ] working without network
-    + [ ] diffing algorithm? -> ask which copy we want to save/save conflicting copy separately -> choose conflict resolution strategy
 ```
 GOALS:
 + [x] Real vFS on linux: not downloading everything then serving it. Uses the built-in nextcloud thumbnailer for a rich experience
 + [x] webdav with QUICK/HTTP3 support for speed
-+ [x] streaming-download VFS support: play back large 4K videos locally without issues.
++ [x] streaming-download VFS support: play back large 4K videos locally without issues, at network-rate and without pre-downloading the file.
+<<<<<
++ [ ] optionally caches files: opening a file twice is just 1x network request if enabled, being smart about edits
+    future:
+    + [ ] streaming cache .part
+    + [ ] limit the cache size
+    + [ ] gui show what's used by cache, kept files
+    + [ ] auto-purge cache after N days and/or size
 
-+ [ ] review tests
++ [x] files high-performance backend (notify-push) full support, files update as fast as possible atomically, to avoid merge errors
++ [x] maps nextcloud permissions to filesystem permissions
++ [x] No dumb 'Some files could not be synced' - Filename contains trailing spaces -> saving will immediately cause a filesystem error, notifying the caller causing the error.
 
-+ [ ] notify-push immediate new file notifications when opening a browser
-    + [ ] auto-update, without needing to reload, working even if nautilus is in the background
-    + [ ] implement CRUD
-    + [ ] test with synced file
-    + [ ] test moving
-    + [ ] fix infinite loop
-    + [ ] fix other CRUD
-+ [ ] fix notify-push performance regression
-    + ● ---
-    Now for the sequential loading / batching issue — this one has a different
-    root cause that needs to be clear:
-    
-    Why batching happens: Nautilus calls readdir one directory at a time and
-    blocks waiting for each result before issuing the next. Our FUSE handler
-    blocks on that PROPFIND (~400ms). So with 55 top-level dirs: 55 × 400ms = ~22
-    seconds, strictly sequential. The 10-slot throttle is completely unused —
-    there's never more than 1 PROPFIND outstanding.
-    
-    The "batch" appearance comes from two things:
-    1. Dirs already in the on-disk cache (714 dirs cached) appear instantly;
-    uncached dirs take 400ms each
-    2. The notify_push loop was causing some dirs to be re-listed in bursts (now
-    fixed)
-    
-    The only way to parallelize is to have the child directories already cached
-    before Nautilus asks for them. That's aggressive_prefetch — when / readdir
-    returns 55 children, immediately start background PROPFINDs for all 55 using
+---------
 
-+ [ ] test write to a file, check in nextcloud
-    + [ ] test time of update: open file, modify externally, expect gedit to detect it when saving
-+ [ ] fix permissions probably wrong (hddstore media says read, modify), hddstore bulk says nothing
-+ [ ] Feature parity with the NC file explorer (share, file options, view who shared, keep remote permissions etc)
++ [ ] add comment with: https://flying-sheep.github.io/freedesktop-icons/
++ [ ] refactor abstract file explorer API implementation - concrete cosumers (nautilus, demo web GUI, etc)
++ [ ] Feature parity with the NC browser file explorer/mobile app (share, file options, view who shared, keep remote permissions etc)
     + add/remove from favorites
     + details
     + rename/move or copy
     + send/share (same as details view)
     + 'sync'
-
-+ [ ] No dumb 'Some files could not be synced' - Filename contains trailing spaces -> saving will immediately cause a filesystem error
-+ [ ] Dash app has feature parity with the Android/iOS app (in driver)
-+ [ ] Performs as good in a heavy enterprise than in a new personal cloud
++ [ ] configuration as cli flags? As yaml? review all.
 + [ ] Enterprise OAuth2 login with authd-shared token for automatic login for multi-user computers and zero touch provisioning to new machines
-+ [ ] refactor abstract file explorer API implementation - concrete cosumers (nautilus, demo web GUI, etc)
+
++ [x] test write to a file, check in nextcloud
+    + [x] uploading icon
+    + [x] keep a local copy of the file if written by us (configurable)
+    + [x] can we make files within FUSE be actual filesystem/inode links, instead of passing through our rust code?
+        + to actual TODO
+    + [x] test locally updating a synced file
+    + [x] test remotely updating a synced file
+
+    + [ ] test both to emulate a race
+    + [ ] test with emulate no network access, showing the local cached copy --emulate-no-network-in 15s
+    + [ ] diffing algorithm? -> ask which copy we want to save/save conflicting copy separately -> choose conflict resolution strategy
+    + [ ] ensure that the 'uploading/downloading' section in the dash app reacts to the rest
+    
+    + [ ] test moving -> ensure it's a move/rename operation and not just a delete/copy
+
++ [ ] pause sync/unmount behaviour
+    + [x] impl
+    + [ ] manual test
+
++ [ ] manually review tests
+
++ [x] Performs as good in a heavy enterprise than in a new personal cloud
++ [ ] CI/CD
+    + [x] choose appimage/flatpak/snap -> does not play well with FUSE mount, unix socket IPC, nautilus... use apt
+    + [ ] Ship a .deb built with cargo-deb (for the Rust daemon
+
 ```
 
 ## Feature Goals:
@@ -293,3 +292,23 @@ Turso Limbo
 ## Future
 + [ ] Clean branding images/icons etc. Ask NC team
 + [ ] Add project to remotefs-rs/remotefs-rs list of used projects
+
+## Cache and Storage Paths
+
+ncrs stores locally-available files under `~/.cache/ncrs/<server-hash>/`:
+
+| Directory | Purpose | Survives restart | User-controlled |
+|-----------|---------|-----------------|-----------------|
+| `kept/`   | Files explicitly pinned via "Keep Locally" | Yes | Yes (KEEP/EVICT) |
+| `cache/`  | Files auto-downloaded during reads | Yes (validated on boot) | No (may be evicted) |
+
+The `<server-hash>` component is derived from the WebDAV URL to allow multiple server configurations.
+
+Additional metadata files in the root:
+- `dir_cache.json` -- cached directory listings (etags + entries)
+- `file_cache.json` -- tracks which files are cached/kept locally (remote path, etag, kept flag)
+- `journal.bin` -- offline mutation journal for pending uploads/deletes/renames
+
+Config options (in `~/.config/ncrs/config.yaml`):
+- `auto_keep_locally_modified_files: true` -- keep a local copy after uploading a file you edited
+- `auto_keep_cached_files: true` -- promote read-cached files to kept automatically

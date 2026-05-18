@@ -172,41 +172,17 @@ impl CloudBackend for NextcloudBackend {
         entry_tx: std::sync::mpsc::Sender<RemoteEntry>,
         self_tx: std::sync::mpsc::Sender<RemoteEntry>,
     ) -> Result<Option<String>, BackendReadError> {
-        let (dav_tx, dav_rx) = std::sync::mpsc::channel();
-        let (dav_self_tx, dav_self_rx) = std::sync::mpsc::channel();
-
-        let http = self.http.clone();
-        let webdav_url = self.webdav_url.clone();
-        let username = self.username.clone();
-        let password = self.password.clone();
-        let path = path.to_path_buf();
-
-        let etag_handle = std::thread::spawn(move || {
-            propfind::propfind_list_streaming(
-                &http,
-                &webdav_url,
-                &username,
-                &password,
-                &path,
-                timeout,
-                dav_tx,
-                dav_self_tx,
-            )
-        });
-
-        if let Ok(dav_entry) = dav_self_rx.recv() {
-            let _ = self_tx.send(RemoteEntry::from(dav_entry));
-        }
-        for dav_entry in dav_rx {
-            if entry_tx.send(RemoteEntry::from(dav_entry)).is_err() {
-                break;
-            }
-        }
-
-        etag_handle
-            .join()
-            .unwrap_or_else(|_| Err("streaming thread panicked".into()))
-            .map_err(str_to_read_error)
+        propfind::propfind_list_streaming(
+            &self.http,
+            &self.webdav_url,
+            &self.username,
+            &self.password,
+            path,
+            timeout,
+            entry_tx,
+            self_tx,
+        )
+        .map_err(str_to_read_error)
     }
 
     fn dir_change_token(
@@ -351,8 +327,10 @@ impl CloudBackend for NextcloudBackend {
 
         let connected = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let connected_ret = connected.clone();
         let shutdown_ret = shutdown.clone();
+        let paused_ret = paused.clone();
 
         std::thread::spawn(move || {
             watcher_loop(
@@ -363,6 +341,7 @@ impl CloudBackend for NextcloudBackend {
                 &password,
                 &connected,
                 &shutdown,
+                &paused,
                 &callback,
             );
         });
@@ -370,6 +349,7 @@ impl CloudBackend for NextcloudBackend {
         Box::new(NcChangeWatcher {
             connected: connected_ret,
             shutdown: shutdown_ret,
+            paused: paused_ret,
         })
     }
 
@@ -436,11 +416,15 @@ impl CloudBackend for NextcloudBackend {
 struct NcChangeWatcher {
     connected: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 impl ChangeWatcherHandle for NcChangeWatcher {
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+    fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
     }
 }
 
@@ -458,6 +442,7 @@ fn watcher_loop(
     password: &str,
     connected: &Arc<AtomicBool>,
     shutdown: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
     callback: &ChangeCallback,
 ) {
     let mut reconnect_delay = Duration::from_secs(1);
@@ -466,6 +451,13 @@ fn watcher_loop(
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
+
+        if paused.load(Ordering::Relaxed) {
+            connected.store(false, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+
         connected.store(false, Ordering::Relaxed);
 
         let ws_url = match crate::notify_push::discover_ws_url(http, base_url, username, password) {
@@ -482,7 +474,7 @@ fn watcher_loop(
         };
 
         match watcher_connect_and_listen(
-            &ws_url, http, webdav_url, username, password, connected, shutdown, callback,
+            &ws_url, http, webdav_url, username, password, connected, shutdown, paused, callback,
         ) {
             Ok(()) => {
                 log::info!("change_watcher: connection closed cleanly");
@@ -510,6 +502,7 @@ fn watcher_connect_and_listen(
     password: &str,
     connected: &Arc<AtomicBool>,
     shutdown: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
     callback: &ChangeCallback,
 ) -> Result<(), String> {
     use tungstenite::{connect, Message};
@@ -580,9 +573,10 @@ fn watcher_connect_and_listen(
             Ok(msg) => msg,
         };
         match msg {
-            Message::Text(ref t) => {
+            Message::Text(ref t) if !paused.load(Ordering::Relaxed) => {
                 watcher_handle_event(t, http, webdav_url, username, password, callback);
             }
+            Message::Text(_) => {}
             Message::Close(_) => {
                 log::info!("change_watcher: server closed connection");
                 connected.store(false, Ordering::Relaxed);

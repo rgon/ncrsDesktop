@@ -156,6 +156,7 @@ struct FileCacheEntry {
     local_path: PathBuf,
     remote_modified: Option<SystemTime>,
     etag: Option<String>,
+    kept: bool,
 }
 
 struct StreamState {
@@ -196,10 +197,13 @@ pub struct MountOptions {
     #[serde(default = "default_true")]
     pub optimistic_listing: bool,
     /// Keep a local cache copy of files after they are written and uploaded.
-    /// When true the post-upload emblem is a green checkmark (Local); when false
+    /// When true the post-upload emblem is a green checkmark (Kept); when false
     /// the staging copy is discarded and no emblem is shown (Synced).
     #[serde(default)]
     pub auto_keep_locally_modified_files: bool,
+    /// Automatically promote cached files (from read operations) to kept.
+    #[serde(default)]
+    pub auto_keep_cached_files: bool,
 }
 
 fn default_true() -> bool { true }
@@ -366,6 +370,8 @@ pub(crate) struct FsCache {
     pending_dirs: HashMap<PathBuf, PendingDir>,
     pub(crate) file_cache: HashMap<PathBuf, FileCacheEntry>,
     cache_dir: PathBuf,
+    kept_dir: PathBuf,
+    auto_cache_dir: PathBuf,
     pub(crate) pending_notify: Arc<(Mutex<()>, Condvar)>,
 }
 
@@ -661,6 +667,8 @@ const FILE_CACHE_FILE: &str = "file_cache.json";
 #[derive(Serialize, Deserialize)]
 struct PersistedFileEntry {
     etag: Option<String>,
+    #[serde(default)]
+    kept: bool,
 }
 
 pub(crate) fn save_file_cache(cache: &Mutex<FsCache>) {
@@ -669,7 +677,7 @@ pub(crate) fn save_file_cache(cache: &Mutex<FsCache>) {
     let map: HashMap<String, PersistedFileEntry> = c.file_cache.iter()
         .filter_map(|(k, v)| {
             v.etag.as_ref()?;
-            Some((k.to_string_lossy().into_owned(), PersistedFileEntry { etag: v.etag.clone() }))
+            Some((k.to_string_lossy().into_owned(), PersistedFileEntry { etag: v.etag.clone(), kept: v.kept }))
         })
         .collect();
     drop(c);
@@ -685,7 +693,12 @@ pub(crate) fn save_file_cache(cache: &Mutex<FsCache>) {
     }
 }
 
-fn load_file_cache(cache: &Mutex<FsCache>) -> HashMap<PathBuf, String> {
+struct LoadedCacheEntry {
+    etag: String,
+    kept: bool,
+}
+
+fn load_file_cache(cache: &Mutex<FsCache>) -> HashMap<PathBuf, LoadedCacheEntry> {
     let path = {
         let c = cache.safe_lock();
         c.cache_dir.join(FILE_CACHE_FILE)
@@ -703,15 +716,33 @@ fn load_file_cache(cache: &Mutex<FsCache>) -> HashMap<PathBuf, String> {
     };
     let c = cache.safe_lock();
     let mut result = HashMap::new();
+    let mut migrated = 0usize;
     for (k, v) in map {
         let remote_path = PathBuf::from(&k);
         if let Some(etag) = v.etag {
             let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
-            let local_path = c.cache_dir.join(rel);
-            if local_path.metadata().map_or(false, |m| m.len() > 0) {
-                result.insert(remote_path, etag);
+            let kept_path = c.kept_dir.join(rel);
+            let cache_path = c.auto_cache_dir.join(rel);
+            let legacy_path = c.cache_dir.join(rel);
+            if kept_path.metadata().map_or(false, |m| m.len() > 0) {
+                result.insert(remote_path, LoadedCacheEntry { etag, kept: true });
+            } else if cache_path.metadata().map_or(false, |m| m.len() > 0) {
+                result.insert(remote_path, LoadedCacheEntry { etag, kept: v.kept });
+            } else if legacy_path.metadata().map_or(false, |m| m.len() > 0) {
+                let target = if v.kept { &c.kept_dir } else { &c.kept_dir };
+                let new_path = target.join(rel);
+                if let Some(parent) = new_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::rename(&legacy_path, &new_path).is_ok() {
+                    migrated += 1;
+                    result.insert(remote_path, LoadedCacheEntry { etag, kept: true });
+                }
             }
         }
+    }
+    if migrated > 0 {
+        log::info!("FILE_CACHE migrated {} legacy files to kept/", migrated);
     }
     log::info!("FILE_CACHE loaded {} entries", result.len());
     result
@@ -893,21 +924,45 @@ pub(crate) fn ensure_file_cached(
     dirty: &ipc::DirtySet,
     remote_path: PathBuf,
     transfers: Option<&TransferMap>,
+    kept: bool,
 ) -> Result<PathBuf, String> {
-    let (maybe_local, cached_mod, current_mod, cache_dir, file_size) = {
+    let (maybe_local, was_kept, cached_mod, current_mod, target_dir, file_size) = {
         let c = cache.safe_lock();
         let entry = c.file_cache.get(&remote_path);
         let maybe_local = entry
             .filter(|e| e.local_path.metadata().map_or(false, |m| m.len() > 0))
             .map(|e| e.local_path.clone());
+        let was_kept = entry.map_or(false, |e| e.kept);
         let cached_mod = entry.and_then(|e| e.remote_modified);
         let current_mod = c.remote_modified_for(&remote_path);
         let file_size = c.find_entry(&remote_path).map(|e| e.size).unwrap_or(0);
-        (maybe_local, cached_mod, current_mod, c.cache_dir.clone(), file_size)
+        let target_dir = if kept { c.kept_dir.clone() } else { c.auto_cache_dir.clone() };
+        (maybe_local, was_kept, cached_mod, current_mod, target_dir, file_size)
     };
 
     if let Some(local) = maybe_local {
         if cached_mod == current_mod {
+            if kept && !was_kept {
+                let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
+                let new_path = target_dir.join(rel);
+                if local != new_path {
+                    if let Some(parent) = new_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::rename(&local, &new_path).is_ok() {
+                        let mut c = cache.safe_lock();
+                        if let Some(entry) = c.file_cache.get_mut(&remote_path) {
+                            entry.local_path = new_path.clone();
+                            entry.kept = true;
+                        }
+                        drop(c);
+                        save_file_cache(cache);
+                        status.safe_lock().insert(remote_path.clone(), FileStatus::Kept);
+                        dirty.safe_lock().insert(remote_path);
+                        return Ok(new_path);
+                    }
+                }
+            }
             return Ok(local);
         }
     }
@@ -925,7 +980,7 @@ pub(crate) fn ensure_file_cached(
     }
 
     let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
-    let local_path = cache_dir.join(rel);
+    let local_path = target_dir.join(rel);
     if let Some(parent) = local_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -947,17 +1002,18 @@ pub(crate) fn ensure_file_cached(
 
     if let Some(tm) = transfers { tm.safe_lock().remove(&remote_path); }
 
+    let final_status = if kept { FileStatus::Kept } else { FileStatus::Cached };
     {
         let mut c = cache.safe_lock();
         let mod_time = c.remote_modified_for(&remote_path);
         let etag = c.remote_etag_for(&remote_path);
         c.file_cache.insert(
             remote_path.clone(),
-            FileCacheEntry { local_path: local_path.clone(), remote_modified: mod_time, etag },
+            FileCacheEntry { local_path: local_path.clone(), remote_modified: mod_time, etag, kept },
         );
     }
     save_file_cache(cache);
-    status.safe_lock().insert(remote_path.clone(), FileStatus::Local);
+    status.safe_lock().insert(remote_path.clone(), final_status);
     dirty.safe_lock().insert(remote_path);
     Ok(local_path)
 }
@@ -975,7 +1031,7 @@ fn keep_locally_recursive(
     let known_dir = cache.safe_lock().is_known_directory(&remote_path);
 
     if known_dir == Some(false) {
-        if let Err(e) = ensure_file_cached(conn, cache, status, dirty, remote_path.clone(), transfers) {
+        if let Err(e) = ensure_file_cached(conn, cache, status, dirty, remote_path.clone(), transfers, true) {
             log::warn!("keep failed {}: {}", remote_path.display(), e);
         }
         return;
@@ -985,7 +1041,7 @@ fn keep_locally_recursive(
         Ok(e) => e,
         Err(e) => {
             if known_dir.is_none() {
-                if let Err(e2) = ensure_file_cached(conn, cache, status, dirty, remote_path.clone(), transfers) {
+                if let Err(e2) = ensure_file_cached(conn, cache, status, dirty, remote_path.clone(), transfers, true) {
                     log::warn!("keep failed {}: {} / {}", remote_path.display(), e, e2);
                 }
             } else {
@@ -1014,7 +1070,7 @@ fn keep_locally_recursive(
         std::thread::scope(|s| {
             for path in chunk {
                 s.spawn(|| {
-                    if let Err(e) = ensure_file_cached(conn, cache, status, dirty, path.clone(), transfers) {
+                    if let Err(e) = ensure_file_cached(conn, cache, status, dirty, path.clone(), transfers, true) {
                         log::warn!("keep failed {}: {}", path.display(), e);
                     }
                 });
@@ -1262,6 +1318,7 @@ pub struct NextCloudFs {
     log_user: String,
     aggressive_prefetch: bool,
     auto_keep_locally_modified_files: bool,
+    auto_keep_cached_files: bool,
 }
 
 impl NextCloudFs {
@@ -1273,8 +1330,14 @@ impl NextCloudFs {
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("ncrs")
             .join(url_to_dir_name(&options.url));
+        let kept_dir = cache_dir.join("kept");
+        let auto_cache_dir = cache_dir.join("cache");
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| format!("Cannot create cache dir: {}", e))?;
+        std::fs::create_dir_all(&kept_dir)
+            .map_err(|e| format!("Cannot create kept dir: {}", e))?;
+        std::fs::create_dir_all(&auto_cache_dir)
+            .map_err(|e| format!("Cannot create auto-cache dir: {}", e))?;
 
         let journal_arc: mutation_journal::SharedJournal =
             Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&cache_dir)));
@@ -1363,6 +1426,8 @@ impl NextCloudFs {
                     pending_dirs: HashMap::new(),
                     file_cache: HashMap::new(),
                     cache_dir,
+                    kept_dir,
+                    auto_cache_dir,
                     pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
                 }));
                 load_dir_cache(&c);
@@ -1384,6 +1449,7 @@ impl NextCloudFs {
             log_user: options.log_user,
             aggressive_prefetch: options.aggressive_prefetch,
             auto_keep_locally_modified_files: options.auto_keep_locally_modified_files,
+            auto_keep_cached_files: options.auto_keep_cached_files,
         })
     }
 
@@ -1819,6 +1885,7 @@ impl Filesystem for NextCloudFs {
         let elog = self.error_log.clone();
         let tmap = self.transfer_map.clone();
         let notifier_slot = self.notifier_slot.clone();
+        let auto_keep_cached = self.auto_keep_cached_files;
 
         thread::spawn(move || {
             let fetch = std::cmp::max(sz, READ_AHEAD);
@@ -1907,7 +1974,7 @@ impl Filesystem for NextCloudFs {
                 }
                 Err(e) => {
                     log::warn!("range read failed, falling back to full download: {}", e);
-                    match ensure_file_cached(&conn, &cache, &status, &dirty, path.clone(), Some(&tmap)) {
+                    match ensure_file_cached(&conn, &cache, &status, &dirty, path.clone(), Some(&tmap), auto_keep_cached) {
                         Ok(local) => {
                             if let Ok(f) = std::fs::File::open(&local) {
                                 let mut buf = vec![0u8; sz];
@@ -2050,14 +2117,14 @@ impl Filesystem for NextCloudFs {
 
                     {
                         // Collect entry paths and allocate inodes (short cache lock)
-                        let cache_dir = {
+                        let (kept_dir, auto_cache_dir) = {
                             let mut c = cache.safe_lock();
                             for entry in entries.iter() {
                                 if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
                                     c.allocate_inode(path.join(name));
                                 }
                             }
-                            c.cache_dir.clone()
+                            (c.kept_dir.clone(), c.auto_cache_dir.clone())
                         };
 
                         let mut shared_paths = Vec::new();
@@ -2095,13 +2162,23 @@ impl Filesystem for NextCloudFs {
                             }));
                             if !entry.is_dir {
                                 let rel = entry_path.strip_prefix("/").unwrap_or(&entry_path);
-                                let local_path = cache_dir.join(rel);
-                                if local_path.exists() {
-                                    status_entries.push((entry_path.clone(), FileStatus::Local));
+                                let kept_path = kept_dir.join(rel);
+                                let cached_path = auto_cache_dir.join(rel);
+                                if kept_path.metadata().map_or(false, |m| m.len() > 0) {
+                                    status_entries.push((entry_path.clone(), FileStatus::Kept));
                                     cache_entries.push((entry_path.clone(), FileCacheEntry {
-                                        local_path,
+                                        local_path: kept_path,
                                         remote_modified: entry.modified,
                                         etag: entry.change_token.clone(),
+                                        kept: true,
+                                    }));
+                                } else if cached_path.metadata().map_or(false, |m| m.len() > 0) {
+                                    status_entries.push((entry_path.clone(), FileStatus::Cached));
+                                    cache_entries.push((entry_path.clone(), FileCacheEntry {
+                                        local_path: cached_path,
+                                        remote_modified: entry.modified,
+                                        etag: entry.change_token.clone(),
+                                        kept: false,
                                     }));
                                 } else {
                                     status_entries.push((entry_path.clone(), FileStatus::Remote));
@@ -2484,20 +2561,20 @@ impl Filesystem for NextCloudFs {
                             of.original_etag = result.new_change_token.clone();
                         }
                         if auto_keep {
-                            // Keep a local copy so the file is available offline.
                             let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
-                            let cache_path = cache.safe_lock().cache_dir.join(rel);
+                            let keep_path = cache.safe_lock().kept_dir.join(rel);
                             let mut kept = false;
-                            if let Some(parent) = cache_path.parent() {
+                            if let Some(parent) = keep_path.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
-                            if std::fs::write(&cache_path, &body).is_ok() {
+                            if std::fs::write(&keep_path, &body).is_ok() {
                                 cache.safe_lock().file_cache.insert(remote_path.clone(), FileCacheEntry {
-                                    local_path: cache_path,
+                                    local_path: keep_path,
                                     remote_modified: Some(SystemTime::now()),
                                     etag: result.new_change_token,
+                                    kept: true,
                                 });
-                                smap.safe_lock().insert(remote_path.clone(), FileStatus::Local);
+                                smap.safe_lock().insert(remote_path.clone(), FileStatus::Kept);
                                 kept = true;
                             }
                             if !kept {
@@ -3261,12 +3338,18 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                 );
             }));
 
-            // Sync watcher connection status to the notify_push_connected flag
+            // Sync watcher connection status and pause state
             let np_connected = filesystem.notify_push_connected_flag();
+            let sync_offline = offline_flag.clone();
+            let sync_paused = filesystem.paused_flag();
             let watcher_shutdown = filesystem.shutdown_flag();
             thread::spawn(move || {
                 while !watcher_shutdown.load(Ordering::Relaxed) {
                     np_connected.store(watcher.is_connected(), Ordering::Relaxed);
+                    watcher.set_paused(
+                        sync_offline.load(Ordering::Relaxed)
+                            || sync_paused.load(Ordering::Relaxed),
+                    );
                     thread::sleep(Duration::from_secs(2));
                 }
                 drop(watcher);
@@ -3303,17 +3386,17 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             thread::spawn(move || {
                 log::info!("FILE_CACHE boot validation: checking {} files", saved_etags.len());
                 let mut stale = 0usize;
-                for (remote_path, old_etag) in &saved_etags {
+                for (remote_path, entry) in &saved_etags {
                     if file_shutdown.load(Ordering::Relaxed) {
                         log::info!("FILE_CACHE boot validation: shutdown, aborting");
                         break;
                     }
                     match boot_backend.dir_change_token(remote_path, PROPFIND_TIMEOUT) {
-                        Ok(Some(ref new_etag)) if new_etag == old_etag => {}
+                        Ok(Some(ref new_etag)) if new_etag == &entry.etag => {}
                         Ok(new_etag) => {
-                            log::info!("FILE_CACHE stale: {} (etag {:?} → {:?})", remote_path.display(), old_etag, new_etag);
+                            log::info!("FILE_CACHE stale: {} (etag {:?} → {:?})", remote_path.display(), entry.etag, new_etag);
                             cache.safe_lock().file_cache.remove(remote_path);
-                            match ensure_file_cached(&boot_conn, &cache, &status, &dirty, remote_path.clone(), Some(&boot_transfers)) {
+                            match ensure_file_cached(&boot_conn, &cache, &status, &dirty, remote_path.clone(), Some(&boot_transfers), entry.kept) {
                                 Ok(_) => log::info!("FILE_CACHE re-downloaded {}", remote_path.display()),
                                 Err(e) => log::warn!("FILE_CACHE re-download {} failed: {}", remote_path.display(), e),
                             }
@@ -3453,8 +3536,9 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let max_concurrent_requests = doc["max_concurrent_requests"].as_i64().unwrap_or(10) as usize;
     let optimistic_listing = doc["optimistic_listing"].as_bool().unwrap_or(true);
     let auto_keep_locally_modified_files = doc["auto_keep_locally_modified_files"].as_bool().unwrap_or(false);
+    let auto_keep_cached_files = doc["auto_keep_cached_files"].as_bool().unwrap_or(false);
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files })
 }
 
 #[cfg(test)]
@@ -3475,6 +3559,8 @@ mod tests {
             pending_dirs: HashMap::new(),
             file_cache: HashMap::new(),
             cache_dir: PathBuf::from("/tmp/ncrs-test-cache"),
+            kept_dir: PathBuf::from("/tmp/ncrs-test-cache/kept"),
+            auto_cache_dir: PathBuf::from("/tmp/ncrs-test-cache/cache"),
             pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
         }
     }
@@ -4326,6 +4412,7 @@ mod tests {
             local_path: PathBuf::from("/tmp/ncrs-cache/original.txt"),
             remote_modified: None,
             etag: Some("etag1".into()),
+            kept: true,
         });
 
         // Simulate rename file_cache move
