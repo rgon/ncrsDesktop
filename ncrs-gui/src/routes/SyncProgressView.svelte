@@ -10,10 +10,18 @@
         total_bytes: number;
     }
 
+    interface StorageStats {
+        kept_bytes: number;
+        cached_bytes: number;
+        remote_used: number;
+        remote_total: number;
+    }
+
     interface Props extends HTMLAttributes<HTMLElement> {
         class?: string;
         syncState?: string;
         transfers?: TransferProgress[];
+        storage?: StorageStats;
         onremount?: () => void;
     }
 
@@ -21,6 +29,7 @@
         class: mClass = "",
         syncState = "idle",
         transfers = [],
+        storage = { kept_bytes: 0, cached_bytes: 0, remote_used: 0, remote_total: 0 },
         onremount,
         ...restProps
     }: Props = $props();
@@ -43,6 +52,8 @@
             default:           return syncState.startsWith("error") ? "Sync error" : syncState;
         }
     });
+
+    const hasStorage = $derived(storage.kept_bytes > 0 || storage.cached_bytes > 0 || storage.remote_used > 0);
 
     function formatSize(bytes: number): string {
         if (bytes < 1024) return `${bytes} B`;
@@ -86,6 +97,45 @@
                 <progress class="progress progress-primary w-16 flex-shrink-0" value={pct} max="100"></progress>
             </div>
         {/each}
+    </div>
+    {/if}
+
+    {#if hasStorage}
+    <div class="px-3 pb-2">
+        <div class="flex items-center gap-3 text-xs text-gray-500">
+            {#if storage.kept_bytes > 0}
+                <span title="Files explicitly kept locally">
+                    <span class="inline-block w-2 h-2 rounded-full bg-success mr-1"></span>Kept: {formatSize(storage.kept_bytes)}
+                </span>
+            {/if}
+            {#if storage.cached_bytes > 0}
+                <span title="Auto-cached files (read cache)">
+                    <span class="inline-block w-2 h-2 rounded-full bg-info mr-1"></span>Cache: {formatSize(storage.cached_bytes)}
+                </span>
+            {/if}
+            {#if storage.remote_total > 0}
+                <span class="ml-auto" title="Server storage: {formatSize(storage.remote_used)} of {formatSize(storage.remote_total)}">
+                    Server: {formatSize(storage.remote_used)} / {formatSize(storage.remote_total)}
+                </span>
+            {:else if storage.remote_used > 0}
+                <span class="ml-auto">Server: {formatSize(storage.remote_used)}</span>
+            {/if}
+        </div>
+        {#if storage.remote_total > 0}
+            {@const localTotal = storage.kept_bytes + storage.cached_bytes}
+            {@const serverPct = Math.min(100, Math.round((storage.remote_used / storage.remote_total) * 100))}
+            {@const keptPct = storage.remote_total > 0 ? Math.min(100, Math.round((storage.kept_bytes / storage.remote_total) * 100)) : 0}
+            {@const cachedPct = storage.remote_total > 0 ? Math.min(100, Math.round((storage.cached_bytes / storage.remote_total) * 100)) : 0}
+            <div class="w-full bg-base-200 rounded-full h-1.5 mt-1 overflow-hidden flex">
+                {#if keptPct > 0}
+                    <div class="bg-success h-full" style="width: {keptPct}%"></div>
+                {/if}
+                {#if cachedPct > 0}
+                    <div class="bg-info h-full" style="width: {cachedPct}%"></div>
+                {/if}
+                <div class="bg-primary/30 h-full" style="width: {Math.max(0, serverPct - keptPct - cachedPct)}%"></div>
+            </div>
+        {/if}
     </div>
     {/if}
 </div>

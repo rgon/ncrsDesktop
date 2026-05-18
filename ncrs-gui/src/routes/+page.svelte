@@ -71,6 +71,13 @@
         resolved: boolean;
     }
 
+    interface StorageStats {
+        kept_bytes: number;
+        cached_bytes: number;
+        remote_used: number;
+        remote_total: number;
+    }
+
     // ── State ─────────────────────────────────────────────────────────────────
 
     type View = "notifications" | "search" | "errors" | "conflicts";
@@ -81,6 +88,7 @@
     let errors = $state<SyncError[]>([]);
     let transfers = $state<TransferProgress[]>([]);
     let conflicts = $state<ConflictRecord[]>([]);
+    let storage = $state<StorageStats>({ kept_bytes: 0, cached_bytes: 0, remote_used: 0, remote_total: 0 });
     let pendingMutations = $state(0);
     let avatarError = $state(false);
     let activeView = $state<View>("notifications");
@@ -126,6 +134,7 @@
         errors = await invoke<SyncError[]>("get_errors");
         transfers = await invoke<TransferProgress[]>("get_transfers");
         conflicts = await invoke<ConflictRecord[]>("get_conflicts");
+        invoke<StorageStats>("get_storage_stats").then(s => { storage = s; }).catch(() => {});
     }
 
     async function clearErrors() {
@@ -171,6 +180,10 @@
             conflicts = e.payload;
         });
 
+        const storageInterval = setInterval(() => {
+            invoke<StorageStats>("get_storage_stats").then(s => { storage = s; }).catch(() => {});
+        }, 30_000);
+
         const clickOutListener = (event: MouseEvent) => {
             const container = document.querySelector(".window");
             if (container && !container.contains(event.target as Node)) close();
@@ -189,6 +202,7 @@
             unlistenTransfers.then(f => f());
             unlistenJournal.then(f => f());
             unlistenConflicts.then(f => f());
+            clearInterval(storageInterval);
             document.removeEventListener("click", clickOutListener);
             document.removeEventListener("keydown", escKeyListener);
         };
@@ -303,7 +317,7 @@
         </div>
 
         <!-- Sync status bar -->
-        <SyncProgressView {syncState} {transfers} onremount={handleRemount} />
+        <SyncProgressView {syncState} {transfers} {storage} onremount={handleRemount} />
 
         <!-- Content area: search, errors, or notifications -->
         {#if activeView === "search"}

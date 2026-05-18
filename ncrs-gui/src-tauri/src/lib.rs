@@ -13,7 +13,7 @@ use tauri::async_runtime::spawn;
 use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration};
 
-use ncrs_core::{mount_ncfs, mutation_journal::{self, SharedJournal, JournalEntry, ConflictRecord}, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, ErrorLog, MountOptions, SyncError, SyncState, TransferMap, TransferProgress};
+use ncrs_core::{mount_ncfs, mutation_journal::{self, SharedJournal, JournalEntry, ConflictRecord}, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, ipc::StorageStats, ErrorLog, MountOptions, SyncError, SyncState, TransferMap, TransferProgress};
 
 // ── Shared app state ─────────────────────────────────────────────────────────
 
@@ -180,6 +180,25 @@ fn get_conflicts(state: State<Arc<AppState>>) -> Vec<ConflictRecord> {
 #[tauri::command]
 fn resolve_conflict(state: State<Arc<AppState>>, id: u64) {
     state.journal.lock().unwrap().resolve_conflict(id);
+}
+
+#[tauri::command]
+async fn get_storage_stats() -> Result<StorageStats, String> {
+    tokio::task::spawn_blocking(|| {
+        let sock = ncrs_core::ipc::socket_path();
+        let stream = std::os::unix::net::UnixStream::connect(&sock)
+            .map_err(|e| format!("ipc connect: {}", e))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+        use std::io::{BufRead, Write};
+        let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+        writeln!(writer, "STORAGE").map_err(|e| e.to_string())?;
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        serde_json::from_str(line.trim()).map_err(|e| format!("parse: {}", e))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -364,6 +383,7 @@ pub fn run() {
             resolve_conflict,
             fetch_search_providers,
             search_nextcloud,
+            get_storage_stats,
             remount,
         ])
         .setup(move |app| {

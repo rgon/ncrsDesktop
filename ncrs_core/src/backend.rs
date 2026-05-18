@@ -203,6 +203,10 @@ pub trait CloudBackend: Send + Sync + 'static {
     fn has_preview(&self, _entry: &RemoteEntry) -> bool {
         false
     }
+
+    fn quota(&self, _timeout: Duration) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 // -- Optional extension traits ------------------------------------------------

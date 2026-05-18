@@ -157,6 +157,7 @@ struct FileCacheEntry {
     remote_modified: Option<SystemTime>,
     etag: Option<String>,
     kept: bool,
+    size: u64,
 }
 
 struct StreamState {
@@ -396,6 +397,15 @@ pub(crate) struct FsCache {
 }
 
 impl FsCache {
+    fn storage_totals(&self) -> (u64, u64) {
+        let mut kept = 0u64;
+        let mut cached = 0u64;
+        for e in self.file_cache.values() {
+            if e.kept { kept += e.size; } else { cached += e.size; }
+        }
+        (kept, cached)
+    }
+
     fn get_path(&self, inode: u64) -> Option<PathBuf> {
         self.inodes.get(&inode).cloned()
     }
@@ -689,6 +699,8 @@ struct PersistedFileEntry {
     etag: Option<String>,
     #[serde(default)]
     kept: bool,
+    #[serde(default)]
+    size: u64,
 }
 
 pub(crate) fn save_file_cache(cache: &Mutex<FsCache>) {
@@ -697,7 +709,7 @@ pub(crate) fn save_file_cache(cache: &Mutex<FsCache>) {
     let map: HashMap<String, PersistedFileEntry> = c.file_cache.iter()
         .filter_map(|(k, v)| {
             v.etag.as_ref()?;
-            Some((k.to_string_lossy().into_owned(), PersistedFileEntry { etag: v.etag.clone(), kept: v.kept }))
+            Some((k.to_string_lossy().into_owned(), PersistedFileEntry { etag: v.etag.clone(), kept: v.kept, size: v.size }))
         })
         .collect();
     drop(c);
@@ -716,6 +728,7 @@ pub(crate) fn save_file_cache(cache: &Mutex<FsCache>) {
 struct LoadedCacheEntry {
     etag: String,
     kept: bool,
+    size: u64,
 }
 
 fn load_file_cache(cache: &Mutex<FsCache>) -> HashMap<PathBuf, LoadedCacheEntry> {
@@ -744,11 +757,17 @@ fn load_file_cache(cache: &Mutex<FsCache>) -> HashMap<PathBuf, LoadedCacheEntry>
             let kept_path = c.kept_dir.join(rel);
             let cache_path = c.auto_cache_dir.join(rel);
             let legacy_path = c.cache_dir.join(rel);
-            if kept_path.metadata().map_or(false, |m| m.len() > 0) {
-                result.insert(remote_path, LoadedCacheEntry { etag, kept: true });
-            } else if cache_path.metadata().map_or(false, |m| m.len() > 0) {
-                result.insert(remote_path, LoadedCacheEntry { etag, kept: v.kept });
-            } else if legacy_path.metadata().map_or(false, |m| m.len() > 0) {
+            if let Ok(m) = kept_path.metadata() { if m.len() > 0 {
+                let sz = if v.size > 0 { v.size } else { m.len() };
+                result.insert(remote_path, LoadedCacheEntry { etag, kept: true, size: sz });
+                continue;
+            }}
+            if let Ok(m) = cache_path.metadata() { if m.len() > 0 {
+                let sz = if v.size > 0 { v.size } else { m.len() };
+                result.insert(remote_path, LoadedCacheEntry { etag, kept: v.kept, size: sz });
+                continue;
+            }}
+            if let Ok(lm) = legacy_path.metadata() { if lm.len() > 0 {
                 let target = if v.kept { &c.kept_dir } else { &c.kept_dir };
                 let new_path = target.join(rel);
                 if let Some(parent) = new_path.parent() {
@@ -756,9 +775,10 @@ fn load_file_cache(cache: &Mutex<FsCache>) -> HashMap<PathBuf, LoadedCacheEntry>
                 }
                 if std::fs::rename(&legacy_path, &new_path).is_ok() {
                     migrated += 1;
-                    result.insert(remote_path, LoadedCacheEntry { etag, kept: true });
+                    let sz = if v.size > 0 { v.size } else { lm.len() };
+                    result.insert(remote_path, LoadedCacheEntry { etag, kept: true, size: sz });
                 }
-            }
+            }}
         }
     }
     if migrated > 0 {
@@ -1126,7 +1146,7 @@ pub(crate) fn ensure_file_cached(
         let etag = c.remote_etag_for(&remote_path);
         c.file_cache.insert(
             remote_path.clone(),
-            FileCacheEntry { local_path: local_path.clone(), remote_modified: mod_time, etag, kept },
+            FileCacheEntry { local_path: local_path.clone(), remote_modified: mod_time, etag, kept, size: std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0) },
         );
     }
     save_file_cache(cache);
@@ -2137,6 +2157,7 @@ impl Filesystem for NextCloudFs {
                                         remote_modified: mod_time,
                                         etag,
                                         kept,
+                                        size: file_total_size,
                                     });
                                     drop(c);
                                     save_file_cache(&cache);
@@ -2349,21 +2370,25 @@ impl Filesystem for NextCloudFs {
                                 let rel = entry_path.strip_prefix("/").unwrap_or(&entry_path);
                                 let kept_path = kept_dir.join(rel);
                                 let cached_path = auto_cache_dir.join(rel);
-                                if kept_path.metadata().map_or(false, |m| m.len() > 0) {
+                                let kept_meta = kept_path.metadata().ok().filter(|m| m.len() > 0);
+                                let cached_meta = cached_path.metadata().ok().filter(|m| m.len() > 0);
+                                if let Some(km) = kept_meta {
                                     status_entries.push((entry_path.clone(), FileStatus::Kept));
                                     cache_entries.push((entry_path.clone(), FileCacheEntry {
                                         local_path: kept_path,
                                         remote_modified: entry.modified,
                                         etag: entry.change_token.clone(),
                                         kept: true,
+                                        size: km.len(),
                                     }));
-                                } else if cached_path.metadata().map_or(false, |m| m.len() > 0) {
+                                } else if let Some(cm) = cached_meta {
                                     status_entries.push((entry_path.clone(), FileStatus::Cached));
                                     cache_entries.push((entry_path.clone(), FileCacheEntry {
                                         local_path: cached_path,
                                         remote_modified: entry.modified,
                                         etag: entry.change_token.clone(),
                                         kept: false,
+                                        size: cm.len(),
                                     }));
                                 } else {
                                     status_entries.push((entry_path.clone(), FileStatus::Remote));
@@ -2758,6 +2783,7 @@ impl Filesystem for NextCloudFs {
                                     remote_modified: Some(SystemTime::now()),
                                     etag: result.new_change_token,
                                     kept: true,
+                                    size: body.len() as u64,
                                 });
                                 smap.safe_lock().insert(remote_path.clone(), FileStatus::Kept);
                                 kept = true;
@@ -3418,7 +3444,8 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let username = options.username.clone().unwrap_or_default();
     let ipc_password = options.password.clone().unwrap_or_default();
     let file_change_queue: ipc::FileChangeQueue = Arc::new(Mutex::new(Vec::new()));
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, ipc_password, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone());
+    let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, ipc_password, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone());
 
     let offline_flag = filesystem.is_offline_flag();
     let backend = filesystem.conn.backend.clone();
@@ -3595,6 +3622,36 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                 log::info!("FILE_CACHE boot validation done: {}/{} stale", stale, saved_etags.len());
             });
         }
+    }
+
+    // Storage stats update thread
+    {
+        let stats_cache = filesystem.cache_ref();
+        let stats_backend = backend.clone();
+        let stats_shutdown = filesystem.shutdown_flag();
+        let stats_store = storage_stats;
+        thread::spawn(move || {
+            loop {
+                let (kept, cached) = stats_cache.safe_lock().storage_totals();
+                let (remote_used, remote_total) = stats_backend
+                    .quota(Duration::from_secs(10))
+                    .unwrap_or((0, 0));
+                {
+                    let mut s = stats_store.safe_lock();
+                    s.kept_bytes = kept;
+                    s.cached_bytes = cached;
+                    s.remote_used = remote_used;
+                    s.remote_total = remote_total;
+                }
+                let mut slept = Duration::ZERO;
+                let interval = Duration::from_secs(60);
+                while slept < interval {
+                    if stats_shutdown.load(Ordering::Relaxed) { return; }
+                    thread::sleep(Duration::from_secs(5));
+                    slept += Duration::from_secs(5);
+                }
+            }
+        });
     }
 
     // Cache cleanup thread
@@ -4629,6 +4686,7 @@ mod tests {
             remote_modified: None,
             etag: Some("etag1".into()),
             kept: true,
+            size: 1024,
         });
 
         // Simulate rename file_cache move

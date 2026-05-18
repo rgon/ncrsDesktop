@@ -409,6 +409,12 @@ impl CloudBackend for NextcloudBackend {
             .copied()
             .unwrap_or(false)
     }
+
+    fn quota(&self, timeout: Duration) -> Option<(u64, u64)> {
+        propfind::propfind_quota(&self.http, &self.webdav_url, &self.username, &self.password, timeout)
+            .map_err(|e| log::debug!("quota fetch: {}", e))
+            .ok()
+    }
 }
 
 // -- Change watcher -----------------------------------------------------------

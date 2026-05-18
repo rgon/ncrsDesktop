@@ -576,6 +576,75 @@ impl<R: std::io::BufRead> ResponseReader<R> {
     }
 }
 
+const PROPFIND_QUOTA_BODY: &str = r#"<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:quota-used-bytes />
+    <d:quota-available-bytes />
+  </d:prop>
+</d:propfind>"#;
+
+pub fn propfind_quota(
+    client: &reqwest::blocking::Client,
+    webdav_url: &str,
+    username: &str,
+    password: &str,
+    timeout: Duration,
+) -> Result<(u64, u64), String> {
+    let resp = client
+        .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), webdav_url)
+        .basic_auth(username, Some(password))
+        .header("Depth", "0")
+        .header("Content-Type", "application/xml")
+        .body(PROPFIND_QUOTA_BODY)
+        .timeout(timeout)
+        .send()
+        .map_err(|e| format!("PROPFIND quota: {}", e))?;
+
+    if !resp.status().is_success() && resp.status().as_u16() != 207 {
+        return Err(format!("PROPFIND quota: HTTP {}", resp.status()));
+    }
+
+    let body = resp.text().map_err(|e| format!("PROPFIND quota body: {}", e))?;
+    let mut used: Option<u64> = None;
+    let mut available: Option<u64> = None;
+
+    let mut reader = quick_xml::Reader::from_str(&body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut current_tag = String::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(ref e)) => {
+                current_tag = tag_local_name(e.name().as_ref()).to_string();
+            }
+            Ok(quick_xml::events::Event::Text(ref e)) => {
+                if let Ok(text) = e.unescape() {
+                    match current_tag.as_str() {
+                        "quota-used-bytes" => used = text.trim().parse().ok(),
+                        "quota-available-bytes" => {
+                            let v: i64 = text.trim().parse().unwrap_or(-1);
+                            if v >= 0 { available = Some(v as u64); }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    match (used, available) {
+        (Some(u), Some(a)) => Ok((u, u + a)),
+        (Some(u), None) => Ok((u, 0)),
+        _ => Err("PROPFIND quota: missing quota-used-bytes".into()),
+    }
+}
+
 fn tag_local_name(full: &[u8]) -> &str {
     let s = std::str::from_utf8(full).unwrap_or("");
     s.rsplit_once(':').map(|(_, local)| local).unwrap_or(s)
