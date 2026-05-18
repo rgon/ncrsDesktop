@@ -3063,32 +3063,43 @@ fn boot_validate_root(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>) {
     }
     match list_dir_propfind(conn, root.clone()) {
         Ok((etag, self_entry, fresh_files)) => {
-            let mut c = cache.safe_lock();
+            let mut invalidated_paths: Vec<PathBuf> = Vec::new();
             let mut matched = 0usize;
-            let mut stale = 0usize;
-            for entry in &fresh_files {
-                if !entry.is_dir {
-                    continue;
-                }
-                let child_path = entry.path.clone();
-                let fresh_etag = entry.etag.as_deref();
-                let cached_etag = c.dir_cache.get(&child_path).and_then(|e| e.etag.as_deref());
-                match (fresh_etag, cached_etag) {
-                    (Some(f), Some(c_etag)) if f == c_etag => {
-                        matched += 1;
+            {
+                let mut c = cache.safe_lock();
+                for entry in &fresh_files {
+                    if !entry.is_dir {
+                        continue;
                     }
-                    _ => {
-                        if let Some(dir_entry) = c.dir_cache.get_mut(&child_path) {
-                            dir_entry.invalidated = true;
-                            stale += 1;
+                    let child_path = entry.path.clone();
+                    let fresh_etag = entry.etag.as_deref();
+                    let cached_etag = c.dir_cache.get(&child_path).and_then(|e| e.etag.as_deref());
+                    match (fresh_etag, cached_etag) {
+                        (Some(f), Some(c_etag)) if f == c_etag => {
+                            matched += 1;
+                        }
+                        _ => {
+                            if c.dir_cache.contains_key(&child_path) {
+                                invalidated_paths.push(child_path);
+                            }
                         }
                     }
                 }
+                // Remove stale entries so start_background_propfind won't
+                // skip them (it early-returns when the path is in dir_cache).
+                for p in &invalidated_paths {
+                    c.dir_cache.remove(p);
+                }
+                c.put_dir_cache(root, etag, self_entry, fresh_files);
             }
-            c.put_dir_cache(root, etag, self_entry, fresh_files);
-            drop(c);
-            log::info!("BOOT_VALIDATE /: {} dirs unchanged, {} invalidated", matched, stale);
+            log::info!("BOOT_VALIDATE /: {} dirs unchanged, {} invalidated", matched, invalidated_paths.len());
             schedule_save_dir_cache(cache);
+            for p in &invalidated_paths {
+                start_background_propfind(conn, cache, p.clone(), 0);
+            }
+            if !invalidated_paths.is_empty() {
+                log::info!("BOOT_VALIDATE: kicked off {} background re-fetches", invalidated_paths.len());
+            }
         }
         Err(e) => {
             log::warn!("BOOT_VALIDATE / failed: {} — cache served as-is", e);
