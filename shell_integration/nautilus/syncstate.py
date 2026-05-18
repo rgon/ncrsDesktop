@@ -33,18 +33,20 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import gi
+
 gi.require_version("Nautilus", "4.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, GObject, Gtk, Nautilus  # noqa: E402
 
 # ── Emblem names (standard XDG / FreeDesktop icon names) ─────────────────────
-_EMBLEM_KEPT      = "emblem-default"        # green tick — user-pinned file
-_EMBLEM_CACHED    = "emblem-generic"        # auto-downloaded file (read cache)
-_EMBLEM_REMOTE    = "emblem-downloads"     # cloud / down-arrow
-_EMBLEM_SYNCED    = "emblem-default"        # green tick — reserved for future use (synced status emits no emblem)
-_EMBLEM_SHARED    = "emblem-shared"        # people / shared
-_EMBLEM_PARTIAL   = "emblem-downloads"     # partial download (some files local)
-_EMBLEM_UPLOADING = "emblem-synchronizing" # circular arrows — upload in progress
+# See: https://flying-sheep.github.io/freedesktop-icons/
+_EMBLEM_KEPT = "emblem-default"  # green tick — user-pinned file
+_EMBLEM_CACHED = "emblem-generic"  # auto-downloaded file (read cache)
+_EMBLEM_REMOTE = "emblem-downloads"  # cloud / down-arrow
+_EMBLEM_SYNCED = "emblem-default"  # green tick — reserved for future use (synced status emits no emblem)
+_EMBLEM_SHARED = "emblem-shared"  # people / shared
+_EMBLEM_PARTIAL = "emblem-downloads"  # partial download (some files local)
+_EMBLEM_UPLOADING = "emblem-synchronizing"  # circular arrows — upload in progress
 
 SOCKET_TIMEOUT = 2.0  # seconds
 
@@ -81,7 +83,9 @@ def _sock_path() -> str:
 
 def _load_mount_point(config_path: str | None = None) -> str | None:
     if config_path is None:
-        config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser(
+            "~/.config"
+        )
         config_path = os.path.join(config_home, "ncrs", "config.yaml")
     try:
         with open(config_path) as f:
@@ -97,7 +101,7 @@ def _load_mount_point(config_path: str | None = None) -> str | None:
 
 
 class _PersistentConn:
-    __slots__ = ('_sock', '_rfile')
+    __slots__ = ("_sock", "_rfile")
 
     def __init__(self):
         self._sock = None
@@ -114,7 +118,7 @@ class _PersistentConn:
             s.close()
             raise
         self._sock = s
-        self._rfile = s.makefile('rb')
+        self._rfile = s.makefile("rb")
 
     def send(self, cmd: str) -> str:
         for attempt in range(2):
@@ -167,7 +171,7 @@ def query_status(path: str, sock_path: str | None = None) -> str:
 
 
 def _send_command(cmd: str) -> str:
-    conn = getattr(_local, 'conn', None)
+    conn = getattr(_local, "conn", None)
     if conn is None:
         conn = _PersistentConn()
         _local.conn = conn
@@ -207,7 +211,6 @@ def _invalidate_path(path: str) -> bool:
     return GLib.SOURCE_REMOVE
 
 
-
 def _poll_keep_done(path: str) -> None:
     try:
         for _ in range(240):
@@ -221,6 +224,7 @@ def _poll_keep_done(path: str) -> None:
 
 
 # ── Column provider ──────────────────────────────────────────────────────────
+
 
 class NcrsColumnProvider(GObject.GObject, Nautilus.ColumnProvider):
     def get_columns(self):
@@ -346,7 +350,9 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 return
 
             path = file_info.get_location().get_path()
-            if path is None or not (path == self._mount or path.startswith(self._mount + "/")):
+            if path is None or not (
+                path == self._mount or path.startswith(self._mount + "/")
+            ):
                 return
 
             detail = _send_command(f"DETAIL {path}")
@@ -380,7 +386,9 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             file_info.add_string_attribute("ncrs_owner", owner)
             try:
                 size_val = int(size_str)
-                file_info.add_string_attribute("ncrs_size", _human_size(size_val) if size_val > 0 else "")
+                file_info.add_string_attribute(
+                    "ncrs_size", _human_size(size_val) if size_val > 0 else ""
+                )
             except ValueError:
                 file_info.add_string_attribute("ncrs_size", "")
         except Exception:
@@ -388,6 +396,7 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
 
 
 # ── Menu provider ─────────────────────────────────────────────────────────────
+
 
 class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
     def __init__(self):
@@ -457,9 +466,14 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
                 for path in paths:
                     url = _send_command(f"WEBURL {path}")
                     if url.startswith("http"):
-                        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.Popen(
+                            ["xdg-open", url],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
             except Exception:
                 _log_error("_on_view_in_web")
+
         _POOL.submit(_do)
 
     def _on_keep_locally(self, _menu_item, paths):
@@ -473,6 +487,7 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
                     _POOL.submit(_poll_keep_done, path)
             except Exception:
                 _log_error("_on_keep_locally")
+
         _POOL.submit(_do)
 
     def _on_evict_locally(self, _menu_item, paths):
@@ -484,6 +499,7 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
                     GLib.idle_add(_invalidate_path, path)
             except Exception:
                 _log_error("_on_evict_locally")
+
         _POOL.submit(_do)
 
     def get_background_items(self, *args):
@@ -515,7 +531,9 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
 
 class _SearchDialog(Gtk.Window):
     def __init__(self):
-        super().__init__(title="Search Nextcloud", default_width=600, default_height=450)
+        super().__init__(
+            title="Search Nextcloud", default_width=600, default_height=450
+        )
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         box.set_margin_top(12)
@@ -589,7 +607,9 @@ class _SearchDialog(Gtk.Window):
             return GLib.SOURCE_REMOVE
         for group in groups:
             header = Gtk.Label()
-            header.set_markup(f"<b>{GLib.markup_escape_text(group.get('provider_name', ''))}</b>")
+            header.set_markup(
+                f"<b>{GLib.markup_escape_text(group.get('provider_name', ''))}</b>"
+            )
             header.set_halign(Gtk.Align.START)
             self._results_box.append(header)
             for entry in group.get("entries", []):
