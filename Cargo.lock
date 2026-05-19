@@ -2553,6 +2553,7 @@ dependencies = [
  "reqwest 0.12.20",
  "serde",
  "serde_json",
+ "tempfile",
  "tungstenite",
  "url",
  "yaml-rust2",
