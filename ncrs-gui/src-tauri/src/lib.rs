@@ -59,6 +59,7 @@ fn get_sync_state(state: State<Arc<AppState>>) -> String {
         SyncState::Syncing => "syncing".into(),
         SyncState::Paused => "paused".into(),
         SyncState::Unmounted => "unmounted".into(),
+        SyncState::Wiped => "wiped".into(),
         SyncState::Error(ref e) => format!("error: {}", e),
     }
 }
@@ -311,12 +312,15 @@ fn rerender_tray_menu(
     if *sync_state == SyncState::Unmounted {
         let remount_i = MenuItem::with_id(app, "remount", "Remount", true, None::<&str>)?;
         builder = builder.item(&remount_i);
+    } else if *sync_state == SyncState::Wiped {
+        let wiped_i = MenuItem::with_id(app, "wiped", "Device wiped — reconfigure to reconnect", false, None::<&str>)?;
+        builder = builder.item(&wiped_i);
     } else {
         let pause_text = match sync_state {
             SyncState::Idle => "Pause Sync",
             SyncState::Paused => "Resume Sync",
             SyncState::Syncing => "Pause Sync",
-            SyncState::Unmounted => unreachable!(),
+            SyncState::Unmounted | SyncState::Wiped => unreachable!(),
             SyncState::Error(_) => "Sync Error",
         };
         let pause_i = MenuItem::with_id(app, "pause", pause_text, true, None::<&str>)?;
@@ -409,12 +413,17 @@ pub fn run() {
             let tray_id_listener = tray_icon_id.clone();
             let app_handle_listener = app.handle().clone();
             app.listen("sync-state-changed", move |event| {
-                if event.payload().trim_matches('"') == "unmounted" {
+                let payload = event.payload().trim_matches('"');
+                if payload == "unmounted" || payload == "wiped" {
                     let tray_id = tray_id_listener.lock().unwrap().clone();
                     let Some(tray_id) = tray_id else { return };
                     let ss = state_listener.sync_state.lock().unwrap().clone();
                     if let Some(tray) = app_handle_listener.tray_by_id(&tray_id) {
-                        let icon_path = concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png");
+                        let icon_path = if payload == "wiped" {
+                            concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.error.png")
+                        } else {
+                            concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png")
+                        };
                         let _ = tray.set_icon(Some(load_icon(icon_path)));
                         if let Ok(menu) = rerender_tray_menu(&app_handle_listener, &ss) {
                             let _ = tray.set_menu(Some(menu));
@@ -459,7 +468,7 @@ pub fn run() {
                     SyncState::Idle => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png"),
                     SyncState::Paused => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"),
                     SyncState::Syncing => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.syncing.png"),
-                    SyncState::Unmounted => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"),
+                    SyncState::Unmounted | SyncState::Wiped => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"),
                     SyncState::Error(_) => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.error.png"),
                 };
 
@@ -542,11 +551,29 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     thread::spawn(move || {
         let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal), Some(fuse_paused));
         match &result {
-            Ok(()) => log::info!("FUSE unmounted cleanly"),
-            Err(e) => log::error!("FUSE error: {}", e),
+            Ok(()) => {
+                log::info!("FUSE unmounted cleanly");
+                *fuse_state.sync_state.lock().unwrap() = SyncState::Unmounted;
+                fuse_app.emit("sync-state-changed", "unmounted").ok();
+            }
+            Err(e) if e == "REMOTE_WIPE" => {
+                log::warn!("FUSE unmounted due to remote wipe");
+                *fuse_state.sync_state.lock().unwrap() = SyncState::Wiped;
+                fuse_app.emit("sync-state-changed", "wiped").ok();
+                fuse_app
+                    .notification()
+                    .builder()
+                    .title("Nextcloud: Device Wiped")
+                    .body("This device has been remotely wiped. All cached data has been deleted and credentials cleared.")
+                    .show()
+                    .ok();
+            }
+            Err(e) => {
+                log::error!("FUSE error: {}", e);
+                *fuse_state.sync_state.lock().unwrap() = SyncState::Unmounted;
+                fuse_app.emit("sync-state-changed", "unmounted").ok();
+            }
         }
-        *fuse_state.sync_state.lock().unwrap() = SyncState::Unmounted;
-        fuse_app.emit("sync-state-changed", "unmounted").ok();
         let _ = shutdown_tx.send(true);
     });
 

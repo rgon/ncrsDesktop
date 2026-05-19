@@ -84,6 +84,13 @@ impl std::fmt::Display for BackendReadError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReachabilityStatus {
+    Reachable,
+    AuthRejected(u16),
+    Unreachable,
+}
+
 pub struct PutResult {
     pub new_change_token: Option<String>,
 }
@@ -168,6 +175,14 @@ pub trait CloudBackend: Send + Sync + 'static {
     // -- Connectivity ---------------------------------------------------------
 
     fn is_reachable(&self, timeout: Duration) -> bool;
+
+    fn check_reachability(&self, timeout: Duration) -> ReachabilityStatus {
+        if self.is_reachable(timeout) {
+            ReachabilityStatus::Reachable
+        } else {
+            ReachabilityStatus::Unreachable
+        }
+    }
 
     // -- Change notifications -------------------------------------------------
 

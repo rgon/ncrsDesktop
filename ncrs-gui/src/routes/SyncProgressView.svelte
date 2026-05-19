@@ -48,6 +48,7 @@
             case "syncing":    return "Syncing…";
             case "paused":     return "Sync paused";
             case "unmounted":  return "Filesystem unmounted";
+            case "wiped":      return "Device wiped by server";
             case "idle":       return "Up to date";
             default:           return syncState.startsWith("error") ? "Sync error" : syncState;
         }
@@ -79,7 +80,9 @@
             {/if}
         </div>
         <span class="ml-4 text-sm">{label()}</span>
-        {#if syncState === "unmounted" && onremount}
+        {#if syncState === "wiped"}
+            <span class="text-error text-xs ml-2">Credentials cleared. Reconfigure to reconnect.</span>
+        {:else if syncState === "unmounted" && onremount}
             <button class="btn btn-primary btn-xs ml-2" onclick={onremount}>Remount</button>
         {/if}
     </div>

@@ -318,6 +318,22 @@ impl CloudBackend for NextcloudBackend {
         .is_ok()
     }
 
+    fn check_reachability(&self, timeout: Duration) -> crate::backend::ReachabilityStatus {
+        use crate::backend::ReachabilityStatus;
+        match propfind::propfind_status(
+            &self.http,
+            &self.webdav_url,
+            &self.username,
+            &self.password,
+            Path::new("/"),
+            timeout,
+        ) {
+            Ok(()) => ReachabilityStatus::Reachable,
+            Err(code) if code == 401 || code == 403 => ReachabilityStatus::AuthRejected(code),
+            Err(_) => ReachabilityStatus::Unreachable,
+        }
+    }
+
     fn start_change_watcher(&self, callback: ChangeCallback) -> Box<dyn ChangeWatcherHandle> {
         let http = self.http.clone();
         let base_url = self.base_url.clone();

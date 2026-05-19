@@ -9,6 +9,7 @@ pub mod notifications;
 pub mod notify_push;
 pub mod preview;
 pub mod propfind;
+pub mod remote_wipe;
 pub mod search;
 pub mod webdav_ops;
 
@@ -186,6 +187,7 @@ pub enum SyncState {
     Syncing,
     Paused,
     Unmounted,
+    Wiped,
     Error(String),
 }
 
@@ -196,6 +198,7 @@ impl std::fmt::Display for SyncState {
             SyncState::Syncing => write!(f, "syncing"),
             SyncState::Paused => write!(f, "paused"),
             SyncState::Unmounted => write!(f, "unmounted"),
+            SyncState::Wiped => write!(f, "wiped"),
             SyncState::Error(e) => write!(f, "error:{}", e),
         }
     }
@@ -3397,6 +3400,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let offline_flag = filesystem.is_offline_flag();
     let backend = filesystem.conn.backend.clone();
     let notifier_slot = filesystem.notifier_slot();
+    let wipe_flag = Arc::new(AtomicBool::new(false));
 
     if !options.offline {
         // Replay any journal entries from a previous session
@@ -3423,6 +3427,9 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let elog_for_monitor = filesystem.error_log();
             let shutdown_monitor = filesystem.shutdown_flag();
             let paused_monitor = filesystem.paused_flag();
+            let wipe_flag_monitor = wipe_flag.clone();
+            let conn_monitor = filesystem.conn.clone();
+            let cache_dir_monitor = filesystem.cache_ref().safe_lock().cache_dir.clone();
             thread::spawn(move || {
                 loop {
                     if shutdown_monitor.load(Ordering::Relaxed) {
@@ -3443,22 +3450,54 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                     }
                     if paused_monitor.load(Ordering::Relaxed) { continue; }
 
-                    let reachable = backend_monitor.is_reachable(Duration::from_secs(5));
-
-                    let was_offline = offline.swap(!reachable, Ordering::Relaxed);
-                    if was_offline && reachable {
-                        log::info!("CONNECTIVITY restored — replaying mutation journal");
-                        let j = journal_for_monitor.clone();
-                        let b = backend_monitor.clone();
-                        let c = cache_for_monitor.clone();
-                        let d = dirty_for_monitor.clone();
-                        let el = elog_for_monitor.clone();
-                        thread::spawn(move || {
-                            let ctx = mutation_journal::ReplayContext { backend: b };
-                            mutation_journal::replay_journal(&j, &ctx, &c, &d, &el);
-                        });
-                    } else if !was_offline && !reachable {
-                        log::warn!("CONNECTIVITY lost — serving from cache");
+                    match backend_monitor.check_reachability(Duration::from_secs(5)) {
+                        backend::ReachabilityStatus::Reachable => {
+                            let was_offline = offline.swap(false, Ordering::Relaxed);
+                            if was_offline {
+                                log::info!("CONNECTIVITY restored — replaying mutation journal");
+                                let j = journal_for_monitor.clone();
+                                let b = backend_monitor.clone();
+                                let c = cache_for_monitor.clone();
+                                let d = dirty_for_monitor.clone();
+                                let el = elog_for_monitor.clone();
+                                thread::spawn(move || {
+                                    let ctx = mutation_journal::ReplayContext { backend: b };
+                                    mutation_journal::replay_journal(&j, &ctx, &c, &d, &el);
+                                });
+                            }
+                        }
+                        backend::ReachabilityStatus::AuthRejected(code) => {
+                            log::warn!("CONNECTIVITY: auth rejected (HTTP {}), checking for remote wipe", code);
+                            match remote_wipe::check_wipe(&conn_monitor.http, &conn_monitor.base_url, &conn_monitor.password) {
+                                Ok(true) => {
+                                    log::warn!("REMOTE WIPE requested by server — executing");
+                                    let config_path = config::config_path();
+                                    if let Err(e) = remote_wipe::execute_wipe(&cache_dir_monitor, &config_path) {
+                                        log::error!("REMOTE_WIPE execution error: {}", e);
+                                    }
+                                    if let Err(e) = remote_wipe::confirm_wipe(&conn_monitor.http, &conn_monitor.base_url, &conn_monitor.password) {
+                                        log::warn!("REMOTE_WIPE: failed to confirm to server: {}", e);
+                                    }
+                                    wipe_flag_monitor.store(true, Ordering::Relaxed);
+                                    shutdown_monitor.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                                Ok(false) => {
+                                    log::info!("CONNECTIVITY: auth rejected but no wipe pending — token may be revoked");
+                                    offline.store(true, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    log::warn!("CONNECTIVITY: wipe check failed: {} — will retry", e);
+                                    offline.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        backend::ReachabilityStatus::Unreachable => {
+                            let was_offline = offline.swap(true, Ordering::Relaxed);
+                            if !was_offline {
+                                log::warn!("CONNECTIVITY lost — serving from cache");
+                            }
+                        }
                     }
                 }
             });
@@ -3702,6 +3741,10 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     shutdown_flag.store(true, Ordering::Relaxed);
     log::info!("FUSE session ended — shutdown signal sent to background threads");
+
+    if wipe_flag.load(Ordering::Relaxed) {
+        return Err("REMOTE_WIPE".to_string());
+    }
 
     result
 }

@@ -77,6 +77,33 @@ pub fn propfind_list(
     result
 }
 
+pub fn propfind_status(
+    client: &reqwest::blocking::Client,
+    webdav_url: &str,
+    username: &str,
+    password: &str,
+    path: &std::path::Path,
+    timeout: Duration,
+) -> Result<(), u16> {
+    let url = build_url(webdav_url, path);
+    let resp = client
+        .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
+        .timeout(timeout)
+        .header("Depth", "0")
+        .header("Content-Type", "application/xml")
+        .basic_auth(username, Some(password))
+        .body(PROPFIND_ETAG_BODY)
+        .send()
+        .map_err(|_| 0u16)?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::MULTI_STATUS || status.is_success() {
+        Ok(())
+    } else {
+        Err(status.as_u16())
+    }
+}
+
 pub fn propfind_etag(
     client: &reqwest::blocking::Client,
     webdav_url: &str,
