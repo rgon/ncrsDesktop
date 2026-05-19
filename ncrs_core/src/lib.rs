@@ -13,7 +13,7 @@ pub mod remote_wipe;
 pub mod search;
 pub mod webdav_ops;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1408,12 +1408,27 @@ pub struct NextCloudFs {
     auto_keep_cached_files: bool,
     read_ahead_bytes: usize,
     cache_streamed_reads: bool,
+    exclude_folders: HashSet<PathBuf>,
 }
 
 impl NextCloudFs {
     pub fn new(options: MountOptions) -> Result<Self, String> {
         let username = options.username.unwrap_or_default();
         let password = options.password.unwrap_or_default();
+
+        let exclude_folders: HashSet<PathBuf> = options.exclude_folders.iter().map(|s| {
+            let s = s.trim();
+            if s.starts_with('/') { PathBuf::from(s) } else { PathBuf::from(format!("/{}", s)) }
+        }).collect();
+        for kp in &options.keep_paths {
+            let kp = kp.trim();
+            let kp_path = if kp.starts_with('/') { PathBuf::from(kp) } else { PathBuf::from(format!("/{}", kp)) };
+            for ep in &exclude_folders {
+                if kp_path.starts_with(ep) || ep.starts_with(&kp_path) {
+                    panic!("invalid config: path {:?} is both in keep_paths and exclude_folders", kp);
+                }
+            }
+        }
 
         let cache_dir = dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -1560,6 +1575,7 @@ impl NextCloudFs {
             auto_keep_cached_files: options.auto_keep_cached_files,
             read_ahead_bytes: options.read_ahead_bytes,
             cache_streamed_reads: options.cache_streamed_reads,
+            exclude_folders,
         })
     }
 
@@ -1691,6 +1707,10 @@ impl Filesystem for NextCloudFs {
         };
 
         let full_path = parent_path.join(&name_str);
+        if self.exclude_folders.contains(&full_path) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
         {
             let mut ghosts = self.ghost_entries.safe_lock();
             if let Some(kind) = ghosts.get(&full_path)
@@ -2217,6 +2237,7 @@ impl Filesystem for NextCloudFs {
         let dirty = self.dirty.clone();
         let conn = self.conn.clone();
         let aggressive_prefetch = self.aggressive_prefetch;
+        let exclude_folders = self.exclude_folders.clone();
 
         thread::spawn(move || {
             if offset == 0 {
@@ -2241,6 +2262,7 @@ impl Filesystem for NextCloudFs {
                             None => continue,
                         };
                         let entry_path = path.join(name);
+                        if entry.is_dir && exclude_folders.contains(&entry_path) { continue; }
                         let entry_ino = c.get_inode(&entry_path).unwrap_or(1);
                         let kind =
                             if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
@@ -2421,6 +2443,7 @@ impl Filesystem for NextCloudFs {
                                 None => continue,
                             };
                             let entry_path = path.join(name);
+                            if entry.is_dir && exclude_folders.contains(&entry_path) { continue; }
                             let entry_ino = c.get_inode(&entry_path).unwrap_or(1);
                             let kind =
                                 if entry.is_dir { FileType::Directory } else { FileType::RegularFile };

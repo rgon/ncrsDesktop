@@ -1043,3 +1043,77 @@
         assert!(cache.dir_cache[&PathBuf::from("/changed")].invalidated,
             "dir with changed etag should be invalidated");
     }
+
+    // ── exclude_folders config ─────────────────────────────────────────────────
+
+    #[test]
+    fn exclude_folders_parsed_from_config() {
+        let yaml = r#"
+url: "https://cloud.example.com/remote.php/dav/files/user/"
+username: "user"
+password: "pass"
+exclude_folders:
+  - /Photos
+  - Videos
+"#;
+        let opts = config::configuration_parser(yaml).unwrap();
+        assert_eq!(opts.exclude_folders, vec!["/Photos", "Videos"]);
+    }
+
+    #[test]
+    fn exclude_folders_defaults_to_empty() {
+        let yaml = r#"
+url: "https://cloud.example.com/remote.php/dav/files/user/"
+username: "user"
+password: "pass"
+"#;
+        let opts = config::configuration_parser(yaml).unwrap();
+        assert!(opts.exclude_folders.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "both in keep_paths and exclude_folders")]
+    fn exclude_folders_panics_on_overlap_with_keep_paths() {
+        let exclude: HashSet<PathBuf> = [PathBuf::from("/Photos")].into();
+        let keep_paths = vec!["/Photos".to_string()];
+        for kp in &keep_paths {
+            let kp = kp.trim();
+            let kp_path = if kp.starts_with('/') { PathBuf::from(kp) } else { PathBuf::from(format!("/{}", kp)) };
+            for ep in &exclude {
+                if kp_path.starts_with(ep) || ep.starts_with(&kp_path) {
+                    panic!("invalid config: path {:?} is both in keep_paths and exclude_folders", kp);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "both in keep_paths and exclude_folders")]
+    fn exclude_folders_panics_on_nested_overlap() {
+        let exclude: HashSet<PathBuf> = [PathBuf::from("/Photos")].into();
+        let keep_paths = vec!["/Photos/Vacation".to_string()];
+        for kp in &keep_paths {
+            let kp = kp.trim();
+            let kp_path = if kp.starts_with('/') { PathBuf::from(kp) } else { PathBuf::from(format!("/{}", kp)) };
+            for ep in &exclude {
+                if kp_path.starts_with(ep) || ep.starts_with(&kp_path) {
+                    panic!("invalid config: path {:?} is both in keep_paths and exclude_folders", kp);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exclude_folders_no_panic_when_disjoint() {
+        let exclude: HashSet<PathBuf> = [PathBuf::from("/Photos")].into();
+        let keep_paths = vec!["/Documents".to_string()];
+        for kp in &keep_paths {
+            let kp = kp.trim();
+            let kp_path = if kp.starts_with('/') { PathBuf::from(kp) } else { PathBuf::from(format!("/{}", kp)) };
+            for ep in &exclude {
+                if kp_path.starts_with(ep) || ep.starts_with(&kp_path) {
+                    panic!("invalid config: path {:?} is both in keep_paths and exclude_folders", kp);
+                }
+            }
+        }
+    }

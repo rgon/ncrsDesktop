@@ -38,6 +38,8 @@ pub struct MountOptions {
     pub cache_cleanup_interval_secs: u64,
     #[serde(default)]
     pub keep_paths: Vec<String>,
+    #[serde(default)]
+    pub exclude_folders: Vec<String>,
 }
 
 fn default_true() -> bool { true }
@@ -87,8 +89,11 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let keep_paths = doc["keep_paths"].as_vec()
         .map(|v| v.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
+    let exclude_folders = doc["exclude_folders"].as_vec()
+        .map(|v| v.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths })
+    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
