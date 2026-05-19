@@ -259,7 +259,7 @@ impl CloudBackend for NextcloudBackend {
         body: Vec<u8>,
         if_match: Option<&str>,
     ) -> Result<PutResult, BackendWriteError> {
-        webdav_ops::put_file(
+        webdav_ops::put_file_chunked(
             &self.http,
             &self.base_url,
             &self.username,
