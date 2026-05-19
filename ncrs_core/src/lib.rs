@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod config;
+pub mod edit_locally;
 pub mod filename_validation;
 pub mod fuse_notify;
 pub mod ipc;

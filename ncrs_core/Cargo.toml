@@ -26,5 +26,9 @@ serde_json = "1"
 clap = { workspace = true, features = ["derive"] }
 tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 
+[[bin]]
+name = "ncrs-open"
+path = "src/bin/ncrs_open.rs"
+
 [dev-dependencies]
 tempfile = "3"

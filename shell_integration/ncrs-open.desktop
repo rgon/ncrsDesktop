@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Nextcloud Edit Locally (ncRS)
+Comment=Handle nc:// URIs to open Nextcloud files locally
+Type=Application
+Exec=ncrs-open %u
+MimeType=x-scheme-handler/nc;
+NoDisplay=true
