@@ -130,7 +130,10 @@ fn dismiss_notification(state: State<Arc<AppState>>, id: u64) {
     if let Some(opts) = opts {
         state.notifications.lock().unwrap().retain(|n| n.notification_id != id);
         let base = ncrs_core::notifications::base_url(&opts.url);
-        let creds = opts.credentials();
+        let creds = match opts.credentials() {
+            Ok(c) => c,
+            Err(e) => { log::warn!("dismiss notification: {}", e); return; }
+        };
         let http3 = opts.http3;
         thread::spawn(move || {
             if let Err(e) =
@@ -212,7 +215,7 @@ async fn fetch_search_providers(
         .clone()
         .ok_or_else(|| "not connected".to_string())?;
     let base = ncrs_core::notifications::base_url(&opts.url);
-    let creds = opts.credentials();
+    let creds = opts.credentials()?;
     let http3 = opts.http3;
 
     tokio::task::spawn_blocking(move || {
@@ -235,7 +238,7 @@ async fn search_nextcloud(
         .clone()
         .ok_or_else(|| "not connected".to_string())?;
     let base = ncrs_core::notifications::base_url(&opts.url);
-    let creds = opts.credentials();
+    let creds = opts.credentials()?;
     let http3 = opts.http3;
     let mount_point = opts.mount_point.clone();
 
@@ -578,7 +581,13 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     let poll_state = state.clone();
     let poll_app = app.clone();
     let poll_url = opts.url.clone();
-    let poll_creds = opts.credentials();
+    let poll_creds = match opts.credentials() {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("notification polling: {}", e);
+            return Ok(());
+        }
+    };
     let poll_http3 = opts.http3;
     let notif_shutdown = shutdown_rx.clone();
     spawn(async move {

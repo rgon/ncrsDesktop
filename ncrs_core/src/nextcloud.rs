@@ -217,18 +217,18 @@ impl CloudBackend for NextcloudBackend {
     ) -> Result<u64, BackendReadError> {
         if self.creds.is_bearer() {
             let url = self.webdav_file_url(path);
-            let resp = self.creds.apply(self.http_read.get(&url).timeout(timeout))
+            let mut resp = self.creds.apply(self.http_read.get(&url).timeout(timeout))
                 .send()
                 .map_err(|e| BackendReadError::Network(e.to_string()))?;
-            if !resp.status().is_success() {
-                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let status = resp.status();
+            if !status.is_success() {
+                if status == reqwest::StatusCode::NOT_FOUND {
                     return Err(BackendReadError::NotFound);
                 }
-                return Err(BackendReadError::Server(resp.status().as_u16(), String::new()));
+                let body = resp.text().unwrap_or_default();
+                return Err(BackendReadError::Server(status.as_u16(), body));
             }
-            let bytes = resp.bytes().map_err(|e| BackendReadError::Network(e.to_string()))?;
-            let size = bytes.len() as u64;
-            dest.write_all(&bytes)
+            let size = resp.copy_to(dest)
                 .map_err(|e| BackendReadError::Network(e.to_string()))?;
             Ok(size)
         } else {
@@ -500,10 +500,10 @@ fn watcher_loop(
 
         connected.store(false, Ordering::Relaxed);
 
-        let ws_url = match crate::notify_push::discover_ws_url(http, base_url, creds) {
-            Ok(url) => {
-                log::info!("change_watcher: discovered endpoint {}", url);
-                url
+        let info = match crate::notify_push::discover_endpoints(http, base_url, creds) {
+            Ok(info) => {
+                log::info!("change_watcher: discovered endpoint {}", info.ws_url);
+                info
             }
             Err(e) => {
                 log::warn!("change_watcher: discovery failed: {}", e);
@@ -514,7 +514,7 @@ fn watcher_loop(
         };
 
         match watcher_connect_and_listen(
-            &ws_url, http, webdav_url, creds, connected, shutdown, paused, callback,
+            &info, http, webdav_url, creds, connected, shutdown, paused, callback,
         ) {
             Ok(()) => {
                 log::info!("change_watcher: connection closed cleanly");
@@ -535,7 +535,7 @@ fn watcher_loop(
 }
 
 fn watcher_connect_and_listen(
-    ws_url: &str,
+    info: &crate::notify_push::NotifyPushInfo,
     http: &reqwest::blocking::Client,
     webdav_url: &str,
     creds: &Credentials,
@@ -546,8 +546,18 @@ fn watcher_connect_and_listen(
 ) -> Result<(), String> {
     use tungstenite::{connect, Message};
 
+    let (ws_user, ws_secret) = if creds.is_bearer() {
+        let pre_auth_url = info.pre_auth_url.as_deref()
+            .ok_or_else(|| "bearer auth requires notify_push pre_auth endpoint, but server does not advertise it".to_string())?;
+        let ticket = crate::notify_push::fetch_pre_auth_ticket(http, pre_auth_url, creds)?;
+        log::info!("change_watcher: obtained pre_auth ticket");
+        (String::new(), ticket)
+    } else {
+        (creds.username().to_string(), creds.secret().to_string())
+    };
+
     let (mut socket, _) =
-        connect(ws_url).map_err(|e| format!("WebSocket connect: {}", e))?;
+        connect(&info.ws_url).map_err(|e| format!("WebSocket connect: {}", e))?;
 
     fn set_ws_read_timeout(
         socket: &tungstenite::WebSocket<
@@ -567,10 +577,10 @@ fn watcher_connect_and_listen(
     }
 
     socket
-        .send(Message::Text(creds.username().into()))
+        .send(Message::Text(ws_user.into()))
         .map_err(|e| format!("send username: {}", e))?;
     socket
-        .send(Message::Text(creds.secret().into()))
+        .send(Message::Text(ws_secret.into()))
         .map_err(|e| format!("send password: {}", e))?;
 
     let auth_msg = socket

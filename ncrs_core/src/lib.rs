@@ -1414,7 +1414,7 @@ pub struct NextCloudFs {
 
 impl NextCloudFs {
     pub fn new(options: MountOptions) -> Result<Self, String> {
-        let creds = options.credentials();
+        let creds = options.credentials()?;
 
         let exclude_folders: HashSet<PathBuf> = options.exclude_folders.iter().map(|s| {
             let s = s.trim();
@@ -3411,7 +3411,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let evict_cb = filesystem.evict_callback();
     let prefetch_cb = filesystem.prefetch_callback();
     let base_url = notifications::base_url(&options.url);
-    let ipc_creds = options.credentials();
+    let ipc_creds = options.credentials()?;
     let file_change_queue: ipc::FileChangeQueue = Arc::new(Mutex::new(Vec::new()));
     let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
     ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone());

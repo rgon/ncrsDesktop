@@ -9,7 +9,7 @@ const DEFAULT_READ_AHEAD: usize = 64 * 1024 * 1024; // 64 MB
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MountOptions {
     pub url: String,
     pub username: Option<String>,
@@ -46,15 +46,32 @@ pub struct MountOptions {
     pub exclude_folders: Vec<String>,
 }
 
+impl std::fmt::Debug for MountOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MountOptions")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("bearer_token", &self.bearer_token.as_ref().map(|_| "[REDACTED]"))
+            .field("auth_command", &self.auth_command)
+            .field("mount_point", &self.mount_point)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MountOptions {
-    pub fn credentials(&self) -> Credentials {
+    pub fn credentials(&self) -> Result<Credentials, String> {
         let username = self.username.clone().unwrap_or_default();
         let token = self.resolve_bearer_token();
         if let Some(token) = token {
-            Credentials::Bearer { username, token }
+            Ok(Credentials::Bearer { username, token })
+        } else if let Some(ref password) = self.password {
+            if password.is_empty() {
+                return Err("password is empty — configure password, bearer_token, or auth_command".into());
+            }
+            Ok(Credentials::Basic { username, password: password.clone() })
         } else {
-            let password = self.password.clone().unwrap_or_default();
-            Credentials::Basic { username, password }
+            Err("no credentials configured — set password, bearer_token, or auth_command".into())
         }
     }
 
@@ -206,4 +223,82 @@ pub fn load_config() -> Result<MountOptions, String> {
     }
 
     Ok(opts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config(auth_line: &str) -> MountOptions {
+        let yaml = format!(
+            "url: \"https://cloud.example.com/remote.php/dav/files/user/\"\nusername: \"user\"\n{}\nmount_point: \"/mnt/nc\"\nuser: test\n",
+            auth_line,
+        );
+        configuration_parser(&yaml).unwrap()
+    }
+
+    #[test]
+    fn credentials_basic_ok() {
+        let opts = minimal_config("password: \"s3cret\"");
+        let creds = opts.credentials().unwrap();
+        assert!(!creds.is_bearer());
+        assert_eq!(creds.username(), "user");
+        assert_eq!(creds.secret(), "s3cret");
+    }
+
+    #[test]
+    fn credentials_bearer_ok() {
+        let opts = minimal_config("bearer_token: \"ey.jwt.tok\"");
+        let creds = opts.credentials().unwrap();
+        assert!(creds.is_bearer());
+        assert_eq!(creds.username(), "user");
+        assert_eq!(creds.secret(), "ey.jwt.tok");
+    }
+
+    #[test]
+    fn credentials_missing_errors() {
+        let opts = minimal_config("");
+        assert!(opts.credentials().is_err());
+    }
+
+    #[test]
+    fn credentials_empty_password_errors() {
+        let opts = minimal_config("password: \"\"");
+        assert!(opts.credentials().is_err());
+    }
+
+    #[test]
+    fn credentials_bearer_takes_precedence() {
+        let opts = minimal_config("password: \"pw\"\nbearer_token: \"tok\"");
+        let creds = opts.credentials().unwrap();
+        assert!(creds.is_bearer());
+        assert_eq!(creds.secret(), "tok");
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let opts = minimal_config("password: \"super-secret\"");
+        let debug = format!("{:?}", opts);
+        assert!(!debug.contains("super-secret"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn credentials_debug_redacts_secrets() {
+        let creds = Credentials::Basic {
+            username: "user".into(),
+            password: "super-secret".into(),
+        };
+        let debug = format!("{:?}", creds);
+        assert!(!debug.contains("super-secret"));
+        assert!(debug.contains("[REDACTED]"));
+
+        let creds = Credentials::Bearer {
+            username: "user".into(),
+            token: "ey.jwt.secret".into(),
+        };
+        let debug = format!("{:?}", creds);
+        assert!(!debug.contains("ey.jwt.secret"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 }

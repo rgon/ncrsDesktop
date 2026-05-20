@@ -1,10 +1,27 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum Credentials {
     Basic { username: String, password: String },
     Bearer { username: String, token: String },
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credentials::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"[REDACTED]")
+                .finish(),
+            Credentials::Bearer { username, .. } => f
+                .debug_struct("Bearer")
+                .field("username", username)
+                .field("token", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 impl Credentials {

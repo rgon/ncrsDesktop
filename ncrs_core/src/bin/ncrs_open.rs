@@ -29,7 +29,10 @@ fn main() {
     };
 
     let base_url = ncrs_core::notifications::base_url(&config.url);
-    let creds = config.credentials();
+    let creds = config.credentials().unwrap_or_else(|e| {
+        eprintln!("ncrs-open: {}", e);
+        std::process::exit(1);
+    });
 
     let data = match ncrs_core::edit_locally::resolve_token(
         &base_url, &creds, &parsed.token,
