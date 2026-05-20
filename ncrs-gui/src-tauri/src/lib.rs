@@ -578,37 +578,32 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     });
 
     // Notification polling — async on Tokio runtime, no dedicated OS thread
-    let poll_state = state.clone();
-    let poll_app = app.clone();
-    let poll_url = opts.url.clone();
-    let poll_creds = match opts.credentials() {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("notification polling: {}", e);
-            return Ok(());
-        }
-    };
-    let poll_http3 = opts.http3;
-    let notif_shutdown = shutdown_rx.clone();
-    spawn(async move {
-        let base = ncrs_core::notifications::base_url(&poll_url);
-        loop {
-            if *notif_shutdown.borrow() { break; }
-            let b = base.clone();
-            let c = poll_creds.clone();
-            match tokio::task::spawn_blocking(move || {
-                ncrs_core::notifications::fetch_notifications(&b, &c, poll_http3)
-            }).await {
-                Ok(Ok(notifs)) => {
-                    *poll_state.notifications.lock().unwrap() = notifs.clone();
-                    poll_app.emit("notifications-updated", notifs).ok();
+    if let Ok(poll_creds) = opts.credentials() {
+        let poll_state = state.clone();
+        let poll_app = app.clone();
+        let poll_url = opts.url.clone();
+        let poll_http3 = opts.http3;
+        let notif_shutdown = shutdown_rx.clone();
+        spawn(async move {
+            let base = ncrs_core::notifications::base_url(&poll_url);
+            loop {
+                if *notif_shutdown.borrow() { break; }
+                let b = base.clone();
+                let c = poll_creds.clone();
+                match tokio::task::spawn_blocking(move || {
+                    ncrs_core::notifications::fetch_notifications(&b, &c, poll_http3)
+                }).await {
+                    Ok(Ok(notifs)) => {
+                        *poll_state.notifications.lock().unwrap() = notifs.clone();
+                        poll_app.emit("notifications-updated", notifs).ok();
+                    }
+                    Ok(Err(e)) => log::warn!("fetch notifications: {}", e),
+                    Err(e) => log::warn!("notification poll panicked: {}", e),
                 }
-                Ok(Err(e)) => log::warn!("fetch notifications: {}", e),
-                Err(e) => log::warn!("notification poll panicked: {}", e),
+                sleep(Duration::from_secs(30)).await;
             }
-            sleep(Duration::from_secs(30)).await;
-        }
-    });
+        });
+    }
 
     // Error log polling — check every 2s, emit event + desktop notification on new errors
     let err_state = state.clone();

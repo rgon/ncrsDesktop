@@ -105,7 +105,7 @@ impl MountOptions {
                 }
             }
         } else {
-            self.bearer_token.clone()
+            self.bearer_token.as_ref().filter(|t| !t.is_empty()).cloned()
         }
     }
 }
@@ -264,6 +264,12 @@ mod tests {
     #[test]
     fn credentials_empty_password_errors() {
         let opts = minimal_config("password: \"\"");
+        assert!(opts.credentials().is_err());
+    }
+
+    #[test]
+    fn credentials_empty_bearer_token_errors() {
+        let opts = minimal_config("bearer_token: \"\"");
         assert!(opts.credentials().is_err());
     }
 
