@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            libfuse3-dev \
+            fuse3 \
+            pkg-config \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            python3-nautilus \
+            dpkg-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build core (release)
+        run: cargo build --release -p ncrs_core
+
+      - name: Run tests
+        run: cargo test -p ncrs_core
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ncrs-gui/pnpm-lock.yaml
+
+      - name: Build frontend
+        working-directory: ncrs-gui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Build GUI (release)
+        run: cargo build --release -p ncrs-gui
+
+      - name: Assemble .deb
+        run: bash scripts/build-deb.sh
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncrs-deb
+          path: dist/*.deb
+          retention-days: 14
