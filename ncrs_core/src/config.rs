@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use yaml_rust2::YamlLoader;
 
+use crate::auth::Credentials;
+
 const DEFAULT_READ_AHEAD: usize = 64 * 1024 * 1024; // 64 MB
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -12,6 +14,8 @@ pub struct MountOptions {
     pub url: String,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub bearer_token: Option<String>,
+    pub auth_command: Option<String>,
     pub mount_point: PathBuf,
     pub log_user: String,
     pub aggressive_prefetch: bool,
@@ -40,6 +44,53 @@ pub struct MountOptions {
     pub keep_paths: Vec<String>,
     #[serde(default)]
     pub exclude_folders: Vec<String>,
+}
+
+impl MountOptions {
+    pub fn credentials(&self) -> Credentials {
+        let username = self.username.clone().unwrap_or_default();
+        let token = self.resolve_bearer_token();
+        if let Some(token) = token {
+            Credentials::Bearer { username, token }
+        } else {
+            let password = self.password.clone().unwrap_or_default();
+            Credentials::Basic { username, password }
+        }
+    }
+
+    fn resolve_bearer_token(&self) -> Option<String> {
+        if let Some(ref cmd) = self.auth_command {
+            match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if token.is_empty() {
+                        log::warn!("auth_command produced empty output");
+                        None
+                    } else {
+                        Some(token)
+                    }
+                }
+                Ok(output) => {
+                    log::error!(
+                        "auth_command failed ({}): {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                    None
+                }
+                Err(e) => {
+                    log::error!("auth_command execution error: {}", e);
+                    None
+                }
+            }
+        } else {
+            self.bearer_token.clone()
+        }
+    }
 }
 
 fn default_true() -> bool { true }
@@ -72,6 +123,8 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
         .to_string();
     let username = doc["username"].as_str().map(str::to_string);
     let password = doc["password"].as_str().map(str::to_string);
+    let bearer_token = doc["bearer_token"].as_str().map(str::to_string);
+    let auth_command = doc["auth_command"].as_str().map(str::to_string);
     let mount_point =
         PathBuf::from(doc["mount_point"].as_str().unwrap_or("/media/ncrs_mount"));
     let log_user = doc["user"].as_str().unwrap_or("default_user").to_string();
@@ -93,7 +146,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
         .map(|v| v.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
 
-    Ok(MountOptions { url, username, password, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders })
+    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
@@ -105,7 +158,11 @@ const DEFAULT_CONFIG: &str = r#"# ncRS Desktop configuration
 url: ""
 
 username: ""
+
+# Authentication: provide ONE of password, bearer_token, or auth_command.
 password: ""
+# bearer_token: ""
+# auth_command: "secret-tool lookup xdg:schema-id org.freedesktop.Secret.Generic label authd"
 
 # Local directory where the WebDAV tree will be mounted.
 mount_point: ""
