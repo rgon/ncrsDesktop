@@ -45,8 +45,7 @@ fn xdg_thumb_path(file_uri: &str) -> PathBuf {
 fn fetch_preview_bytes(
     client: &reqwest::blocking::Client,
     base: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     remote_path: &str,
     fileid: Option<u64>,
 ) -> Result<Vec<u8>, String> {
@@ -60,8 +59,7 @@ fn fetch_preview_bytes(
     } else {
         req.query(&[("file", &remote_path.to_string()), ("x", &size), ("y", &size), ("a", &"1".to_string())])
     };
-    let resp = req
-        .basic_auth(username, Some(password))
+    let resp = creds.apply(req)
         .send()
         .map_err(|e| e.to_string())?;
 
@@ -111,8 +109,7 @@ fn inject_png_text_chunks(png: &[u8], entries: &[(&str, &str)]) -> Option<Vec<u8
 pub fn prefetch_thumbnail(
     client: &reqwest::blocking::Client,
     base: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     mount_point: &Path,
     remote_path: &Path,
     mtime: Option<SystemTime>,
@@ -124,7 +121,7 @@ pub fn prefetch_thumbnail(
         return;
     }
 
-    let png = match fetch_preview_bytes(client, base, username, password, &remote_path.to_string_lossy(), fileid) {
+    let png = match fetch_preview_bytes(client, base, creds, &remote_path.to_string_lossy(), fileid) {
         Ok(d) => d,
         Err(e) => {
             log::debug!("thumbnail {}: {}", remote_path.display(), e);
@@ -156,8 +153,7 @@ pub fn prefetch_thumbnail(
 pub fn prefetch_directory_thumbnails(
     client: &reqwest::blocking::Client,
     base: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     mount_point: &Path,
     entries: &[(PathBuf, Option<SystemTime>, bool, Option<u64>)],
     active_streams: &Arc<AtomicUsize>,
@@ -176,7 +172,7 @@ pub fn prefetch_directory_thumbnails(
         std::thread::scope(|s| {
             for (path, mtime, _, fileid) in chunk {
                 s.spawn(|| {
-                    prefetch_thumbnail(client, base, username, password, mount_point, path, *mtime, *fileid);
+                    prefetch_thumbnail(client, base, creds, mount_point, path, *mtime, *fileid);
                 });
             }
         });

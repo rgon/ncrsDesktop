@@ -61,17 +61,15 @@ fn dav_url(base_url: &str, username: &str, path: &Path) -> String {
 pub fn put_file(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     path: &Path,
     body: Vec<u8>,
     if_match_etag: Option<&str>,
 ) -> Result<PutResult, WriteError> {
-    let url = dav_url(base_url, username, path);
-    let mut req = client
+    let url = dav_url(base_url, creds.username(), path);
+    let mut req = creds.apply(client
         .put(&url)
-        .timeout(WRITE_TIMEOUT)
-        .basic_auth(username, Some(password))
+        .timeout(WRITE_TIMEOUT))
         .body(body);
 
     if let Some(etag) = if_match_etag {
@@ -102,15 +100,13 @@ pub fn put_file(
 pub fn mkcol(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     path: &Path,
 ) -> Result<(), WriteError> {
-    let url = format!("{}/", dav_url(base_url, username, path).trim_end_matches('/'));
-    let resp = client
+    let url = format!("{}/", dav_url(base_url, creds.username(), path).trim_end_matches('/'));
+    let resp = creds.apply(client
         .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &url)
-        .timeout(WRITE_TIMEOUT)
-        .basic_auth(username, Some(password))
+        .timeout(WRITE_TIMEOUT))
         .send()
         .map_err(|e| WriteError::Network(e.to_string()))?;
 
@@ -129,15 +125,13 @@ pub fn mkcol(
 pub fn delete(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     path: &Path,
 ) -> Result<(), WriteError> {
-    let url = dav_url(base_url, username, path);
-    let resp = client
+    let url = dav_url(base_url, creds.username(), path);
+    let resp = creds.apply(client
         .delete(&url)
-        .timeout(WRITE_TIMEOUT)
-        .basic_auth(username, Some(password))
+        .timeout(WRITE_TIMEOUT))
         .send()
         .map_err(|e| WriteError::Network(e.to_string()))?;
 
@@ -155,17 +149,15 @@ pub fn delete(
 pub fn move_resource(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     from: &Path,
     to: &Path,
 ) -> Result<(), WriteError> {
-    let src_url = dav_url(base_url, username, from);
-    let dst_url = dav_url(base_url, username, to);
-    let resp = client
+    let src_url = dav_url(base_url, creds.username(), from);
+    let dst_url = dav_url(base_url, creds.username(), to);
+    let resp = creds.apply(client
         .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &src_url)
-        .timeout(WRITE_TIMEOUT)
-        .basic_auth(username, Some(password))
+        .timeout(WRITE_TIMEOUT))
         .header("Destination", &dst_url)
         .header("Overwrite", "F")
         .send()
@@ -189,14 +181,13 @@ const CHUNK_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 pub fn put_file_chunked(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     path: &Path,
     body: Vec<u8>,
     if_match_etag: Option<&str>,
 ) -> Result<PutResult, WriteError> {
     if body.len() <= CHUNK_SIZE {
-        return put_file(client, base_url, username, password, path, body, if_match_etag);
+        return put_file(client, base_url, creds, path, body, if_match_etag);
     }
 
     let transfer_id = format!("ncrs-{}-{}", std::process::id(), std::time::SystemTime::now()
@@ -205,14 +196,13 @@ pub fn put_file_chunked(
     let uploads_base = format!(
         "{}/remote.php/dav/uploads/{}/{}",
         base_url.trim_end_matches('/'),
-        percent_encoding::utf8_percent_encode(username, PATH_COMPONENT),
+        percent_encoding::utf8_percent_encode(creds.username(), PATH_COMPONENT),
         percent_encoding::utf8_percent_encode(&transfer_id, PATH_COMPONENT),
     );
 
-    let resp = client
+    let resp = creds.apply(client
         .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &uploads_base)
-        .timeout(WRITE_TIMEOUT)
-        .basic_auth(username, Some(password))
+        .timeout(WRITE_TIMEOUT))
         .send()
         .map_err(|e| WriteError::Network(format!("chunked MKCOL: {}", e)))?;
     if !resp.status().is_success() && resp.status().as_u16() != 405 {
@@ -223,29 +213,27 @@ pub fn put_file_chunked(
     for (i, chunk) in body.chunks(CHUNK_SIZE).enumerate() {
         let chunk_url = format!("{}/{:010}", uploads_base, i);
         log::info!("CHUNKED_UPLOAD {}/{} ({} bytes)", i + 1, total_chunks, chunk.len());
-        let resp = client
+        let resp = creds.apply(client
             .put(&chunk_url)
-            .timeout(CHUNK_UPLOAD_TIMEOUT)
-            .basic_auth(username, Some(password))
+            .timeout(CHUNK_UPLOAD_TIMEOUT))
             .body(chunk.to_vec())
             .send()
             .map_err(|e| {
-                let _ = cleanup_chunked_upload(client, &uploads_base, username, password);
+                let _ = cleanup_chunked_upload(client, &uploads_base, creds);
                 WriteError::Network(format!("chunk {} upload: {}", i, e))
             })?;
         let status = resp.status().as_u16();
         if status != 200 && status != 201 && status != 204 {
-            let _ = cleanup_chunked_upload(client, &uploads_base, username, password);
+            let _ = cleanup_chunked_upload(client, &uploads_base, creds);
             return Err(WriteError::Server(status, format!("chunk {} upload: {}", i, resp.text().unwrap_or_default())));
         }
     }
 
-    let dest_url = dav_url(base_url, username, path);
+    let dest_url = dav_url(base_url, creds.username(), path);
     let assemble_url = format!("{}/.file", uploads_base);
-    let mut req = client
+    let mut req = creds.apply(client
         .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &assemble_url)
-        .timeout(WRITE_TIMEOUT)
-        .basic_auth(username, Some(password))
+        .timeout(WRITE_TIMEOUT))
         .header("Destination", &dest_url)
         .header("Overwrite", "T");
 
@@ -273,13 +261,11 @@ pub fn put_file_chunked(
 fn cleanup_chunked_upload(
     client: &reqwest::blocking::Client,
     uploads_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
 ) -> Result<(), WriteError> {
-    client
+    creds.apply(client
         .delete(uploads_url)
-        .timeout(WRITE_TIMEOUT)
-        .basic_auth(username, Some(password))
+        .timeout(WRITE_TIMEOUT))
         .send()
         .map_err(|e| WriteError::Network(e.to_string()))?;
     Ok(())

@@ -155,7 +155,7 @@ fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>,
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, username: String, password: String, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -190,8 +190,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let fids = fileid_map.clone();
             let details = detail_map.clone();
             let dirty = dirty_set.clone();
-            let uname = username.clone();
-            let passwd = password.clone();
+            let creds_clone = creds.clone();
             let burl = base_url.clone();
             let cb = keep_cb.clone();
             let ev = evict_cb.clone();
@@ -204,7 +203,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let active = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, dirty, uname, passwd, burl, cb, ev, pf, elog, tmap, jrnl, fcq, sstats);
+                handle_client(stream, mount, map, shared, fids, details, dirty, creds_clone, burl, cb, ev, pf, elog, tmap, jrnl, fcq, sstats);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -231,8 +230,7 @@ fn handle_client(
     fileid_map: FileIdMap,
     detail_map: FileDetailMap,
     dirty_set: DirtySet,
-    username: String,
-    password: String,
+    creds: crate::auth::Credentials,
     base_url: String,
     keep_cb: Option<KeepCallback>,
     evict_cb: Option<EvictCallback>,
@@ -294,7 +292,7 @@ fn handle_client(
                         ""
                     } else {
                         match detail.owner_id.as_deref() {
-                            Some(owner) if owner == username => "Shared by you",
+                            Some(owner) if owner == creds.username() => "Shared by you",
                             Some(_) => "Shared with you",
                             None => "Shared",
                         }
@@ -435,7 +433,7 @@ fn handle_client(
             if term.is_empty() {
                 "[]".to_string()
             } else {
-                match crate::search::search_all(&base_url, &username, &password, term, false) {
+                match crate::search::search_all(&base_url, &creds, term, false) {
                     Ok(results) => serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string()),
                     Err(e) => {
                         log::error!("IPC SEARCH failed: {}", e);

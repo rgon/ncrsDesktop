@@ -130,12 +130,11 @@ fn dismiss_notification(state: State<Arc<AppState>>, id: u64) {
     if let Some(opts) = opts {
         state.notifications.lock().unwrap().retain(|n| n.notification_id != id);
         let base = ncrs_core::notifications::base_url(&opts.url);
-        let user = opts.username.unwrap_or_default();
-        let pass = opts.password.unwrap_or_default();
+        let creds = opts.credentials();
         let http3 = opts.http3;
         thread::spawn(move || {
             if let Err(e) =
-                ncrs_core::notifications::dismiss_notification(&base, &user, &pass, id, http3)
+                ncrs_core::notifications::dismiss_notification(&base, &creds, id, http3)
             {
                 log::warn!("dismiss notification {}: {}", id, e);
             }
@@ -213,12 +212,11 @@ async fn fetch_search_providers(
         .clone()
         .ok_or_else(|| "not connected".to_string())?;
     let base = ncrs_core::notifications::base_url(&opts.url);
-    let user = opts.username.unwrap_or_default();
-    let pass = opts.password.unwrap_or_default();
+    let creds = opts.credentials();
     let http3 = opts.http3;
 
     tokio::task::spawn_blocking(move || {
-        ncrs_core::search::fetch_providers(&base, &user, &pass, http3)
+        ncrs_core::search::fetch_providers(&base, &creds, http3)
     })
     .await
     .map_err(|e| format!("fetch providers failed: {}", e))?
@@ -237,13 +235,12 @@ async fn search_nextcloud(
         .clone()
         .ok_or_else(|| "not connected".to_string())?;
     let base = ncrs_core::notifications::base_url(&opts.url);
-    let user = opts.username.unwrap_or_default();
-    let pass = opts.password.unwrap_or_default();
+    let creds = opts.credentials();
     let http3 = opts.http3;
     let mount_point = opts.mount_point.clone();
 
     let mut groups = tokio::task::spawn_blocking(move || {
-        ncrs_core::search::search_filtered(&base, &user, &pass, &term, http3, &provider_ids)
+        ncrs_core::search::search_filtered(&base, &creds, &term, http3, &provider_ids)
     })
     .await
     .map_err(|e| format!("search task failed: {}", e))??;
@@ -581,8 +578,7 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     let poll_state = state.clone();
     let poll_app = app.clone();
     let poll_url = opts.url.clone();
-    let poll_user = opts.username.clone().unwrap_or_default();
-    let poll_pass = opts.password.clone().unwrap_or_default();
+    let poll_creds = opts.credentials();
     let poll_http3 = opts.http3;
     let notif_shutdown = shutdown_rx.clone();
     spawn(async move {
@@ -590,10 +586,9 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
         loop {
             if *notif_shutdown.borrow() { break; }
             let b = base.clone();
-            let u = poll_user.clone();
-            let p = poll_pass.clone();
+            let c = poll_creds.clone();
             match tokio::task::spawn_blocking(move || {
-                ncrs_core::notifications::fetch_notifications(&b, &u, &p, poll_http3)
+                ncrs_core::notifications::fetch_notifications(&b, &c, poll_http3)
             }).await {
                 Ok(Ok(notifs)) => {
                     *poll_state.notifications.lock().unwrap() = notifs.clone();

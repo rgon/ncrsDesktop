@@ -60,14 +60,12 @@ struct NotifyPushEndpoints {
 pub(crate) fn discover_ws_url(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
 ) -> Result<String, String> {
     let url = format!("{}/ocs/v2.php/cloud/capabilities?format=json", base_url);
-    let resp = client
+    let resp = creds.apply(client
         .get(&url)
-        .timeout(CAPABILITIES_TIMEOUT)
-        .basic_auth(username, Some(password))
+        .timeout(CAPABILITIES_TIMEOUT))
         .header("OCS-APIREQUEST", "true")
         .send()
         .map_err(|e| format!("capabilities request failed: {}", e))?;

@@ -6,6 +6,7 @@ use std::time::Duration;
 use remotefs::RemoteFs;
 use remotefs_webdav::WebDAVFs;
 
+use crate::auth::Credentials;
 use crate::backend::{
     BackendReadError, BackendWriteError, ChangeCallback, ChangeEvent, ChangeWatcherHandle,
     CloudBackend, HasNotifications, HasPreviews, PutResult, RemoteEntry, Searchable,
@@ -31,8 +32,7 @@ const PATH_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
 pub struct NextcloudBackend {
     base_url: String,
     webdav_url: String,
-    username: String,
-    password: String,
+    creds: Credentials,
     http: reqwest::blocking::Client,
     http_read: reqwest::blocking::Client,
     http3: bool,
@@ -43,33 +43,42 @@ impl NextcloudBackend {
     pub fn new(
         base_url: String,
         webdav_url: String,
-        username: String,
-        password: String,
+        creds: Credentials,
         http: reqwest::blocking::Client,
         http_read: reqwest::blocking::Client,
         http3: bool,
     ) -> Result<Self, String> {
-        let mut initial = WebDAVFs::new(&username, &password, &webdav_url);
-        initial
-            .connect()
-            .map_err(|e| format!("WebDAV connect failed: {}", e))?;
-        Ok(NextcloudBackend {
-            base_url,
-            webdav_url,
-            username,
-            password,
-            http,
-            http_read,
-            http3,
-            conns: Mutex::new(vec![initial]),
-        })
+        if !creds.is_bearer() {
+            let mut initial = WebDAVFs::new(creds.username(), creds.secret(), &webdav_url);
+            initial
+                .connect()
+                .map_err(|e| format!("WebDAV connect failed: {}", e))?;
+            Ok(NextcloudBackend {
+                base_url,
+                webdav_url,
+                creds,
+                http,
+                http_read,
+                http3,
+                conns: Mutex::new(vec![initial]),
+            })
+        } else {
+            Ok(NextcloudBackend {
+                base_url,
+                webdav_url,
+                creds,
+                http,
+                http_read,
+                http3,
+                conns: Mutex::new(Vec::new()),
+            })
+        }
     }
 
     pub fn new_offline(
         base_url: String,
         webdav_url: String,
-        username: String,
-        password: String,
+        creds: Credentials,
         http: reqwest::blocking::Client,
         http_read: reqwest::blocking::Client,
         http3: bool,
@@ -77,8 +86,7 @@ impl NextcloudBackend {
         NextcloudBackend {
             base_url,
             webdav_url,
-            username,
-            password,
+            creds,
             http,
             http_read,
             http3,
@@ -90,7 +98,10 @@ impl NextcloudBackend {
         if let Some(conn) = self.conns.lock().unwrap_or_else(|e| e.into_inner()).pop() {
             return Ok(conn);
         }
-        let mut conn = WebDAVFs::new(&self.username, &self.password, &self.webdav_url);
+        if self.creds.is_bearer() {
+            return Err("WebDAVFs does not support bearer auth".into());
+        }
+        let mut conn = WebDAVFs::new(self.creds.username(), self.creds.secret(), &self.webdav_url);
         conn.connect()
             .map_err(|e| format!("WebDAV connect: {}", e))?;
         Ok(conn)
@@ -152,8 +163,7 @@ impl CloudBackend for NextcloudBackend {
         let (etag, self_entry, entries) = propfind::propfind_list(
             &self.http,
             &self.webdav_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             path,
             timeout,
         )
@@ -175,8 +185,7 @@ impl CloudBackend for NextcloudBackend {
         propfind::propfind_list_streaming(
             &self.http,
             &self.webdav_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             path,
             timeout,
             entry_tx,
@@ -193,8 +202,7 @@ impl CloudBackend for NextcloudBackend {
         propfind::propfind_etag(
             &self.http,
             &self.webdav_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             path,
             timeout,
         )
@@ -205,19 +213,37 @@ impl CloudBackend for NextcloudBackend {
         &self,
         path: &Path,
         dest: &mut dyn std::io::Write,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<u64, BackendReadError> {
-        let mut conn = self.checkout().map_err(BackendReadError::Network)?;
-        let collector = SharedCollector::default();
-        let result = conn
-            .open_file(path, Box::new(collector.clone()))
-            .map_err(|e| BackendReadError::Network(e.to_string()));
-        self.checkin(conn);
-        let size = result?;
-        let data = collector.0.lock().unwrap_or_else(|e| e.into_inner());
-        dest.write_all(&data)
-            .map_err(|e| BackendReadError::Network(e.to_string()))?;
-        Ok(size)
+        if self.creds.is_bearer() {
+            let url = self.webdav_file_url(path);
+            let resp = self.creds.apply(self.http_read.get(&url).timeout(timeout))
+                .send()
+                .map_err(|e| BackendReadError::Network(e.to_string()))?;
+            if !resp.status().is_success() {
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Err(BackendReadError::NotFound);
+                }
+                return Err(BackendReadError::Server(resp.status().as_u16(), String::new()));
+            }
+            let bytes = resp.bytes().map_err(|e| BackendReadError::Network(e.to_string()))?;
+            let size = bytes.len() as u64;
+            dest.write_all(&bytes)
+                .map_err(|e| BackendReadError::Network(e.to_string()))?;
+            Ok(size)
+        } else {
+            let mut conn = self.checkout().map_err(BackendReadError::Network)?;
+            let collector = SharedCollector::default();
+            let result = conn
+                .open_file(path, Box::new(collector.clone()))
+                .map_err(|e| BackendReadError::Network(e.to_string()));
+            self.checkin(conn);
+            let size = result?;
+            let data = collector.0.lock().unwrap_or_else(|e| e.into_inner());
+            dest.write_all(&data)
+                .map_err(|e| BackendReadError::Network(e.to_string()))?;
+            Ok(size)
+        }
     }
 
     fn read_file_range(
@@ -234,7 +260,8 @@ impl CloudBackend for NextcloudBackend {
             .get(&url)
             .timeout(timeout)
             .header("Range", format!("bytes={}-{}", offset, end))
-            .basic_auth(&self.username, Some(&self.password))
+            ;
+        let resp = self.creds.apply(resp)
             .send()
             .map_err(|e| BackendReadError::Network(e.to_string()))?;
         let status = resp.status();
@@ -262,8 +289,7 @@ impl CloudBackend for NextcloudBackend {
         webdav_ops::put_file_chunked(
             &self.http,
             &self.base_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             path,
             body,
             if_match,
@@ -276,8 +302,7 @@ impl CloudBackend for NextcloudBackend {
         webdav_ops::mkcol(
             &self.http,
             &self.base_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             path,
         )
         .map_err(BackendWriteError::from)
@@ -287,8 +312,7 @@ impl CloudBackend for NextcloudBackend {
         webdav_ops::delete(
             &self.http,
             &self.base_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             path,
         )
         .map_err(BackendWriteError::from)
@@ -298,8 +322,7 @@ impl CloudBackend for NextcloudBackend {
         webdav_ops::move_resource(
             &self.http,
             &self.base_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             from,
             to,
         )
@@ -310,8 +333,7 @@ impl CloudBackend for NextcloudBackend {
         propfind::propfind_etag(
             &self.http,
             &self.webdav_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             Path::new("/"),
             timeout,
         )
@@ -323,8 +345,7 @@ impl CloudBackend for NextcloudBackend {
         match propfind::propfind_status(
             &self.http,
             &self.webdav_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             Path::new("/"),
             timeout,
         ) {
@@ -338,8 +359,7 @@ impl CloudBackend for NextcloudBackend {
         let http = self.http.clone();
         let base_url = self.base_url.clone();
         let webdav_url = self.webdav_url.clone();
-        let username = self.username.clone();
-        let password = self.password.clone();
+        let creds = self.creds.clone();
 
         let connected = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -353,8 +373,7 @@ impl CloudBackend for NextcloudBackend {
                 &http,
                 &base_url,
                 &webdav_url,
-                &username,
-                &password,
+                &creds,
                 &connected,
                 &shutdown,
                 &paused,
@@ -427,7 +446,7 @@ impl CloudBackend for NextcloudBackend {
     }
 
     fn quota(&self, timeout: Duration) -> Option<(u64, u64)> {
-        propfind::propfind_quota(&self.http, &self.webdav_url, &self.username, &self.password, timeout)
+        propfind::propfind_quota(&self.http, &self.webdav_url, &self.creds, timeout)
             .map_err(|e| log::debug!("quota fetch: {}", e))
             .ok()
     }
@@ -460,8 +479,7 @@ fn watcher_loop(
     http: &reqwest::blocking::Client,
     base_url: &str,
     webdav_url: &str,
-    username: &str,
-    password: &str,
+    creds: &Credentials,
     connected: &Arc<AtomicBool>,
     shutdown: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
@@ -482,7 +500,7 @@ fn watcher_loop(
 
         connected.store(false, Ordering::Relaxed);
 
-        let ws_url = match crate::notify_push::discover_ws_url(http, base_url, username, password) {
+        let ws_url = match crate::notify_push::discover_ws_url(http, base_url, creds) {
             Ok(url) => {
                 log::info!("change_watcher: discovered endpoint {}", url);
                 url
@@ -496,7 +514,7 @@ fn watcher_loop(
         };
 
         match watcher_connect_and_listen(
-            &ws_url, http, webdav_url, username, password, connected, shutdown, paused, callback,
+            &ws_url, http, webdav_url, creds, connected, shutdown, paused, callback,
         ) {
             Ok(()) => {
                 log::info!("change_watcher: connection closed cleanly");
@@ -520,8 +538,7 @@ fn watcher_connect_and_listen(
     ws_url: &str,
     http: &reqwest::blocking::Client,
     webdav_url: &str,
-    username: &str,
-    password: &str,
+    creds: &Credentials,
     connected: &Arc<AtomicBool>,
     shutdown: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
@@ -550,10 +567,10 @@ fn watcher_connect_and_listen(
     }
 
     socket
-        .send(Message::Text(username.into()))
+        .send(Message::Text(creds.username().into()))
         .map_err(|e| format!("send username: {}", e))?;
     socket
-        .send(Message::Text(password.into()))
+        .send(Message::Text(creds.secret().into()))
         .map_err(|e| format!("send password: {}", e))?;
 
     let auth_msg = socket
@@ -596,7 +613,7 @@ fn watcher_connect_and_listen(
         };
         match msg {
             Message::Text(ref t) if !paused.load(Ordering::Relaxed) => {
-                watcher_handle_event(t, http, webdav_url, username, password, callback);
+                watcher_handle_event(t, http, webdav_url, creds, callback);
             }
             Message::Text(_) => {}
             Message::Close(_) => {
@@ -616,8 +633,7 @@ fn watcher_handle_event(
     event: &str,
     http: &reqwest::blocking::Client,
     webdav_url: &str,
-    username: &str,
-    password: &str,
+    creds: &Credentials,
     callback: &ChangeCallback,
 ) {
     let trimmed = event.trim();
@@ -629,8 +645,7 @@ fn watcher_handle_event(
                 match propfind::resolve_fileids(
                     http,
                     webdav_url,
-                    username,
-                    password,
+                    creds,
                     &ids,
                     Duration::from_secs(15),
                 ) {
@@ -703,7 +718,7 @@ fn watcher_handle_event(
 
 impl Searchable for NextcloudBackend {
     fn fetch_search_providers(&self) -> Result<Vec<search::SearchProvider>, String> {
-        search::fetch_providers(&self.base_url, &self.username, &self.password, self.http3)
+        search::fetch_providers(&self.base_url, &self.creds, self.http3)
     }
 
     fn search(
@@ -713,8 +728,7 @@ impl Searchable for NextcloudBackend {
     ) -> Result<Vec<search::SearchResultGroup>, String> {
         search::search_filtered(
             &self.base_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             term,
             self.http3,
             provider_ids,
@@ -728,8 +742,7 @@ impl HasNotifications for NextcloudBackend {
     fn fetch_notifications(&self) -> Result<Vec<notifications::NcNotification>, String> {
         notifications::fetch_notifications(
             &self.base_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             self.http3,
         )
     }
@@ -737,8 +750,7 @@ impl HasNotifications for NextcloudBackend {
     fn dismiss_notification(&self, id: u64) -> Result<(), String> {
         notifications::dismiss_notification(
             &self.base_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             id,
             self.http3,
         )
@@ -759,8 +771,7 @@ impl HasPreviews for NextcloudBackend {
         preview::prefetch_thumbnail(
             &self.http,
             &self.base_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             mount_point,
             remote_path,
             mtime,
@@ -789,8 +800,7 @@ impl HasPreviews for NextcloudBackend {
         preview::prefetch_directory_thumbnails(
             &self.http,
             &self.base_url,
-            &self.username,
-            &self.password,
+            &self.creds,
             mount_point,
             &mapped,
             &zero,

@@ -29,11 +29,10 @@ fn main() {
     };
 
     let base_url = ncrs_core::notifications::base_url(&config.url);
-    let username = config.username.unwrap_or_default();
-    let password = config.password.unwrap_or_default();
+    let creds = config.credentials();
 
     let data = match ncrs_core::edit_locally::resolve_token(
-        &base_url, &username, &password, &parsed.token,
+        &base_url, &creds, &parsed.token,
     ) {
         Ok(d) => d,
         Err(e) => {

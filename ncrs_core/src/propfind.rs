@@ -45,8 +45,7 @@ pub struct DavEntry {
 pub fn propfind_list(
     client: &reqwest::blocking::Client,
     webdav_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     path: &std::path::Path,
     timeout: Duration,
 ) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), String> {
@@ -54,12 +53,11 @@ pub fn propfind_list(
     let t0 = Instant::now();
     log::info!("PROPFIND {} start", path.display());
 
-    let resp = client
+    let resp = creds.apply(client
         .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
         .timeout(timeout)
         .header("Depth", "1")
-        .header("Content-Type", "application/xml")
-        .basic_auth(username, Some(password))
+        .header("Content-Type", "application/xml"))
         .body(PROPFIND_BODY)
         .send()
         .map_err(|e| format!("PROPFIND {}: {}", path.display(), e))?;
@@ -80,18 +78,16 @@ pub fn propfind_list(
 pub fn propfind_status(
     client: &reqwest::blocking::Client,
     webdav_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     path: &std::path::Path,
     timeout: Duration,
 ) -> Result<(), u16> {
     let url = build_url(webdav_url, path);
-    let resp = client
+    let resp = creds.apply(client
         .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
         .timeout(timeout)
         .header("Depth", "0")
-        .header("Content-Type", "application/xml")
-        .basic_auth(username, Some(password))
+        .header("Content-Type", "application/xml"))
         .body(PROPFIND_ETAG_BODY)
         .send()
         .map_err(|_| 0u16)?;
@@ -107,20 +103,18 @@ pub fn propfind_status(
 pub fn propfind_etag(
     client: &reqwest::blocking::Client,
     webdav_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     path: &std::path::Path,
     timeout: Duration,
 ) -> Result<Option<String>, String> {
     let url = build_url(webdav_url, path);
     log::debug!("PROPFIND_ETAG {}", url);
 
-    let resp = client
+    let resp = creds.apply(client
         .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
         .timeout(timeout)
         .header("Depth", "0")
-        .header("Content-Type", "application/xml")
-        .basic_auth(username, Some(password))
+        .header("Content-Type", "application/xml"))
         .body(PROPFIND_ETAG_BODY)
         .send()
         .map_err(|e| format!("PROPFIND_ETAG {}: {}", path.display(), e))?;
@@ -138,8 +132,7 @@ pub fn propfind_etag(
 pub fn resolve_fileids(
     client: &reqwest::blocking::Client,
     webdav_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     file_ids: &[u64],
     timeout: Duration,
 ) -> Result<Vec<PathBuf>, String> {
@@ -188,11 +181,10 @@ pub fn resolve_fileids(
 
     log::debug!("SEARCH resolve_fileids {:?} at {}", file_ids, dav_root);
 
-    let resp = client
+    let resp = creds.apply(client
         .request(reqwest::Method::from_bytes(b"SEARCH").unwrap(), &dav_root)
         .timeout(timeout)
-        .header("Content-Type", "text/xml")
-        .basic_auth(username, Some(password))
+        .header("Content-Type", "text/xml"))
         .body(body)
         .send()
         .map_err(|e| format!("SEARCH resolve_fileids: {}", e))?;
@@ -279,8 +271,7 @@ fn parse_multistatus_stream<R: std::io::BufRead>(
 pub fn propfind_list_streaming<E: From<DavEntry> + Send>(
     client: &reqwest::blocking::Client,
     webdav_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     path: &std::path::Path,
     timeout: Duration,
     tx: std::sync::mpsc::Sender<E>,
@@ -290,12 +281,11 @@ pub fn propfind_list_streaming<E: From<DavEntry> + Send>(
     let t0 = Instant::now();
     log::info!("PROPFIND_STREAM {} start", path.display());
 
-    let resp = client
+    let resp = creds.apply(client
         .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
         .timeout(timeout)
         .header("Depth", "1")
-        .header("Content-Type", "application/xml")
-        .basic_auth(username, Some(password))
+        .header("Content-Type", "application/xml"))
         .body(PROPFIND_BODY)
         .send()
         .map_err(|e| format!("PROPFIND {}: {}", path.display(), e))?;
@@ -614,15 +604,13 @@ const PROPFIND_QUOTA_BODY: &str = r#"<?xml version="1.0"?>
 pub fn propfind_quota(
     client: &reqwest::blocking::Client,
     webdav_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     timeout: Duration,
 ) -> Result<(u64, u64), String> {
-    let resp = client
+    let resp = creds.apply(client
         .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), webdav_url)
-        .basic_auth(username, Some(password))
         .header("Depth", "0")
-        .header("Content-Type", "application/xml")
+        .header("Content-Type", "application/xml"))
         .body(PROPFIND_QUOTA_BODY)
         .timeout(timeout)
         .send()

@@ -67,17 +67,15 @@ fn client(http3: bool) -> reqwest::blocking::Client {
 
 pub fn fetch_notifications(
     base: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     http3: bool,
 ) -> Result<Vec<NcNotification>, String> {
     let url = format!(
         "{}/ocs/v2.php/apps/notifications/api/v2/notifications?format=json",
         base
     );
-    let resp = client(http3)
-        .get(&url)
-        .basic_auth(username, Some(password))
+    let resp = creds.apply(client(http3)
+        .get(&url))
         .header("OCS-APIREQUEST", "true")
         .send()
         .map_err(|e| e.to_string())?;
@@ -91,8 +89,7 @@ pub fn fetch_notifications(
 
 pub fn dismiss_notification(
     base: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     notification_id: u64,
     http3: bool,
 ) -> Result<(), String> {
@@ -100,9 +97,8 @@ pub fn dismiss_notification(
         "{}/ocs/v2.php/apps/notifications/api/v2/notifications/{}",
         base, notification_id
     );
-    client(http3)
-        .delete(&url)
-        .basic_auth(username, Some(password))
+    creds.apply(client(http3)
+        .delete(&url))
         .header("OCS-APIREQUEST", "true")
         .send()
         .map_err(|e| e.to_string())?;
