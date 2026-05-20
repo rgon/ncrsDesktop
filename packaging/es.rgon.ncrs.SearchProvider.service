@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=es.rgon.ncrs.SearchProvider
+Exec=/usr/bin/ncrs-search-provider

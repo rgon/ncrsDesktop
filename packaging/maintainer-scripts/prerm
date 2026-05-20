@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running --quiet 2>/dev/null; then
+            systemctl --global disable ncrs.service || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#

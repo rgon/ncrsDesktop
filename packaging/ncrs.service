@@ -1,0 +1,14 @@
+[Unit]
+Description=ncRS Nextcloud virtual filesystem
+Documentation=https://github.com/rgon/ncrsDesktop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ncrs
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

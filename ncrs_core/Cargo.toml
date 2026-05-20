@@ -20,6 +20,7 @@ assets = [
   ["../shell_integration/gnome-search/ncrs-search-provider", "usr/bin/ncrs-search-provider", "755"],
   ["../shell_integration/gnome-search/es.rgon.ncrs.SearchProvider.ini", "usr/share/gnome-shell/search-providers/es.rgon.ncrs.SearchProvider.ini", "644"],
   ["../shell_integration/gnome-search/es.rgon.ncrs.desktop", "usr/share/applications/es.rgon.ncrs.desktop", "644"],
+  ["../packaging/es.rgon.ncrs.SearchProvider.service", "usr/share/dbus-1/services/es.rgon.ncrs.SearchProvider.service", "644"],
 ]
 maintainer-scripts = "../packaging/maintainer-scripts"
 systemd-units = []

@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Enable service for all future user login sessions
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running --quiet 2>/dev/null; then
+            systemctl --global enable ncrs.service || true
+        fi
+        # Register the nc:// URI handler and other desktop entries
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database -q /usr/share/applications || true
+        fi
+        # Refresh MIME info cache
+        if command -v update-mime-database >/dev/null 2>&1; then
+            update-mime-database /usr/share/mime || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
