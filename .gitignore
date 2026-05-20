@@ -1,2 +1,4 @@
 /target
+/dist
 shell_integration/gnome-search/__pycache__/
+shell_integration/nautilus/__pycache__/
