@@ -25,7 +25,7 @@ Performs as good in an actual business than in a recently created personal cloud
 + [x] add option in our yaml to keep paths by default, without requiring the user to specify them (log an error if not found, but don't panic the application)
 + [ ] allow setting the mount path with ~ and $HOME
 + [ ] auto-create the mountpoint directory if it does not exist
-
++ [ ] review: is it possible that this extension makes my nautilus hang? In which case would it cause it?
 
 + [ ] configuration as cli flags? As yaml? review all.
 + [ ] Enterprise OAuth2 login with authd-shared token for automatic login for multi-user computers and zero touch provisioning to new machines
@@ -88,15 +88,10 @@ sudo apt-get install python3-nautilus
 
 ### First-time setup
 
-**1. Create the mount point** — any empty directory works:
-```sh
-mkdir -p ~/ncrs
-```
-
-**2. Create the config file** — run the daemon once to generate the skeleton, then fill it in:
+**Create the config file** — run the daemon once to generate the skeleton, then fill it in:
 ```sh
 cargo run -p ncrs_core        # exits immediately, writes ~/.config/ncrs/config.yaml
-$EDITOR ~/.config/ncrs/config.yaml
+nano ~/.config/ncrs/config.yaml
 ```
 
 The file looks like this; use an [app password](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) rather than your main password:

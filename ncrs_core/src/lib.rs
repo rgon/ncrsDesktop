@@ -3717,6 +3717,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     let fuse_options = build_fuse_options();
 
+    if !options.mount_point.exists() {
+        std::fs::create_dir_all(&options.mount_point)
+            .map_err(|e| format!("failed to create mount point {}: {}", options.mount_point.display(), e))?;
+        log::info!("Created mount point directory {}", options.mount_point.display());
+    }
+
     let mp_str = options.mount_point.to_string_lossy().to_string();
     let _ = std::process::Command::new("fusermount")
         .args(["-uz", &mp_str])
