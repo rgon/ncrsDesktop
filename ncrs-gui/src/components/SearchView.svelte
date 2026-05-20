@@ -230,13 +230,16 @@
                             {/if}
                         </div>
                         {#if entry.resource_url}
-                        <button
+                        <div
+                            role="button"
+                            tabindex="0"
                             class="btn btn-ghost btn-xs btn-square opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
                             onclick={(e) => viewOnline(e, entry.resource_url)}
+                            onkeydown={(e) => e.key === 'Enter' && viewOnline(e, entry.resource_url)}
                             title="View in Nextcloud Web"
                         >
                             <Icon class="w-3.5 h-3.5" path={mdiOpenInNew} />
-                        </button>
+                        </div>
                         {/if}
                     </button>
                     {/each}
