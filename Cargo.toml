@@ -5,5 +5,10 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Gonzalo Ruiz <gonza@logo.cl>"]
+
 [workspace.dependencies]
 clap = "4.5.40"
