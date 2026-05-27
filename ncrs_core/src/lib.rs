@@ -3712,16 +3712,19 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     let fuse_options = build_fuse_options();
 
-    if !options.mount_point.exists() {
-        std::fs::create_dir_all(&options.mount_point)
-            .map_err(|e| format!("failed to create mount point {}: {}", options.mount_point.display(), e))?;
-        log::info!("Created mount point directory {}", options.mount_point.display());
-    }
-
     let mp_str = options.mount_point.to_string_lossy().to_string();
+
+    // Try to unmount any stale FUSE mount first — a dead mount makes
+    // exists() return false while the inode still occupies the path.
     let _ = std::process::Command::new("fusermount")
         .args(["-uz", &mp_str])
         .output();
+
+    if let Err(e) = std::fs::create_dir_all(&options.mount_point) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(format!("failed to create mount point {}: {}", options.mount_point.display(), e));
+        }
+    }
 
     log::info!(
         "Mounting WebDAV {} at {}",

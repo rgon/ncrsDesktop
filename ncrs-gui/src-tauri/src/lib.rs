@@ -434,21 +434,20 @@ pub fn run() {
             let app_handle_listener = app.handle().clone();
             app.listen("sync-state-changed", move |event| {
                 let payload = event.payload().trim_matches('"');
-                if payload == "unmounted" || payload == "wiped" {
-                    let tray_id = tray_id_listener.lock().unwrap().clone();
-                    let Some(tray_id) = tray_id else { return };
-                    let ss = state_listener.sync_state.lock().unwrap().clone();
-                    if let Some(tray) = app_handle_listener.tray_by_id(&tray_id) {
-                        let icon_path = if payload == "wiped" {
-                            concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.error.png")
-                        } else {
-                            concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png")
-                        };
-                        let _ = tray.set_icon(Some(load_icon(icon_path)));
-                        if let Ok(menu) = rerender_tray_menu(&app_handle_listener, &ss) {
-                            let _ = tray.set_menu(Some(menu));
-                        }
-                    }
+                let tray_id = tray_id_listener.lock().unwrap().clone();
+                let Some(tray_id) = tray_id else { return };
+                let ss = state_listener.sync_state.lock().unwrap().clone();
+                let Some(tray) = app_handle_listener.tray_by_id(&tray_id) else { return };
+
+                let icon_path: &'static str = match payload {
+                    "wiped" => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.error.png"),
+                    "unmounted" | "paused" => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"),
+                    "syncing" => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.syncing.png"),
+                    _ => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png"),
+                };
+                let _ = tray.set_icon(Some(load_icon(icon_path)));
+                if let Ok(menu) = rerender_tray_menu(&app_handle_listener, &ss) {
+                    let _ = tray.set_menu(Some(menu));
                 }
             });
 
@@ -532,7 +531,18 @@ pub fn run() {
                 spawn(start_ncfs_daemon(remount_app, remount_state));
             }
             "settings" => open_main_window(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                let mount_point = app_state_menu.mount_options.lock().unwrap()
+                    .as_ref()
+                    .map(|o| o.mount_point.to_string_lossy().to_string());
+                if let Some(mp) = mount_point {
+                    log::info!("quit: unmounting {}", mp);
+                    let _ = std::process::Command::new("fusermount")
+                        .args(["-uz", &mp])
+                        .output();
+                }
+                app.exit(0);
+            }
             other => { plugins::handle_plugin_tray_event(app, other); }
         })
         .run(tauri::generate_context!())
