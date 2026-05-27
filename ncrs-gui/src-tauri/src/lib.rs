@@ -6,7 +6,6 @@ use tauri::{
     menu::{MenuBuilder, MenuItem},
     tray::{TrayIconBuilder, TrayIconId},
     AppHandle, Emitter, EventLoopMessage, Listener, Manager, State, WindowEvent,
-    PhysicalSize,
 };
 use tauri_plugin_opener::OpenerExt;
 use tauri::async_runtime::spawn;
@@ -14,6 +13,8 @@ use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration};
 
 use ncrs_core::{mount_ncfs, mutation_journal::{self, SharedJournal, JournalEntry, ConflictRecord}, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, ipc::StorageStats, ErrorLog, MountOptions, SyncError, SyncState, TransferMap, TransferProgress};
+
+mod plugins;
 
 // ── Shared app state ─────────────────────────────────────────────────────────
 
@@ -267,6 +268,11 @@ async fn search_nextcloud(
     Ok(groups)
 }
 
+#[tauri::command]
+fn get_plugin_metas() -> Vec<ncrs_plugin::PluginMeta> {
+    plugins::all_metas()
+}
+
 fn extract_dir_param(url: &str) -> Option<String> {
     let query = url.split('?').nth(1)?;
     for pair in query.split('&') {
@@ -327,6 +333,14 @@ fn rerender_tray_menu(
         builder = builder.item(&pause_i);
     }
 
+    let plugin_items = plugins::all_tray_items(app)?;
+    if !plugin_items.is_empty() {
+        builder = builder.separator();
+        for item in &plugin_items {
+            builder = builder.item(item);
+        }
+    }
+
     builder
         .separator()
         .item(&settings_i)
@@ -339,18 +353,7 @@ fn load_icon(path: &'static str) -> Image<'static> {
 }
 
 fn open_main_window(app: &AppHandle) {
-    let main_window = match app.get_webview_window("main") {
-        Some(w) => w,
-        None => return,
-    };
-    let monitor = main_window.primary_monitor().unwrap();
-    if let Some(m) = monitor {
-        let _ = main_window.set_size(*m.size());
-    } else {
-        let _ = main_window.set_size(PhysicalSize::new(1860u32, 1000u32));
-    }
-    main_window.show().unwrap();
-    main_window.set_focus().unwrap();
+    ncrs_plugin::open_main_window(app);
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -388,9 +391,22 @@ pub fn run() {
             fetch_search_providers,
             search_nextcloud,
             get_storage_stats,
+            get_plugin_metas,
             remount,
+            nc_passwords::commands::nc_passwords_connect,
+            nc_passwords::commands::nc_passwords_disconnect,
+            nc_passwords::commands::nc_passwords_is_connected,
+            nc_passwords::commands::nc_passwords_list,
+            nc_passwords::commands::nc_passwords_show,
+            nc_passwords::commands::nc_passwords_search,
+            nc_passwords::commands::nc_passwords_create,
+            nc_passwords::commands::nc_passwords_delete,
+            nc_passwords::commands::nc_passwords_folders,
+            nc_passwords::commands::nc_passwords_tags,
+            nc_passwords::commands::nc_passwords_favicon_url,
         ])
         .setup(move |app| {
+            nc_passwords::setup(app.handle());
             let state_listener = app_state_setup.clone();
             spawn(start_ncfs_daemon(app.handle().clone(), app_state_setup));
 
@@ -513,7 +529,7 @@ pub fn run() {
             }
             "settings" => open_main_window(app),
             "quit" => app.exit(0),
-            _ => {}
+            other => { plugins::handle_plugin_tray_event(app, other); }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -537,6 +553,11 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     };
 
     *state.mount_options.lock().unwrap() = Some(opts.clone());
+
+    let base_url = ncrs_core::notifications::base_url(&opts.url);
+    let user = opts.username.clone().unwrap_or_default();
+    let pass = opts.password.clone().unwrap_or_default();
+    nc_passwords::set_credentials(&app, &base_url, &user, &pass);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 

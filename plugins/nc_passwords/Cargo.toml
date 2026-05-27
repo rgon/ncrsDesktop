@@ -1,0 +1,16 @@
+[package]
+name = "nc_passwords"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ncrs_plugin = { path = "../ncrs_plugin" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-runtime-wry = "2.6.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.11", features = ["blocking", "json", "cookies"] }
+log = "0.4"
+
+[dev-dependencies]
+serde_json = "1"
