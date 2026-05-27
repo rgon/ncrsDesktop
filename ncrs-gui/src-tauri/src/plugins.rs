@@ -15,8 +15,20 @@ pub fn all_metas() -> Vec<PluginMeta> {
 
 pub fn all_tray_items(app: &AppHandle) -> Result<Vec<MenuItem<WryRuntime>>, tauri::Error> {
     let mut items = Vec::new();
-    for plugin in all_plugins() {
-        items.extend(plugin.tray_items(app)?);
+    let plugins = all_plugins();
+    log::info!("all_tray_items: {} plugin(s) registered", plugins.len());
+    for plugin in plugins {
+        let meta = plugin.meta();
+        match plugin.tray_items(app) {
+            Ok(tray_items) => {
+                log::info!("plugin '{}': {} tray item(s)", meta.id, tray_items.len());
+                items.extend(tray_items);
+            }
+            Err(e) => {
+                log::error!("plugin '{}': tray_items failed: {}", meta.id, e);
+                return Err(e);
+            }
+        }
     }
     Ok(items)
 }

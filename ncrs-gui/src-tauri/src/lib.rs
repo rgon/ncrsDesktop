@@ -270,7 +270,9 @@ async fn search_nextcloud(
 
 #[tauri::command]
 fn get_plugin_metas() -> Vec<ncrs_plugin::PluginMeta> {
-    plugins::all_metas()
+    let metas = plugins::all_metas();
+    log::info!("get_plugin_metas: returning {} plugin(s): {:?}", metas.len(), metas.iter().map(|m| &m.id).collect::<Vec<_>>());
+    metas
 }
 
 fn extract_dir_param(url: &str) -> Option<String> {
@@ -334,6 +336,7 @@ fn rerender_tray_menu(
     }
 
     let plugin_items = plugins::all_tray_items(app)?;
+    log::info!("tray menu: {} plugin item(s)", plugin_items.len());
     if !plugin_items.is_empty() {
         builder = builder.separator();
         for item in &plugin_items {
@@ -407,6 +410,7 @@ pub fn run() {
         ])
         .setup(move |app| {
             nc_passwords::setup(app.handle());
+            log::info!("plugin setup done: nc_passwords");
             let state_listener = app_state_setup.clone();
             spawn(start_ncfs_daemon(app.handle().clone(), app_state_setup));
 
