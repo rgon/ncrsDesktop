@@ -19,6 +19,8 @@
     import SearchView from '../components/SearchView.svelte';
     import ErrorsView from '../components/ErrorsView.svelte';
     import ConflictsView from '../components/ConflictsView.svelte';
+    import PluginsView from '../components/PluginsView.svelte';
+    import { getPluginComponent } from '../plugins/registry';
 
     // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -80,7 +82,7 @@
 
     // ── State ─────────────────────────────────────────────────────────────────
 
-    type View = "notifications" | "search" | "errors" | "conflicts";
+    type View = "notifications" | "search" | "errors" | "conflicts" | "plugins" | `plugin:${string}`;
 
     let userInfo = $state<UserInfo | null>(null);
     let syncState = $state<string>("idle");
@@ -271,6 +273,14 @@
             <div>
                 <button
                     class="btn btn-ghost btn-sm rounded-btn"
+                    class:btn-active={activeView === "plugins" || activeView.startsWith("plugin:")}
+                    aria-label="Apps"
+                    onclick={() => { activeView = activeView === "plugins" || activeView.startsWith("plugin:") ? "notifications" : "plugins"; }}
+                >
+                    <Icon class="w-6 h-6" path={mdiAppsBox} />
+                </button>
+                <button
+                    class="btn btn-ghost btn-sm rounded-btn"
                     class:btn-active={activeView === "search"}
                     aria-label="Search"
                     onclick={() => { activeView = activeView === "search" ? "notifications" : "search"; }}
@@ -329,6 +339,19 @@
             <ErrorsView {errors} onclear={clearErrors} />
         {:else if activeView === "conflicts"}
             <ConflictsView {conflicts} {pendingMutations} onresolve={resolveConflict} />
+        {:else if activeView === "plugins"}
+            <PluginsView onselect={(id) => { activeView = `plugin:${id}`; }} />
+        {:else if activeView.startsWith("plugin:")}
+            {@const pluginId = activeView.slice(7)}
+            {@const entry = getPluginComponent(pluginId)}
+            {#if entry}
+                {@const PluginComponent = entry.component}
+                <PluginComponent />
+            {:else}
+                <div class="flex items-center justify-center h-24 text-gray-400 text-sm">
+                    Plugin view not available
+                </div>
+            {/if}
         {:else}
             <div class="overflow-y-auto p-2 flex-grow">
                 {#if notifications.length === 0}
