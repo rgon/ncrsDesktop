@@ -69,6 +69,10 @@ pub fn execute_wipe(cache_dir: &Path, config_path: &Path) -> Result<(), String> 
                         let trimmed = line.trim_start();
                         if trimmed.starts_with("password:") {
                             "password: \"\""
+                        } else if trimmed.starts_with("bearer_token:") {
+                            "bearer_token: \"\""
+                        } else if trimmed.starts_with("auth_command:") {
+                            "auth_command: \"\""
                         } else {
                             line
                         }
@@ -109,7 +113,7 @@ mod tests {
         let config_path = tmp.path().join("config.yaml");
         fs::write(
             &config_path,
-            "url: \"https://cloud.example.com\"\nusername: \"user\"\npassword: \"secret-token\"\nmount_point: \"/mnt/nc\"\n",
+            "url: \"https://cloud.example.com\"\nusername: \"user\"\npassword: \"secret-token\"\nbearer_token: \"ey.jwt.token\"\nauth_command: \"secret-tool lookup label authd\"\nmount_point: \"/mnt/nc\"\n",
         )
         .unwrap();
 
@@ -118,7 +122,11 @@ mod tests {
         assert!(!cache_dir.exists());
         let config = fs::read_to_string(&config_path).unwrap();
         assert!(config.contains("password: \"\""));
+        assert!(config.contains("bearer_token: \"\""));
+        assert!(config.contains("auth_command: \"\""));
         assert!(!config.contains("secret-token"));
+        assert!(!config.contains("ey.jwt.token"));
+        assert!(!config.contains("secret-tool"));
         assert!(config.contains("url: \"https://cloud.example.com\""));
     }
 }

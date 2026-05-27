@@ -96,15 +96,13 @@ fn absolutize(base: &str, url: &str) -> String {
 
 pub fn fetch_providers(
     base: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     http3: bool,
 ) -> Result<Vec<SearchProvider>, String> {
     let url = format!("{}/ocs/v2.php/search/providers", base);
-    let resp = client(http3)
+    let resp = creds.apply(client(http3)
         .get(&url)
-        .query(&[("format", "json")])
-        .basic_auth(username, Some(password))
+        .query(&[("format", "json")]))
         .header("OCS-APIREQUEST", "true")
         .send()
         .map_err(|e| e.to_string())?;
@@ -117,8 +115,7 @@ pub fn fetch_providers(
 
 pub fn search_provider(
     base: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     provider_id: &str,
     term: &str,
     http3: bool,
@@ -128,10 +125,9 @@ pub fn search_provider(
         base, provider_id,
     );
     let limit = RESULTS_PER_PROVIDER.to_string();
-    let resp = client(http3)
+    let resp = creds.apply(client(http3)
         .get(&url)
-        .query(&[("term", term), ("limit", &limit), ("format", "json")])
-        .basic_auth(username, Some(password))
+        .query(&[("term", term), ("limit", &limit), ("format", "json")]))
         .header("OCS-APIREQUEST", "true")
         .send()
         .map_err(|e| e.to_string())?;
@@ -145,24 +141,22 @@ pub fn search_provider(
 /// Search all providers in parallel, returning only groups with results.
 pub fn search_all(
     base: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     term: &str,
     http3: bool,
 ) -> Result<Vec<SearchResultGroup>, String> {
-    search_filtered(base, username, password, term, http3, &[])
+    search_filtered(base, creds, term, http3, &[])
 }
 
 /// Search selected providers (or all if `provider_ids` is empty).
 pub fn search_filtered(
     base: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     term: &str,
     http3: bool,
     provider_ids: &[String],
 ) -> Result<Vec<SearchResultGroup>, String> {
-    let mut providers = fetch_providers(base, username, password, http3)?;
+    let mut providers = fetch_providers(base, creds, http3)?;
     providers.sort_by_key(|p| p.order);
     if !provider_ids.is_empty() {
         providers.retain(|p| provider_ids.contains(&p.id));
@@ -177,7 +171,7 @@ pub fn search_filtered(
                 let pid = p.id.clone();
                 let pname = p.name.clone();
                 s.spawn(move || {
-                    match search_provider(base, username, password, &pid, term, http3) {
+                    match search_provider(base, creds, &pid, term, http3) {
                         Ok(entries) if !entries.is_empty() => {
                             let entries = entries
                                 .into_iter()

@@ -55,19 +55,23 @@ struct NotifyPushCap {
 #[derive(serde::Deserialize)]
 struct NotifyPushEndpoints {
     websocket: String,
+    pre_auth: Option<String>,
 }
 
-pub(crate) fn discover_ws_url(
+pub(crate) struct NotifyPushInfo {
+    pub ws_url: String,
+    pub pre_auth_url: Option<String>,
+}
+
+pub(crate) fn discover_endpoints(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    username: &str,
-    password: &str,
-) -> Result<String, String> {
+    creds: &crate::auth::Credentials,
+) -> Result<NotifyPushInfo, String> {
     let url = format!("{}/ocs/v2.php/cloud/capabilities?format=json", base_url);
-    let resp = client
+    let resp = creds.apply(client
         .get(&url)
-        .timeout(CAPABILITIES_TIMEOUT)
-        .basic_auth(username, Some(password))
+        .timeout(CAPABILITIES_TIMEOUT))
         .header("OCS-APIREQUEST", "true")
         .send()
         .map_err(|e| format!("capabilities request failed: {}", e))?;
@@ -77,12 +81,40 @@ pub(crate) fn discover_ws_url(
     }
 
     let caps: OcsCapabilities = resp.json().map_err(|e| format!("capabilities parse error: {}", e))?;
-    caps.ocs
+    let np = caps.ocs
         .data
         .capabilities
         .notify_push
-        .map(|np| np.endpoints.websocket)
-        .ok_or_else(|| "notify_push capability not found (app not installed?)".into())
+        .ok_or_else(|| "notify_push capability not found (app not installed?)".to_string())?;
+    Ok(NotifyPushInfo {
+        ws_url: np.endpoints.websocket,
+        pre_auth_url: np.endpoints.pre_auth,
+    })
+}
+
+const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) fn fetch_pre_auth_ticket(
+    client: &reqwest::blocking::Client,
+    pre_auth_url: &str,
+    creds: &crate::auth::Credentials,
+) -> Result<String, String> {
+    let resp = creds.apply(client.post(pre_auth_url).timeout(PRE_AUTH_TIMEOUT))
+        .send()
+        .map_err(|e| format!("pre_auth request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("pre_auth returned {}", resp.status()));
+    }
+
+    let ticket = resp.text()
+        .map_err(|e| format!("pre_auth body read: {}", e))?
+        .trim()
+        .to_string();
+    if ticket.is_empty() {
+        return Err("pre_auth returned empty ticket".into());
+    }
+    Ok(ticket)
 }
 
 // -- Cache invalidation utilities ---------------------------------------------

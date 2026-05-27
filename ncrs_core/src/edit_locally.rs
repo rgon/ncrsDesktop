@@ -22,8 +22,7 @@ pub struct OpenLocalEditorData {
 
 pub fn resolve_token(
     base_url: &str,
-    username: &str,
-    password: &str,
+    creds: &crate::auth::Credentials,
     token: &str,
 ) -> Result<OpenLocalEditorData, String> {
     let url = format!(
@@ -31,10 +30,9 @@ pub fn resolve_token(
         base_url
     );
     let client = reqwest::blocking::Client::new();
-    let resp = client
+    let resp = creds.apply(client
         .post(&url)
-        .timeout(API_TIMEOUT)
-        .basic_auth(username, Some(password))
+        .timeout(API_TIMEOUT))
         .header("OCS-APIREQUEST", "true")
         .json(&serde_json::json!({ "token": token }))
         .send()

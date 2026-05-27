@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod backend;
 pub mod config;
 pub mod edit_locally;
@@ -1353,8 +1354,7 @@ struct ConnInfo {
     backend: Arc<dyn crate::backend::CloudBackend>,
     base_url: String,
     webdav_url: String,
-    username: String,
-    password: String,
+    creds: auth::Credentials,
     mount_point: PathBuf,
     http: reqwest::blocking::Client,
     optimistic_listing: bool,
@@ -1414,8 +1414,7 @@ pub struct NextCloudFs {
 
 impl NextCloudFs {
     pub fn new(options: MountOptions) -> Result<Self, String> {
-        let username = options.username.unwrap_or_default();
-        let password = options.password.unwrap_or_default();
+        let creds = options.credentials()?;
 
         let exclude_folders: HashSet<PathBuf> = options.exclude_folders.iter().map(|s| {
             let s = s.trim();
@@ -1501,8 +1500,7 @@ impl NextCloudFs {
             Arc::new(crate::nextcloud::NextcloudBackend::new_offline(
                 base_url.clone(),
                 options.url.clone(),
-                username.clone(),
-                password.clone(),
+                creds.clone(),
                 http.clone(),
                 http_read.clone(),
                 options.http3,
@@ -1511,8 +1509,7 @@ impl NextCloudFs {
             Arc::new(crate::nextcloud::NextcloudBackend::new(
                 base_url.clone(),
                 options.url.clone(),
-                username.clone(),
-                password.clone(),
+                creds.clone(),
                 http.clone(),
                 http_read.clone(),
                 options.http3,
@@ -1523,8 +1520,7 @@ impl NextCloudFs {
             backend,
             base_url,
             webdav_url: options.url.clone(),
-            username: username.clone(),
-            password: password.clone(),
+            creds,
             mount_point: options.mount_point.clone(),
             http,
             http_read,
@@ -2466,8 +2462,7 @@ impl Filesystem for NextCloudFs {
                                 preview::prefetch_directory_thumbnails(
                                     &conn2.http,
                                     &conn2.base_url,
-                                    &conn2.username,
-                                    &conn2.password,
+                                    &conn2.creds,
                                     &conn2.mount_point,
                                     &thumb_candidates,
                                     &conn2.active_streams,
@@ -3304,7 +3299,8 @@ fn do_range_read_stream<'a>(
         .get(&url)
         .timeout(DOWNLOAD_TIMEOUT)
         .header("Range", format!("bytes={}-{}", offset, end))
-        .basic_auth(&conn.username, Some(&conn.password))
+        ;
+    let resp = conn.creds.apply(resp)
         .send()
         .map_err(|e| e.to_string())?;
     let status = resp.status();
@@ -3415,11 +3411,10 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let evict_cb = filesystem.evict_callback();
     let prefetch_cb = filesystem.prefetch_callback();
     let base_url = notifications::base_url(&options.url);
-    let username = options.username.clone().unwrap_or_default();
-    let ipc_password = options.password.clone().unwrap_or_default();
+    let ipc_creds = options.credentials()?;
     let file_change_queue: ipc::FileChangeQueue = Arc::new(Mutex::new(Vec::new()));
     let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), username, ipc_password, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone());
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone());
 
     let offline_flag = filesystem.is_offline_flag();
     let backend = filesystem.conn.backend.clone();
@@ -3492,14 +3487,14 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                         }
                         backend::ReachabilityStatus::AuthRejected(code) => {
                             log::warn!("CONNECTIVITY: auth rejected (HTTP {}), checking for remote wipe", code);
-                            match remote_wipe::check_wipe(&conn_monitor.http, &conn_monitor.base_url, &conn_monitor.password) {
+                            match remote_wipe::check_wipe(&conn_monitor.http, &conn_monitor.base_url, conn_monitor.creds.secret()) {
                                 Ok(true) => {
                                     log::warn!("REMOTE WIPE requested by server — executing");
                                     let config_path = config::config_path();
                                     if let Err(e) = remote_wipe::execute_wipe(&cache_dir_monitor, &config_path) {
                                         log::error!("REMOTE_WIPE execution error: {}", e);
                                     }
-                                    if let Err(e) = remote_wipe::confirm_wipe(&conn_monitor.http, &conn_monitor.base_url, &conn_monitor.password) {
+                                    if let Err(e) = remote_wipe::confirm_wipe(&conn_monitor.http, &conn_monitor.base_url, conn_monitor.creds.secret()) {
                                         log::warn!("REMOTE_WIPE: failed to confirm to server: {}", e);
                                     }
                                     wipe_flag_monitor.store(true, Ordering::Relaxed);
