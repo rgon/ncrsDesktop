@@ -35,8 +35,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_returns_empty_with_no_plugins() {
-        assert!(all_metas().is_empty());
+    fn registry_has_registered_plugins() {
+        let metas = all_metas();
+        assert!(!metas.is_empty());
+        assert!(metas.iter().any(|m| m.id == "nc_passwords"));
     }
 
     #[test]
