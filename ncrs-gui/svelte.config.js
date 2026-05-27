@@ -11,6 +11,7 @@ const config = {
     adapter: adapter(),
     alias: {
       '$plugins': '../../plugins',
+      '$components': 'src/components',
     },
   },
 };

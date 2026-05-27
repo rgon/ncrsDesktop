@@ -182,6 +182,10 @@
             conflicts = e.payload;
         });
 
+        const unlistenPluginNav = listen<string>("navigate-plugin", (e) => {
+            activeView = `plugin:${e.payload}`;
+        });
+
         const storageInterval = setInterval(() => {
             invoke<StorageStats>("get_storage_stats").then(s => { storage = s; }).catch(() => {});
         }, 30_000);
@@ -204,6 +208,7 @@
             unlistenTransfers.then(f => f());
             unlistenJournal.then(f => f());
             unlistenConflicts.then(f => f());
+            unlistenPluginNav.then(f => f());
             clearInterval(storageInterval);
             document.removeEventListener("click", clickOutListener);
             document.removeEventListener("keydown", escKeyListener);
