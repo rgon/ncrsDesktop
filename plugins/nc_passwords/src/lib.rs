@@ -1,5 +1,6 @@
 pub mod api;
 pub mod commands;
+pub mod window_context;
 
 use std::sync::Mutex;
 
@@ -15,6 +16,7 @@ type WryRuntime = Wry<EventLoopMessage>;
 pub struct NcPasswordsState {
     pub credentials: Mutex<Option<(String, String, String)>>,
     pub client: Mutex<Option<PasswordsClient>>,
+    pub last_window_context: Mutex<Option<String>>,
 }
 
 impl Default for NcPasswordsState {
@@ -22,6 +24,7 @@ impl Default for NcPasswordsState {
         Self {
             credentials: Mutex::new(None),
             client: Mutex::new(None),
+            last_window_context: Mutex::new(None),
         }
     }
 }
