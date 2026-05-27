@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tauri::menu::MenuItem;
-use tauri::{AppHandle, EventLoopMessage};
+use tauri::{AppHandle, EventLoopMessage, Manager};
 use tauri_runtime_wry::Wry;
 
 type WryRuntime = Wry<EventLoopMessage>;
@@ -25,6 +25,19 @@ pub trait NcrsPlugin: Send + Sync {
     fn handle_tray_event(&self, app: &AppHandle, id: &str) -> bool {
         let _ = (app, id);
         false
+    }
+}
+
+pub fn open_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let monitor = w.primary_monitor().unwrap();
+        if let Some(m) = monitor {
+            let _ = w.set_size(*m.size());
+        } else {
+            let _ = w.set_size(tauri::PhysicalSize::new(1860u32, 1000u32));
+        }
+        let _ = w.show();
+        let _ = w.set_focus();
     }
 }
 

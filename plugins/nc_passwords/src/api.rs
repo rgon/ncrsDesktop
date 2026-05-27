@@ -346,4 +346,43 @@ mod tests {
             "00000000-0000-0000-0000-000000000000"
         );
     }
+
+    #[test]
+    fn password_entry_deserializes_with_minimal_fields() {
+        let json = r#"{
+            "id": "min-1",
+            "label": "Minimal",
+            "username": "u",
+            "password": "p",
+            "url": "",
+            "notes": ""
+        }"#;
+        let entry: PasswordEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.id, "min-1");
+        assert_eq!(entry.folder, "");
+        assert!(!entry.favorite);
+        assert!(!entry.trashed);
+        assert_eq!(entry.status_code, 0);
+        assert_eq!(entry.created, 0);
+    }
+
+    #[test]
+    fn client_trims_trailing_slash() {
+        let client = PasswordsClient::new("https://cloud.example.com/", "u", "p");
+        let url = client.favicon_url("x.com", 16);
+        assert!(
+            url.starts_with("https://cloud.example.com/index.php/"),
+            "URL should not have double slash: {url}"
+        );
+    }
+
+    #[test]
+    fn api_url_format() {
+        let client = PasswordsClient::new("https://cloud.example.com", "u", "p");
+        let url = client.api_url("/api/1.0/password/list");
+        assert_eq!(
+            url,
+            "https://cloud.example.com/index.php/apps/passwords/api/1.0/password/list"
+        );
+    }
 }

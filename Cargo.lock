@@ -2559,7 +2559,6 @@ name = "nc_passwords"
 version = "0.1.0"
 dependencies = [
  "log",
- "ncrs_core",
  "ncrs_plugin",
  "reqwest 0.11.27",
  "serde",

@@ -6,7 +6,6 @@ use tauri::{
     menu::{MenuBuilder, MenuItem},
     tray::{TrayIconBuilder, TrayIconId},
     AppHandle, Emitter, EventLoopMessage, Listener, Manager, State, WindowEvent,
-    PhysicalSize,
 };
 use tauri_plugin_opener::OpenerExt;
 use tauri::async_runtime::spawn;
@@ -354,18 +353,7 @@ fn load_icon(path: &'static str) -> Image<'static> {
 }
 
 fn open_main_window(app: &AppHandle) {
-    let main_window = match app.get_webview_window("main") {
-        Some(w) => w,
-        None => return,
-    };
-    let monitor = main_window.primary_monitor().unwrap();
-    if let Some(m) = monitor {
-        let _ = main_window.set_size(*m.size());
-    } else {
-        let _ = main_window.set_size(PhysicalSize::new(1860u32, 1000u32));
-    }
-    main_window.show().unwrap();
-    main_window.set_focus().unwrap();
+    ncrs_plugin::open_main_window(app);
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────

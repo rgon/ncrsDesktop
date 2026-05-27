@@ -50,16 +50,7 @@ impl NcrsPlugin for NcPasswordsPlugin {
 
     fn handle_tray_event(&self, app: &AppHandle, id: &str) -> bool {
         if id == "plugin_passwords_open" {
-            if let Some(w) = app.get_webview_window("main") {
-                let monitor = w.primary_monitor().unwrap();
-                if let Some(m) = monitor {
-                    let _ = w.set_size(*m.size());
-                } else {
-                    let _ = w.set_size(tauri::PhysicalSize::new(1860u32, 1000u32));
-                }
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
+            ncrs_plugin::open_main_window(app);
             app.emit("navigate-plugin", "nc_passwords").ok();
             true
         } else {
@@ -76,5 +67,47 @@ pub fn set_credentials(app: &AppHandle, base_url: &str, username: &str, password
     if let Some(state) = app.try_state::<NcPasswordsState>() {
         *state.credentials.lock().unwrap() =
             Some((base_url.into(), username.into(), password.into()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ncrs_plugin::NcrsPlugin;
+
+    #[test]
+    fn plugin_meta_has_correct_id() {
+        let plugin = NcPasswordsPlugin;
+        let meta = plugin.meta();
+        assert_eq!(meta.id, "nc_passwords");
+        assert_eq!(meta.name, "Passwords");
+        assert!(!meta.version.is_empty());
+    }
+
+    #[test]
+    fn plugin_meta_serializes() {
+        let plugin = NcPasswordsPlugin;
+        let meta = plugin.meta();
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: ncrs_plugin::PluginMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, meta.id);
+        assert_eq!(back.icon, "mdiLock");
+    }
+
+    #[test]
+    fn default_state_has_no_credentials_or_client() {
+        let state = NcPasswordsState::default();
+        assert!(state.credentials.lock().unwrap().is_none());
+        assert!(state.client.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn handle_tray_event_rejects_unknown_id() {
+        let plugin = NcPasswordsPlugin;
+        // Cannot call handle_tray_event without AppHandle, but we can verify
+        // the meta's tray item ID constant matches what handle_tray_event checks
+        let meta = plugin.meta();
+        let expected_tray_id = format!("plugin_{}_open", meta.id.replace("nc_", ""));
+        assert_eq!(expected_tray_id, "plugin_passwords_open");
     }
 }

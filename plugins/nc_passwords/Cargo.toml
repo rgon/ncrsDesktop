@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 ncrs_plugin = { path = "../ncrs_plugin" }
-ncrs_core = { path = "../../ncrs_core" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-runtime-wry = "2.6.0"
 serde = { version = "1", features = ["derive"] }
