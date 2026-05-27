@@ -405,8 +405,20 @@ pub fn run() {
             get_storage_stats,
             get_plugin_metas,
             remount,
+            nc_passwords::commands::nc_passwords_connect,
+            nc_passwords::commands::nc_passwords_disconnect,
+            nc_passwords::commands::nc_passwords_is_connected,
+            nc_passwords::commands::nc_passwords_list,
+            nc_passwords::commands::nc_passwords_show,
+            nc_passwords::commands::nc_passwords_search,
+            nc_passwords::commands::nc_passwords_create,
+            nc_passwords::commands::nc_passwords_delete,
+            nc_passwords::commands::nc_passwords_folders,
+            nc_passwords::commands::nc_passwords_tags,
+            nc_passwords::commands::nc_passwords_favicon_url,
         ])
         .setup(move |app| {
+            nc_passwords::setup(app.handle());
             let state_listener = app_state_setup.clone();
             spawn(start_ncfs_daemon(app.handle().clone(), app_state_setup));
 
@@ -553,6 +565,11 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     };
 
     *state.mount_options.lock().unwrap() = Some(opts.clone());
+
+    let base_url = ncrs_core::notifications::base_url(&opts.url);
+    let user = opts.username.clone().unwrap_or_default();
+    let pass = opts.password.clone().unwrap_or_default();
+    nc_passwords::set_credentials(&app, &base_url, &user, &pass);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
