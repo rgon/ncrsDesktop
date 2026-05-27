@@ -15,6 +15,8 @@ use tokio::time::{sleep, Duration};
 
 use ncrs_core::{mount_ncfs, mutation_journal::{self, SharedJournal, JournalEntry, ConflictRecord}, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, ipc::StorageStats, ErrorLog, MountOptions, SyncError, SyncState, TransferMap, TransferProgress};
 
+mod plugins;
+
 // ── Shared app state ─────────────────────────────────────────────────────────
 
 pub struct AppState {
@@ -267,6 +269,11 @@ async fn search_nextcloud(
     Ok(groups)
 }
 
+#[tauri::command]
+fn get_plugin_metas() -> Vec<ncrs_plugin::PluginMeta> {
+    plugins::all_metas()
+}
+
 fn extract_dir_param(url: &str) -> Option<String> {
     let query = url.split('?').nth(1)?;
     for pair in query.split('&') {
@@ -325,6 +332,14 @@ fn rerender_tray_menu(
         };
         let pause_i = MenuItem::with_id(app, "pause", pause_text, true, None::<&str>)?;
         builder = builder.item(&pause_i);
+    }
+
+    let plugin_items = plugins::all_tray_items(app)?;
+    if !plugin_items.is_empty() {
+        builder = builder.separator();
+        for item in &plugin_items {
+            builder = builder.item(item);
+        }
     }
 
     builder
@@ -388,6 +403,7 @@ pub fn run() {
             fetch_search_providers,
             search_nextcloud,
             get_storage_stats,
+            get_plugin_metas,
             remount,
         ])
         .setup(move |app| {
@@ -513,7 +529,7 @@ pub fn run() {
             }
             "settings" => open_main_window(app),
             "quit" => app.exit(0),
-            _ => {}
+            other => { plugins::handle_plugin_tray_event(app, other); }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application")
