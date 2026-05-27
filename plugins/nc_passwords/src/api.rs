@@ -20,7 +20,7 @@ pub struct PasswordEntry {
     #[serde(default)]
     pub hidden: bool,
     #[serde(rename = "statusCode", default)]
-    pub status_code: i32,
+    pub status_code: String,
     #[serde(default)]
     pub created: u64,
     #[serde(default)]
@@ -287,7 +287,7 @@ mod tests {
             "favorite": true,
             "trashed": false,
             "hidden": false,
-            "statusCode": 0,
+            "statusCode": "GOOD",
             "created": 1700000000,
             "updated": 1700000001,
             "edited": 1700000002
@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(entry.folder, "");
         assert!(!entry.favorite);
         assert!(!entry.trashed);
-        assert_eq!(entry.status_code, 0);
+        assert_eq!(entry.status_code, "");
         assert_eq!(entry.created, 0);
     }
 

@@ -17,7 +17,7 @@
         folder: string;
         favorite: boolean;
         trashed: boolean;
-        status_code: number;
+        status_code: string;
         created: number;
         updated: number;
     }
