@@ -1,7 +1,8 @@
 [workspace]
 members = [
   "ncrs_core",
-  "ncrs-gui/src-tauri"
+  "ncrs-gui/src-tauri",
+  "plugins/ncrs_plugin",
 ]
 resolver = "2"
 
