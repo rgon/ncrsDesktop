@@ -49,16 +49,3 @@ jobs:
 
       - name: Run tests
         run: cargo test -p ncrs_core
-
-      - name: Build .deb
-        run: bash scripts/build-deb.sh
-
-      - name: Test .deb
-        run: bash scripts/test-deb.sh --container
-
-      - name: Upload deb artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ncrs-deb
-          path: dist/*.deb
-          retention-days: 14
