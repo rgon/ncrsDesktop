@@ -103,6 +103,15 @@ mount_point: /home/you/ncrs
 user: youruser
 ```
 
+### Provisioning (corporate / multi-user)
+
+The `.deb` (built by `scripts/build-deb.sh`, published on releases) is designed for fleet deployment:
+
+- **Config is per-user** at `~/.config/ncrs/config.yaml` (XDG; there is no system-wide config). A template ships at `/usr/share/doc/ncrs/config.yaml.example`, or generate one with `ncrs --print-default-config`.
+- **Push per-user config files** with your config-management tool (e.g. Ansible `template` to each user's `~/.config/ncrs/config.yaml`), or pre-fill `/etc/skel/.config/ncrs/config.yaml` so new accounts start provisioned. Always use per-user [app passwords](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) or an `auth_command` — never a shared credential.
+- **The GUI tray app autostarts at login** via `/etc/xdg/autostart/ncrs-gui.desktop`. Per-user opt-out: copy that file to `~/.config/autostart/` and add `Hidden=true`. On unprovisioned machines the app stays in the tray and shows a "configuration missing" notification; it writes the config template on first run.
+- **Headless alternative**: `systemctl --user enable --now ncrs.service` runs the daemon without the GUI. Do not enable it alongside the GUI autostart — both mount the same mount point.
+
 ### Running
 
 **GUI + daemon** (the normal way):
@@ -143,6 +152,12 @@ End-to-end tests against a real WebDAV server (requires Docker):
 docker compose -f docker/docker-compose.yml up -d
 WEBDAV_TEST_URL=http://localhost:8888 cargo test -p ncrs_core --test integration_test
 docker compose -f docker/docker-compose.yml down
+```
+
+Package build + verification (what CI runs; `--container` needs Docker or Podman):
+```sh
+./scripts/build-deb.sh              # options: --version, --arch, --out-dir, --skip-gui, --skip-build
+./scripts/test-deb.sh --container   # metadata, contents, desktop entries, clean-install smoke test
 ```
 
 ## TODO (development progress tracker):
