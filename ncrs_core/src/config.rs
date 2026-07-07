@@ -195,18 +195,78 @@ pub fn config_path() -> PathBuf {
         .join("config.yaml")
 }
 
-/// Set config file permissions to 0600 (owner read/write only).
-/// Non-fatal: logs a warning on failure rather than aborting startup.
-pub fn restrict_config_permissions(path: &std::path::Path) {
+/// Warn if the config file permissions are broader than 0600.
+/// Does not modify the file — just logs so the user knows to run `chmod 0600`.
+pub fn warn_config_permissions(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = std::fs::set_permissions(path, perms) {
-            log::warn!("could not set 0600 on {}: {}", path.display(), e);
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode != 0o600 {
+                    log::warn!(
+                        "config file {} has permissions {:04o} — expected 0600 (owner read/write only). \
+                         Run `chmod 0600 {}` to secure your credentials.",
+                        path.display(), mode, path.display()
+                    );
+                }
+            }
+            Err(e) => log::warn!("could not check permissions on {}: {}", path.display(), e),
         }
     }
 }
+
+// ── Keyring ───────────────────────────────────────────────────────────────────
+
+const KEYRING_SERVICE: &str = "ncrs";
+
+/// Build the keyring account key from username + server URL.
+/// E.g. "alice@https://cloud.example.com"
+fn keyring_account(username: &str, url: &str) -> String {
+    // Strip the WebDAV path suffix so the key is stable even if the path changes.
+    let server = url
+        .find("/remote.php")
+        .or_else(|| url.find("/webdav"))
+        .map_or(url, |i| &url[..i])
+        .trim_end_matches('/');
+    format!("{}@{}", username, server)
+}
+
+/// Load the app password from the system keyring. Returns `None` if no entry
+/// exists or if the keyring is unavailable (headless environment, locked session).
+pub fn load_password_from_keyring(username: &str, url: &str) -> Option<String> {
+    let account = keyring_account(username, url);
+    let entry = match keyring::Entry::new(KEYRING_SERVICE, &account) {
+        Ok(e) => e,
+        Err(e) => { log::warn!("keyring init for {}: {}", account, e); return None; }
+    };
+    match entry.get_password() {
+        Ok(pw) => {
+            log::info!("loaded credentials from keyring for {}", account);
+            Some(pw)
+        }
+        Err(keyring::Error::NoEntry) => None,
+        Err(e) => {
+            log::warn!("keyring read failed for {}: {}", account, e);
+            None
+        }
+    }
+}
+
+/// Persist the app password in the system keyring (GNOME Keyring / KWallet).
+pub fn save_password_to_keyring(username: &str, url: &str, password: &str) -> Result<(), String> {
+    let account = keyring_account(username, url);
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
+        .map_err(|e| format!("keyring init for {}: {}", account, e))?;
+    entry
+        .set_password(password)
+        .map_err(|e| format!("keyring save failed for {}: {}", account, e))?;
+    log::info!("saved credentials to keyring for {}", account);
+    Ok(())
+}
+
+// ── Config loading ────────────────────────────────────────────────────────────
 
 pub fn load_config() -> Result<MountOptions, String> {
     let path = config_path();
@@ -217,23 +277,39 @@ pub fn load_config() -> Result<MountOptions, String> {
             .map_err(|e| format!("Cannot create config dir {}: {}", dir.display(), e))?;
         std::fs::write(&path, DEFAULT_CONFIG)
             .map_err(|e| format!("Cannot write default config: {}", e))?;
-        restrict_config_permissions(&path);
+        warn_config_permissions(&path);
         return Err(format!(
             "Created default config at {}. Please fill it in and restart.",
             path.display()
         ));
     }
 
+    warn_config_permissions(&path);
+
     let yaml = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
 
-    let opts = configuration_parser(&yaml)?;
+    let mut opts = configuration_parser(&yaml)?;
 
     if opts.url.is_empty() {
         return Err(format!(
             "Config at {} is incomplete (url is empty). Please fill it in.",
             path.display()
         ));
+    }
+
+    // If the config file has no credentials, fall back to the system keyring.
+    // This is the normal state for accounts created via the interactive login flow.
+    let has_file_creds = opts.password.as_deref().is_some_and(|p| !p.is_empty())
+        || opts.bearer_token.as_deref().is_some_and(|t| !t.is_empty())
+        || opts.auth_command.is_some();
+
+    if !has_file_creds {
+        if let Some(ref username) = opts.username.clone() {
+            if let Some(pw) = load_password_from_keyring(username, &opts.url) {
+                opts.password = Some(pw);
+            }
+        }
     }
 
     Ok(opts)

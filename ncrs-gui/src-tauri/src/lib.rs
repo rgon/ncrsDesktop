@@ -440,22 +440,28 @@ fn write_config_from_login(
 ) -> Result<(), String> {
     let webdav_url = ncrs_core::login_flow::webdav_url(&creds.server, &creds.login_name);
 
+    // Save the app password to the system keyring — not to the config file.
+    ncrs_core::config::save_password_to_keyring(
+        &creds.login_name,
+        &webdav_url,
+        &creds.app_password,
+    )?;
+
     let mount_point = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/home"))
         .join("Nextcloud")
         .to_string_lossy()
         .into_owned();
 
+    // No password field — credentials live in the keyring.
     let config = format!(
         "# ncRS Desktop configuration\n\
          url: \"{}\"\n\
          username: \"{}\"\n\
-         password: \"{}\"\n\
          mount_point: \"{}\"\n\
          user: \"{}\"\n",
         webdav_url,
         creds.login_name,
-        creds.app_password,
         mount_point,
         creds.login_name,
     );
@@ -465,7 +471,7 @@ fn write_config_from_login(
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
     }
     std::fs::write(&config_path, config).map_err(|e| format!("write config: {}", e))?;
-    ncrs_core::config::restrict_config_permissions(&config_path);
+    ncrs_core::config::warn_config_permissions(&config_path);
     log::info!("config written to {}", config_path.display());
     Ok(())
 }
