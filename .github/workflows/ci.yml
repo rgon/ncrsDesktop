@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -24,7 +24,9 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             python3-nautilus \
-            dpkg-dev
+            dpkg-dev \
+            desktop-file-utils \
+            lintian
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -32,38 +34,29 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build core (release)
-        run: cargo build --release -p ncrs_core
-
-      - name: Run tests
-        run: cargo test -p ncrs_core
-
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 11
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: ncrs-gui/pnpm-lock.yaml
 
-      - name: Build frontend
-        working-directory: ncrs-gui
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm build
+      - name: Run tests
+        run: cargo test -p ncrs_core
 
-      - name: Build GUI (release)
-        run: cargo build --release -p ncrs-gui
-
-      - name: Assemble .deb
+      - name: Build .deb
         run: bash scripts/build-deb.sh
 
+      - name: Test .deb
+        run: bash scripts/test-deb.sh --container
+
       - name: Upload deb artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ncrs-deb
           path: dist/*.deb

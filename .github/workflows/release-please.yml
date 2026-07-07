@@ -15,7 +15,7 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
         id: release
         with:
           config-file: release-please-config.json
@@ -26,7 +26,9 @@ jobs:
     if: needs.release-please.outputs.release_created
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
 
       - name: Install system dependencies
         run: |
@@ -40,7 +42,9 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             python3-nautilus \
-            dpkg-dev
+            dpkg-dev \
+            desktop-file-utils \
+            lintian
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -49,28 +53,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 11
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: ncrs-gui/pnpm-lock.yaml
 
-      - name: Build frontend
-        working-directory: ncrs-gui
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm build
+      - name: Build .deb
+        run: bash scripts/build-deb.sh
 
-      - name: Build release
-        run: |
-          cargo build --release -p ncrs_core
-          cargo build --release -p ncrs-gui
-          bash scripts/build-deb.sh
+      - name: Test .deb
+        run: bash scripts/test-deb.sh --container
 
       - name: Upload .deb to GitHub release
         env:
