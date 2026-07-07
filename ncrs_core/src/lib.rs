@@ -3409,9 +3409,10 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     if let Some(j) = journal {
         filesystem.journal = j;
     }
-    if let Some(p) = paused {
-        Arc::get_mut(&mut filesystem.conn).expect("conn not yet shared").paused = p;
-    }
+    // One shared pause flag for the FUSE connection, background workers, and
+    // the IPC PAUSE/RESUME verbs — callers without their own flag get one.
+    let paused_flag = paused.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    Arc::get_mut(&mut filesystem.conn).expect("conn not yet shared").paused = paused_flag.clone();
     let keep_cb = filesystem.keep_callback();
     let evict_cb = filesystem.evict_callback();
     let prefetch_cb = filesystem.prefetch_callback();
@@ -3419,7 +3420,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let ipc_creds = options.credentials()?;
     let file_change_queue: ipc::FileChangeQueue = Arc::new(Mutex::new(Vec::new()));
     let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone());
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone());
 
     let offline_flag = filesystem.is_offline_flag();
     let backend = filesystem.conn.backend.clone();

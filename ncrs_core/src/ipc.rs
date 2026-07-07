@@ -13,10 +13,12 @@
 ///   CHANGES\n                        → tab-separated changed paths
 ///   FILE_CHANGES\n                    → tab-separated A:/path or D:/path entries
 ///   STORAGE\n                         → JSON {kept_bytes, cached_bytes, remote_used, remote_total}
+///   STATE\n                           → paused|syncing|idle (daemon-wide sync state)
+///   PAUSE\n / RESUME\n                → ok (suspend/resume background sync)
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -155,7 +157,7 @@ fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>,
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -200,10 +202,11 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let jrnl = journal.clone();
             let fcq = file_change_queue.clone();
             let sstats = storage_stats.clone();
+            let pause_flag = paused.clone();
             let active = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, dirty, creds_clone, burl, cb, ev, pf, elog, tmap, jrnl, fcq, sstats);
+                handle_client(stream, mount, map, shared, fids, details, dirty, creds_clone, burl, cb, ev, pf, elog, tmap, jrnl, fcq, sstats, pause_flag);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -240,6 +243,7 @@ fn handle_client(
     journal: crate::mutation_journal::SharedJournal,
     file_change_queue: FileChangeQueue,
     storage_stats: SharedStorageStats,
+    paused: Arc<AtomicBool>,
 ) {
     let mut write_half = match stream.try_clone() {
         Ok(s) => s,
@@ -458,6 +462,23 @@ fn handle_client(
         } else if trimmed == "STORAGE" {
             let stats = storage_stats.safe_lock().clone();
             serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())
+        } else if trimmed == "STATE" {
+            // Same derivation the GUI uses: pause wins, then transfer activity.
+            if paused.load(Ordering::Relaxed) {
+                "paused".to_string()
+            } else if !transfer_map.safe_lock().is_empty() {
+                "syncing".to_string()
+            } else {
+                "idle".to_string()
+            }
+        } else if trimmed == "PAUSE" {
+            paused.store(true, Ordering::Relaxed);
+            log::info!("sync paused via IPC");
+            "ok".to_string()
+        } else if trimmed == "RESUME" {
+            paused.store(false, Ordering::Relaxed);
+            log::info!("sync resumed via IPC");
+            "ok".to_string()
         } else if let Some(msg) = trimmed.strip_prefix("LOG ") {
             log::info!("[nautilus] {}", msg);
             "ok".to_string()
