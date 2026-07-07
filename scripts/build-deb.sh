@@ -55,7 +55,9 @@ if ! $SKIP_GUI && ! $SKIP_BUILD; then
         pnpm install --frozen-lockfile
         pnpm build
         cd ..
-        cargo build --release -p ncrs-gui
+        # custom-protocol embeds the frontend; without it the binary expects
+        # the vite dev server at devUrl (works on dev machines only).
+        cargo build --release -p ncrs-gui --features custom-protocol
     fi
 fi
 

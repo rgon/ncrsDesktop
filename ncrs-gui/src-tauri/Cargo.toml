@@ -14,6 +14,12 @@ edition.workspace = true
 name = "ncrs_gui_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Embeds the built frontend (frontendDist) instead of pointing the webview at
+# the vite dev server (devUrl). The tauri CLI enables it for `tauri build`;
+# plain-cargo release builds (scripts/build-deb.sh) must pass it explicitly.
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

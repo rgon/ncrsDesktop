@@ -92,6 +92,23 @@ for f in "${REQUIRED[@]}"; do
     check "$f" grep -qx "$f" <<<"$CONTENTS"
 done
 
+# A GUI binary built without tauri's custom-protocol feature embeds no
+# frontend and tries to load the vite dev server (devUrl) at runtime —
+# "connection refused" on any machine not running `pnpm dev`. Embedded
+# asset paths are stored uncompressed, so grep -a finds them.
+if ! $SKIP_GUI; then
+    # Extract to a file first: grep -q on the pipe would exit early and
+    # SIGPIPE tar, which pipefail turns into a spurious failure.
+    GUI_BIN="$(mktemp)"
+    dpkg-deb --fsys-tarfile "$DEB" | tar -xO ./usr/bin/ncrs-gui > "$GUI_BIN" 2>/dev/null || true
+    if grep -aq '_app/immutable' "$GUI_BIN"; then
+        pass "ncrs-gui embeds the production frontend"
+    else
+        fail "ncrs-gui embeds the production frontend (built without --features custom-protocol?)"
+    fi
+    rm -f "$GUI_BIN"
+fi
+
 # ── Desktop entry validation ──────────────────────────────────────────────────
 # Validate the .desktop files actually inside the .deb under test, not the
 # repo checkout's copies (which may differ from the packaged artifact).
