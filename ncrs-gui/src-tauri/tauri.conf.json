@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ncrs-gui",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.rgon.ncrs-gui",
   "build": {
     "beforeDevCommand": "pnpm dev",
