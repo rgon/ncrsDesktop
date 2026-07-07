@@ -136,6 +136,15 @@ fn get_user_info(state: State<Arc<AppState>>) -> Option<UserInfo> {
 }
 
 #[tauri::command]
+async fn get_nc_theme(state: State<'_, Arc<AppState>>) -> Result<Option<ncrs_core::login_flow::ThemeColors>, ()> {
+    let url = state.mount_options.lock().unwrap().as_ref().map(|o| o.url.clone());
+    let Some(url) = url else { return Ok(None) };
+    Ok(tokio::task::spawn_blocking(move || ncrs_core::login_flow::fetch_server_theme(&url))
+        .await
+        .unwrap_or(None))
+}
+
+#[tauri::command]
 fn open_mount_folder(state: State<Arc<AppState>>, app: AppHandle) {
     let mount = {
         let opts = state.mount_options.lock().unwrap();
@@ -617,6 +626,7 @@ pub fn run() {
             start_login_flow,
             get_sync_state,
             get_user_info,
+            get_nc_theme,
             open_mount_folder,
             get_notifications,
             dismiss_notification,

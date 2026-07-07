@@ -154,6 +154,11 @@
         transfers = await invoke<TransferProgress[]>("get_transfers");
         conflicts = await invoke<ConflictRecord[]>("get_conflicts");
         invoke<StorageStats>("get_storage_stats").then(s => { storage = s; }).catch(() => {});
+        invoke<{ color: string; color_text: string } | null>("get_nc_theme").then(theme => {
+            if (theme) {
+                document.documentElement.style.setProperty("--nc-accent", theme.color);
+            }
+        }).catch(() => {});
     }
 
     async function clearErrors() {

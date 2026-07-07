@@ -98,6 +98,31 @@ pub fn poll_login_flow(endpoint: &str, token: &str) -> Result<Option<LoginResult
     Ok(Some(result))
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ThemeColors {
+    pub color: String,
+    pub color_text: String,
+}
+
+/// Fetch the Nextcloud server theme color from the public capabilities endpoint.
+/// Returns None if the theming app is disabled or the request fails.
+pub fn fetch_server_theme(server_url: &str) -> Option<ThemeColors> {
+    let server = base_server(server_url);
+    let url = format!("{}/ocs/v1.php/cloud/capabilities?format=json", server);
+    let client = build_client().ok()?;
+    let resp = client
+        .get(&url)
+        .header("OCS-APIRequest", "true")
+        .send()
+        .ok()?;
+    let v: serde_json::Value = resp.json().ok()?;
+    let theming = v.pointer("/ocs/data/capabilities/theming")?;
+    Some(ThemeColors {
+        color: theming["color"].as_str()?.to_string(),
+        color_text: theming["color-text"].as_str()?.to_string(),
+    })
+}
+
 /// Build the WebDAV files URL from the server and login_name returned by the login flow.
 pub fn webdav_url(server: &str, login_name: &str) -> String {
     let server = base_server(server);
