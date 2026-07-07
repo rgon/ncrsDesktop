@@ -56,6 +56,7 @@ pub fn init_login_flow(server_url: &str) -> Result<LoginFlowInit, String> {
     let resp = client
         .post(&url)
         .header("OCS-APIRequest", "true")
+        .header("User-Agent", "NCRS Desktop")
         .send()
         .map_err(|e| format!("login flow init: {}", e))?;
     if !resp.status().is_success() {
