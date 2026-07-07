@@ -281,6 +281,13 @@ impl MutationJournal {
         &self.conflicts
     }
 
+    /// Replace in-memory entries and conflicts from remote state (attach mode).
+    /// Does NOT persist to disk — the daemon's files are authoritative.
+    pub fn replace_from_remote(&mut self, entries: Vec<JournalEntry>, conflicts: Vec<ConflictRecord>) {
+        self.entries = entries.into();
+        self.conflicts = conflicts;
+    }
+
     // ── Persistence ──────────────────────────────────────────
 
     fn save_journal(&self) {

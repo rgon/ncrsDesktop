@@ -828,7 +828,7 @@ async fn attached_poll_loop(
     loop {
         sleep(Duration::from_secs(2)).await;
 
-        let replies = tokio::task::spawn_blocking(|| ipc_request(&["STATE", "ERRORS", "TRANSFERS"]))
+        let replies = tokio::task::spawn_blocking(|| ipc_request(&["STATE", "ERRORS", "TRANSFERS", "JOURNAL", "CONFLICTS"]))
             .await
             .ok()
             .flatten();
@@ -881,6 +881,18 @@ async fn attached_poll_loop(
                 let mut map = state.transfer_map.lock().unwrap();
                 map.clear();
                 map.extend(transfers.into_iter().map(|t| (t.path.clone(), t)));
+            }
+        }
+
+        // Mirror journal and conflicts from the daemon so get_pending_mutations,
+        // get_conflicts, and the journal poller events work in attach mode.
+        if let Some(json) = replies.get(3) {
+            if let Ok(entries) = serde_json::from_str::<Vec<JournalEntry>>(json) {
+                let conflicts: Vec<ConflictRecord> = replies
+                    .get(4)
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                state.journal.lock().unwrap().replace_from_remote(entries, conflicts);
             }
         }
     }
