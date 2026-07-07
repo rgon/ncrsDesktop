@@ -9,7 +9,7 @@
     import {
         mdiFolder, mdiAppsBox, mdiPlus, mdiAccountCog,
         mdiChevronDown, mdiClose, mdiMagnify, mdiBell,
-        mdiBellOutline, mdiAlertCircleOutline, mdiSwapHorizontal,
+        mdiBellOutline, mdiAlertCircleOutline,
     } from '@mdi/js';
 
     import { onMount } from 'svelte';
@@ -17,8 +17,7 @@
     import SetStatusView from './SetStatusView.svelte';
     import SyncProgressView from './SyncProgressView.svelte';
     import SearchView from '../components/SearchView.svelte';
-    import ErrorsView from '../components/ErrorsView.svelte';
-    import ConflictsView from '../components/ConflictsView.svelte';
+    import IssuesView from '../components/IssuesView.svelte';
     import PluginsView from '../components/PluginsView.svelte';
     import LoginView from '../components/LoginView.svelte';
     import { getPluginComponent } from '../plugins/registry';
@@ -83,7 +82,7 @@
 
     // ── State ─────────────────────────────────────────────────────────────────
 
-    type View = "login" | "notifications" | "search" | "errors" | "conflicts" | "plugins" | `plugin:${string}`;
+    type View = "login" | "notifications" | "search" | "issues" | "plugins" | `plugin:${string}`;
 
     let userInfo = $state<UserInfo | null>(null);
     let syncState = $state<string>("idle");
@@ -321,23 +320,14 @@
                 </button>
                 <button
                     class="nc-icon-btn"
-                    class:nc-active={activeView === "errors"}
-                    aria-label="Sync errors"
-                    onclick={() => { activeView = activeView === "errors" ? "notifications" : "errors"; }}
+                    class:nc-active={activeView === "issues"}
+                    aria-label="Issues"
+                    onclick={() => { activeView = activeView === "issues" ? "notifications" : "issues"; }}
                 >
                     <Icon class="nc-icon" path={mdiAlertCircleOutline} />
                     {#if errors.length > 0}
-                        <span class="nc-badge nc-badge-error">{errors.length}</span>
-                    {/if}
-                </button>
-                <button
-                    class="nc-icon-btn"
-                    class:nc-active={activeView === "conflicts"}
-                    aria-label="Conflicts"
-                    onclick={() => { activeView = activeView === "conflicts" ? "notifications" : "conflicts"; }}
-                >
-                    <Icon class="nc-icon" path={mdiSwapHorizontal} />
-                    {#if conflicts.length > 0}
+                        <span class="nc-badge nc-badge-error">{errors.length + conflicts.length}</span>
+                    {:else if conflicts.length > 0}
                         <span class="nc-badge nc-badge-warn">{conflicts.length}</span>
                     {/if}
                 </button>
@@ -374,11 +364,8 @@
                     onclose={() => { activeView = "notifications"; }}
                 />
 
-            {:else if activeView === "errors"}
-                <ErrorsView {errors} onclear={clearErrors} />
-
-            {:else if activeView === "conflicts"}
-                <ConflictsView {conflicts} {pendingMutations} onresolve={resolveConflict} />
+            {:else if activeView === "issues"}
+                <IssuesView {errors} {conflicts} {pendingMutations} onclear={clearErrors} onresolve={resolveConflict} />
 
             {:else if activeView === "plugins"}
                 <PluginsView onselect={(id) => { activeView = `plugin:${id}`; }} />
