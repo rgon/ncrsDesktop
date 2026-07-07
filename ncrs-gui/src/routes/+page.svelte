@@ -251,7 +251,7 @@
         <header class="nc-header">
 
             <!-- Avatar + status dropdown -->
-            <div class="dropdown dropdown-hover dropdown-center" title="Set status">
+            <div class="dropdown dropdown-hover dropdown-start" title="Set status">
                 <div tabindex="0" role="button" class="nc-avatar-wrap">
                     {#if userInfo?.avatar_url && !avatarError}
                         <img
@@ -279,7 +279,7 @@
                         <Icon class="nc-chevron-icon" path={mdiChevronDown} />
                     </h1>
                     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-                    <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box z-1 w-52 p-2 shadow-sm">
+                    <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box z-1 min-w-[13rem] w-max max-w-xs p-2 shadow-sm">
                         <li><button onclick={() => false}>
                             <Icon class="w-4 h-4 mr-2" path={mdiAccountCog} /> {userInfo?.username ?? "—"}
                         </button></li>
@@ -534,7 +534,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 130px;
     margin-top: 1px;
 }
 
