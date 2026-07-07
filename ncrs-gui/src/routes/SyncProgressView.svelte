@@ -58,7 +58,7 @@
             case "unmounted": return "Unmounted";
             case "wiped":     return "Wiped by server";
             case "idle":      return "Up to date";
-            default:          return syncState.startsWith("error") ? "Sync error" : syncState;
+            default:          return syncState.startsWith("error:") ? syncState.slice(7) : syncState;
         }
     });
 
@@ -80,14 +80,11 @@
     <!-- Status row -->
     <div class="nc-sync-row">
         <span class={dotClass()}></span>
-        <span class="nc-sync-label">{statusLabel()}</span>
+        <span class="nc-sync-label" title={statusLabel()}>{statusLabel()}</span>
 
         {#if syncState === "wiped"}
             <span class="nc-sync-alert">Credentials cleared — reconfigure to reconnect.</span>
         {:else if (syncState === "unmounted" || syncState.startsWith("error:")) && onremount}
-            {#if syncState.startsWith("error:")}
-                <span class="nc-sync-alert" title={syncState.slice(7)}>{syncState.slice(7)}</span>
-            {/if}
             <button class="nc-remount-btn" onclick={onremount}>Remount</button>
         {/if}
 
@@ -163,15 +160,14 @@
     font-size: 12px;
     color: var(--nc-text-2);
     flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .nc-sync-alert {
     font-size: 11px;
     color: var(--nc-error);
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
 }
 
 .nc-remount-btn {
