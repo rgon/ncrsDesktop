@@ -510,8 +510,7 @@ fn rerender_tray_menu(
     app: &AppHandle,
     sync_state: &SyncState,
 ) -> Result<tauri::menu::Menu<tauri_runtime_wry::Wry<EventLoopMessage>>, tauri::Error> {
-    let about_i = MenuItem::with_id(app, "about", "Open main Dialog", true, None::<&str>)?;
-    let settings_i = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    let about_i = MenuItem::with_id(app, "about", "Open ncRS", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Exit Nextcloud", true, None::<&str>)?;
 
     let mut builder = MenuBuilder::new(app)
@@ -547,7 +546,6 @@ fn rerender_tray_menu(
 
     builder
         .separator()
-        .item(&settings_i)
         .item(&quit_i)
         .build()
 }
@@ -768,7 +766,6 @@ pub fn run() {
                 let remount_app = app.app_handle().clone();
                 spawn(start_ncfs_daemon(remount_app, remount_state));
             }
-            "settings" => open_main_window(app),
             "quit" => {
                 let mount_point = app_state_menu.mount_options.lock().unwrap()
                     .as_ref()
