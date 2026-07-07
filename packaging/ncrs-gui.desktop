@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=ncRS
+GenericName=Nextcloud Sync Client
+Comment=Mount and sync your Nextcloud as a local filesystem
+Exec=/usr/bin/ncrs-gui
+TryExec=/usr/bin/ncrs-gui
+Icon=ncrs
+Terminal=false
+StartupNotify=false
+Categories=Network;FileTransfer;
+Keywords=Nextcloud;sync;WebDAV;files;
+X-GNOME-Autostart-Delay=5
