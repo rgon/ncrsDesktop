@@ -20,6 +20,7 @@
     import ErrorsView from '../components/ErrorsView.svelte';
     import ConflictsView from '../components/ConflictsView.svelte';
     import PluginsView from '../components/PluginsView.svelte';
+    import LoginView from '../components/LoginView.svelte';
     import { getPluginComponent } from '../plugins/registry';
 
     // ── Types ─────────────────────────────────────────────────────────────────
@@ -82,7 +83,7 @@
 
     // ── State ─────────────────────────────────────────────────────────────────
 
-    type View = "notifications" | "search" | "errors" | "conflicts" | "plugins" | `plugin:${string}`;
+    type View = "login" | "notifications" | "search" | "errors" | "conflicts" | "plugins" | `plugin:${string}`;
 
     let userInfo = $state<UserInfo | null>(null);
     let syncState = $state<string>("idle");
@@ -94,6 +95,7 @@
     let pendingMutations = $state(0);
     let avatarError = $state(false);
     let activeView = $state<View>("notifications");
+    let needsLogin = $state(false);
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -129,7 +131,16 @@
         if (url) await invoke("open_link", { url });
     }
 
+    interface ConfigStatus { needs_login: boolean; server_url: string | null; }
+
     async function loadInfo() {
+        const status = await invoke<ConfigStatus>("get_config_status");
+        if (status.needs_login) {
+            needsLogin = true;
+            activeView = "login";
+            return;
+        }
+        needsLogin = false;
         userInfo = await invoke<UserInfo | null>("get_user_info");
         syncState = await invoke<string>("get_sync_state");
         notifications = await invoke<NcNotification[]>("get_notifications");
@@ -186,6 +197,12 @@
             activeView = `plugin:${e.payload}`;
         });
 
+        const unlistenLoginComplete = listen<{ server: string; login_name: string }>("login-complete", () => {
+            needsLogin = false;
+            activeView = "notifications";
+            loadInfo();
+        });
+
         const storageInterval = setInterval(() => {
             invoke<StorageStats>("get_storage_stats").then(s => { storage = s; }).catch(() => {});
         }, 30_000);
@@ -212,6 +229,7 @@
             unlistenJournal.then(f => f());
             unlistenConflicts.then(f => f());
             unlistenPluginNav.then(f => f());
+            unlistenLoginComplete.then(f => f());
             clearInterval(storageInterval);
             document.removeEventListener("click", clickOutListener);
             document.removeEventListener("keydown", escKeyListener);
@@ -337,8 +355,11 @@
         <!-- Sync status bar -->
         <SyncProgressView {syncState} {transfers} {storage} onremount={handleRemount} />
 
+        <!-- Login overlay: shown when credentials are not configured -->
+        {#if activeView === "login"}
+            <LoginView />
         <!-- Content area: search, errors, or notifications -->
-        {#if activeView === "search"}
+        {:else if activeView === "search"}
             <SearchView
                 class="flex flex-col flex-grow overflow-hidden"
                 onclose={() => { activeView = "notifications"; }}

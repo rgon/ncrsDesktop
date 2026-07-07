@@ -2571,6 +2571,7 @@ dependencies = [
 name = "ncrs-gui"
 version = "0.1.1"
 dependencies = [
+ "dirs",
  "env_logger",
  "log",
  "nc_passwords",

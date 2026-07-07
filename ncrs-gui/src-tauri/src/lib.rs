@@ -29,6 +29,8 @@ pub struct AppState {
     /// True when mirroring an external daemon (systemd service) over IPC
     /// instead of owning the mount in-process.
     pub attached: std::sync::atomic::AtomicBool,
+    /// Set to true to cancel an in-progress login flow poll loop.
+    pub login_flow_cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for AppState {
@@ -44,6 +46,7 @@ impl Default for AppState {
             journal: Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&tmp_dir))),
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             attached: std::sync::atomic::AtomicBool::new(false),
+            login_flow_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -303,6 +306,169 @@ fn get_plugin_metas() -> Vec<ncrs_plugin::PluginMeta> {
     metas
 }
 
+// ── Login flow commands ───────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct ConfigStatus {
+    pub needs_login: bool,
+    pub server_url: Option<String>,
+}
+
+#[tauri::command]
+fn get_config_status() -> ConfigStatus {
+    match ncrs_core::config::load_config() {
+        Ok(opts) => {
+            // Config loaded; check credentials are actually usable.
+            if opts.credentials().is_err() {
+                let server = ncrs_core::notifications::base_url(&opts.url);
+                ConfigStatus { needs_login: true, server_url: Some(server) }
+            } else {
+                ConfigStatus { needs_login: false, server_url: None }
+            }
+        }
+        Err(_) => ConfigStatus { needs_login: true, server_url: None },
+    }
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct LoginComplete {
+    pub server: String,
+    pub login_name: String,
+}
+
+/// Initialise the Nextcloud Login Flow v2, open the browser, and start a
+/// background poll loop. Returns the login URL so the frontend can show a
+/// fallback link in case the browser didn't open.
+#[tauri::command]
+async fn start_login_flow(
+    server_url: String,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    // Cancel any previous poll that might still be running.
+    state.login_flow_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let server = server_url.trim().trim_end_matches('/').to_string();
+    if server.is_empty() {
+        return Err("Server URL must not be empty".into());
+    }
+
+    let init = tokio::task::spawn_blocking({
+        let s = server.clone();
+        move || ncrs_core::login_flow::init_login_flow(&s)
+    })
+    .await
+    .map_err(|e| format!("task error: {}", e))??;
+
+    // Open the browser so the user can authorise this app.
+    if let Err(e) = app.opener().open_url(&init.login_url, None::<&str>) {
+        log::warn!("could not open browser for login flow: {}", e);
+    }
+
+    let login_url = init.login_url.clone();
+    let poll_endpoint = init.poll_endpoint.clone();
+    let poll_token = init.poll_token.clone();
+
+    // Reset cancel flag for the new loop.
+    state.login_flow_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    let cancel = state.login_flow_cancel.clone();
+    let state_clone = (*state).clone();
+
+    spawn(async move {
+        const POLL_INTERVAL_SECS: u64 = 2;
+        const TIMEOUT_SECS: u64 = 300; // 5 minutes
+        let max_iters = TIMEOUT_SECS / POLL_INTERVAL_SECS;
+
+        for _ in 0..max_iters {
+            sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                log::info!("login flow poll cancelled");
+                return;
+            }
+
+            let ep = poll_endpoint.clone();
+            let tok = poll_token.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                ncrs_core::login_flow::poll_login_flow(&ep, &tok)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(Some(creds))) => {
+                    log::info!("login flow succeeded for {}", creds.login_name);
+
+                    if let Err(e) = write_config_from_login(&creds) {
+                        log::error!("failed to write config after login: {}", e);
+                        app.emit("login-error", e).ok();
+                        return;
+                    }
+
+                    app.emit(
+                        "login-complete",
+                        LoginComplete {
+                            server: creds.server.clone(),
+                            login_name: creds.login_name.clone(),
+                        },
+                    )
+                    .ok();
+
+                    // Start the mount/daemon now that credentials are saved.
+                    let _ = spawn(start_ncfs_daemon(app.clone(), state_clone));
+                    return;
+                }
+                Ok(Ok(None)) => {} // Not authorised yet, keep polling.
+                Ok(Err(e)) => {
+                    log::warn!("login flow poll error: {}", e);
+                    // Non-fatal network hiccup — keep polling.
+                }
+                Err(e) => {
+                    log::error!("login flow poll task panic: {}", e);
+                    return;
+                }
+            }
+        }
+
+        log::warn!("login flow timed out after {} seconds", TIMEOUT_SECS);
+        app.emit("login-error", "Login timed out. Please try again.").ok();
+    });
+
+    Ok(login_url)
+}
+
+fn write_config_from_login(
+    creds: &ncrs_core::login_flow::LoginResult,
+) -> Result<(), String> {
+    let webdav_url = ncrs_core::login_flow::webdav_url(&creds.server, &creds.login_name);
+
+    let mount_point = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/home"))
+        .join("Nextcloud")
+        .to_string_lossy()
+        .into_owned();
+
+    let config = format!(
+        "# ncRS Desktop configuration\n\
+         url: \"{}\"\n\
+         username: \"{}\"\n\
+         password: \"{}\"\n\
+         mount_point: \"{}\"\n\
+         user: \"{}\"\n",
+        webdav_url,
+        creds.login_name,
+        creds.app_password,
+        mount_point,
+        creds.login_name,
+    );
+
+    let config_path = ncrs_core::config::config_path();
+    if let Some(dir) = config_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
+    }
+    std::fs::write(&config_path, config).map_err(|e| format!("write config: {}", e))?;
+    log::info!("config written to {}", config_path.display());
+    Ok(())
+}
+
 fn extract_dir_param(url: &str) -> Option<String> {
     let query = url.split('?').nth(1)?;
     for pair in query.split('&') {
@@ -442,6 +608,8 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             close_window,
+            get_config_status,
+            start_login_flow,
             get_sync_state,
             get_user_info,
             open_mount_folder,

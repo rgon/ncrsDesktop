@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod backend;
 pub mod config;
+pub mod login_flow;
 pub mod edit_locally;
 pub mod filename_validation;
 pub mod fuse_notify;
