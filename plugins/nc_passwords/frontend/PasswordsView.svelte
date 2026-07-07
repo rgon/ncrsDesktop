@@ -1,4 +1,7 @@
 <script lang="ts">
+    // @ts-nocheck — module resolution for @tauri-apps/api and @mdi/js is handled
+    // by the ncrs-gui vite alias at build time; these imports aren't resolvable
+    // from the plugin's location during static analysis.
     import { invoke } from "@tauri-apps/api/core";
     import { onMount } from "svelte";
     import Icon from "$components/Icon.svelte";
