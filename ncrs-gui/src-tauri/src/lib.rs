@@ -26,6 +26,9 @@ pub struct AppState {
     pub transfer_map: TransferMap,
     pub journal: SharedJournal,
     pub paused: Arc<std::sync::atomic::AtomicBool>,
+    /// True when mirroring an external daemon (systemd service) over IPC
+    /// instead of owning the mount in-process.
+    pub attached: std::sync::atomic::AtomicBool,
 }
 
 impl Default for AppState {
@@ -40,8 +43,33 @@ impl Default for AppState {
             transfer_map: Arc::new(Mutex::new(std::collections::HashMap::new())),
             journal: Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&tmp_dir))),
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            attached: std::sync::atomic::AtomicBool::new(false),
         }
     }
+}
+
+// ── IPC client (attach mode) ──────────────────────────────────────────────────
+
+/// Send line verbs to a running daemon's IPC socket; one reply line per verb.
+/// Returns None when no daemon is listening (absent or stale socket).
+fn ipc_request(verbs: &[&str]) -> Option<Vec<String>> {
+    use std::io::{BufRead, Write};
+    let sock = ncrs_core::ipc::socket_path();
+    let stream = std::os::unix::net::UnixStream::connect(&sock).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
+    let mut writer = stream.try_clone().ok()?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut replies = Vec::with_capacity(verbs.len());
+    for verb in verbs {
+        writeln!(writer, "{}", verb).ok()?;
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        replies.push(line.trim().to_string());
+    }
+    Some(replies)
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
@@ -516,6 +544,17 @@ pub fn run() {
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
+                // Attach mode: the external daemon owns sync — forward the
+                // toggle over IPC (the attach poll confirms the new state).
+                if app_state_menu.attached.load(std::sync::atomic::Ordering::Relaxed) {
+                    let verb = if new_state == SyncState::Paused { "PAUSE" } else { "RESUME" };
+                    thread::spawn(move || {
+                        if ipc_request(&[verb]).is_none() {
+                            log::warn!("could not forward {} to external daemon", verb);
+                        }
+                    });
+                }
+
                 let _ = tray.set_icon(Some(load_icon(TrayIcon::for_state(&new_state))));
 
                 app.notification()
@@ -559,6 +598,13 @@ pub fn run() {
                 let mount_point = app_state_menu.mount_options.lock().unwrap()
                     .as_ref()
                     .map(|o| o.mount_point.to_string_lossy().to_string());
+                // Attach mode: the mount belongs to the external daemon —
+                // quitting the tray must not unmount it.
+                if app_state_menu.attached.load(std::sync::atomic::Ordering::Relaxed) {
+                    log::info!("quit: leaving external daemon's mount untouched");
+                    app.exit(0);
+                    return;
+                }
                 if let Some(mp) = mount_point {
                     log::info!("quit: unmounting {}", mp);
                     // Clean unmount first so the dir can be removed below;
@@ -610,42 +656,58 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // FUSE mount thread — share error_log and transfer_map with the core
-    let fuse_opts = opts.clone();
-    let error_log = state.error_log.clone();
-    let transfer_map = state.transfer_map.clone();
-    let journal = state.journal.clone();
-    let fuse_app = app.clone();
-    let fuse_state = state.clone();
-    let fuse_paused = state.paused.clone();
-    thread::spawn(move || {
-        let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal), Some(fuse_paused));
-        match &result {
-            Ok(()) => {
-                log::info!("FUSE unmounted cleanly");
-                *fuse_state.sync_state.lock().unwrap() = SyncState::Unmounted;
-                fuse_app.emit("sync-state-changed", "unmounted").ok();
+    state.attached.store(false, std::sync::atomic::Ordering::Relaxed);
+    let external_daemon = tokio::task::spawn_blocking(|| ipc_request(&["STATE"]))
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+
+    if external_daemon {
+        // Attach mode: another daemon (e.g. the ncrs systemd user service)
+        // already owns the mount — mirror its state over IPC instead of
+        // mounting a second time.
+        log::info!("existing ncrs daemon detected — attaching via IPC");
+        state.attached.store(true, std::sync::atomic::Ordering::Relaxed);
+        spawn(attached_poll_loop(app.clone(), state.clone(), shutdown_tx));
+    } else {
+        // FUSE mount thread — share error_log and transfer_map with the core
+        let fuse_opts = opts.clone();
+        let error_log = state.error_log.clone();
+        let transfer_map = state.transfer_map.clone();
+        let journal = state.journal.clone();
+        let fuse_app = app.clone();
+        let fuse_state = state.clone();
+        let fuse_paused = state.paused.clone();
+        thread::spawn(move || {
+            let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal), Some(fuse_paused));
+            match &result {
+                Ok(()) => {
+                    log::info!("FUSE unmounted cleanly");
+                    *fuse_state.sync_state.lock().unwrap() = SyncState::Unmounted;
+                    fuse_app.emit("sync-state-changed", "unmounted").ok();
+                }
+                Err(e) if e == "REMOTE_WIPE" => {
+                    log::warn!("FUSE unmounted due to remote wipe");
+                    *fuse_state.sync_state.lock().unwrap() = SyncState::Wiped;
+                    fuse_app.emit("sync-state-changed", "wiped").ok();
+                    fuse_app
+                        .notification()
+                        .builder()
+                        .title("Nextcloud: Device Wiped")
+                        .body("This device has been remotely wiped. All cached data has been deleted and credentials cleared.")
+                        .show()
+                        .ok();
+                }
+                Err(e) => {
+                    log::error!("FUSE error: {}", e);
+                    *fuse_state.sync_state.lock().unwrap() = SyncState::Unmounted;
+                    fuse_app.emit("sync-state-changed", "unmounted").ok();
+                }
             }
-            Err(e) if e == "REMOTE_WIPE" => {
-                log::warn!("FUSE unmounted due to remote wipe");
-                *fuse_state.sync_state.lock().unwrap() = SyncState::Wiped;
-                fuse_app.emit("sync-state-changed", "wiped").ok();
-                fuse_app
-                    .notification()
-                    .builder()
-                    .title("Nextcloud: Device Wiped")
-                    .body("This device has been remotely wiped. All cached data has been deleted and credentials cleared.")
-                    .show()
-                    .ok();
-            }
-            Err(e) => {
-                log::error!("FUSE error: {}", e);
-                *fuse_state.sync_state.lock().unwrap() = SyncState::Unmounted;
-                fuse_app.emit("sync-state-changed", "unmounted").ok();
-            }
-        }
-        let _ = shutdown_tx.send(true);
-    });
+            let _ = shutdown_tx.send(true);
+        });
+    }
 
     // Notification polling — async on Tokio runtime, no dedicated OS thread
     if let Ok(poll_creds) = opts.credentials() {
@@ -752,4 +814,74 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     });
 
     Ok(())
+}
+
+// Attach mode: mirror the external daemon's state over IPC into the same
+// shared structures the embedded mount would fill, so the tray, events, and
+// frontend commands behave identically in both modes.
+async fn attached_poll_loop(
+    app: AppHandle,
+    state: Arc<AppState>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let mut failures = 0u32;
+    loop {
+        sleep(Duration::from_secs(2)).await;
+
+        let replies = tokio::task::spawn_blocking(|| ipc_request(&["STATE", "ERRORS", "TRANSFERS"]))
+            .await
+            .ok()
+            .flatten();
+        let Some(replies) = replies else {
+            failures += 1;
+            // ~6s of silence: the daemon is gone. Show Unmounted; the Remount
+            // menu re-probes and either re-attaches (service restarted) or
+            // mounts embedded (mount point now free).
+            if failures >= 3 {
+                log::warn!("external ncrs daemon stopped responding — detaching");
+                state.attached.store(false, std::sync::atomic::Ordering::Relaxed);
+                *state.sync_state.lock().unwrap() = SyncState::Unmounted;
+                app.emit("sync-state-changed", "unmounted").ok();
+                let _ = shutdown_tx.send(true);
+                return;
+            }
+            continue;
+        };
+        failures = 0;
+
+        let new_state = match replies.first().map(String::as_str) {
+            Some("paused") => SyncState::Paused,
+            Some("syncing") => SyncState::Syncing,
+            _ => SyncState::Idle,
+        };
+        let changed = {
+            let mut ss = state.sync_state.lock().unwrap();
+            if *ss != new_state {
+                *ss = new_state.clone();
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            app.emit("sync-state-changed", new_state.to_string()).ok();
+        }
+
+        // The error/transfer pollers read these maps and emit the usual
+        // events (and desktop notifications), same as in embedded mode.
+        if let Some(json) = replies.get(1) {
+            if let Ok(errors) = serde_json::from_str::<Vec<SyncError>>(json) {
+                let mut log = state.error_log.lock().unwrap();
+                log.clear();
+                log.extend(errors);
+            }
+        }
+        if let Some(json) = replies.get(2) {
+            if let Ok(transfers) = serde_json::from_str::<Vec<TransferProgress>>(json) {
+                let mut map = state.transfer_map.lock().unwrap();
+                map.clear();
+                map.extend(transfers.into_iter().map(|t| (t.path.clone(), t)));
+            }
+        }
+    }
 }

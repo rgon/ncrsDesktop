@@ -110,7 +110,7 @@ The `.deb` (built by `scripts/build-deb.sh`, published on releases) is designed 
 - **Config is per-user** at `~/.config/ncrs/config.yaml` (XDG; there is no system-wide config). A template ships at `/usr/share/doc/ncrs/config.yaml.example`, or generate one with `ncrs --print-default-config`.
 - **Push per-user config files** with your config-management tool (e.g. Ansible `template` to each user's `~/.config/ncrs/config.yaml`), or pre-fill `/etc/skel/.config/ncrs/config.yaml` so new accounts start provisioned. Always use per-user [app passwords](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) or an `auth_command` — never a shared credential.
 - **The GUI tray app autostarts at login** via `/etc/xdg/autostart/ncrs-gui.desktop`. Per-user opt-out: copy that file to `~/.config/autostart/` and add `Hidden=true`. On unprovisioned machines the app stays in the tray and shows a "configuration missing" notification; it writes the config template on first run.
-- **Headless alternative**: `systemctl --user enable --now ncrs.service` runs the daemon without the GUI. Do not enable it alongside the GUI autostart — both mount the same mount point.
+- **Headless alternative**: `systemctl --user enable --now ncrs.service` runs the daemon without the GUI. The two coexist: when the GUI starts and finds the service already serving the IPC socket, it attaches as a client — mirroring sync state, errors, and transfers in the tray and forwarding pause/resume — instead of mounting a second time. Quitting an attached tray leaves the service's mount untouched.
 
 ### Running
 
