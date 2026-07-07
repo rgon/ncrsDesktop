@@ -100,8 +100,8 @@ fn get_sync_state(state: State<Arc<AppState>>) -> String {
 async fn remount(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     {
         let ss = state.sync_state.lock().unwrap();
-        if *ss != SyncState::Unmounted {
-            return Err("Can only remount when unmounted".into());
+        if !matches!(*ss, SyncState::Unmounted | SyncState::Error(_)) {
+            return Err("Can only remount when unmounted or in error".into());
         }
     }
     *state.sync_state.lock().unwrap() = SyncState::Idle;
@@ -750,7 +750,7 @@ pub fn run() {
 
                 {
                     let ss = app_state_menu.sync_state.lock().unwrap();
-                    if *ss != SyncState::Unmounted { return; }
+                    if !matches!(*ss, SyncState::Unmounted | SyncState::Error(_)) { return; }
                 }
 
                 *app_state_menu.sync_state.lock().unwrap() = SyncState::Idle;
@@ -873,8 +873,8 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
                 }
                 Err(e) => {
                     log::error!("FUSE error: {}", e);
-                    *fuse_state.sync_state.lock().unwrap() = SyncState::Unmounted;
-                    fuse_app.emit("sync-state-changed", "unmounted").ok();
+                    *fuse_state.sync_state.lock().unwrap() = SyncState::Error(e.clone());
+                    fuse_app.emit("sync-state-changed", format!("error: {}", e)).ok();
                 }
             }
             let _ = shutdown_tx.send(true);

@@ -84,7 +84,10 @@
 
         {#if syncState === "wiped"}
             <span class="nc-sync-alert">Credentials cleared — reconfigure to reconnect.</span>
-        {:else if syncState === "unmounted" && onremount}
+        {:else if (syncState === "unmounted" || syncState.startsWith("error:")) && onremount}
+            {#if syncState.startsWith("error:")}
+                <span class="nc-sync-alert" title={syncState.slice(7)}>{syncState.slice(7)}</span>
+            {/if}
             <button class="nc-remount-btn" onclick={onremount}>Remount</button>
         {/if}
 
@@ -165,6 +168,10 @@
 .nc-sync-alert {
     font-size: 11px;
     color: var(--nc-error);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .nc-remount-btn {
