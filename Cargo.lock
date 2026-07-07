@@ -2569,7 +2569,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "env_logger",
  "log",
@@ -2582,13 +2582,14 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
  "tauri-runtime-wry",
  "tokio",
 ]
 
 [[package]]
 name = "ncrs_core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "crc32fast",
@@ -4765,6 +4766,21 @@ dependencies = [
  "thiserror 2.0.12",
  "url",
  "windows",
+ "zbus",
+]
+
+[[package]]
+name = "tauri-plugin-single-instance"
+version = "2.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97d0e07b40fb2eb13778e30778f5979347a2bf30e1b9d47f78ff7fe92d2e4b3d"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.12",
+ "tracing",
+ "windows-sys 0.59.0",
  "zbus",
 ]
 

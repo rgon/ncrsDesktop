@@ -351,8 +351,38 @@ fn rerender_tray_menu(
         .build()
 }
 
-fn load_icon(path: &'static str) -> Image<'static> {
-    Image::from_path(std::path::Path::new(path)).expect("Failed to load icon image")
+// Icons are embedded at compile time; the installed binary must not depend
+// on the build machine's checkout path (CARGO_MANIFEST_DIR).
+#[derive(Clone, Copy)]
+enum TrayIcon {
+    Idle,
+    Paused,
+    Syncing,
+    Error,
+}
+
+impl TrayIcon {
+    fn for_state(state: &SyncState) -> Self {
+        match state {
+            SyncState::Idle => TrayIcon::Idle,
+            SyncState::Paused | SyncState::Unmounted | SyncState::Wiped => TrayIcon::Paused,
+            SyncState::Syncing => TrayIcon::Syncing,
+            SyncState::Error(_) => TrayIcon::Error,
+        }
+    }
+}
+
+fn load_icon(kind: TrayIcon) -> Image<'static> {
+    static ICONS: [std::sync::OnceLock<Image<'static>>; 4] = [const { std::sync::OnceLock::new() }; 4];
+    let (slot, bytes): (usize, &'static [u8]) = match kind {
+        TrayIcon::Idle => (0, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png"))),
+        TrayIcon::Paused => (1, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"))),
+        TrayIcon::Syncing => (2, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.syncing.png"))),
+        TrayIcon::Error => (3, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.error.png"))),
+    };
+    ICONS[slot]
+        .get_or_init(|| Image::from_bytes(bytes).expect("embedded tray icon is valid PNG"))
+        .clone()
 }
 
 fn open_main_window(app: &AppHandle) {
@@ -373,6 +403,12 @@ pub fn run() {
     let tray_id_menu = tray_icon_id.clone();
 
     tauri::Builder::default()
+        // Must be the first plugin: a second launch (e.g. the app-menu entry
+        // while the autostarted instance runs) would spawn a second daemon
+        // that steals the FUSE mount — surface the existing window instead.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            open_main_window(app);
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
@@ -416,10 +452,7 @@ pub fn run() {
 
             let initial_state = SyncState::Idle;
             let menu = rerender_tray_menu(app.handle(), &initial_state)?;
-            let icon = load_icon(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/icons/tray_icon.idle.png"
-            ));
+            let icon = load_icon(TrayIcon::Idle);
 
             let tray = TrayIconBuilder::new()
                 .menu(&menu)
@@ -439,13 +472,13 @@ pub fn run() {
                 let ss = state_listener.sync_state.lock().unwrap().clone();
                 let Some(tray) = app_handle_listener.tray_by_id(&tray_id) else { return };
 
-                let icon_path: &'static str = match payload {
-                    "wiped" => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.error.png"),
-                    "unmounted" | "paused" => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"),
-                    "syncing" => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.syncing.png"),
-                    _ => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png"),
+                let icon_kind = match payload {
+                    "wiped" => TrayIcon::Error,
+                    "unmounted" | "paused" => TrayIcon::Paused,
+                    "syncing" => TrayIcon::Syncing,
+                    _ => TrayIcon::Idle,
                 };
-                let _ = tray.set_icon(Some(load_icon(icon_path)));
+                let _ = tray.set_icon(Some(load_icon(icon_kind)));
                 if let Ok(menu) = rerender_tray_menu(&app_handle_listener, &ss) {
                     let _ = tray.set_menu(Some(menu));
                 }
@@ -483,15 +516,7 @@ pub fn run() {
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
-                let icon_path: &'static str = match new_state {
-                    SyncState::Idle => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png"),
-                    SyncState::Paused => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"),
-                    SyncState::Syncing => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.syncing.png"),
-                    SyncState::Unmounted | SyncState::Wiped => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"),
-                    SyncState::Error(_) => concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.error.png"),
-                };
-
-                let _ = tray.set_icon(Some(load_icon(icon_path)));
+                let _ = tray.set_icon(Some(load_icon(TrayIcon::for_state(&new_state))));
 
                 app.notification()
                     .builder()
@@ -520,8 +545,7 @@ pub fn run() {
                 app_state_menu.paused.store(false, std::sync::atomic::Ordering::Relaxed);
                 app.emit("sync-state-changed", "idle").ok();
 
-                let icon_path = concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png");
-                let _ = tray.set_icon(Some(load_icon(icon_path)));
+                let _ = tray.set_icon(Some(load_icon(TrayIcon::Idle)));
                 if let Ok(menu) = rerender_tray_menu(app.app_handle(), &SyncState::Idle) {
                     let _ = tray.set_menu(Some(menu));
                 }
