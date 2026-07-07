@@ -2556,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "nc_passwords"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "ncrs_plugin",
@@ -2615,7 +2615,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs_plugin"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
