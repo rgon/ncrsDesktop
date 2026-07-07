@@ -83,6 +83,7 @@ if ! $SKIP_GUI; then
         ./usr/share/applications/ncrs-gui.desktop
         ./etc/xdg/autostart/ncrs-gui.desktop
         ./usr/share/icons/hicolor/32x32/apps/ncrs.png
+        ./usr/share/icons/hicolor/64x64/apps/ncrs.png
         ./usr/share/icons/hicolor/128x128/apps/ncrs.png
         ./usr/share/icons/hicolor/256x256/apps/ncrs.png
         ./usr/share/icons/hicolor/512x512/apps/ncrs.png

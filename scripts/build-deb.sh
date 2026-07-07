@@ -102,6 +102,7 @@ if ! $SKIP_GUI; then
     install -Dm644 packaging/ncrs-gui.desktop                            "$PKG_DIR/usr/share/applications/ncrs-gui.desktop"
     install -Dm644 packaging/ncrs-gui.desktop                            "$PKG_DIR/etc/xdg/autostart/ncrs-gui.desktop"
     install -Dm644 ncrs-gui/src-tauri/icons/32x32.png                    "$PKG_DIR/usr/share/icons/hicolor/32x32/apps/ncrs.png"
+    install -Dm644 ncrs-gui/src-tauri/icons/64x64.png                    "$PKG_DIR/usr/share/icons/hicolor/64x64/apps/ncrs.png"
     install -Dm644 ncrs-gui/src-tauri/icons/128x128.png                  "$PKG_DIR/usr/share/icons/hicolor/128x128/apps/ncrs.png"
     install -Dm644 "ncrs-gui/src-tauri/icons/128x128@2x.png"             "$PKG_DIR/usr/share/icons/hicolor/256x256/apps/ncrs.png"
     install -Dm644 ncrs-gui/src-tauri/icons/icon.png                     "$PKG_DIR/usr/share/icons/hicolor/512x512/apps/ncrs.png"
