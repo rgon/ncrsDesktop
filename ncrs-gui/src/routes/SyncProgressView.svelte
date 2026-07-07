@@ -35,22 +35,30 @@
     }: Props = $props();
 
     const hasTransfers = $derived(transfers.length > 0);
-    const label = $derived(() => {
+
+    const dotClass = $derived(() => {
+        if (hasTransfers || syncState === "syncing") return "nc-dot nc-dot-syncing";
+        if (syncState === "paused") return "nc-dot nc-dot-paused";
+        if (syncState === "unmounted" || syncState === "wiped" || syncState.startsWith("error")) return "nc-dot nc-dot-error";
+        return "nc-dot nc-dot-idle";
+    });
+
+    const statusLabel = $derived(() => {
         if (hasTransfers) {
             const dl = transfers.filter(t => t.direction === "Download").length;
             const ul = transfers.filter(t => t.direction === "Upload").length;
             const parts: string[] = [];
-            if (dl) parts.push(`${dl} download${dl > 1 ? "s" : ""}`);
-            if (ul) parts.push(`${ul} upload${ul > 1 ? "s" : ""}`);
-            return parts.join(", ");
+            if (dl) parts.push(`${dl} ↓`);
+            if (ul) parts.push(`${ul} ↑`);
+            return parts.join("  ");
         }
         switch (syncState) {
-            case "syncing":    return "Syncing…";
-            case "paused":     return "Sync paused";
-            case "unmounted":  return "Filesystem unmounted";
-            case "wiped":      return "Device wiped by server";
-            case "idle":       return "Up to date";
-            default:           return syncState.startsWith("error") ? "Sync error" : syncState;
+            case "syncing":   return "Syncing…";
+            case "paused":    return "Paused";
+            case "unmounted": return "Unmounted";
+            case "wiped":     return "Wiped by server";
+            case "idle":      return "Up to date";
+            default:          return syncState.startsWith("error") ? "Sync error" : syncState;
         }
     });
 
@@ -68,77 +76,189 @@
     }
 </script>
 
-<div class="bg-base-300 {mClass}" {...restProps}>
-    <div class="h-8 flex items-center justify-center">
-        <div class="w-64">
-            {#if hasTransfers}
-            <progress class="progress progress-primary w-full"></progress>
-            {:else if syncState === "syncing"}
-            <progress class="progress progress-primary w-full"></progress>
-            {:else}
-            <progress class="progress progress-primary w-full" value="100" max="100"></progress>
-            {/if}
-        </div>
-        <span class="ml-4 text-sm">{label()}</span>
+<div class="nc-sync-bar {mClass}" {...restProps}>
+    <!-- Status row -->
+    <div class="nc-sync-row">
+        <span class={dotClass()}></span>
+        <span class="nc-sync-label">{statusLabel()}</span>
+
         {#if syncState === "wiped"}
-            <span class="text-error text-xs ml-2">Credentials cleared. Reconfigure to reconnect.</span>
+            <span class="nc-sync-alert">Credentials cleared — reconfigure to reconnect.</span>
         {:else if syncState === "unmounted" && onremount}
-            <button class="btn btn-primary btn-xs ml-2" onclick={onremount}>Remount</button>
+            <button class="nc-remount-btn" onclick={onremount}>Remount</button>
+        {/if}
+
+        <!-- Storage summary (inline, right-aligned) -->
+        {#if hasStorage && !hasTransfers}
+            <span class="nc-storage-inline">
+                {#if storage.remote_total > 0}
+                    {formatSize(storage.remote_used)} / {formatSize(storage.remote_total)}
+                {:else if storage.remote_used > 0}
+                    {formatSize(storage.remote_used)}
+                {/if}
+            </span>
         {/if}
     </div>
 
+    <!-- Active transfers -->
     {#if hasTransfers}
-    <div class="px-3 pb-2 space-y-1 max-h-32 overflow-y-auto">
+    <div class="nc-transfers">
         {#each transfers as t (t.path)}
             {@const pct = t.total_bytes > 0 ? Math.round((t.bytes_done / t.total_bytes) * 100) : 0}
-            <div class="flex items-center gap-2 text-xs">
-                <Icon class="w-3.5 h-3.5 flex-shrink-0 opacity-60" path={t.direction === "Download" ? mdiArrowDown : mdiArrowUp} />
-                <span class="truncate flex-1 min-w-0" title={t.path}>{fileName(t.path)}</span>
+            <div class="nc-transfer-row">
+                <Icon
+                    class="nc-transfer-arrow"
+                    path={t.direction === "Download" ? mdiArrowDown : mdiArrowUp}
+                />
+                <span class="nc-transfer-name" title={t.path}>{fileName(t.path)}</span>
                 {#if t.total_bytes > 0}
-                    <span class="flex-shrink-0 tabular-nums text-gray-500">{formatSize(t.bytes_done)} / {formatSize(t.total_bytes)}</span>
+                    <span class="nc-transfer-size">{formatSize(t.bytes_done)}/{formatSize(t.total_bytes)}</span>
                 {/if}
-                <progress class="progress progress-primary w-16 flex-shrink-0" value={pct} max="100"></progress>
+                <div class="nc-transfer-track">
+                    <div class="nc-transfer-fill" style="width:{pct}%"></div>
+                </div>
             </div>
         {/each}
     </div>
     {/if}
 
-    {#if hasStorage}
-    <div class="px-3 pb-2">
-        <div class="flex items-center gap-3 text-xs text-gray-500">
-            {#if storage.kept_bytes > 0}
-                <span title="Files explicitly kept locally">
-                    <span class="inline-block w-2 h-2 rounded-full bg-success mr-1"></span>Kept: {formatSize(storage.kept_bytes)}
-                </span>
+    <!-- Storage bar -->
+    {#if hasStorage && storage.remote_total > 0}
+    <div class="nc-storage-bar-wrap">
+        {@const keptPct = Math.min(100, Math.round((storage.kept_bytes / storage.remote_total) * 100))}
+        {@const cachedPct = Math.min(100, Math.round((storage.cached_bytes / storage.remote_total) * 100))}
+        {@const serverPct = Math.min(100, Math.round((storage.remote_used / storage.remote_total) * 100))}
+        <div class="nc-storage-track">
+            {#if keptPct > 0}
+                <div class="nc-storage-seg nc-seg-kept" style="width:{keptPct}%"></div>
             {/if}
-            {#if storage.cached_bytes > 0}
-                <span title="Auto-cached files (read cache)">
-                    <span class="inline-block w-2 h-2 rounded-full bg-info mr-1"></span>Cache: {formatSize(storage.cached_bytes)}
-                </span>
+            {#if cachedPct > 0}
+                <div class="nc-storage-seg nc-seg-cached" style="width:{cachedPct}%"></div>
             {/if}
-            {#if storage.remote_total > 0}
-                <span class="ml-auto" title="Server storage: {formatSize(storage.remote_used)} of {formatSize(storage.remote_total)}">
-                    Server: {formatSize(storage.remote_used)} / {formatSize(storage.remote_total)}
-                </span>
-            {:else if storage.remote_used > 0}
-                <span class="ml-auto">Server: {formatSize(storage.remote_used)}</span>
-            {/if}
+            <div class="nc-storage-seg nc-seg-remote" style="width:{Math.max(0, serverPct - keptPct - cachedPct)}%"></div>
         </div>
-        {#if storage.remote_total > 0}
-            {@const localTotal = storage.kept_bytes + storage.cached_bytes}
-            {@const serverPct = Math.min(100, Math.round((storage.remote_used / storage.remote_total) * 100))}
-            {@const keptPct = storage.remote_total > 0 ? Math.min(100, Math.round((storage.kept_bytes / storage.remote_total) * 100)) : 0}
-            {@const cachedPct = storage.remote_total > 0 ? Math.min(100, Math.round((storage.cached_bytes / storage.remote_total) * 100)) : 0}
-            <div class="w-full bg-base-200 rounded-full h-1.5 mt-1 overflow-hidden flex">
-                {#if keptPct > 0}
-                    <div class="bg-success h-full" style="width: {keptPct}%"></div>
-                {/if}
-                {#if cachedPct > 0}
-                    <div class="bg-info h-full" style="width: {cachedPct}%"></div>
-                {/if}
-                <div class="bg-primary/30 h-full" style="width: {Math.max(0, serverPct - keptPct - cachedPct)}%"></div>
-            </div>
-        {/if}
     </div>
     {/if}
 </div>
+
+<style>
+.nc-sync-bar {
+    flex-shrink: 0;
+    background: var(--nc-surface);
+    border-bottom: 1px solid var(--nc-border);
+}
+
+.nc-sync-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 0 14px;
+    height: 32px;
+}
+
+.nc-sync-label {
+    font-size: 12px;
+    color: var(--nc-text-2);
+    flex: 1;
+}
+
+.nc-sync-alert {
+    font-size: 11px;
+    color: var(--nc-error);
+}
+
+.nc-remount-btn {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--nc-accent);
+    background: none;
+    border: 1px solid var(--nc-accent);
+    border-radius: 4px;
+    padding: 2px 8px;
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s;
+}
+.nc-remount-btn:hover { background: var(--nc-accent); color: #fff; }
+
+.nc-storage-inline {
+    font-size: 11px;
+    color: var(--nc-text-3);
+    flex-shrink: 0;
+    margin-left: auto;
+    padding-left: 8px;
+}
+
+/* ── Transfers ─────────────────────────────── */
+
+.nc-transfers {
+    padding: 4px 14px 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    max-height: 120px;
+    overflow-y: auto;
+}
+
+.nc-transfer-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--nc-text-2);
+}
+
+:global(.nc-transfer-arrow) {
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+    opacity: 0.6;
+}
+
+.nc-transfer-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nc-transfer-size {
+    color: var(--nc-text-3);
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+}
+
+.nc-transfer-track {
+    width: 48px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--nc-border);
+    flex-shrink: 0;
+    overflow: hidden;
+}
+
+.nc-transfer-fill {
+    height: 100%;
+    background: var(--nc-accent);
+    border-radius: 2px;
+    transition: width 0.3s;
+}
+
+/* ── Storage bar ───────────────────────────── */
+
+.nc-storage-bar-wrap {
+    padding: 0 14px 6px;
+}
+
+.nc-storage-track {
+    height: 2px;
+    background: var(--nc-border);
+    border-radius: 1px;
+    display: flex;
+    overflow: hidden;
+}
+
+.nc-storage-seg { height: 100%; }
+.nc-seg-kept   { background: var(--nc-success); }
+.nc-seg-cached { background: var(--nc-accent); opacity: 0.5; }
+.nc-seg-remote { background: var(--nc-accent); opacity: 0.2; }
+</style>
