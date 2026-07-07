@@ -36,9 +36,22 @@ fn build_client() -> Result<Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Strip any path that shouldn't be part of the server base URL.
+/// Handles cases where the user pastes a full WebDAV or index.php URL.
+fn base_server(server_url: &str) -> &str {
+    let s = server_url.trim_end_matches('/');
+    // Strip /remote.php/…, /webdav/…, /index.php/…, /dav/…
+    for prefix in ["/remote.php", "/index.php", "/webdav", "/dav/"] {
+        if let Some(i) = s.find(prefix) {
+            return &s[..i];
+        }
+    }
+    s
+}
+
 pub fn init_login_flow(server_url: &str) -> Result<LoginFlowInit, String> {
-    let server = server_url.trim_end_matches('/');
-    let url = format!("{}/index.php/login/v2/init", server);
+    let server = base_server(server_url);
+    let url = format!("{}/index.php/login/v2", server);
     let client = build_client()?;
     let resp = client
         .post(&url)
@@ -86,7 +99,7 @@ pub fn poll_login_flow(endpoint: &str, token: &str) -> Result<Option<LoginResult
 
 /// Build the WebDAV files URL from the server and login_name returned by the login flow.
 pub fn webdav_url(server: &str, login_name: &str) -> String {
-    let server = server.trim_end_matches('/');
+    let server = base_server(server);
     let encoded = percent_encoding::utf8_percent_encode(login_name, percent_encoding::NON_ALPHANUMERIC).to_string();
     format!("{}/remote.php/dav/files/{}/", server, encoded)
 }
