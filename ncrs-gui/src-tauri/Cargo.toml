@@ -35,5 +35,6 @@ tauri-runtime-wry = "2.6.0"
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 env_logger = "0.11"
+dirs = "6.0.0"
 ncrs_plugin = { path = "../../plugins/ncrs_plugin" }
 nc_passwords = { path = "../../plugins/nc_passwords" }

@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod backend;
 pub mod config;
+pub mod login_flow;
 pub mod edit_locally;
 pub mod filename_validation;
 pub mod fuse_notify;
@@ -3761,6 +3762,10 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     shutdown_flag.store(true, Ordering::Relaxed);
     log::info!("FUSE session ended — shutdown signal sent to background threads");
+
+    // Remove the IPC socket so a subsequent remount doesn't mistake the
+    // still-running server thread for an external daemon and enter attach mode.
+    let _ = std::fs::remove_file(crate::ipc::socket_path());
 
     // The session has unmounted; remove the now-empty mount dir so an
     // unmounted state can't be mistaken for an empty share. remove_dir

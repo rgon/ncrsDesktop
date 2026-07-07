@@ -132,7 +132,7 @@
         }
     }
 
-    async function viewOnline(e: MouseEvent, url: string) {
+    async function viewOnline(e: MouseEvent | KeyboardEvent, url: string) {
         e.stopPropagation();
         if (url) await invoke("open_link", { url });
     }
