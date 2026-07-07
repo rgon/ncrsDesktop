@@ -3763,6 +3763,10 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     shutdown_flag.store(true, Ordering::Relaxed);
     log::info!("FUSE session ended — shutdown signal sent to background threads");
 
+    // Remove the IPC socket so a subsequent remount doesn't mistake the
+    // still-running server thread for an external daemon and enter attach mode.
+    let _ = std::fs::remove_file(crate::ipc::socket_path());
+
     // The session has unmounted; remove the now-empty mount dir so an
     // unmounted state can't be mistaken for an empty share. remove_dir
     // refuses non-empty or still-mounted dirs, so this is safe best-effort.
