@@ -41,17 +41,10 @@
 </script>
 
 <div class="lv-root">
-    <!-- Logo / wordmark -->
+    <!-- Wordmark -->
     <div class="lv-brand">
-        <svg class="lv-logo" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <circle cx="18" cy="18" r="17" stroke="var(--nc-accent)" stroke-width="2"/>
-            <circle cx="18" cy="18" r="8" fill="var(--nc-accent)" opacity="0.15"/>
-            <path d="M18 10 L18 18 L24 14" stroke="var(--nc-accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <div>
-            <p class="lv-product">ncRS Desktop</p>
-            <p class="lv-tagline">Nextcloud sync client</p>
-        </div>
+        <p class="lv-product">ncRS Desktop</p>
+        <p class="lv-tagline">Nextcloud sync client</p>
     </div>
 
     {#if status !== "waiting"}
@@ -125,15 +118,7 @@
 /* ── Brand ─────────────────────────────────── */
 
 .lv-brand {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-}
-
-.lv-logo {
-    width: 40px;
-    height: 40px;
-    flex-shrink: 0;
+    text-align: center;
 }
 
 .lv-product {
