@@ -561,9 +561,20 @@ pub fn run() {
                     .map(|o| o.mount_point.to_string_lossy().to_string());
                 if let Some(mp) = mount_point {
                     log::info!("quit: unmounting {}", mp);
-                    let _ = std::process::Command::new("fusermount")
-                        .args(["-uz", &mp])
-                        .output();
+                    // Clean unmount first so the dir can be removed below;
+                    // fall back to a lazy detach if the mount is busy.
+                    let clean = std::process::Command::new("fusermount")
+                        .args(["-u", &mp])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    if !clean {
+                        let _ = std::process::Command::new("fusermount")
+                            .args(["-uz", &mp])
+                            .output();
+                    }
+                    // Best-effort: refuses non-empty or still-mounted dirs.
+                    let _ = std::fs::remove_dir(&mp);
                 }
                 app.exit(0);
             }

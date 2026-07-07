@@ -3714,16 +3714,41 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     let mp_str = options.mount_point.to_string_lossy().to_string();
 
-    // Try to unmount any stale FUSE mount first — a dead mount makes
-    // exists() return false while the inode still occupies the path.
-    let _ = std::process::Command::new("fusermount")
-        .args(["-uz", &mp_str])
-        .output();
+    // Classify the mount point before touching it:
+    //  - stat fails with ENOTCONN: stale FUSE mount left by a dead process — detach it
+    //  - listed as a live fuse mount in /proc/self/mounts: another instance owns it — refuse,
+    //    detaching here would steal the mount out from under that instance
+    //  - otherwise: plain (or missing) directory — create it and require it empty
+    match std::fs::metadata(&options.mount_point) {
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {
+            log::info!("Detaching stale FUSE mount at {}", mp_str);
+            let _ = std::process::Command::new("fusermount")
+                .args(["-uz", &mp_str])
+                .output();
+        }
+        _ => {
+            if is_live_fuse_mount(&options.mount_point) {
+                return Err(format!(
+                    "{} is already mounted — is another ncrs instance (GUI or systemd service) running?",
+                    mp_str
+                ));
+            }
+        }
+    }
 
     if let Err(e) = std::fs::create_dir_all(&options.mount_point) {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(format!("failed to create mount point {}: {}", options.mount_point.display(), e));
+        return Err(format!("failed to create mount point {}: {}", options.mount_point.display(), e));
+    }
+    match std::fs::read_dir(&options.mount_point) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(format!(
+                    "mount point {} is not empty — mounting would hide its contents; move them away first",
+                    mp_str
+                ));
+            }
         }
+        Err(e) => return Err(format!("cannot read mount point {}: {}", mp_str, e)),
     }
 
     log::info!(
@@ -3770,11 +3795,42 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     shutdown_flag.store(true, Ordering::Relaxed);
     log::info!("FUSE session ended — shutdown signal sent to background threads");
 
+    // The session has unmounted; remove the now-empty mount dir so an
+    // unmounted state can't be mistaken for an empty share. remove_dir
+    // refuses non-empty or still-mounted dirs, so this is safe best-effort.
+    let _ = std::fs::remove_dir(&options.mount_point);
+
     if wipe_flag.load(Ordering::Relaxed) {
         return Err("REMOTE_WIPE".to_string());
     }
 
     result
+}
+
+// True if the path appears as a mounted fuse filesystem in /proc/self/mounts.
+// A stale (dead-process) mount also appears here, so callers must rule that
+// out first via the ENOTCONN stat check.
+fn is_live_fuse_mount(mp: &Path) -> bool {
+    let canon = mp.canonicalize().unwrap_or_else(|_| mp.to_path_buf());
+    // /proc mount entries escape space/tab/newline/backslash as octal
+    let escaped = canon
+        .to_string_lossy()
+        .replace('\\', "\\134")
+        .replace(' ', "\\040")
+        .replace('\t', "\\011")
+        .replace('\n', "\\012");
+    std::fs::read_to_string("/proc/self/mounts")
+        .map(|mounts| {
+            mounts.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let _source = fields.next();
+                matches!(
+                    (fields.next(), fields.next()),
+                    (Some(dir), Some(fstype)) if dir == escaped && fstype.starts_with("fuse")
+                )
+            })
+        })
+        .unwrap_or(false)
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
