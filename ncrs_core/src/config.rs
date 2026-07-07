@@ -195,6 +195,19 @@ pub fn config_path() -> PathBuf {
         .join("config.yaml")
 }
 
+/// Set config file permissions to 0600 (owner read/write only).
+/// Non-fatal: logs a warning on failure rather than aborting startup.
+pub fn restrict_config_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        if let Err(e) = std::fs::set_permissions(path, perms) {
+            log::warn!("could not set 0600 on {}: {}", path.display(), e);
+        }
+    }
+}
+
 pub fn load_config() -> Result<MountOptions, String> {
     let path = config_path();
 
@@ -204,6 +217,7 @@ pub fn load_config() -> Result<MountOptions, String> {
             .map_err(|e| format!("Cannot create config dir {}: {}", dir.display(), e))?;
         std::fs::write(&path, DEFAULT_CONFIG)
             .map_err(|e| format!("Cannot write default config: {}", e))?;
+        restrict_config_permissions(&path);
         return Err(format!(
             "Created default config at {}. Please fill it in and restart.",
             path.display()

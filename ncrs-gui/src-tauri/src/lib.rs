@@ -465,6 +465,7 @@ fn write_config_from_login(
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
     }
     std::fs::write(&config_path, config).map_err(|e| format!("write config: {}", e))?;
+    ncrs_core::config::restrict_config_permissions(&config_path);
     log::info!("config written to {}", config_path.display());
     Ok(())
 }
