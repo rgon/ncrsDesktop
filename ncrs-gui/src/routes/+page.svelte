@@ -191,8 +191,11 @@
         }, 30_000);
 
         const clickOutListener = (event: MouseEvent) => {
+            // composedPath is frozen when dispatch starts, so a click on a
+            // node that a Svelte re-render detaches mid-dispatch (e.g. view
+            // switch) still reports .window as its ancestor.
             const container = document.querySelector(".window");
-            if (container && !container.contains(event.target as Node)) close();
+            if (container && !event.composedPath().includes(container)) close();
         };
         document.addEventListener("click", clickOutListener);
 
