@@ -40,50 +40,68 @@
     });
 </script>
 
-<div class="flex flex-col items-center justify-center h-full gap-6 px-8 py-6">
-    <div class="text-center">
-        <h2 class="text-lg font-bold">Connect to Nextcloud</h2>
-        <p class="text-xs text-gray-500 mt-1">Enter your server address to sign in</p>
+<div class="lv-root">
+    <!-- Logo / wordmark -->
+    <div class="lv-brand">
+        <svg class="lv-logo" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <circle cx="18" cy="18" r="17" stroke="var(--nc-accent)" stroke-width="2"/>
+            <circle cx="18" cy="18" r="8" fill="var(--nc-accent)" opacity="0.15"/>
+            <path d="M18 10 L18 18 L24 14" stroke="var(--nc-accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div>
+            <p class="lv-product">ncRS Desktop</p>
+            <p class="lv-tagline">Nextcloud sync client</p>
+        </div>
     </div>
 
     {#if status !== "waiting"}
-        <div class="w-full flex flex-col gap-2">
-            <label class="text-xs font-semibold" for="server-url">Server URL</label>
+        <!-- Form -->
+        <div class="lv-form">
+            <label class="lv-label" for="server-url">Nextcloud server</label>
             <input
                 id="server-url"
-                class="input input-bordered input-sm w-full"
+                class="nc-input"
                 type="url"
                 placeholder="https://cloud.example.com"
                 bind:value={serverUrl}
                 onkeydown={(e) => { if (e.key === "Enter") connect(); }}
+                autocomplete="url"
+                spellcheck="false"
             />
+
+            {#if status === "error" && errorMsg}
+                <p class="lv-error">{errorMsg}</p>
+            {/if}
+
+            <button class="nc-btn-primary lv-connect-btn" onclick={connect}>
+                Sign in with Nextcloud
+            </button>
         </div>
 
-        {#if status === "error" && errorMsg}
-            <p class="text-xs text-error text-center">{errorMsg}</p>
-        {/if}
+        <p class="lv-hint">
+            Your browser will open to complete sign-in. Your password is never stored in the config file.
+        </p>
 
-        <button class="btn btn-primary btn-sm w-full" onclick={connect}>
-            Connect
-        </button>
     {:else}
-        <div class="flex flex-col items-center gap-3">
-            <span class="loading loading-spinner loading-md text-primary"></span>
-            <p class="text-sm font-medium text-center">Waiting for authorization in your browser…</p>
-            <p class="text-xs text-gray-400 text-center">
-                A browser window should have opened. Log in to Nextcloud and approve the connection.
+        <!-- Waiting state -->
+        <div class="lv-waiting">
+            <div class="lv-spinner" aria-hidden="true"></div>
+            <p class="lv-waiting-title">Waiting for authorization…</p>
+            <p class="lv-waiting-sub">
+                Your browser should have opened. Log in and approve the connection.
             </p>
+
             {#if loginUrl}
-                <a
-                    class="text-xs text-primary underline break-all text-center"
-                    href={loginUrl}
-                    onclick={(e) => { e.preventDefault(); invoke("open_link", { url: loginUrl }); }}
+                <button
+                    class="lv-manual-link"
+                    onclick={() => invoke("open_link", { url: loginUrl })}
                 >
-                    Open login page manually
-                </a>
+                    Open login page manually →
+                </button>
             {/if}
+
             <button
-                class="btn btn-ghost btn-xs mt-2"
+                class="nc-btn-ghost lv-cancel-btn"
                 onclick={() => { status = "idle"; errorMsg = ""; }}
             >
                 Cancel
@@ -91,3 +109,140 @@
         </div>
     {/if}
 </div>
+
+<style>
+.lv-root {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 28px;
+    gap: 24px;
+    background: var(--nc-bg);
+}
+
+/* ── Brand ─────────────────────────────────── */
+
+.lv-brand {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.lv-logo {
+    width: 40px;
+    height: 40px;
+    flex-shrink: 0;
+}
+
+.lv-product {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--nc-text);
+    line-height: 1.2;
+    letter-spacing: -0.01em;
+}
+
+.lv-tagline {
+    font-size: 11px;
+    color: var(--nc-text-3);
+    margin-top: 2px;
+}
+
+/* ── Form ──────────────────────────────────── */
+
+.lv-form {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.lv-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--nc-text-2);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.lv-error {
+    font-size: 12px;
+    color: var(--nc-error);
+    line-height: 1.4;
+}
+
+.lv-connect-btn {
+    margin-top: 4px;
+}
+
+/* ── Hint ──────────────────────────────────── */
+
+.lv-hint {
+    font-size: 11px;
+    color: var(--nc-text-3);
+    text-align: center;
+    line-height: 1.5;
+    max-width: 280px;
+}
+
+/* ── Waiting ───────────────────────────────── */
+
+.lv-waiting {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+}
+
+@keyframes lv-rotate {
+    to { transform: rotate(360deg); }
+}
+
+.lv-spinner {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 3px solid var(--nc-border);
+    border-top-color: var(--nc-accent);
+    flex-shrink: 0;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .lv-spinner { animation: lv-rotate 0.85s linear infinite; }
+}
+
+.lv-waiting-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--nc-text);
+}
+
+.lv-waiting-sub {
+    font-size: 12px;
+    color: var(--nc-text-2);
+    text-align: center;
+    line-height: 1.5;
+    max-width: 260px;
+}
+
+.lv-manual-link {
+    font-size: 12px;
+    color: var(--nc-accent);
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    transition: opacity 0.1s;
+}
+.lv-manual-link:hover { opacity: 0.75; }
+
+.lv-cancel-btn {
+    margin-top: 4px;
+    width: auto;
+}
+</style>
