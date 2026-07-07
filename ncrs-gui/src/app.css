@@ -1,2 +1,217 @@
 @import "tailwindcss";
 @plugin "daisyui";
+
+/* ── Design tokens ─────────────────────────────────────── */
+
+[data-theme="light"] {
+  --nc-bg:      #F4F6FB;
+  --nc-surface: #E9EDF6;
+  --nc-border:  #CDD3E6;
+  --nc-text:    #18192D;
+  --nc-text-2:  #5B6180;
+  --nc-text-3:  #9299B8;
+  --nc-accent:  #2563EB;
+  --nc-success: #15803D;
+  --nc-error:   #DC2626;
+  --nc-warning: #B45309;
+}
+
+[data-theme="dark"] {
+  --nc-bg:      #0F1120;
+  --nc-surface: #181B2E;
+  --nc-border:  #232744;
+  --nc-text:    #E4E8F6;
+  --nc-text-2:  #7880AA;
+  --nc-text-3:  #464E72;
+  --nc-accent:  #4080F0;
+  --nc-success: #4ADE80;
+  --nc-error:   #F87171;
+  --nc-warning: #FBBF24;
+}
+
+/* ── Base ─────────────────────────────────────────────── */
+
+:root {
+  font-family: Inter, system-ui, -apple-system, Helvetica Neue, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  background-color: transparent;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-synthesis: none;
+}
+
+/* ── Sync dot animation ───────────────────────────────── */
+
+@keyframes nc-spin {
+  to { transform: rotate(360deg); }
+}
+
+.nc-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.nc-dot-idle   { background: var(--nc-success); }
+.nc-dot-paused { background: var(--nc-text-3); }
+.nc-dot-error  { background: var(--nc-error); }
+
+.nc-dot-syncing {
+  background: transparent;
+  border: 2px solid var(--nc-accent);
+  border-top-color: transparent;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .nc-dot-syncing { animation: nc-spin 0.8s linear infinite; }
+}
+
+/* ── Toolbar icon buttons ─────────────────────────────── */
+
+.nc-icon-btn {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  background: none;
+  border: none;
+  color: var(--nc-text-2);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.1s, color 0.1s;
+}
+.nc-icon-btn:hover              { background: var(--nc-border); color: var(--nc-text); }
+.nc-icon-btn.nc-active          { color: var(--nc-accent); background: color-mix(in srgb, var(--nc-accent) 10%, transparent); }
+.nc-icon-btn.nc-close:hover     { background: var(--nc-error); color: #fff; }
+
+.nc-badge {
+  position: absolute;
+  top: 2px;
+  right: 1px;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  border-radius: 7px;
+  font-size: 8px;
+  font-weight: 700;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  line-height: 1;
+}
+.nc-badge-error { background: var(--nc-error); }
+.nc-badge-warn  { background: var(--nc-warning); }
+.nc-badge-info  { background: var(--nc-accent); }
+
+/* ── Notification items ───────────────────────────────── */
+
+.nc-notif {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--nc-border);
+  transition: background 0.08s;
+}
+.nc-notif:hover      { background: var(--nc-surface); }
+.nc-notif:last-child { border-bottom: none; }
+
+/* ── Form inputs ──────────────────────────────────────── */
+
+.nc-input {
+  width: 100%;
+  padding: 8px 11px;
+  font-size: 13px;
+  font-family: inherit;
+  background: var(--nc-surface);
+  border: 1px solid var(--nc-border);
+  border-radius: 6px;
+  color: var(--nc-text);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  box-sizing: border-box;
+}
+.nc-input:focus {
+  border-color: var(--nc-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--nc-accent) 16%, transparent);
+}
+.nc-input::placeholder { color: var(--nc-text-3); }
+
+/* ── Primary button ───────────────────────────────────── */
+
+.nc-btn-primary {
+  display: block;
+  width: 100%;
+  padding: 9px 14px;
+  font-size: 13px;
+  font-family: inherit;
+  font-weight: 600;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  background: var(--nc-accent);
+  color: #fff;
+  transition: filter 0.1s;
+  text-align: center;
+}
+.nc-btn-primary:hover   { filter: brightness(1.1); }
+.nc-btn-primary:active  { filter: brightness(0.92); }
+.nc-btn-primary:disabled { opacity: 0.45; cursor: default; }
+
+/* ── Ghost / outline button ───────────────────────────── */
+
+.nc-btn-ghost {
+  padding: 5px 12px;
+  font-size: 12px;
+  font-family: inherit;
+  border-radius: 5px;
+  border: 1px solid var(--nc-border);
+  background: transparent;
+  color: var(--nc-text-2);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+.nc-btn-ghost:hover { background: var(--nc-surface); color: var(--nc-text); }
+
+/* ── Inline action button (notification row) ──────────── */
+
+.nc-action-btn {
+  padding: 3px 8px;
+  font-size: 11px;
+  font-family: inherit;
+  font-weight: 600;
+  border-radius: 4px;
+  border: 1px solid var(--nc-accent);
+  background: transparent;
+  color: var(--nc-accent);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.1s, color 0.1s;
+}
+.nc-action-btn:hover { background: var(--nc-accent); color: #fff; }
+
+/* ── Dismiss × button ─────────────────────────────────── */
+
+.nc-dismiss-btn {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  background: none;
+  border: none;
+  color: var(--nc-text-3);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.1s, color 0.1s;
+}
+.nc-dismiss-btn:hover { background: var(--nc-border); color: var(--nc-text); }
