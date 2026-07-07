@@ -37,15 +37,9 @@ PKG_DIR="$OUT_DIR/ncrs_${VERSION}_${ARCH}"
 
 echo "Building ncrs ${VERSION} (${ARCH}) → ${OUT_DIR}"
 
-# ── Build core binaries ───────────────────────────────────────────────────────
-if ! $SKIP_BUILD; then
-    echo "→ Building core binaries..."
-    cargo build --release -p ncrs_core
-fi
-
-# ── Build GUI (unless --skip-gui) ─────────────────────────────────────────────
+# ── Build GUI frontend (must precede cargo so Tauri can embed it) ─────────────
 if ! $SKIP_GUI && ! $SKIP_BUILD; then
-    echo "→ Building GUI..."
+    echo "→ Building GUI frontend..."
     if ! command -v pnpm >/dev/null 2>&1; then
         echo "  pnpm not found; install it with: npm i -g pnpm"
         echo "  Skipping GUI build."
@@ -55,9 +49,19 @@ if ! $SKIP_GUI && ! $SKIP_BUILD; then
         pnpm install --frozen-lockfile
         pnpm build
         cd ..
-        # custom-protocol embeds the frontend; without it the binary expects
+    fi
+fi
+
+# ── Build Rust binaries (single invocation so shared deps compile once) ────────
+if ! $SKIP_BUILD; then
+    if $SKIP_GUI; then
+        echo "→ Building core binaries..."
+        cargo build --release -p ncrs_core
+    else
+        echo "→ Building core and GUI binaries..."
+        # custom-protocol embeds the frontend; without it ncrs-gui expects
         # the vite dev server at devUrl (works on dev machines only).
-        cargo build --release -p ncrs-gui --features custom-protocol
+        cargo build --release -p ncrs_core -p ncrs-gui --features ncrs-gui/custom-protocol
     fi
 fi
 
