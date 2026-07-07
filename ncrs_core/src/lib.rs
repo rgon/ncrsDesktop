@@ -3394,6 +3394,11 @@ fn build_fuse_options() -> Vec<MountOption> {
 }
 
 pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>, paused: Option<Arc<AtomicBool>>) -> Result<(), String> {
+    // Must run before anything that touches shared resources (the IPC socket,
+    // cache dirs, journal): a refused second instance must leave the running
+    // daemon's state untouched.
+    prepare_mount_point(&options.mount_point)?;
+
     let mut filesystem = NextCloudFs::new(options.clone())?;
     if let Some(el) = error_log {
         filesystem.error_log = el;
@@ -3712,45 +3717,6 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     let fuse_options = build_fuse_options();
 
-    let mp_str = options.mount_point.to_string_lossy().to_string();
-
-    // Classify the mount point before touching it:
-    //  - stat fails with ENOTCONN: stale FUSE mount left by a dead process — detach it
-    //  - listed as a live fuse mount in /proc/self/mounts: another instance owns it — refuse,
-    //    detaching here would steal the mount out from under that instance
-    //  - otherwise: plain (or missing) directory — create it and require it empty
-    match std::fs::metadata(&options.mount_point) {
-        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {
-            log::info!("Detaching stale FUSE mount at {}", mp_str);
-            let _ = std::process::Command::new("fusermount")
-                .args(["-uz", &mp_str])
-                .output();
-        }
-        _ => {
-            if is_live_fuse_mount(&options.mount_point) {
-                return Err(format!(
-                    "{} is already mounted — is another ncrs instance (GUI or systemd service) running?",
-                    mp_str
-                ));
-            }
-        }
-    }
-
-    if let Err(e) = std::fs::create_dir_all(&options.mount_point) {
-        return Err(format!("failed to create mount point {}: {}", options.mount_point.display(), e));
-    }
-    match std::fs::read_dir(&options.mount_point) {
-        Ok(mut entries) => {
-            if entries.next().is_some() {
-                return Err(format!(
-                    "mount point {} is not empty — mounting would hide its contents; move them away first",
-                    mp_str
-                ));
-            }
-        }
-        Err(e) => return Err(format!("cannot read mount point {}: {}", mp_str, e)),
-    }
-
     log::info!(
         "Mounting WebDAV {} at {}",
         options.url,
@@ -3805,6 +3771,48 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     }
 
     result
+}
+
+// Classify and prepare the mount point:
+//  - stat fails with ENOTCONN: stale FUSE mount left by a dead process — detach it
+//  - listed as a live fuse mount in /proc/self/mounts: another instance owns it — refuse,
+//    detaching here would steal the mount out from under that instance
+//  - otherwise: plain (or missing) directory — create it and require it empty
+fn prepare_mount_point(mount_point: &Path) -> Result<(), String> {
+    let mp_str = mount_point.to_string_lossy().to_string();
+
+    match std::fs::metadata(mount_point) {
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {
+            log::info!("Detaching stale FUSE mount at {}", mp_str);
+            let _ = std::process::Command::new("fusermount")
+                .args(["-uz", &mp_str])
+                .output();
+        }
+        _ => {
+            if is_live_fuse_mount(mount_point) {
+                return Err(format!(
+                    "{} is already mounted — is another ncrs instance (GUI or systemd service) running?",
+                    mp_str
+                ));
+            }
+        }
+    }
+
+    if let Err(e) = std::fs::create_dir_all(mount_point) {
+        return Err(format!("failed to create mount point {}: {}", mp_str, e));
+    }
+    match std::fs::read_dir(mount_point) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(format!(
+                    "mount point {} is not empty — mounting would hide its contents; move them away first",
+                    mp_str
+                ));
+            }
+        }
+        Err(e) => return Err(format!("cannot read mount point {}: {}", mp_str, e)),
+    }
+    Ok(())
 }
 
 // True if the path appears as a mounted fuse filesystem in /proc/self/mounts.
