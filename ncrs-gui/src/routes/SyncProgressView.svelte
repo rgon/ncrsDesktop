@@ -124,20 +124,20 @@
 
     <!-- Storage bar -->
     {#if hasStorage && storage.remote_total > 0}
-    <div class="nc-storage-bar-wrap">
         {@const keptPct = Math.min(100, Math.round((storage.kept_bytes / storage.remote_total) * 100))}
         {@const cachedPct = Math.min(100, Math.round((storage.cached_bytes / storage.remote_total) * 100))}
         {@const serverPct = Math.min(100, Math.round((storage.remote_used / storage.remote_total) * 100))}
-        <div class="nc-storage-track">
-            {#if keptPct > 0}
-                <div class="nc-storage-seg nc-seg-kept" style="width:{keptPct}%"></div>
-            {/if}
-            {#if cachedPct > 0}
-                <div class="nc-storage-seg nc-seg-cached" style="width:{cachedPct}%"></div>
-            {/if}
-            <div class="nc-storage-seg nc-seg-remote" style="width:{Math.max(0, serverPct - keptPct - cachedPct)}%"></div>
+        <div class="nc-storage-bar-wrap">
+            <div class="nc-storage-track">
+                {#if keptPct > 0}
+                    <div class="nc-storage-seg nc-seg-kept" style="width:{keptPct}%"></div>
+                {/if}
+                {#if cachedPct > 0}
+                    <div class="nc-storage-seg nc-seg-cached" style="width:{cachedPct}%"></div>
+                {/if}
+                <div class="nc-storage-seg nc-seg-remote" style="width:{Math.max(0, serverPct - keptPct - cachedPct)}%"></div>
+            </div>
         </div>
-    </div>
     {/if}
 </div>
 
