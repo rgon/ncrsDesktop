@@ -3,27 +3,11 @@ name = "ncrs_core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+default-run = "ncrs"
 
-[package.metadata.deb]
+[[bin]]
 name = "ncrs"
-maintainer = "Gonzalo Ruiz <gonza@logo.cl>"
-extended-description = "Mounts your Nextcloud as a local FUSE filesystem with offline caching, real-time sync, conflict detection, and GNOME/Nautilus integration."
-depends = "$auto, fuse3"
-section = "net"
-priority = "optional"
-assets = [
-  ["target/release/ncrs", "usr/bin/ncrs", "755"],
-  ["target/release/ncrs-open", "usr/bin/ncrs-open", "755"],
-  ["../packaging/ncrs.service", "usr/lib/systemd/user/ncrs.service", "644"],
-  ["../packaging/ncrs-open.desktop", "usr/share/applications/ncrs-open.desktop", "644"],
-  ["../shell_integration/nautilus/syncstate.py", "usr/share/nautilus-python/extensions/ncrs-syncstate.py", "644"],
-  ["../shell_integration/gnome-search/ncrs-search-provider", "usr/bin/ncrs-search-provider", "755"],
-  ["../shell_integration/gnome-search/es.rgon.ncrs.SearchProvider.ini", "usr/share/gnome-shell/search-providers/es.rgon.ncrs.SearchProvider.ini", "644"],
-  ["../shell_integration/gnome-search/es.rgon.ncrs.desktop", "usr/share/applications/es.rgon.ncrs.desktop", "644"],
-  ["../packaging/es.rgon.ncrs.SearchProvider.service", "usr/share/dbus-1/services/es.rgon.ncrs.SearchProvider.service", "644"],
-]
-maintainer-scripts = "../packaging/maintainer-scripts"
-systemd-units = []
+path = "src/main.rs"
 
 [dependencies]
 log = "0.4"

@@ -168,7 +168,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
 
 // ── Config file loading ───────────────────────────────────────────────────────
 
-const DEFAULT_CONFIG: &str = r#"# ncRS Desktop configuration
+pub const DEFAULT_CONFIG: &str = r#"# ncRS Desktop configuration
 # Generated on first run — fill in your Nextcloud credentials.
 
 # Full WebDAV URL, e.g. https://cloud.example.com/remote.php/dav/files/USERNAME/

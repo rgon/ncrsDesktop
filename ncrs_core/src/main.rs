@@ -24,11 +24,20 @@ struct Cli {
     /// When set, the post-upload emblem is a green checkmark; otherwise no emblem is shown.
     #[arg(long)]
     auto_keep_locally_modified_files: bool,
+
+    /// Print the default config template to stdout and exit
+    #[arg(long)]
+    print_default_config: bool,
 }
 
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
+
+    if cli.print_default_config {
+        print!("{}", ncrs_core::config::DEFAULT_CONFIG);
+        return;
+    }
 
     let mut opts = if let Some(ref path) = cli.config {
         let yaml = match std::fs::read_to_string(path) {
