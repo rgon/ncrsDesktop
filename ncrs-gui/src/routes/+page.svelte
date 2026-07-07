@@ -96,6 +96,7 @@
     let avatarError = $state(false);
     let activeView = $state<View>("notifications");
     let needsLogin = $state(false);
+    let configServerUrl = $state("");
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -137,6 +138,7 @@
         const status = await invoke<ConfigStatus>("get_config_status");
         if (status.needs_login) {
             needsLogin = true;
+            configServerUrl = status.server_url ?? "";
             activeView = "login";
             return;
         }
@@ -357,7 +359,7 @@
 
         <!-- Login overlay: shown when credentials are not configured -->
         {#if activeView === "login"}
-            <LoginView />
+            <LoginView initialServerUrl={configServerUrl} />
         <!-- Content area: search, errors, or notifications -->
         {:else if activeView === "search"}
             <SearchView

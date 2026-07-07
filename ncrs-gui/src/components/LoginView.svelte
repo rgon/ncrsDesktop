@@ -3,7 +3,8 @@
     import { listen } from "@tauri-apps/api/event";
     import { onMount } from "svelte";
 
-    let serverUrl = $state("");
+    let { initialServerUrl = "" }: { initialServerUrl?: string } = $props();
+    let serverUrl = $state(initialServerUrl);
     let status = $state<"idle" | "waiting" | "error">("idle");
     let errorMsg = $state("");
     let loginUrl = $state("");
