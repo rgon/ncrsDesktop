@@ -4,7 +4,7 @@ use std::thread;
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItem},
-    tray::{TrayIconBuilder, TrayIconId},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent, TrayIconId},
     AppHandle, Emitter, EventLoopMessage, Listener, Manager, State, WindowEvent,
 };
 use tauri_plugin_opener::OpenerExt;
@@ -668,7 +668,12 @@ pub fn run() {
             let tray = TrayIconBuilder::new()
                 .menu(&menu)
                 .icon(icon)
-                .show_menu_on_left_click(true)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                        open_main_window(tray.app_handle());
+                    }
+                })
                 .build(app)
                 .unwrap();
 
