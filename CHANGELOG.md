@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.4](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.3...ncrs-v0.1.4) (2026-07-09)
+
+
+### Features
+
+* **gui:** add settings view with yaml config editing and version indicator ([63b3154](https://github.com/rgon/ncrsDesktop/commit/63b315440767e394c001b970a35a8c121296188c))
+
+
+### Bug Fixes
+
+* **fuse:** guard newly created files in uploading set to prevent ENOENT race ([9462955](https://github.com/rgon/ncrsDesktop/commit/94629552fc2c6551995b9edfca4a413cd595ed9b))
+
 ## [0.1.3](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.2...ncrs-v0.1.3) (2026-07-09)
 
 
