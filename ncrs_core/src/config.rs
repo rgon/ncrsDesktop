@@ -315,6 +315,136 @@ pub fn load_config() -> Result<MountOptions, String> {
     Ok(opts)
 }
 
+// ── Settings editing ──────────────────────────────────────────────────────────
+
+/// The subset of config fields exposed for GUI editing (no credentials).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConfigSettings {
+    pub mount_point: String,
+    pub aggressive_prefetch: bool,
+    pub http3: bool,
+    pub max_concurrent_requests: usize,
+    pub optimistic_listing: bool,
+    pub auto_keep_locally_modified_files: bool,
+    pub auto_keep_cached_files: bool,
+    pub read_ahead_bytes: usize,
+    pub cache_max_size_bytes: u64,
+    pub cache_auto_purge_days: u32,
+    pub cache_cleanup_interval_secs: u64,
+    pub cache_streamed_reads: bool,
+}
+
+impl Default for ConfigSettings {
+    fn default() -> Self {
+        ConfigSettings {
+            mount_point: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/home"))
+                .join("Nextcloud")
+                .to_string_lossy()
+                .into_owned(),
+            aggressive_prefetch: false,
+            http3: false,
+            max_concurrent_requests: 10,
+            optimistic_listing: true,
+            auto_keep_locally_modified_files: false,
+            auto_keep_cached_files: false,
+            read_ahead_bytes: DEFAULT_READ_AHEAD,
+            cache_max_size_bytes: default_cache_max_size(),
+            cache_auto_purge_days: default_cache_purge_days(),
+            cache_cleanup_interval_secs: default_cache_cleanup_interval(),
+            cache_streamed_reads: false,
+        }
+    }
+}
+
+pub fn config_settings_from_opts(opts: &MountOptions) -> ConfigSettings {
+    ConfigSettings {
+        mount_point: opts.mount_point.to_string_lossy().into_owned(),
+        aggressive_prefetch: opts.aggressive_prefetch,
+        http3: opts.http3,
+        max_concurrent_requests: opts.max_concurrent_requests,
+        optimistic_listing: opts.optimistic_listing,
+        auto_keep_locally_modified_files: opts.auto_keep_locally_modified_files,
+        auto_keep_cached_files: opts.auto_keep_cached_files,
+        read_ahead_bytes: opts.read_ahead_bytes,
+        cache_max_size_bytes: opts.cache_max_size_bytes,
+        cache_auto_purge_days: opts.cache_auto_purge_days,
+        cache_cleanup_interval_secs: opts.cache_cleanup_interval_secs,
+        cache_streamed_reads: opts.cache_streamed_reads,
+    }
+}
+
+/// Rewrite the config file, preserving credentials and server fields, applying
+/// only the settings-panel fields from `settings`.
+pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> {
+    let path = config_path();
+
+    let existing = if path.exists() {
+        std::fs::read_to_string(&path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let docs = YamlLoader::load_from_str(&existing).unwrap_or_default();
+
+    let (url, username, password, bearer_token, auth_command, log_user) =
+        if let Some(doc) = docs.first() {
+            let url = doc["url"].as_str().unwrap_or("").to_string();
+            let username = doc["username"].as_str().unwrap_or("").to_string();
+            let password = doc["password"]
+                .as_str()
+                .and_then(|s| if s.is_empty() { None } else { Some(s.to_string()) });
+            let bearer_token = doc["bearer_token"]
+                .as_str()
+                .and_then(|s| if s.is_empty() { None } else { Some(s.to_string()) });
+            let auth_command = doc["auth_command"]
+                .as_str()
+                .and_then(|s| if s.is_empty() { None } else { Some(s.to_string()) });
+            let log_user = doc["user"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| username.clone());
+            (url, username, password, bearer_token, auth_command, log_user)
+        } else {
+            (String::new(), String::new(), None, None, None, String::new())
+        };
+
+    let mut content = String::from("# ncRS Desktop configuration\n\n");
+    content.push_str(&format!("url: {:?}\n", url));
+    content.push_str(&format!("username: {:?}\n", username));
+    if let Some(ref pw) = password {
+        content.push_str(&format!("password: {:?}\n", pw));
+    }
+    if let Some(ref bt) = bearer_token {
+        content.push_str(&format!("bearer_token: {:?}\n", bt));
+    }
+    if let Some(ref ac) = auth_command {
+        content.push_str(&format!("auth_command: {:?}\n", ac));
+    }
+    content.push_str(&format!("mount_point: {:?}\n", settings.mount_point));
+    content.push_str(&format!("user: {:?}\n", log_user));
+    content.push('\n');
+    content.push_str(&format!("aggressive_prefetch: {}\n", settings.aggressive_prefetch));
+    content.push_str(&format!("http3: {}\n", settings.http3));
+    content.push_str(&format!("max_concurrent_requests: {}\n", settings.max_concurrent_requests));
+    content.push_str(&format!("optimistic_listing: {}\n", settings.optimistic_listing));
+    content.push_str(&format!("auto_keep_locally_modified_files: {}\n", settings.auto_keep_locally_modified_files));
+    content.push_str(&format!("auto_keep_cached_files: {}\n", settings.auto_keep_cached_files));
+    content.push_str(&format!("read_ahead_bytes: {}\n", settings.read_ahead_bytes));
+    content.push_str(&format!("cache_max_size_bytes: {}\n", settings.cache_max_size_bytes));
+    content.push_str(&format!("cache_auto_purge_days: {}\n", settings.cache_auto_purge_days));
+    content.push_str(&format!("cache_cleanup_interval_secs: {}\n", settings.cache_cleanup_interval_secs));
+    content.push_str(&format!("cache_streamed_reads: {}\n", settings.cache_streamed_reads));
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
+    }
+    std::fs::write(&path, &content).map_err(|e| format!("write config: {}", e))?;
+    warn_config_permissions(&path);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

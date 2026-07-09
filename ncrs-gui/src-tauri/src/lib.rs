@@ -321,22 +321,41 @@ fn get_plugin_metas() -> Vec<ncrs_plugin::PluginMeta> {
 pub struct ConfigStatus {
     pub needs_login: bool,
     pub server_url: Option<String>,
+    pub needs_setup: bool,
 }
 
 #[tauri::command]
 fn get_config_status() -> ConfigStatus {
     match ncrs_core::config::load_config() {
         Ok(opts) => {
-            // Config loaded; check credentials are actually usable.
             if opts.credentials().is_err() {
                 let server = ncrs_core::notifications::base_url(&opts.url);
-                ConfigStatus { needs_login: true, server_url: Some(server) }
+                ConfigStatus { needs_login: true, server_url: Some(server), needs_setup: false }
             } else {
-                ConfigStatus { needs_login: false, server_url: None }
+                let needs_setup = opts.mount_point.as_os_str().is_empty();
+                ConfigStatus { needs_login: false, server_url: None, needs_setup }
             }
         }
-        Err(_) => ConfigStatus { needs_login: true, server_url: None },
+        Err(_) => ConfigStatus { needs_login: true, server_url: None, needs_setup: false },
     }
+}
+
+#[tauri::command]
+fn get_config_values() -> ncrs_core::config::ConfigSettings {
+    match ncrs_core::config::load_config() {
+        Ok(opts) => ncrs_core::config::config_settings_from_opts(&opts),
+        Err(_) => ncrs_core::config::ConfigSettings::default(),
+    }
+}
+
+#[tauri::command]
+fn save_config_values(values: ncrs_core::config::ConfigSettings) -> Result<(), String> {
+    ncrs_core::config::rewrite_config_settings(&values)
+}
+
+#[tauri::command]
+fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -643,6 +662,9 @@ pub fn run() {
             get_storage_stats,
             get_plugin_metas,
             remount,
+            get_config_values,
+            save_config_values,
+            get_app_version,
             nc_passwords::commands::nc_passwords_connect,
             nc_passwords::commands::nc_passwords_disconnect,
             nc_passwords::commands::nc_passwords_is_connected,

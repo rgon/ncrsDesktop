@@ -9,7 +9,7 @@
     import {
         mdiFolder, mdiAppsBox, mdiPlus, mdiAccountCog,
         mdiChevronDown, mdiClose, mdiMagnify, mdiBell,
-        mdiBellOutline, mdiAlertCircleOutline,
+        mdiBellOutline, mdiAlertCircleOutline, mdiCog,
     } from '@mdi/js';
 
     import { onMount } from 'svelte';
@@ -20,6 +20,7 @@
     import IssuesView from '../components/IssuesView.svelte';
     import PluginsView from '../components/PluginsView.svelte';
     import LoginView from '../components/LoginView.svelte';
+    import SettingsView from '../components/SettingsView.svelte';
     import { getPluginComponent } from '../plugins/registry';
 
     // ── Types ─────────────────────────────────────────────────────────────────
@@ -82,7 +83,7 @@
 
     // ── State ─────────────────────────────────────────────────────────────────
 
-    type View = "login" | "notifications" | "search" | "issues" | "plugins" | `plugin:${string}`;
+    type View = "login" | "notifications" | "search" | "issues" | "plugins" | "settings" | `plugin:${string}`;
 
     let userInfo = $state<UserInfo | null>(null);
     let syncState = $state<string>("idle");
@@ -96,6 +97,7 @@
     let activeView = $state<View>("notifications");
     let needsLogin = $state(false);
     let configServerUrl = $state("");
+    let needsSetup = $state(false);
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -135,7 +137,7 @@
         if (url) await invoke("open_link", { url });
     }
 
-    interface ConfigStatus { needs_login: boolean; server_url: string | null; }
+    interface ConfigStatus { needs_login: boolean; server_url: string | null; needs_setup: boolean; }
 
     async function loadInfo() {
         const status = await invoke<ConfigStatus>("get_config_status");
@@ -146,6 +148,11 @@
             return;
         }
         needsLogin = false;
+        needsSetup = status.needs_setup;
+        if (status.needs_setup && activeView !== "settings") {
+            activeView = "settings";
+            return;
+        }
         userInfo = await invoke<UserInfo | null>("get_user_info");
         syncState = await invoke<string>("get_sync_state");
         notifications = await invoke<NcNotification[]>("get_notifications");
@@ -342,6 +349,14 @@
                         <span class="nc-badge nc-badge-info">{notifications.length}</span>
                     {/if}
                 </button>
+                <button
+                    class="nc-icon-btn"
+                    class:nc-active={activeView === "settings"}
+                    aria-label="Settings"
+                    onclick={() => { activeView = activeView === "settings" ? "notifications" : "settings"; }}
+                >
+                    <Icon class="nc-icon" path={mdiCog} />
+                </button>
             </div>
 
             <!-- Close -->
@@ -357,6 +372,9 @@
         <div class="nc-content">
             {#if activeView === "login"}
                 <LoginView initialServerUrl={configServerUrl} />
+
+            {:else if activeView === "settings"}
+                <SettingsView forced={needsSetup} />
 
             {:else if activeView === "search"}
                 <SearchView
