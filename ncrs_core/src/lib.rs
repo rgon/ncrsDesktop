@@ -349,6 +349,10 @@ pub(crate) struct FsCache {
     kept_dir: PathBuf,
     auto_cache_dir: PathBuf,
     pub(crate) pending_notify: Arc<(Mutex<()>, Condvar)>,
+    // Full paths of files whose PUT is in flight. put_dir_cache preserves
+    // these entries so a concurrent PROPFIND refresh doesn't evict them
+    // before the upload completes, which would cause ENOENT on stat().
+    pub(crate) uploading: HashSet<PathBuf>,
 }
 
 impl FsCache {
@@ -413,7 +417,18 @@ impl FsCache {
         self.dir_cache.get(path)?.etag.clone()
     }
 
-    fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, self_entry: Option<RemoteEntry>, files: Vec<RemoteEntry>) {
+    fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, self_entry: Option<RemoteEntry>, mut files: Vec<RemoteEntry>) {
+        // Re-merge any in-flight uploads missing from the server listing so
+        // that concurrent PROPFIND refreshes don't produce ENOENT on stat().
+        if let Some(old) = self.dir_cache.get(&path) {
+            for old_entry in old.files.iter() {
+                if self.uploading.contains(&old_entry.path)
+                    && !files.iter().any(|f| f.path == old_entry.path)
+                {
+                    files.push(old_entry.clone());
+                }
+            }
+        }
         self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), refreshing: false, invalidated: false });
     }
 
@@ -1550,6 +1565,7 @@ impl NextCloudFs {
                     kept_dir,
                     auto_cache_dir,
                     pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
+                    uploading: HashSet::new(),
                 }));
                 load_dir_cache(&c);
                 c
@@ -2705,6 +2721,10 @@ impl Filesystem for NextCloudFs {
             let smap = self.status.clone();
             let auto_keep = self.auto_keep_locally_modified_files;
 
+            // Guard this path in the uploading set so put_dir_cache doesn't
+            // evict it from a concurrent PROPFIND refresh before the PUT lands.
+            self.cache.safe_lock().uploading.insert(remote_path.clone());
+
             thread::spawn(move || {
                 let _permit = conn.throttle.acquire();
                 let upload_size = body.len() as u64;
@@ -2718,6 +2738,7 @@ impl Filesystem for NextCloudFs {
                 match conn.backend.put_file(&remote_path, body.clone(), etag_ref) {
                     Ok(result) => {
                         tmap.safe_lock().remove(&remote_path);
+                        cache.safe_lock().uploading.remove(&remote_path);
                         log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_change_token);
                         let new_size = body.len() as u64;
                         {
@@ -2771,6 +2792,7 @@ impl Filesystem for NextCloudFs {
                     }
                     Err(backend::BackendWriteError::Conflict) => {
                         tmap.safe_lock().remove(&remote_path);
+                        cache.safe_lock().uploading.remove(&remote_path);
                         smap.safe_lock().remove(&remote_path);
                         log::warn!("CONFLICT on PUT {} — creating conflicted copy", remote_path.display());
                         push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
@@ -2789,6 +2811,7 @@ impl Filesystem for NextCloudFs {
                     }
                     Err(ref e) => {
                         tmap.safe_lock().remove(&remote_path);
+                        cache.safe_lock().uploading.remove(&remote_path);
                         smap.safe_lock().remove(&remote_path);
                         log::error!("PUT {} failed (journaled): {}", remote_path.display(), e);
                         let kind = match e {

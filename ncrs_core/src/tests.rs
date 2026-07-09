@@ -17,6 +17,7 @@
             kept_dir: PathBuf::from("/tmp/ncrs-test-cache/kept"),
             auto_cache_dir: PathBuf::from("/tmp/ncrs-test-cache/cache"),
             pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
+            uploading: HashSet::new(),
         }
     }
 
