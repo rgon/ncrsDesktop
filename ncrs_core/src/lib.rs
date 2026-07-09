@@ -2649,7 +2649,16 @@ impl Filesystem for NextCloudFs {
                     of.write_path.clone(),
                     of.original_etag.clone(),
                 ),
-                _ => {
+                Some(of) => {
+                    // Not dirty: release the uploading guard added in create() since
+                    // no PUT will follow and put_dir_cache should not preserve this entry.
+                    let path = of.remote_path.clone();
+                    drop(files);
+                    self.cache.safe_lock().uploading.remove(&path);
+                    reply.ok();
+                    return;
+                }
+                None => {
                     reply.ok();
                     return;
                 }
@@ -2922,6 +2931,9 @@ impl Filesystem for NextCloudFs {
                 files.push(new_entry.clone());
                 dir.files = Arc::new(files);
             }
+            // Guard against concurrent PROPFIND refreshes evicting this entry
+            // before flush() adds it to uploading (same logic as put_dir_cache).
+            c.uploading.insert(remote_path.clone());
         }
 
         self.open_files.safe_lock().insert(
