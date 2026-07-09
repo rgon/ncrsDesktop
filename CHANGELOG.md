@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.3](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.2...ncrs-v0.1.3) (2026-07-09)
+
+
+### Features
+
+* **gui:** left-click tray icon opens window, right-click shows menu ([09d9295](https://github.com/rgon/ncrsDesktop/commit/09d92952867910e1d16d69c87ebc33a6887fbf64))
+
+
+### Bug Fixes
+
+* **fuse:** preserve in-flight uploads during concurrent dir cache PROPFIND refresh ([c41f68e](https://github.com/rgon/ncrsDesktop/commit/c41f68eae36ca25a0588f2585ce6893f084c650e))
+* **gui:** prevent floating panel from shrinking on HiDPI-scaled displays ([80161ed](https://github.com/rgon/ncrsDesktop/commit/80161ed571ae6cb57b4d9ad4f13768d00d44ba49))
+
+
+### Performance Improvements
+
+* **build:** merge two cargo build passes into one to avoid recompiling shared deps ([51b93b2](https://github.com/rgon/ncrsDesktop/commit/51b93b2ac62b536f5fe860e19694415571e0a1df))
+
 ## [0.1.2](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.1...ncrs-v0.1.2) (2026-07-07)
 
 
