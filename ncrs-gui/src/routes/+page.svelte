@@ -437,7 +437,7 @@
     right: 20px;
     top: 20px;
     width: min(400px, 40vw);
-    height: min(700px, 60vh);
+    height: min(700px, calc(100vh - 80px));
     border-radius: 14px;
     overflow: hidden;
     background: var(--nc-bg);
