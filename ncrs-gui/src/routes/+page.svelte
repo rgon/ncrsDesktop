@@ -178,6 +178,11 @@
         errors = [];
     }
 
+    async function dismissError(timestampMs: number) {
+        await invoke("dismiss_error", { timestampMs });
+        errors = errors.filter(e => e.timestamp_ms !== timestampMs);
+    }
+
     async function resolveConflict(id: number) {
         await invoke("resolve_conflict", { id });
         conflicts = conflicts.filter(c => c.id !== id);
@@ -395,7 +400,7 @@
                 />
 
             {:else if activeView === "issues"}
-                <IssuesView {errors} {conflicts} {pendingMutations} onclear={clearErrors} onresolve={resolveConflict} />
+                <IssuesView {errors} {conflicts} {pendingMutations} onclear={clearErrors} ondismissone={dismissError} onresolve={resolveConflict} />
 
             {:else if activeView === "plugins"}
                 <PluginsView onselect={(id) => { activeView = `plugin:${id}`; }} />

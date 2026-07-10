@@ -21,12 +21,14 @@
         conflicts = [],
         pendingMutations = 0,
         onclear,
+        ondismissone,
         onresolve,
     }: {
         errors: SyncError[];
         conflicts: ConflictRecord[];
         pendingMutations: number;
         onclear: () => void;
+        ondismissone: (timestamp_ms: number) => void;
         onresolve: (id: number) => void;
     } = $props();
 
@@ -124,14 +126,24 @@
                                     <p class="text-xs opacity-80 truncate">{err.message}</p>
                                 {/if}
                             </div>
-                            <button
-                                class="btn btn-ghost btn-xs p-0.5 flex-shrink-0 self-start mt-0.5 opacity-50 hover:opacity-100"
-                                onclick={() => toggleError(i)}
-                                aria-label={expanded ? 'Collapse' : 'Show full path and message'}
-                                title={expanded ? 'Collapse' : 'Show full path and message'}
-                            >
-                                <Icon class="w-3.5 h-3.5 transition-transform {expanded ? 'rotate-180' : ''}" path={mdiChevronDown} />
-                            </button>
+                            <div class="flex flex-col gap-0.5 flex-shrink-0 self-start mt-0.5">
+                                <button
+                                    class="btn btn-ghost btn-xs p-0.5 opacity-50 hover:opacity-100"
+                                    onclick={() => toggleError(i)}
+                                    aria-label={expanded ? 'Collapse' : 'Show full path and message'}
+                                    title={expanded ? 'Collapse' : 'Show full path and message'}
+                                >
+                                    <Icon class="w-3.5 h-3.5 transition-transform {expanded ? 'rotate-180' : ''}" path={mdiChevronDown} />
+                                </button>
+                                <button
+                                    class="btn btn-ghost btn-xs p-0.5 opacity-50 hover:opacity-100"
+                                    onclick={() => ondismissone(err.timestamp_ms)}
+                                    aria-label="Dismiss"
+                                    title="Dismiss"
+                                >
+                                    <Icon class="w-3.5 h-3.5" path={mdiCheck} />
+                                </button>
+                            </div>
                         </div>
                     </div>
                 {/each}
