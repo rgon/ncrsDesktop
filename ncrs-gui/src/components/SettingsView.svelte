@@ -23,6 +23,7 @@
     let version = $state("");
     let status = $state<"idle" | "saving" | "saved" | "error">("idle");
     let errorMsg = $state("");
+    let remounting = $state(false);
 
     // Displayed as MB / GB; stored as bytes
     let readAheadMb = $state(64);
@@ -56,6 +57,18 @@
         } catch (e: unknown) {
             errorMsg = String(e);
             status = "error";
+        }
+    }
+
+    async function remount() {
+        remounting = true;
+        errorMsg = "";
+        try {
+            await invoke("remount");
+        } catch (e: unknown) {
+            errorMsg = String(e);
+        } finally {
+            remounting = false;
         }
     }
 </script>
@@ -194,13 +207,23 @@
             {:else if status === "saved"}
                 <p class="sv-ok">Saved. Remount to apply changes.</p>
             {/if}
-            <button
-                class="nc-btn-primary sv-save-btn"
-                onclick={save}
-                disabled={status === "saving"}
-            >
-                {status === "saving" ? "Saving…" : "Save settings"}
-            </button>
+            <div class="sv-btn-row">
+                <button
+                    class="nc-btn-primary sv-save-btn"
+                    onclick={save}
+                    disabled={status === "saving"}
+                >
+                    {status === "saving" ? "Saving…" : "Save settings"}
+                </button>
+                <button
+                    class="nc-btn-ghost sv-remount-btn"
+                    onclick={remount}
+                    disabled={remounting}
+                    title="Unmount and remount to apply saved settings"
+                >
+                    {remounting ? "Remounting…" : "Remount"}
+                </button>
+            </div>
             <p class="sv-version">ncRS Desktop v{version}</p>
         </div>
     {/if}
@@ -312,8 +335,17 @@
     gap: 6px;
 }
 
+.sv-btn-row {
+    display: flex;
+    gap: 8px;
+}
+
 .sv-save-btn {
-    width: 100%;
+    flex: 1;
+}
+
+.sv-remount-btn {
+    flex-shrink: 0;
 }
 
 .sv-error {
