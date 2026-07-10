@@ -367,20 +367,34 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         finally:
             self._poll_running = False
 
-    def update_file_info(self, file_info):
+    def update_file_info_full(self, provider, handle, closure, file_info):
         try:
             if not self._mount:
-                return
+                Nautilus.info_provider_update_complete_invoke(
+                    closure, provider, handle, Nautilus.OperationResult.COMPLETE)
+                return Nautilus.OperationResult.COMPLETE
 
             if file_info.get_uri_scheme() != "file":
-                return
+                Nautilus.info_provider_update_complete_invoke(
+                    closure, provider, handle, Nautilus.OperationResult.COMPLETE)
+                return Nautilus.OperationResult.COMPLETE
 
             path = file_info.get_location().get_path()
             if path is None or not (
                 path == self._mount or path.startswith(self._mount + "/")
             ):
-                return
+                Nautilus.info_provider_update_complete_invoke(
+                    closure, provider, handle, Nautilus.OperationResult.COMPLETE)
+                return Nautilus.OperationResult.COMPLETE
 
+            _POOL.submit(self._do_update_file_info, provider, handle, closure, file_info, path)
+            return Nautilus.OperationResult.IN_PROGRESS
+        except Exception:
+            _log_error("update_file_info_full")
+            return Nautilus.OperationResult.FAILED
+
+    def _do_update_file_info(self, provider, handle, closure, file_info, path):
+        try:
             detail = _send_command(f"DETAIL {path}")
             parts = detail.split("\t")
             sync = parts[0] if len(parts) > 0 else "unknown"
@@ -389,36 +403,46 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             owner = parts[3] if len(parts) > 3 else ""
             size_str = parts[4] if len(parts) > 4 else "0"
 
-            if sync == "kept":
-                file_info.add_emblem(_EMBLEM_KEPT)
-            elif sync == "cached":
-                file_info.add_emblem(_EMBLEM_CACHED)
-            elif sync == "local":
-                file_info.add_emblem(_EMBLEM_KEPT)
-            elif sync == "synced":
-                pass
-            elif sync == "downloading":
-                file_info.add_emblem(_EMBLEM_REMOTE)
-            elif sync == "uploading":
-                file_info.add_emblem(_EMBLEM_UPLOADING)
-            elif sync == "partial":
-                file_info.add_emblem(_EMBLEM_PARTIAL)
-            if sharing:
-                file_info.add_emblem(_EMBLEM_SHARED)
+            def _apply():
+                try:
+                    if sync == "kept":
+                        file_info.add_emblem(_EMBLEM_KEPT)
+                    elif sync == "cached":
+                        file_info.add_emblem(_EMBLEM_CACHED)
+                    elif sync == "local":
+                        file_info.add_emblem(_EMBLEM_KEPT)
+                    elif sync == "downloading":
+                        file_info.add_emblem(_EMBLEM_REMOTE)
+                    elif sync == "uploading":
+                        file_info.add_emblem(_EMBLEM_UPLOADING)
+                    elif sync == "partial":
+                        file_info.add_emblem(_EMBLEM_PARTIAL)
+                    if sharing:
+                        file_info.add_emblem(_EMBLEM_SHARED)
 
-            file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
-            file_info.add_string_attribute("ncrs_sharing", sharing)
-            file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
-            file_info.add_string_attribute("ncrs_owner", owner)
-            try:
-                size_val = int(size_str)
-                file_info.add_string_attribute(
-                    "ncrs_size", _human_size(size_val) if size_val > 0 else ""
-                )
-            except ValueError:
-                file_info.add_string_attribute("ncrs_size", "")
+                    file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
+                    file_info.add_string_attribute("ncrs_sharing", sharing)
+                    file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
+                    file_info.add_string_attribute("ncrs_owner", owner)
+                    try:
+                        size_val = int(size_str)
+                        file_info.add_string_attribute(
+                            "ncrs_size", _human_size(size_val) if size_val > 0 else ""
+                        )
+                    except ValueError:
+                        file_info.add_string_attribute("ncrs_size", "")
+                except Exception:
+                    _log_error("_apply update_file_info")
+                finally:
+                    Nautilus.info_provider_update_complete_invoke(
+                        closure, provider, handle, Nautilus.OperationResult.COMPLETE)
+                return GLib.SOURCE_REMOVE
+
+            GLib.idle_add(_apply)
         except Exception:
-            _log_error(f"update_file_info({file_info.get_location().get_path()})")
+            _log_error(f"_do_update_file_info({path})")
+            Nautilus.info_provider_update_complete_invoke(
+                closure, provider, handle, Nautilus.OperationResult.FAILED)
 
 
 # ── Menu provider ─────────────────────────────────────────────────────────────
