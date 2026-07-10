@@ -2358,9 +2358,9 @@ impl Filesystem for NextCloudFs {
                                 let rel = entry_path.strip_prefix("/").unwrap_or(&entry_path);
                                 let kept_path = kept_dir.join(rel);
                                 let cached_path = auto_cache_dir.join(rel);
-                                let kept_meta = kept_path.metadata().ok().filter(|m| m.len() > 0);
-                                let cached_meta = cached_path.metadata().ok().filter(|m| m.len() > 0);
-                                if let Some(km) = kept_meta {
+                                // Lazy: only stat cached_path if kept_path misses — most
+                                // files are Remote so this saves one stat(2) per entry.
+                                if let Some(km) = kept_path.metadata().ok().filter(|m| m.len() > 0) {
                                     status_entries.push((entry_path.clone(), FileStatus::Kept));
                                     cache_entries.push((entry_path.clone(), FileCacheEntry {
                                         local_path: kept_path,
@@ -2369,7 +2369,7 @@ impl Filesystem for NextCloudFs {
                                         kept: true,
                                         size: km.len(),
                                     }));
-                                } else if let Some(cm) = cached_meta {
+                                } else if let Some(cm) = cached_path.metadata().ok().filter(|m| m.len() > 0) {
                                     status_entries.push((entry_path.clone(), FileStatus::Cached));
                                     cache_entries.push((entry_path.clone(), FileCacheEntry {
                                         local_path: cached_path,
