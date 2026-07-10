@@ -182,8 +182,16 @@ pub fn prefetch_thumbnail(
     if let Some(parent) = thumb.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&thumb, data) {
+    // Write to a sibling .tmp then rename so concurrent writers can't corrupt
+    // a partially-written PNG that Nautilus has already opened and cached.
+    let tmp = thumb.with_extension("png.tmp");
+    if let Err(e) = std::fs::write(&tmp, &data) {
         log::debug!("write thumbnail {}: {}", thumb.display(), e);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &thumb) {
+        log::debug!("rename thumbnail {}: {}", thumb.display(), e);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
