@@ -332,7 +332,9 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                         elif kind == "D":
                             os.unlink(path)
                         elif kind == "M":
-                            os.utime(path)
+                            # os.utime() on a FUSE path triggers a WebDAV PROPPATCH
+                            # via the kernel→FUSE→daemon chain; signal Nautilus instead.
+                            GLib.idle_add(_invalidate_path, path)
                         elif kind == "DA":
                             os.mkdir(path, 0o755)
                         elif kind == "DD":
