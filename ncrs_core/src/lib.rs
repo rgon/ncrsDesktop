@@ -889,10 +889,41 @@ fn run_cache_cleanup(
 
 // ── Shared operation helpers ──────────────────────────────────────────────────
 
+struct DirDetailArcs {
+    shared: ipc::SharedSet,
+    fileids: ipc::FileIdMap,
+    details: ipc::FileDetailMap,
+    dirty: ipc::DirtySet,
+}
+
+fn apply_dir_detail_maps(path: &Path, entries: &[RemoteEntry], arcs: &DirDetailArcs) {
+    let mut shared_paths = Vec::new();
+    let mut fileid_paths: Vec<(PathBuf, u64)> = Vec::new();
+    let mut detail_entries: Vec<(PathBuf, ipc::FileDetail)> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) else { continue };
+        let ep = path.join(name);
+        if entry.ext.flag("is_shared") { shared_paths.push(ep.clone()); }
+        if let Some(fid) = entry.ext.int("fileid") { fileid_paths.push((ep.clone(), fid)); }
+        detail_entries.push((ep, ipc::FileDetail {
+            permissions: entry.ext.str("permissions").map(str::to_string),
+            owner_id: entry.ext.str("owner_id").map(str::to_string),
+            owner_display_name: entry.ext.str("owner_display_name").map(str::to_string),
+            size: entry.size,
+            is_dir: entry.is_dir,
+        }));
+    }
+    { let mut sh = arcs.shared.safe_lock(); for p in shared_paths { sh.insert(p); } }
+    { let mut fi = arcs.fileids.safe_lock(); for (p, fid) in fileid_paths { fi.insert(p, fid); } }
+    { let mut dt = arcs.details.safe_lock(); for (p, d) in detail_entries { dt.insert(p, d); } }
+    arcs.dirty.safe_lock().insert(path.to_path_buf());
+}
+
 fn get_or_list_dir(
     conn: &Arc<ConnInfo>,
     cache: &Arc<Mutex<FsCache>>,
     path: PathBuf,
+    dir_maps: Option<DirDetailArcs>,
 ) -> Result<(Arc<Vec<RemoteEntry>>, Option<RemoteEntry>), String> {
     if conn.is_offline.load(Ordering::Relaxed) {
         let c = cache.safe_lock();
@@ -912,6 +943,7 @@ fn get_or_list_dir(
                 let conn = conn.clone();
                 let cache = cache.clone();
                 let path = path.clone();
+                let dm = dir_maps;
                 std::thread::spawn(move || {
                     let old_etag = cache.safe_lock().cached_dir_etag(&path);
                     if let Some(ref old) = old_etag {
@@ -930,6 +962,9 @@ fn get_or_list_dir(
                     }
                     match list_dir_propfind(&conn, path.clone()) {
                         Ok((etag, self_entry, fresh)) => {
+                            if let Some(ref arcs) = dm {
+                                apply_dir_detail_maps(&path, &fresh, arcs);
+                            }
                             cache.safe_lock().put_dir_cache(path, etag, self_entry, fresh);
                         }
                         Err(e) => {
@@ -1182,7 +1217,7 @@ fn keep_locally_recursive(
         return;
     }
 
-    let (entries, _self_entry) = match get_or_list_dir(conn, cache, remote_path.clone()) {
+    let (entries, _self_entry) = match get_or_list_dir(conn, cache, remote_path.clone(), None) {
         Ok(e) => e,
         Err(e) => {
             if known_dir.is_none() {
@@ -1836,7 +1871,7 @@ impl Filesystem for NextCloudFs {
 
         let is_cached = self.cache.safe_lock().dir_cache.contains_key(&parent_path);
         if !is_cached {
-            if let Err(e) = get_or_list_dir(&self.conn, &self.cache, parent_path.clone()) {
+            if let Err(e) = get_or_list_dir(&self.conn, &self.cache, parent_path.clone(), None) {
                 log::debug!("lookup: list {} failed (will return ENOENT): {}", parent_path.display(), e);
             }
         }
@@ -2390,7 +2425,12 @@ impl Filesystem for NextCloudFs {
             }
 
             let t_readdir = Instant::now();
-            match get_or_list_dir(&conn, &cache, path.clone()) {
+            match get_or_list_dir(&conn, &cache, path.clone(), Some(DirDetailArcs {
+                shared: shared.clone(),
+                fileids: fileids.clone(),
+                details: details.clone(),
+                dirty: dirty.clone(),
+            })) {
                 Ok((entries, self_entry)) => {
                     log::info!("READDIR {} get_or_list_dir returned {} entries in {:?}", path.display(), entries.len(), t_readdir.elapsed());
 
@@ -3818,30 +3858,41 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let boot_transfers = filesystem.transfer_map();
             let file_shutdown = filesystem.shutdown_flag();
             thread::spawn(move || {
-                log::info!("FILE_CACHE boot validation: checking {} files", saved_etags.len());
-                let mut stale = 0usize;
-                for (remote_path, entry) in &saved_etags {
-                    if file_shutdown.load(Ordering::Relaxed) {
-                        log::info!("FILE_CACHE boot validation: shutdown, aborting");
-                        break;
-                    }
-                    match boot_backend.dir_change_token(remote_path, PROPFIND_TIMEOUT) {
-                        Ok(Some(ref new_etag)) if new_etag == &entry.etag => {}
-                        Ok(new_etag) => {
-                            log::info!("FILE_CACHE stale: {} (etag {:?} → {:?})", remote_path.display(), entry.etag, new_etag);
-                            cache.safe_lock().file_cache.remove(remote_path);
-                            match ensure_file_cached(&boot_conn, &cache, &status, &dirty, remote_path.clone(), Some(&boot_transfers), entry.kept) {
-                                Ok(_) => log::info!("FILE_CACHE re-downloaded {}", remote_path.display()),
-                                Err(e) => log::warn!("FILE_CACHE re-download {} failed: {}", remote_path.display(), e),
+                let total = saved_etags.len();
+                log::info!("FILE_CACHE boot validation: checking {} files in parallel", total);
+                let stale = Arc::new(AtomicUsize::new(0));
+                let handles: Vec<_> = saved_etags.into_iter().map(|(remote_path, entry)| {
+                    let conn = boot_conn.clone();
+                    let cache = cache.clone();
+                    let status = status.clone();
+                    let dirty = dirty.clone();
+                    let transfers = boot_transfers.clone();
+                    let shutdown = file_shutdown.clone();
+                    let backend = boot_backend.clone();
+                    let stale = stale.clone();
+                    thread::spawn(move || {
+                        if shutdown.load(Ordering::Relaxed) { return; }
+                        let _permit = conn.throttle.acquire();
+                        if shutdown.load(Ordering::Relaxed) { return; }
+                        match backend.dir_change_token(&remote_path, PROPFIND_TIMEOUT) {
+                            Ok(Some(ref new_etag)) if new_etag == &entry.etag => {}
+                            Ok(new_etag) => {
+                                log::info!("FILE_CACHE stale: {} (etag {:?} → {:?})", remote_path.display(), entry.etag, new_etag);
+                                cache.safe_lock().file_cache.remove(&remote_path);
+                                match ensure_file_cached(&conn, &cache, &status, &dirty, remote_path.clone(), Some(&transfers), entry.kept) {
+                                    Ok(_) => log::info!("FILE_CACHE re-downloaded {}", remote_path.display()),
+                                    Err(e) => log::warn!("FILE_CACHE re-download {} failed: {}", remote_path.display(), e),
+                                }
+                                stale.fetch_add(1, Ordering::Relaxed);
                             }
-                            stale += 1;
+                            Err(e) => {
+                                log::debug!("FILE_CACHE etag check {} failed: {}", remote_path.display(), e);
+                            }
                         }
-                        Err(e) => {
-                            log::debug!("FILE_CACHE etag check {} failed: {}", remote_path.display(), e);
-                        }
-                    }
-                }
-                log::info!("FILE_CACHE boot validation done: {}/{} stale", stale, saved_etags.len());
+                    })
+                }).collect();
+                for h in handles { h.join().ok(); }
+                log::info!("FILE_CACHE boot validation done: {}/{} stale", stale.load(Ordering::Relaxed), total);
             });
         }
     }

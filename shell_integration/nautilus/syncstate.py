@@ -212,21 +212,35 @@ def _invalidate_path(path: str) -> bool:
 
 
 _POLL_KEEP_ATTEMPTS: dict = {}
+_keep_poll_active: set = set()
+
+
+def _do_check_keep_done(path: str) -> None:
+    """Pool thread: send STATUS; stop polling when download finishes."""
+    try:
+        status = _send_command(f"STATUS {path}")
+        if status.split(",")[0] != "downloading":
+            _keep_poll_active.discard(path)
+            _POLL_KEEP_ATTEMPTS.pop(path, None)
+            GLib.idle_add(_invalidate_path, path)
+    except Exception:
+        _log_error(f"_do_check_keep_done({path})")
+        _keep_poll_active.discard(path)
+        _POLL_KEEP_ATTEMPTS.pop(path, None)
 
 
 def _check_keep_done(path: str) -> bool:
+    """GTK main-thread timer — submits blocking STATUS to the pool, no I/O here."""
     try:
         _POLL_KEEP_ATTEMPTS[path] = _POLL_KEEP_ATTEMPTS.get(path, 0) + 1
-        if _POLL_KEEP_ATTEMPTS[path] > 240:
+        if _POLL_KEEP_ATTEMPTS[path] > 240 or path not in _keep_poll_active:
+            _keep_poll_active.discard(path)
             _POLL_KEEP_ATTEMPTS.pop(path, None)
             return GLib.SOURCE_REMOVE
-        status = _send_command(f"STATUS {path}")
-        if status.split(",")[0] != "downloading":
-            _POLL_KEEP_ATTEMPTS.pop(path, None)
-            GLib.idle_add(_invalidate_path, path)
-            return GLib.SOURCE_REMOVE
+        _POOL.submit(_do_check_keep_done, path)
     except Exception:
         _log_error(f"_check_keep_done({path})")
+        _keep_poll_active.discard(path)
         _POLL_KEEP_ATTEMPTS.pop(path, None)
         return GLib.SOURCE_REMOVE
     return GLib.SOURCE_CONTINUE
@@ -234,6 +248,9 @@ def _check_keep_done(path: str) -> bool:
 
 def _poll_keep_done(path: str) -> None:
     try:
+        if path in _keep_poll_active:
+            return
+        _keep_poll_active.add(path)
         _POLL_KEEP_ATTEMPTS[path] = 0
         GLib.timeout_add(500, _check_keep_done, path)
     except Exception:
