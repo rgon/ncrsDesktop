@@ -200,6 +200,19 @@
                     <input id="http3" type="checkbox" class="sv-check" bind:checked={settings.http3} />
                 </div>
             </section>
+
+            <!-- ── Integration ──────────────────── -->
+            <section class="sv-section">
+                <h3 class="sv-section-title">Integration</h3>
+
+                <div class="sv-toggle">
+                    <div>
+                        <label class="sv-toggle-label" for="gio-cleanup">GNOME auto-cleanup of intermediate files</label>
+                        <p class="sv-hint">GTK/GIO apps (Nautilus, gedit, etc.) write files atomically via a <code>.goutputstream-*</code> or <code>.xdp-*</code> temp file that is renamed within seconds. When enabled, ncRS deletes these intermediates from the server immediately and hides them from directory listings. Orphans left by crashed apps are cleaned up on the next folder open. Disable only if another WebDAV client on the same account needs to see these files.</p>
+                    </div>
+                    <input id="gio-cleanup" type="checkbox" class="sv-check" bind:checked={settings.cleanup_stale_gio_temps} />
+                </div>
+            </section>
         </div>
 
         <!-- ── Footer ───────────────────────────── -->
@@ -289,6 +302,14 @@
     font-weight: 600;
     color: var(--nc-text-2);
     margin-bottom: 4px;
+}
+
+.sv-hint code {
+    font-family: monospace;
+    font-size: 9px;
+    background: color-mix(in srgb, var(--nc-text-3) 12%, transparent);
+    border-radius: 3px;
+    padding: 0 3px;
 }
 
 .sv-hint {
