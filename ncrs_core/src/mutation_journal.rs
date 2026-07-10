@@ -326,12 +326,20 @@ impl MutationJournal {
                     matches!(&e.op, MutationOp::Put { remote_path, if_match_etag: Some(_), .. } if remote_path == path)
                 });
                 if !has_prior_server_etag {
+                    let staging_to_delete: Vec<PathBuf> = self.entries.iter()
+                        .filter_map(|e| {
+                            if let MutationOp::Put { remote_path, staging_path, .. } = &e.op {
+                                if remote_path == path { Some(staging_path.clone()) } else { None }
+                            } else { None }
+                        })
+                        .collect();
                     let before = self.entries.len();
                     self.entries.retain(|e| {
                         !matches!(&e.op, MutationOp::Put { remote_path, .. } if remote_path == path)
                         && !matches!(&e.op, MutationOp::MkDir { path: p } if p == path)
                     });
                     if self.entries.len() < before {
+                        for sp in staging_to_delete { let _ = std::fs::remove_file(&sp); }
                         log::debug!("JOURNAL: coalesced — removed prior ops for {} before Unlink", path.display());
                     }
                 }
@@ -379,6 +387,9 @@ pub(crate) fn replay_journal(
 
         if entry.attempts >= MutationJournal::max_attempts() {
             log::warn!("JOURNAL: entry seq={} exceeded max attempts, marking permanent failure", entry.seq);
+            if let MutationOp::Put { staging_path, .. } = &entry.op {
+                let _ = std::fs::remove_file(staging_path);
+            }
             let mut j = journal.safe_lock();
             let desc = format!("{:?}: {}", entry.op, entry.last_error.as_deref().unwrap_or("unknown"));
             j.add_conflict(ConflictKind::PermanentFailure { description: desc });

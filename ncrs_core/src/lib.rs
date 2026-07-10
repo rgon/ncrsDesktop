@@ -732,6 +732,7 @@ pub(crate) fn save_file_cache(cache: &Mutex<FsCache>) {
 struct LoadedCacheEntry {
     etag: String,
     kept: bool,
+    #[allow(dead_code)]
     size: u64,
 }
 
@@ -1562,27 +1563,41 @@ impl NextCloudFs {
         std::fs::create_dir_all(&auto_cache_dir)
             .map_err(|e| format!("Cannot create auto-cache dir: {}", e))?;
 
-        let mut stale_count = 0usize;
-        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with("write_") {
-                        if let Ok(meta) = entry.metadata() {
-                            if meta.len() == 0 || !meta.is_file() {
-                                let _ = std::fs::remove_file(entry.path());
-                                stale_count += 1;
-                            }
+        let journal_arc: mutation_journal::SharedJournal =
+            Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&cache_dir)));
+
+        // Remove write_* staging files not referenced by any pending journal entry.
+        // Files in the journal still need their staging data for upload replay;
+        // everything else is orphaned (upload completed, non-dirty open, coalesced, etc.).
+        {
+            use mutation_journal::MutationOp;
+            let j = journal_arc.safe_lock();
+            let referenced: std::collections::HashSet<PathBuf> = j.entries()
+                .iter()
+                .filter_map(|e| {
+                    if let MutationOp::Put { staging_path, .. } = &e.op {
+                        Some(staging_path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut stale_count = 0usize;
+            if let Ok(dir_entries) = std::fs::read_dir(&cache_dir) {
+                for entry in dir_entries.flatten() {
+                    if entry.file_name().to_str().map_or(false, |n| n.starts_with("write_")) {
+                        let path = entry.path();
+                        if !referenced.contains(&path) {
+                            let _ = std::fs::remove_file(&path);
+                            stale_count += 1;
                         }
                     }
                 }
             }
+            if stale_count > 0 {
+                log::info!("cleaned up {} orphaned write_* staging files at startup", stale_count);
+            }
         }
-        if stale_count > 0 {
-            log::info!("cleaned up {} stale write_* temp files", stale_count);
-        }
-
-        let journal_arc: mutation_journal::SharedJournal =
-            Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&cache_dir)));
 
         let mut inodes = HashMap::new();
         let mut paths = HashMap::new();
@@ -2339,6 +2354,9 @@ impl Filesystem for NextCloudFs {
                 if let Some(ref wp) = of.write_path {
                     log::warn!("release: fh {} still dirty, staging file preserved at {}", fh.0, wp.display());
                 }
+            } else if let Some(ref wp) = of.write_path {
+                // Opened writable but never written — discard the staging copy.
+                let _ = std::fs::remove_file(wp);
             }
         }
         files.remove(&fh.0);
