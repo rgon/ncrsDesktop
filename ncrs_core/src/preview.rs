@@ -7,6 +7,10 @@ const PREVIEW_SIZE: u32 = 128;
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 const THUMB_BATCH: usize = 2;
+// On-demand RAW preview generation (nc:has-preview=false) is expensive server-side
+// (ImageMagick decoding). Process one at a time and pause between requests so the
+// server keeps PHP workers free for FUSE HTTP operations.
+const RAW_THUMB_INTERVAL_SECS: u64 = 2;
 
 const PREVIEWABLE: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic",
@@ -191,11 +195,19 @@ pub fn prefetch_directory_thumbnails(
     entries: &[(PathBuf, Option<SystemTime>, bool, Option<u64>)],
     active_streams: &Arc<AtomicUsize>,
 ) {
-    let previewable: Vec<_> = entries.iter()
-        .filter(|(path, _, has_preview, _)| *has_preview || is_raw_image(path))
+    // nc:has-preview=true → server already has a cached preview, request is fast.
+    let server_cached: Vec<_> = entries.iter()
+        .filter(|(_, _, has_preview, _)| *has_preview)
         .collect();
 
-    for (i, chunk) in previewable.chunks(THUMB_BATCH).enumerate() {
+    // RAW files the server hasn't pre-cached: on-demand ImageMagick decoding is
+    // expensive. Keep them separate so they don't saturate PHP workers.
+    let on_demand_raw: Vec<_> = entries.iter()
+        .filter(|(path, _, has_preview, _)| !*has_preview && is_raw_image(path))
+        .collect();
+
+    // ── Fast path: server-cached previews (batch, 1 s gap) ───────────────────
+    for (i, chunk) in server_cached.chunks(THUMB_BATCH).enumerate() {
         if i > 0 {
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -209,5 +221,17 @@ pub fn prefetch_directory_thumbnails(
                 });
             }
         });
+    }
+
+    // ── Slow path: on-demand RAW (sequential, generous gap) ──────────────────
+    // One request at a time so the server always has workers left for FUSE ops.
+    for (i, (path, mtime, _, fileid)) in on_demand_raw.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(Duration::from_secs(RAW_THUMB_INTERVAL_SECS));
+        }
+        while active_streams.load(Ordering::Relaxed) > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        prefetch_thumbnail(client, base, creds, mount_point, path, *mtime, *fileid);
     }
 }
