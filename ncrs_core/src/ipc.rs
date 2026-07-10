@@ -288,7 +288,6 @@ fn handle_client(
             match strip_mount(Path::new(path_str), &mount_point) {
                 Some(remote) => {
                     let is_shared = shared_set.safe_lock().contains(&remote);
-                    let has_detail = detail_map.safe_lock().contains_key(&remote);
                     let detail = detail_map.safe_lock().get(&remote).cloned()
                         .unwrap_or_default();
                     let sm = status_map.safe_lock();
@@ -309,12 +308,12 @@ fn handle_client(
                     };
                     let perms = detail.permissions.as_deref().unwrap_or("");
                     let owner = detail.owner_display_name.as_deref().unwrap_or("");
-                    log::info!("IPC DETAIL {} → remote={} status={} has_detail={} shared={} perms={:?} owner={:?}",
-                        path_str, remote.display(), status, has_detail, is_shared, perms, owner);
+                    log::debug!("IPC DETAIL {} → remote={} status={} shared={} perms={:?} owner={:?}",
+                        path_str, remote.display(), status, is_shared, perms, owner);
                     format!("{}\t{}\t{}\t{}\t{}", status, sharing, perms, owner, detail.size)
                 }
                 None => {
-                    log::info!("IPC DETAIL {} → not under mount", path_str);
+                    log::debug!("IPC DETAIL {} → not under mount", path_str);
                     "unknown\t\t\t\t0".to_string()
                 }
             }

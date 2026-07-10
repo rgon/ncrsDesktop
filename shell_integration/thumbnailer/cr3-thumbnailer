@@ -96,11 +96,13 @@ result = subprocess.run(
 if result.returncode != 0 or not result.stdout:
     sys.exit(1)
 
-loader = GdkPixbuf.PixbufLoader.new_with_type('jpeg')
-loader.write(result.stdout)
-loader.close()
-pixbuf = loader.get_pixbuf()
-if not pixbuf:
+try:
+    loader = GdkPixbuf.PixbufLoader.new_with_type('jpeg')
+    loader.write(result.stdout)
+    loader.close()
+    pixbuf = loader.get_pixbuf()
+    if not pixbuf:
+        sys.exit(1)
+    write_thumbnail(pixbuf)
+except Exception:
     sys.exit(1)
-
-write_thumbnail(pixbuf)
