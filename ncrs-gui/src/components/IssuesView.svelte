@@ -1,6 +1,6 @@
 <script lang="ts">
     import Icon from './Icon.svelte';
-    import { mdiAlertCircleOutline, mdiSwapHorizontal, mdiCheck, mdiClockOutline, mdiChevronDown } from '@mdi/js';
+    import { mdiAlertCircleOutline, mdiSwapHorizontal, mdiCheck, mdiClose, mdiClockOutline, mdiChevronDown } from '@mdi/js';
 
     interface SyncError {
         path: string;
@@ -111,39 +111,40 @@
                 </div>
                 {#each errors as err, i (i)}
                     {@const expanded = expandedErrors.has(i)}
-                    <div class="alert alert-error shadow-none rounded-lg mb-1.5 overflow-hidden py-2 px-3">
-                        <div class="flex items-start min-w-0 w-full gap-1.5">
-                            <div class="flex flex-col min-w-0 flex-1">
-                                <div class="flex items-center justify-between gap-2">
-                                    <span class="badge badge-sm badge-outline flex-shrink-0">{errorKindLabel(err.kind)}</span>
-                                    <time class="text-xs opacity-70 flex-shrink-0">{relativeTime(err.timestamp_ms)}</time>
-                                </div>
+                    <div class="alert alert-error shadow-none rounded-lg mb-1.5 overflow-hidden py-2 px-3"
+                         style="display:flex; align-items:flex-start; gap:6px;">
+                        <div class="flex flex-col min-w-0 flex-1">
+                            <div class="flex items-center justify-between gap-2">
+                                <span class="badge badge-sm badge-outline flex-shrink-0">{errorKindLabel(err.kind)}</span>
+                                <time class="text-xs opacity-70 flex-shrink-0">{relativeTime(err.timestamp_ms)}</time>
+                            </div>
+                            {#if fileName(err.path)}
                                 <p class="text-sm font-semibold truncate mt-0.5">{fileName(err.path)}</p>
-                                {#if expanded}
-                                    <p class="text-xs opacity-60 break-all mt-0.5">{err.path}</p>
-                                    <p class="text-xs opacity-80 break-words mt-1">{err.message}</p>
-                                {:else}
-                                    <p class="text-xs opacity-80 truncate">{err.message}</p>
-                                {/if}
-                            </div>
-                            <div class="flex flex-col gap-0.5 flex-shrink-0 self-start mt-0.5">
-                                <button
-                                    class="btn btn-ghost btn-xs p-0.5 opacity-50 hover:opacity-100"
-                                    onclick={() => toggleError(i)}
-                                    aria-label={expanded ? 'Collapse' : 'Show full path and message'}
-                                    title={expanded ? 'Collapse' : 'Show full path and message'}
-                                >
-                                    <Icon class="w-3.5 h-3.5 transition-transform {expanded ? 'rotate-180' : ''}" path={mdiChevronDown} />
-                                </button>
-                                <button
-                                    class="btn btn-ghost btn-xs p-0.5 opacity-50 hover:opacity-100"
-                                    onclick={() => ondismissone(err.timestamp_ms)}
-                                    aria-label="Dismiss"
-                                    title="Dismiss"
-                                >
-                                    <Icon class="w-3.5 h-3.5" path={mdiCheck} />
-                                </button>
-                            </div>
+                            {/if}
+                            {#if expanded}
+                                <p class="text-xs opacity-60 break-all mt-0.5">{err.path}</p>
+                                <p class="text-xs opacity-80 break-words mt-1">{err.message}</p>
+                            {:else}
+                                <p class="text-xs opacity-80 truncate mt-0.5">{err.message}</p>
+                            {/if}
+                        </div>
+                        <div class="flex flex-col gap-0.5 flex-shrink-0 self-start">
+                            <button
+                                class="btn btn-ghost btn-xs p-0.5 opacity-50 hover:opacity-100"
+                                onclick={() => toggleError(i)}
+                                aria-label={expanded ? 'Collapse' : 'Show full path and message'}
+                                title={expanded ? 'Collapse' : 'Show full path and message'}
+                            >
+                                <Icon class="w-3.5 h-3.5 transition-transform {expanded ? 'rotate-180' : ''}" path={mdiChevronDown} />
+                            </button>
+                            <button
+                                class="btn btn-ghost btn-xs p-0.5 opacity-50 hover:opacity-100"
+                                onclick={() => ondismissone(err.timestamp_ms)}
+                                aria-label="Dismiss"
+                                title="Dismiss"
+                            >
+                                <Icon class="w-3.5 h-3.5" path={mdiClose} />
+                            </button>
                         </div>
                     </div>
                 {/each}
@@ -157,7 +158,8 @@
                 {/if}
                 {#each conflicts as conflict (conflict.id)}
                     {@const desc = describeConflict(conflict.kind)}
-                    <div class="alert alert-warning shadow-none rounded-lg mb-1.5 py-2 px-3">
+                    <div class="alert alert-warning shadow-none rounded-lg mb-1.5 py-2 px-3"
+                         style="display:flex; align-items:flex-start; gap:6px;">
                         <div class="flex flex-col min-w-0 flex-1">
                             <div class="flex items-center justify-between gap-2">
                                 <span class="badge badge-sm badge-outline">{desc.label}</span>
