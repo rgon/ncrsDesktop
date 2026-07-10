@@ -1713,6 +1713,30 @@ impl NextCloudFs {
             prefetch_list_dir(&conn, &cache, &remote_path);
         })
     }
+
+    pub fn thumbnail_callback(&self) -> ipc::ThumbnailCallback {
+        let conn = self.conn.clone();
+        let fileids = self.fileids.clone();
+        Arc::new(move |remote_path: PathBuf| {
+            let fileid = fileids.safe_lock().get(&remote_path).copied();
+            let mount_path = conn.mount_point.join(
+                remote_path.strip_prefix("/").unwrap_or(&remote_path)
+            );
+            let mtime = std::fs::metadata(&mount_path).ok()
+                .and_then(|m| m.modified().ok());
+            crate::preview::prefetch_thumbnail(
+                &conn.http,
+                &conn.base_url,
+                &conn.creds,
+                &conn.mount_point,
+                &remote_path,
+                mtime,
+                fileid,
+            );
+            let uri = crate::preview::file_uri(&conn.mount_point, &remote_path);
+            crate::preview::xdg_thumbnail_path(&uri).exists()
+        })
+    }
 }
 
 impl Filesystem for NextCloudFs {
@@ -3512,11 +3536,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let keep_cb = filesystem.keep_callback();
     let evict_cb = filesystem.evict_callback();
     let prefetch_cb = filesystem.prefetch_callback();
+    let thumbnail_cb = filesystem.thumbnail_callback();
     let base_url = notifications::base_url(&options.url);
     let ipc_creds = options.credentials()?;
     let file_change_queue: ipc::FileChangeQueue = Arc::new(Mutex::new(Vec::new()));
     let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone());
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone());
 
     let offline_flag = filesystem.is_offline_flag();
     let backend = filesystem.conn.backend.clone();

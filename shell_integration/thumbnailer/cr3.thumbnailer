@@ -1,4 +1,4 @@
 [Thumbnailer Entry]
 TryExec=/usr/bin/cr3-thumbnailer
 Exec=/usr/bin/cr3-thumbnailer %s %u %o
-MimeType=image/x-canon-cr3;image/x-canon-cr2;
+MimeType=image/x-canon-cr3;image/x-canon-cr2;image/x-canon-crw;image/x-nikon-nef;image/x-nikon-nrw;image/x-sony-arw;image/x-sony-srf;image/x-sony-sr2;image/x-olympus-orf;image/x-fuji-raf;image/x-adobe-dng;image/x-panasonic-rw2;image/x-panasonic-rw;image/x-pentax-pef;image/x-sigma-x3f;image/x-minolta-mrw;image/x-kodak-dcr;image/x-kodak-kdc;image/x-kodak-k25;

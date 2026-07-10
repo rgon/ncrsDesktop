@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""Thumbnailer for Canon CR3 (and CR2) raw files.
+"""ncrs RAW thumbnailer.
 
-Extracts the embedded full-size JPEG preview with exiftool, scales it to the
-requested size with GdkPixbuf, and writes a FreeDesktop-compliant PNG thumbnail
-(tEXt::Thumb::URI and tEXt::Thumb::MTime chunks included).
+Registered via /usr/share/thumbnailers/cr3.thumbnailer for all common camera
+RAW formats.  The daemon already fetches Nextcloud previews proactively when
+directories are listed; this script is the fallback for files not yet in the
+XDG thumbnail cache.
 
-Registered via /usr/share/thumbnailers/cr3.thumbnailer; invoked by Nautilus /
-gnome-thumbnail-factory as:  cr3-thumbnailer %s %u %o
+Priority order (avoids downloading the full RAW file just to show a preview):
+
+  1. XDG cache hit — daemon pre-fetched it; just copy to %o.
+  2. THUMBNAIL IPC command — daemon fetches the NC preview synchronously.
+  3. Local exiftool extraction — only safe if STATUS reports the file is
+     already local (kept/cached/synced); never reads a remote-only file.
 """
+import hashlib
 import os
+import socket
 import subprocess
 import sys
 from urllib.parse import unquote
@@ -18,31 +25,82 @@ gi.require_version('GdkPixbuf', '2.0')
 from gi.repository import GdkPixbuf
 
 size    = int(sys.argv[1])
-src_uri = sys.argv[2]
-dst     = sys.argv[3]
+src_uri = sys.argv[2]   # file:// URI, percent-encoded
+dst     = sys.argv[3]   # output path Nautilus will read
 
 src_path = unquote(src_uri[7:] if src_uri.startswith('file://') else src_uri)
 
-preview_jpg = subprocess.run(
+CACHE_HOME = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
+xdg_dir  = os.path.join(CACHE_HOME, 'thumbnails', 'normal')
+xdg_path = os.path.join(xdg_dir, hashlib.md5(src_uri.encode()).hexdigest() + '.png')
+
+
+def write_thumbnail(pixbuf):
+    w, h   = pixbuf.get_width(), pixbuf.get_height()
+    long   = max(w, h)
+    if long > size:
+        if w >= h:
+            pixbuf = pixbuf.scale_simple(size, max(1, size * h // w), GdkPixbuf.InterpType.BILINEAR)
+        else:
+            pixbuf = pixbuf.scale_simple(max(1, size * w // h), size, GdkPixbuf.InterpType.BILINEAR)
+    mtime = str(int(os.stat(src_path).st_mtime))
+    pixbuf.savev(dst, 'png',
+                 ['tEXt::Thumb::URI', 'tEXt::Thumb::MTime'],
+                 [src_uri, mtime])
+
+
+# ── 1. XDG cache hit (daemon pre-fetched) ─────────────────────────────────────
+if os.path.exists(xdg_path):
+    try:
+        write_thumbnail(GdkPixbuf.Pixbuf.new_from_file(xdg_path))
+        sys.exit(0)
+    except Exception:
+        pass  # corrupted cache entry — fall through
+
+
+# ── 2. Ask daemon to fetch preview from Nextcloud ──────────────────────────────
+def ipc(cmd):
+    sock = os.path.join(
+        os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}'),
+        'ncrs.sock',
+    )
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect(sock)
+            s.sendall((cmd + '\n').encode())
+            return s.recv(4096).decode().strip()
+    except Exception:
+        return None
+
+
+reply = ipc(f'THUMBNAIL {src_path}')
+if reply == 'ok' and os.path.exists(xdg_path):
+    try:
+        write_thumbnail(GdkPixbuf.Pixbuf.new_from_file(xdg_path))
+        sys.exit(0)
+    except Exception:
+        pass
+
+
+# ── 3. Fallback: local embedded JPEG extraction (only for cached files) ────────
+status = ipc(f'STATUS {src_path}')
+if status not in ('kept', 'cached', 'synced'):
+    # File is remote-only; reading it here would trigger a full download.
+    sys.exit(1)
+
+result = subprocess.run(
     ['exiftool', '-b', '-PreviewImage', src_path],
-    capture_output=True, check=True,
-).stdout
-if not preview_jpg:
+    capture_output=True,
+)
+if result.returncode != 0 or not result.stdout:
     sys.exit(1)
 
 loader = GdkPixbuf.PixbufLoader.new_with_type('jpeg')
-loader.write(preview_jpg)
+loader.write(result.stdout)
 loader.close()
 pixbuf = loader.get_pixbuf()
+if not pixbuf:
+    sys.exit(1)
 
-w, h = pixbuf.get_width(), pixbuf.get_height()
-if w >= h:
-    sw, sh = size, max(1, size * h // w)
-else:
-    sw, sh = max(1, size * w // h), size
-
-scaled = pixbuf.scale_simple(sw, sh, GdkPixbuf.InterpType.BILINEAR)
-mtime  = str(int(os.stat(src_path).st_mtime))
-scaled.savev(dst, 'png',
-             ['tEXt::Thumb::URI', 'tEXt::Thumb::MTime'],
-             [src_uri, mtime])
+write_thumbnail(pixbuf)

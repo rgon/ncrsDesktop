@@ -15,6 +15,7 @@
 ///   STORAGE\n                         → JSON {kept_bytes, cached_bytes, remote_used, remote_total}
 ///   STATE\n                           → paused|syncing|idle (daemon-wide sync state)
 ///   PAUSE\n / RESUME\n                → ok (suspend/resume background sync)
+///   THUMBNAIL <abs-path>\n           → ok | error: <msg>  (fetch NC preview → XDG thumb cache)
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,9 @@ impl<T> MutexExt<T> for Mutex<T> {
 pub type KeepCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type EvictCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type PrefetchCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
+/// Synchronously fetch the Nextcloud preview for a remote path and write it to
+/// the XDG thumbnail cache. Returns `true` if the thumbnail is now available.
+pub type ThumbnailCallback = Arc<dyn Fn(PathBuf) -> bool + Send + Sync>;
 pub type SharedSet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
 pub type FileIdMap = Arc<Mutex<std::collections::HashMap<PathBuf, u64>>>;
 
@@ -157,7 +161,7 @@ fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>,
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -197,6 +201,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let cb = keep_cb.clone();
             let ev = evict_cb.clone();
             let pf = prefetch_cb.clone();
+            let th = thumbnail_cb.clone();
             let elog = error_log.clone();
             let tmap = transfer_map.clone();
             let jrnl = journal.clone();
@@ -206,7 +211,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let active = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, dirty, creds_clone, burl, cb, ev, pf, elog, tmap, jrnl, fcq, sstats, pause_flag);
+                handle_client(stream, mount, map, shared, fids, details, dirty, creds_clone, burl, cb, ev, pf, th, elog, tmap, jrnl, fcq, sstats, pause_flag);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -238,6 +243,7 @@ fn handle_client(
     keep_cb: Option<KeepCallback>,
     evict_cb: Option<EvictCallback>,
     prefetch_cb: Option<PrefetchCallback>,
+    thumbnail_cb: Option<ThumbnailCallback>,
     error_log: crate::ErrorLog,
     transfer_map: crate::TransferMap,
     journal: crate::mutation_journal::SharedJournal,
@@ -429,6 +435,14 @@ fn handle_client(
                         }
                     });
                     "ok".to_string()
+                }
+                (None, _) => "error: path not under mount".to_string(),
+                (_, None) => "error: not supported".to_string(),
+            }
+        } else if let Some(path_str) = trimmed.strip_prefix("THUMBNAIL ") {
+            match (strip_mount(Path::new(path_str), &mount_point), &thumbnail_cb) {
+                (Some(remote), Some(cb)) => {
+                    if cb(remote) { "ok".to_string() } else { "error: preview unavailable".to_string() }
                 }
                 (None, _) => "error: path not under mount".to_string(),
                 (_, None) => "error: not supported".to_string(),

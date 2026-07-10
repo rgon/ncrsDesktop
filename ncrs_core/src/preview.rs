@@ -74,6 +74,12 @@ fn xdg_thumb_path(file_uri: &str) -> PathBuf {
     xdg_thumb_dir().join(format!("{}.png", hash))
 }
 
+/// Public accessor for the XDG thumbnail cache path for a given file URI.
+/// The thumbnailer script uses this to find what the daemon has pre-fetched.
+pub fn xdg_thumbnail_path(file_uri: &str) -> PathBuf {
+    xdg_thumb_path(file_uri)
+}
+
 // ── NC preview API ────────────────────────────────────────────────────────────
 
 fn fetch_preview_bytes(
