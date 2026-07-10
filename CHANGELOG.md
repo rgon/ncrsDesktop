@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.9](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.8...ncrs-v0.1.9) (2026-07-10)
+
+
+### Features
+
+* **issues:** add per-item error dismiss button ([fe5fde9](https://github.com/rgon/ncrsDesktop/commit/fe5fde94a559e80593219c983610c65e6795c343))
+* replace stub 'Add account' with working Log out button ([c16bf42](https://github.com/rgon/ncrsDesktop/commit/c16bf42bab588e16e099f484e389e65d686a9548))
+* **tauri:** add dismiss_error command to remove single error by timestamp ([4e71616](https://github.com/rgon/ncrsDesktop/commit/4e7161609e16ec46dda2ca4cbcfe27b0340ab9a9))
+
+
+### Bug Fixes
+
+* **ui:** expandable error cards, pointerdown close, ENOSPC retry storm ([9267a5f](https://github.com/rgon/ncrsDesktop/commit/9267a5f4daf3535f1b2b0802e0e45321c53c116c))
+
 ## [0.1.8](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.7...ncrs-v0.1.8) (2026-07-10)
 
 
