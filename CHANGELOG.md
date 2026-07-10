@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.7](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.6...ncrs-v0.1.7) (2026-07-10)
+
+
+### Features
+
+* **config:** enable http3 by default; add explanatory comments to advanced settings ([4b34dbc](https://github.com/rgon/ncrsDesktop/commit/4b34dbc3a33bfefb601c0313ea63d4501648848a))
+* **fuse:** auto-delete stale GIO atomic-write temps from server on readdir ([e02bbfd](https://github.com/rgon/ncrsDesktop/commit/e02bbfd80fd5a2a05e5c75ccef51604a002b6e3e))
+* **gui:** add description hints to advanced settings toggles ([a129dcb](https://github.com/rgon/ncrsDesktop/commit/a129dcbc4b447653e11b97f4919e37dd0d860ffc))
+* **gui:** add Remount button to settings footer ([3838009](https://github.com/rgon/ncrsDesktop/commit/38380091e36837c784b5a39bdf6ac86cc73b9741))
+* **thumbnailer:** add CR3/CR2 raw thumbnail support via embedded JPEG preview ([0c39c1a](https://github.com/rgon/ncrsDesktop/commit/0c39c1ad47f2c45fa5127d2894a2184fd8129c5c))
+* **thumbnailer:** fetch NC preview via IPC instead of reading local raw file, expand to all registered RAW MIME types ([b5d44c4](https://github.com/rgon/ncrsDesktop/commit/b5d44c48cedc9394d9c4cfe22ce56a1975406de2))
+
+
+### Bug Fixes
+
+* **fuse:** delete all GIO temps on PROPFIND, not just age-threshold ones ([921d2a7](https://github.com/rgon/ncrsDesktop/commit/921d2a77d076aede28f65c00b91fdfaf21ab86a1))
+
 ## [0.1.6](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.5...ncrs-v0.1.6) (2026-07-10)
 
 
