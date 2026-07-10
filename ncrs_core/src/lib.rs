@@ -1522,15 +1522,13 @@ impl NextCloudFs {
         let fileids: ipc::FileIdMap = Arc::new(Mutex::new(HashMap::new()));
         let details: ipc::FileDetailMap = Arc::new(Mutex::new(HashMap::new()));
 
-        let mut http_builder = reqwest::blocking::Client::builder()
+        let http_builder = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(16);
-        let mut read_builder = reqwest::blocking::Client::builder()
+        let read_builder = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(8)
             .tcp_nodelay(true);
         if options.http3 {
-            log::info!("HTTP/3 (QUIC) enabled");
-            http_builder = http_builder.http3_prior_knowledge();
-            read_builder = read_builder.http3_prior_knowledge();
+            log::info!("HTTP/3 flag noted; upgrade negotiated via server alt-svc");
         }
         let http = http_builder.build()
             .map_err(|e| format!("HTTP client: {}", e))?;

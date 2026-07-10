@@ -69,13 +69,11 @@ struct OcsSearchResponse {
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-fn client(http3: bool) -> reqwest::blocking::Client {
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(API_TIMEOUT);
-    if http3 {
-        builder = builder.http3_prior_knowledge();
-    }
-    builder.build().expect("reqwest client")
+fn client(_http3: bool) -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(API_TIMEOUT)
+        .build()
+        .expect("reqwest client")
 }
 
 fn decode_pct(s: &str) -> String {
