@@ -15,10 +15,40 @@ const PREVIEWABLE: &[&str] = &[
     "pdf",
 ];
 
+// RAW camera formats whose MIME types Nextcloud may not report as has_preview=true
+// even when a server-side preview provider (Imagick/VIPS) can generate them.
+// We attempt a preview fetch for these regardless of the has_preview flag.
+const RAW_EXTENSIONS: &[&str] = &[
+    "cr2", "cr3",        // Canon
+    "nef", "nrw",        // Nikon
+    "arw", "srf", "sr2", // Sony
+    "srw",               // Samsung
+    "orf",               // Olympus
+    "raf",               // Fujifilm
+    "dng",               // Adobe DNG (universal raw)
+    "rw2",               // Panasonic
+    "pef", "ptx",        // Pentax
+    "x3f",               // Sigma
+    "3fr",               // Hasselblad
+    "mrw",               // Konica-Minolta
+    "erf",               // Epson
+    "kdc", "dcr",        // Kodak
+    "rwl",               // Leica
+    "iiq",               // Phase One
+    "raw",               // generic raw
+];
+
 pub fn is_previewable(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| PREVIEWABLE.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn is_raw_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| RAW_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
 }
 
@@ -137,7 +167,10 @@ pub fn prefetch_thumbnail(
     let data = match inject_png_text_chunks(&png, &[("Thumb::URI", &uri), ("Thumb::MTime", &mtime_s)]) {
         Some(d) => d,
         None => {
-            log::debug!("thumbnail {}: not a valid PNG, skipping", remote_path.display());
+            // Nextcloud's preview API is expected to return PNG; JPEG (FFD8) means
+            // the server returned a raw JPEG pass-through instead of a scaled preview.
+            let hint = if png.starts_with(&[0xFF, 0xD8]) { " (got JPEG)" } else { "" };
+            log::debug!("thumbnail {}: not a valid PNG{}, skipping", remote_path.display(), hint);
             return;
         }
     };
@@ -159,7 +192,7 @@ pub fn prefetch_directory_thumbnails(
     active_streams: &Arc<AtomicUsize>,
 ) {
     let previewable: Vec<_> = entries.iter()
-        .filter(|(_, _, has_preview, _)| *has_preview)
+        .filter(|(path, _, has_preview, _)| *has_preview || is_raw_image(path))
         .collect();
 
     for (i, chunk) in previewable.chunks(THUMB_BATCH).enumerate() {
