@@ -224,6 +224,11 @@ fn clear_errors(state: State<Arc<AppState>>) {
 }
 
 #[tauri::command]
+fn dismiss_error(state: State<Arc<AppState>>, timestamp_ms: u64) {
+    state.error_log.lock().unwrap().retain(|e| e.timestamp_ms != timestamp_ms);
+}
+
+#[tauri::command]
 fn get_transfers(state: State<Arc<AppState>>) -> Vec<TransferProgress> {
     state.transfer_map.lock().unwrap().values().cloned().collect()
 }
@@ -670,6 +675,7 @@ pub fn run() {
             reveal_in_file_manager,
             get_errors,
             clear_errors,
+            dismiss_error,
             get_transfers,
             get_pending_mutations,
             get_conflicts,
