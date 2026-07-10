@@ -1527,9 +1527,7 @@ impl NextCloudFs {
         let read_builder = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(8)
             .tcp_nodelay(true);
-        if options.http3 {
-            log::info!("HTTP/3 flag noted; upgrade negotiated via server alt-svc");
-        }
+        let _ = options.http3; // reserved; reqwest blocking client requires prior_knowledge for h3
         let http = http_builder.build()
             .map_err(|e| format!("HTTP client: {}", e))?;
         let http_read = read_builder.build()

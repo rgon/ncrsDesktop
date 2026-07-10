@@ -198,7 +198,7 @@
                 <div class="sv-toggle">
                     <div>
                         <label class="sv-toggle-label" for="http3">HTTP/3 (QUIC)</label>
-                        <p class="sv-hint">Allow the server to upgrade the connection to HTTP/3 via its <code>alt-svc</code> advertisement. Has no effect on servers that do not advertise HTTP/3 support. Disable if you see empty directories or connection errors.</p>
+                        <p class="sv-hint">Reserved for future use. HTTP/3 support requires server-side QUIC and a probed fallback path; this toggle has no effect on current connections.</p>
                     </div>
                     <input id="http3" type="checkbox" class="sv-check" bind:checked={settings.http3} />
                 </div>
