@@ -320,9 +320,13 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         super().__init__()
         self._mount = _load_mount_point()
         self._poll_running = False
+        self._poll_skip = 0  # 2-second ticks to skip when idle (adaptive backoff)
         GLib.timeout_add_seconds(2, self._poll_changes)
 
     def _poll_changes(self) -> bool:
+        if self._poll_skip > 0:
+            self._poll_skip -= 1
+            return True
         if self._poll_running:
             return True
         self._poll_running = True
@@ -334,13 +338,15 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         return True
 
     def _do_poll_changes(self):
+        had_changes = False
         try:
             # Targeted VFS ops to generate kernel inotify events
             fc_resp = _send_command("FILE_CHANGES")
             if fc_resp and not fc_resp.startswith("error"):
-                for entry in fc_resp.split("\t"):
-                    if ":" not in entry:
-                        continue
+                entries = [e for e in fc_resp.split("\t") if ":" in e]
+                if entries:
+                    had_changes = True
+                for entry in entries:
                     kind, path = entry.split(":", 1)
                     try:
                         if kind == "A":
@@ -359,14 +365,16 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                         elif kind == "R":
                             old_path, new_path = path.split("\x1e", 1)
                             os.rename(old_path, new_path)
-                    except OSError:
+                    except (OSError, ValueError):
                         pass
 
             # Overlay icon refresh
             resp = _send_command("CHANGES")
             if not resp or resp.startswith("error"):
                 return
-            paths = resp.split("\t")
+            paths = [p for p in resp.split("\t") if p]
+            if paths:
+                had_changes = True
 
             def _invalidate():
                 for p in paths:
@@ -383,6 +391,9 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             _log_error("_poll_changes")
         finally:
             self._poll_running = False
+            # Back off when idle (max 4 skips = 10 s effective interval);
+            # reset immediately when any change is detected.
+            self._poll_skip = 0 if had_changes else min(self._poll_skip + 1, 4)
 
     def update_file_info_full(self, provider, handle, closure, file_info):
         try:

@@ -3271,6 +3271,11 @@ impl Filesystem for NextCloudFs {
                         log::info!("MKCOL {}", remote_path.display());
                         journal.safe_lock().remove(seq);
                     }
+                    Err(backend::BackendWriteError::Server(405, _))
+                    | Err(backend::BackendWriteError::Server(409, _)) => {
+                        log::debug!("MKCOL {} — already exists (idempotent)", remote_path.display());
+                        journal.safe_lock().remove(seq);
+                    }
                     Err(e) => {
                         log::error!("MKCOL {} failed (journaled): {}", remote_path.display(), e);
                         push_error(&elog, remote_path, SyncErrorKind::ServerError(0), format!("mkdir failed: {}", e));
@@ -3341,6 +3346,10 @@ impl Filesystem for NextCloudFs {
                         log::info!("DELETE {}", remote_path.display());
                         journal.safe_lock().remove(seq);
                     }
+                    Err(backend::BackendWriteError::Server(404, _)) => {
+                        log::debug!("DELETE {} — already gone (idempotent)", remote_path.display());
+                        journal.safe_lock().remove(seq);
+                    }
                     Err(e) => {
                         log::error!("DELETE {} failed (journaled): {}", remote_path.display(), e);
                         push_error(&elog, remote_path, SyncErrorKind::ServerError(0), format!("delete failed: {}", e));
@@ -3407,6 +3416,10 @@ impl Filesystem for NextCloudFs {
                 match conn.backend.delete(&remote_path) {
                     Ok(()) => {
                         log::info!("RMDIR {}", remote_path.display());
+                        journal.safe_lock().remove(seq);
+                    }
+                    Err(backend::BackendWriteError::Server(404, _)) => {
+                        log::debug!("RMDIR {} — already gone (idempotent)", remote_path.display());
                         journal.safe_lock().remove(seq);
                     }
                     Err(e) => {
