@@ -224,11 +224,11 @@
             invoke<StorageStats>("get_storage_stats").then(s => { storage = s; }).catch(() => {});
         }, 30_000);
 
-        const clickOutListener = (event: MouseEvent) => {
+        const clickOutListener = (event: PointerEvent) => {
             const container = document.querySelector(".window");
             if (container && !event.composedPath().includes(container)) close();
         };
-        document.addEventListener("click", clickOutListener);
+        document.addEventListener("pointerdown", clickOutListener);
 
         const escKeyListener = (event: KeyboardEvent) => {
             if (event.key === "Escape" && activeView !== "search") close();
@@ -245,7 +245,7 @@
             unlistenPluginNav.then(f => f());
             unlistenLoginComplete.then(f => f());
             clearInterval(storageInterval);
-            document.removeEventListener("click", clickOutListener);
+            document.removeEventListener("pointerdown", clickOutListener);
             document.removeEventListener("keydown", escKeyListener);
         };
     });
@@ -579,6 +579,29 @@
     overflow-y: auto;
     flex: 1;
 }
+
+.nc-notif {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--nc-border);
+    overflow: hidden;
+}
+.nc-notif:last-child { border-bottom: none; }
+
+.nc-dismiss-btn {
+    flex-shrink: 0;
+    background: none;
+    border: none;
+    color: var(--nc-text-3);
+    cursor: pointer;
+    padding: 3px;
+    border-radius: 4px;
+    opacity: 0.5;
+    line-height: 0;
+}
+.nc-dismiss-btn:hover { opacity: 1; background: color-mix(in srgb, var(--nc-text-3) 12%, transparent); }
 
 .nc-empty-state {
     display: flex;

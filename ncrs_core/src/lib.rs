@@ -241,6 +241,14 @@ pub fn push_error(log: &ErrorLog, path: PathBuf, kind: SyncErrorKind, message: S
         .as_millis() as u64;
     let err = SyncError { path, kind, message, timestamp_ms: ts };
     let mut q = log.safe_lock();
+    // Suppress duplicate consecutive entries for the same path+kind to prevent
+    // retry storms (e.g. disk-full failures re-attempted every second) from
+    // flooding both the error log and the GUI.
+    if let Some(last) = q.back() {
+        if last.path == err.path && std::mem::discriminant(&last.kind) == std::mem::discriminant(&err.kind) {
+            return;
+        }
+    }
     if q.len() >= MAX_ERROR_LOG { q.pop_front(); }
     q.push_back(err);
 }
@@ -268,6 +276,10 @@ fn error_to_errno(err: &str) -> Errno {
         Errno::EACCES
     } else if err.contains("404") || err.contains("Not Found") {
         Errno::ENOENT
+    } else if err.contains("No space left on device") || err.contains("os error 28") {
+        // Return the real ENOSPC so callers stop retrying immediately; EIO would
+        // cause thumbnail generators and media apps to spin in a 1-per-second loop.
+        Errno::ENOSPC
     } else {
         Errno::EIO
     }
