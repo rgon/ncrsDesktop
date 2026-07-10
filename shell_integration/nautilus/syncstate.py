@@ -444,32 +444,24 @@ class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             if not paths:
                 return []
 
-            has_local = False
-            has_remote = False
-            for path in paths:
-                status = _send_command(f"STATUS {path}").split(",")[0]
-                if status in ("kept", "cached", "local", "partial"):
-                    has_local = True
-                else:
-                    has_remote = True
-
+            # Both items are always shown — no per-file STATUS queries on the
+            # main thread. Keep/Evict are idempotent on the daemon side.
             items = []
-            if has_remote:
-                keep = Nautilus.MenuItem(
-                    name="NcrsMenuProvider::KeepLocally",
-                    label="Keep Locally",
-                    tip="Download and keep a local copy of the selected files",
-                )
-                keep.connect("activate", self._on_keep_locally, paths)
-                items.append(keep)
-            if has_local:
-                evict = Nautilus.MenuItem(
-                    name="NcrsMenuProvider::EvictLocally",
-                    label="Don't Keep Locally",
-                    tip="Remove the local copy and free disk space",
-                )
-                evict.connect("activate", self._on_evict_locally, paths)
-                items.append(evict)
+            keep = Nautilus.MenuItem(
+                name="NcrsMenuProvider::KeepLocally",
+                label="Keep Locally",
+                tip="Download and keep a local copy of the selected files",
+            )
+            keep.connect("activate", self._on_keep_locally, paths)
+            items.append(keep)
+
+            evict = Nautilus.MenuItem(
+                name="NcrsMenuProvider::EvictLocally",
+                label="Don't Keep Locally",
+                tip="Remove the local copy and free disk space",
+            )
+            evict.connect("activate", self._on_evict_locally, paths)
+            items.append(evict)
 
             view_web = Nautilus.MenuItem(
                 name="NcrsMenuProvider::ViewInWeb",
