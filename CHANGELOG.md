@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.10](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.9...ncrs-v0.1.10) (2026-07-10)
+
+
+### Bug Fixes
+
+* **cache:** delete orphaned write_* staging files after upload completes ([af1686b](https://github.com/rgon/ncrsDesktop/commit/af1686b3b4dcc2786c8bfeff1c59d51870b6e971))
+* **core:** parallelize boot validation and update detail maps on background dir refresh ([553b5fe](https://github.com/rgon/ncrsDesktop/commit/553b5fea7f0481eed6128048fa0a6097c4f16e88))
+* **issues:** override DaisyUI grid on alert cards, add dismiss × button ([b1a260f](https://github.com/rgon/ncrsDesktop/commit/b1a260f295e78db17a96f8e49e2fb4e275fcc9c4))
+* **issues:** replace DaisyUI btn with plain icon-button classes to fix overflow ([9671b18](https://github.com/rgon/ncrsDesktop/commit/9671b182b1f3951d0544d4c891e64d2b216f0aa7))
+* **settings:** add gap between toggle label and checkbox ([a28ad2e](https://github.com/rgon/ncrsDesktop/commit/a28ad2eff626f0b0fa33a8c4418092f9832e233f))
+
+
+### Performance Improvements
+
+* **ipc:** demote DETAIL log to debug, fix thumbnailer crash on malformed JPEG ([a0c247a](https://github.com/rgon/ncrsDesktop/commit/a0c247aad1ba26fc008c4b26f06ac750e32af86b))
+* **ipc:** pre-populate detail/shared/fileid maps before readdir reply.ok() to fix race with Nautilus extension DETAIL queries ([d246cf8](https://github.com/rgon/ncrsDesktop/commit/d246cf85c9b6be8b136dc478e4bebfaa0d6cd1fa))
+* **thumbnailer,extension:** fix hang risks, spurious NC ops, and idle poll overhead ([836cae3](https://github.com/rgon/ncrsDesktop/commit/836cae308e7d781ff41240d37ae1ec3b002bbe1b))
+
 ## [0.1.9](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.8...ncrs-v0.1.9) (2026-07-10)
 
 
