@@ -330,6 +330,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 12px;
     padding: 5px 0;
     border-top: 1px solid var(--nc-border);
 }
