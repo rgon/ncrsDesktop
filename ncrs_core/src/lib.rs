@@ -1426,6 +1426,7 @@ pub struct NextCloudFs {
     read_ahead_bytes: usize,
     cache_streamed_reads: bool,
     exclude_folders: HashSet<PathBuf>,
+    thumb_inflight: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl NextCloudFs {
@@ -1590,6 +1591,7 @@ impl NextCloudFs {
             read_ahead_bytes: options.read_ahead_bytes,
             cache_streamed_reads: options.cache_streamed_reads,
             exclude_folders,
+            thumb_inflight: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -2252,6 +2254,7 @@ impl Filesystem for NextCloudFs {
         let conn = self.conn.clone();
         let aggressive_prefetch = self.aggressive_prefetch;
         let exclude_folders = self.exclude_folders.clone();
+        let thumb_inflight = self.thumb_inflight.clone();
 
         thread::spawn(move || {
             if offset == 0 {
@@ -2483,8 +2486,12 @@ impl Filesystem for NextCloudFs {
                         }
                     }
 
-                    if offset == 0 {
-                        if !thumb_candidates.is_empty() {
+                    if offset == 0 && !thumb_candidates.is_empty() {
+                        let already = {
+                            let mut inf = thumb_inflight.safe_lock();
+                            !inf.insert(path.clone())
+                        };
+                        if !already {
                             let conn2 = conn.clone();
                             thread::spawn(move || {
                                 thread::sleep(Duration::from_millis(500));
@@ -2496,6 +2503,7 @@ impl Filesystem for NextCloudFs {
                                     &thumb_candidates,
                                     &conn2.active_streams,
                                 );
+                                thumb_inflight.safe_lock().remove(&path);
                             });
                         }
                     }
