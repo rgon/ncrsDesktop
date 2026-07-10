@@ -90,6 +90,8 @@ install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.SearchProvider.ini \
                                                                          "$PKG_DIR/usr/share/gnome-shell/search-providers/es.rgon.ncrs.SearchProvider.ini"
 install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.desktop       "$PKG_DIR/usr/share/applications/es.rgon.ncrs.desktop"
 install -Dm644 packaging/es.rgon.ncrs.SearchProvider.service              "$PKG_DIR/usr/share/dbus-1/services/es.rgon.ncrs.SearchProvider.service"
+install -Dm755 shell_integration/thumbnailer/cr3-thumbnailer               "$PKG_DIR/usr/bin/cr3-thumbnailer"
+install -Dm644 shell_integration/thumbnailer/cr3.thumbnailer               "$PKG_DIR/usr/share/thumbnailers/cr3.thumbnailer"
 
 # Example config for provisioning, generated from the binary's built-in
 # template. This executes the staged binary, so it must be runnable on the
@@ -115,7 +117,7 @@ fi
 # ── Write DEBIAN/control ──────────────────────────────────────────────────────
 # ncrs links libssl at build time; ncrs-gui dlopens libayatana-appindicator3
 # for the tray icon (invisible to ldd/shlibdeps) and panics without it.
-DEPENDS="fuse3, python3-nautilus | gir1.2-nautilus-3.0, libssl3t64 | libssl3"
+DEPENDS="fuse3, python3-nautilus | gir1.2-nautilus-3.0, libssl3t64 | libssl3, libimage-exiftool-perl, python3-gi, gir1.2-gdkpixbuf-2.0"
 if ! $SKIP_GUI; then
     DEPENDS="$DEPENDS, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37, libayatana-appindicator3-1 | libappindicator3-1"
 fi

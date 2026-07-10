@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Thumbnailer for Canon CR3 (and CR2) raw files.
+
+Extracts the embedded full-size JPEG preview with exiftool, scales it to the
+requested size with GdkPixbuf, and writes a FreeDesktop-compliant PNG thumbnail
+(tEXt::Thumb::URI and tEXt::Thumb::MTime chunks included).
+
+Registered via /usr/share/thumbnailers/cr3.thumbnailer; invoked by Nautilus /
+gnome-thumbnail-factory as:  cr3-thumbnailer %s %u %o
+"""
+import os
+import subprocess
+import sys
+from urllib.parse import unquote
+
+import gi
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import GdkPixbuf
+
+size    = int(sys.argv[1])
+src_uri = sys.argv[2]
+dst     = sys.argv[3]
+
+src_path = unquote(src_uri[7:] if src_uri.startswith('file://') else src_uri)
+
+preview_jpg = subprocess.run(
+    ['exiftool', '-b', '-PreviewImage', src_path],
+    capture_output=True, check=True,
+).stdout
+if not preview_jpg:
+    sys.exit(1)
+
+loader = GdkPixbuf.PixbufLoader.new_with_type('jpeg')
+loader.write(preview_jpg)
+loader.close()
+pixbuf = loader.get_pixbuf()
+
+w, h = pixbuf.get_width(), pixbuf.get_height()
+if w >= h:
+    sw, sh = size, max(1, size * h // w)
+else:
+    sw, sh = max(1, size * w // h), size
+
+scaled = pixbuf.scale_simple(sw, sh, GdkPixbuf.InterpType.BILINEAR)
+mtime  = str(int(os.stat(src_path).st_mtime))
+scaled.savev(dst, 'png',
+             ['tEXt::Thumb::URI', 'tEXt::Thumb::MTime'],
+             [src_uri, mtime])
