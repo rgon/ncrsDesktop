@@ -118,7 +118,10 @@
                 </div>
 
                 <div class="sv-toggle">
-                    <label class="sv-toggle-label" for="cache-streamed">Cache streamed reads</label>
+                    <div>
+                        <label class="sv-toggle-label" for="cache-streamed">Cache streamed reads</label>
+                        <p class="sv-hint">Save data read via streaming (e.g. media playback) to the local cache. Subsequent opens are served from disk instead of re-downloading. Increases disk usage.</p>
+                    </div>
                     <input id="cache-streamed" type="checkbox" class="sv-check" bind:checked={settings.cache_streamed_reads} />
                 </div>
 
@@ -162,12 +165,18 @@
                 </div>
 
                 <div class="sv-toggle">
-                    <label class="sv-toggle-label" for="prefetch">Aggressive prefetch</label>
+                    <div>
+                        <label class="sv-toggle-label" for="prefetch">Aggressive prefetch</label>
+                        <p class="sv-hint">Pre-fetch metadata and thumbnails for every file in a directory as soon as it is listed. Speeds up browsing at the cost of extra network traffic on large directories.</p>
+                    </div>
                     <input id="prefetch" type="checkbox" class="sv-check" bind:checked={settings.aggressive_prefetch} />
                 </div>
 
                 <div class="sv-toggle">
-                    <label class="sv-toggle-label" for="optimistic">Optimistic directory listing</label>
+                    <div>
+                        <label class="sv-toggle-label" for="optimistic">Optimistic directory listing</label>
+                        <p class="sv-hint">Return directory listings immediately from the local cache while a background refresh fetches the latest contents. Keeps the file manager responsive; disable if listings must always reflect live server state.</p>
+                    </div>
                     <input id="optimistic" type="checkbox" class="sv-check" bind:checked={settings.optimistic_listing} />
                 </div>
 
