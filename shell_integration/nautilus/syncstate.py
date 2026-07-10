@@ -211,14 +211,31 @@ def _invalidate_path(path: str) -> bool:
     return GLib.SOURCE_REMOVE
 
 
+_POLL_KEEP_ATTEMPTS: dict = {}
+
+
+def _check_keep_done(path: str) -> bool:
+    try:
+        _POLL_KEEP_ATTEMPTS[path] = _POLL_KEEP_ATTEMPTS.get(path, 0) + 1
+        if _POLL_KEEP_ATTEMPTS[path] > 240:
+            _POLL_KEEP_ATTEMPTS.pop(path, None)
+            return GLib.SOURCE_REMOVE
+        status = _send_command(f"STATUS {path}")
+        if status.split(",")[0] != "downloading":
+            _POLL_KEEP_ATTEMPTS.pop(path, None)
+            GLib.idle_add(_invalidate_path, path)
+            return GLib.SOURCE_REMOVE
+    except Exception:
+        _log_error(f"_check_keep_done({path})")
+        _POLL_KEEP_ATTEMPTS.pop(path, None)
+        return GLib.SOURCE_REMOVE
+    return GLib.SOURCE_CONTINUE
+
+
 def _poll_keep_done(path: str) -> None:
     try:
-        for _ in range(240):
-            time.sleep(0.5)
-            status = _send_command(f"STATUS {path}")
-            if not status.split(",")[0] == "downloading":
-                GLib.idle_add(_invalidate_path, path)
-                return
+        _POLL_KEEP_ATTEMPTS[path] = 0
+        GLib.timeout_add(500, _check_keep_done, path)
     except Exception:
         _log_error(f"_poll_keep_done({path})")
 
