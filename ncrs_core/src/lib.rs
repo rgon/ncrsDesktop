@@ -149,10 +149,11 @@ struct DirCacheEntry {
 struct PendingDir {
     entries: Vec<RemoteEntry>,
     rx: mpsc::Receiver<RemoteEntry>,
-    etag_rx: mpsc::Receiver<Option<String>>,
+    etag_rx: mpsc::Receiver<Result<Option<String>, String>>,
     self_rx: mpsc::Receiver<RemoteEntry>,
     etag: Option<String>,
     self_entry: Option<RemoteEntry>,
+    failed: Option<String>,
 }
 
 struct FileCacheEntry {
@@ -440,7 +441,7 @@ impl FsCache {
         }
     }
 
-    fn start_pending(&mut self, path: PathBuf, rx: mpsc::Receiver<RemoteEntry>, etag_rx: mpsc::Receiver<Option<String>>, self_rx: mpsc::Receiver<RemoteEntry>) {
+    fn start_pending(&mut self, path: PathBuf, rx: mpsc::Receiver<RemoteEntry>, etag_rx: mpsc::Receiver<Result<Option<String>, String>>, self_rx: mpsc::Receiver<RemoteEntry>) {
         self.pending_dirs.insert(path, PendingDir {
             entries: Vec::new(),
             rx,
@@ -448,10 +449,11 @@ impl FsCache {
             self_rx,
             etag: None,
             self_entry: None,
+            failed: None,
         });
     }
 
-    fn start_pending_and_notify(&mut self, path: PathBuf, rx: mpsc::Receiver<RemoteEntry>, etag_rx: mpsc::Receiver<Option<String>>, self_rx: mpsc::Receiver<RemoteEntry>) -> Arc<(Mutex<()>, Condvar)> {
+    fn start_pending_and_notify(&mut self, path: PathBuf, rx: mpsc::Receiver<RemoteEntry>, etag_rx: mpsc::Receiver<Result<Option<String>, String>>, self_rx: mpsc::Receiver<RemoteEntry>) -> Arc<(Mutex<()>, Condvar)> {
         self.start_pending(path, rx, etag_rx, self_rx);
         self.pending_notify.clone()
     }
@@ -460,7 +462,7 @@ impl FsCache {
     // Used by background prefetch to discover the next wave of directories to pre-fetch.
     fn subdir_paths_for_prefetch(&mut self, path: &Path) -> Vec<PathBuf> {
         if self.pending_dirs.contains_key(path) {
-            self.promote_pending(path);
+            let _ = self.promote_pending(path);
         }
         self.dir_cache.get(path)
             .map(|e| e.files.iter()
@@ -470,13 +472,19 @@ impl FsCache {
             .unwrap_or_default()
     }
 
-    fn promote_pending(&mut self, path: &Path) -> Option<RemoteEntry> {
+    fn promote_pending(&mut self, path: &Path) -> Result<Option<RemoteEntry>, String> {
         if let Some(mut pending) = self.pending_dirs.remove(path) {
             while let Ok(entry) = pending.rx.try_recv() {
                 pending.entries.push(entry);
             }
-            if let Ok(etag) = pending.etag_rx.try_recv() {
-                pending.etag = etag;
+            match pending.etag_rx.try_recv() {
+                Ok(Ok(etag)) => pending.etag = etag,
+                Ok(Err(e)) => pending.failed = Some(e),
+                Err(_) => {}
+            }
+            if let Some(e) = pending.failed {
+                self.pending_notify.1.notify_all();
+                return Err(e);
             }
             if pending.self_entry.is_none() {
                 if let Ok(se) = pending.self_rx.try_recv() {
@@ -486,38 +494,48 @@ impl FsCache {
             let self_entry = pending.self_entry.take();
             self.put_dir_cache(path.to_path_buf(), pending.etag, self_entry.clone(), pending.entries);
             self.pending_notify.1.notify_all();
-            self_entry
+            Ok(self_entry)
         } else {
-            None
+            Ok(None)
         }
     }
 
-    fn get_pending_snapshot(&mut self, path: &Path) -> Option<Vec<RemoteEntry>> {
-        let pending = self.pending_dirs.get_mut(path)?;
-        if pending.self_entry.is_none() {
-            if let Ok(se) = pending.self_rx.try_recv() {
-                pending.self_entry = Some(se);
+    fn get_pending_snapshot(&mut self, path: &Path) -> Result<Option<Vec<RemoteEntry>>, String> {
+        if !self.pending_dirs.contains_key(path) {
+            return Ok(None);
+        }
+        {
+            let pending = self.pending_dirs.get_mut(path).unwrap();
+            if pending.self_entry.is_none() {
+                if let Ok(se) = pending.self_rx.try_recv() {
+                    pending.self_entry = Some(se);
+                }
             }
         }
         let mut got_new = false;
         loop {
-            match pending.rx.try_recv() {
-                Ok(entry) => { pending.entries.push(entry); got_new = true; }
+            match self.pending_dirs.get_mut(path).unwrap().rx.try_recv() {
+                Ok(entry) => {
+                    self.pending_dirs.get_mut(path).unwrap().entries.push(entry);
+                    got_new = true;
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.promote_pending(path);
-                    // promote_pending already calls notify_all
-                    return self.dir_cache.get(path).map(|e| e.files.to_vec());
+                    return match self.promote_pending(path) {
+                        Err(e) => Err(e),
+                        Ok(_) => Ok(self.dir_cache.get(path).map(|e| e.files.to_vec())),
+                    };
                 }
             }
         }
-        if !pending.entries.is_empty() {
+        let has_entries = self.pending_dirs.get(path).map_or(false, |p| !p.entries.is_empty());
+        if has_entries {
             if got_new {
                 self.pending_notify.1.notify_all();
             }
-            Some(pending.entries.clone())
+            Ok(self.pending_dirs.get(path).map(|p| p.entries.clone()))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -915,9 +933,13 @@ fn get_or_list_dir(
     // Check if there's already an in-progress incremental fetch
     {
         let mut c = cache.safe_lock();
-        if let Some(snapshot) = c.get_pending_snapshot(&path) {
-            let self_entry = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
-            return Ok((Arc::new(snapshot), self_entry));
+        match c.get_pending_snapshot(&path) {
+            Err(e) => return Err(e),
+            Ok(Some(snapshot)) => {
+                let self_entry = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
+                return Ok((Arc::new(snapshot), self_entry));
+            }
+            Ok(None) => {}
         }
     }
 
@@ -935,7 +957,7 @@ fn get_or_list_dir(
             true
         } else {
             let (entry_tx, entry_rx) = mpsc::channel();
-            let (etag_tx, etag_rx) = mpsc::channel();
+            let (etag_tx, etag_rx) = mpsc::channel::<Result<Option<String>, String>>();
             let (self_tx, self_rx) = mpsc::channel();
             c.start_pending(path.clone(), entry_rx, etag_rx, self_rx);
 
@@ -948,11 +970,11 @@ fn get_or_list_dir(
                     &path2, PROPFIND_TIMEOUT, entry_tx, self_tx,
                 ) {
                     Ok(etag) => {
-                        let _ = etag_tx.send(etag);
+                        let _ = etag_tx.send(Ok(etag));
                     }
                     Err(e) => {
                         log::warn!("incremental list {}: {}", path2.display(), e);
-                        let _ = etag_tx.send(None);
+                        let _ = etag_tx.send(Err(e.to_string()));
                     }
                 }
                 // Wake any threads waiting in get_or_list_dir for this path.
@@ -972,13 +994,15 @@ fn get_or_list_dir(
     loop {
         {
             let mut c = cache.safe_lock();
-            if let Some(snapshot) = c.get_pending_snapshot(&path) {
-                if !snapshot.is_empty() && !was_invalidated {
+            match c.get_pending_snapshot(&path) {
+                Err(e) => return Err(e),
+                Ok(Some(snapshot)) if !snapshot.is_empty() && !was_invalidated => {
                     if poll_iters > 2 { log::debug!("LIST_STREAM_WAIT {} iters before stream", poll_iters); }
                     log::info!("LIST_STREAM {} ({} entries) in {:?}", path.display(), snapshot.len(), t0.elapsed());
                     let se = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
                     return Ok((Arc::new(snapshot), se));
                 }
+                Ok(_) => {}
             }
             if c.dir_cache.get(&path).map_or(false, |e| !e.invalidated) {
                 let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
@@ -1015,7 +1039,7 @@ fn get_or_list_dir(
         false
     };
     if should_promote {
-        let se = c.promote_pending(&path);
+        let se = c.promote_pending(&path)?;
         if let Some((files, _)) = c.get_cached_dir(&path, ttl) {
             return Ok((files, se));
         }
@@ -1251,10 +1275,10 @@ fn start_background_propfind(
             // _permit (prefetch throttle slot) released here, before chaining children
         };
         match result {
-            Ok(etag) => { let _ = etag_tx.send(etag); }
+            Ok(etag) => { let _ = etag_tx.send(Ok(etag)); }
             Err(e) => {
                 log::debug!("bg propfind {}: {}", path.display(), e);
-                let _ = etag_tx.send(None);
+                let _ = etag_tx.send(Err(e.to_string()));
                 pending_notify2.1.notify_all();
                 schedule_save_dir_cache(&cache2);
                 return;
@@ -2286,6 +2310,7 @@ impl Filesystem for NextCloudFs {
         let exclude_folders = self.exclude_folders.clone();
         let thumb_inflight = self.thumb_inflight.clone();
         let cleanup_stale_gio_temps = self.cleanup_stale_gio_temps;
+        let elog = self.error_log.clone();
 
         thread::spawn(move || {
             if offset == 0 {
@@ -2574,6 +2599,14 @@ impl Filesystem for NextCloudFs {
                 }
                 Err(e) => {
                     log::error!("readdir {}: {}", path.display(), e);
+                    let kind = if e.contains("401") || e.contains("403")
+                        || e.contains("Unauthorized") || e.contains("Forbidden")
+                    {
+                        SyncErrorKind::PermissionDenied
+                    } else {
+                        SyncErrorKind::NetworkError
+                    };
+                    push_error(&elog, path.clone(), kind, e.clone());
                     reply.error(error_to_errno(&e));
                 }
             }
