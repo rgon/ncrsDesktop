@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.4...ncrs-v0.1.5) (2026-07-10)
+
+
+### Features
+
+* **preview:** fetch thumbnails for RAW camera formats regardless of has_preview flag ([98a92cf](https://github.com/rgon/ncrsDesktop/commit/98a92cf03e6bcd3b0c5853d8a92d2bf189bf5e1c))
+
 ## [0.1.4](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.3...ncrs-v0.1.4) (2026-07-09)
 
 
