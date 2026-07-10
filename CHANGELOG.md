@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.6](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.5...ncrs-v0.1.6) (2026-07-10)
+
+
+### Bug Fixes
+
+* **preview:** throttle on-demand RAW thumbnail fetches to avoid starving FUSE HTTP workers ([8473f2b](https://github.com/rgon/ncrsDesktop/commit/8473f2b5561834a7d88d7f690278ac8d36e345a4))
+
+
+### Performance Improvements
+
+* **fuse:** deduplicate concurrent thumbnail-prefetch threads per directory ([861178d](https://github.com/rgon/ncrsDesktop/commit/861178d061c8e324f42488e0bca599a80f400bf6))
+* **fuse:** defer O(n) map retain() calls to after reply.ok() in readdir ([a85c2dd](https://github.com/rgon/ncrsDesktop/commit/a85c2dd7bd4c134c429d629e4283ec75c83d499a))
+* **fuse:** release cache lock before reply.add() loop to unblock concurrent getattr ([fdb907a](https://github.com/rgon/ncrsDesktop/commit/fdb907aa2ff00dce64b3eeac39ddc7edeb683c70))
+* **fuse:** short-circuit second metadata() stat when kept_path already matches ([3769185](https://github.com/rgon/ncrsDesktop/commit/37691851b3affb90558a3e2a4e10422d50980f18))
+* **nautilus:** avoid FUSE utimes upcall for M-type FILE_CHANGES events ([396829b](https://github.com/rgon/ncrsDesktop/commit/396829b0249342a85a27e2cec43dcf44057fbf82))
+* **nautilus:** guard poll loop against backpressure when daemon is slow ([30c32c0](https://github.com/rgon/ncrsDesktop/commit/30c32c044bfbff679bfd87f6f142d8e53ed7bcc5))
+* **nautilus:** make update_file_info async via update_file_info_full + IN_PROGRESS ([bd1eaa8](https://github.com/rgon/ncrsDesktop/commit/bd1eaa82771e431758a4c4665b96b69b8ae528ca))
+* **nautilus:** remove per-file STATUS queries from get_file_items GTK thread ([2dcc8fb](https://github.com/rgon/ncrsDesktop/commit/2dcc8fb21869a6411c5f129d4e17544fae590a02))
+* **nautilus:** replace blocking _poll_keep_done loop with GLib timeout ([4a937c0](https://github.com/rgon/ncrsDesktop/commit/4a937c0821b9182e3981bfe38c438f56695ffa9d))
+* **preview:** write thumbnail via tmp+rename to prevent concurrent corruption ([8e5227d](https://github.com/rgon/ncrsDesktop/commit/8e5227d7784743e8e029299f232670054268462a))
+
 ## [0.1.5](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.4...ncrs-v0.1.5) (2026-07-10)
 
 
