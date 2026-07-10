@@ -50,7 +50,7 @@ _EMBLEM_UPLOADING = "emblem-synchronizing"  # circular arrows — upload in prog
 
 SOCKET_TIMEOUT = 2.0  # seconds
 
-_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ncrs-nautilus")
+_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="ncrs-nautilus")
 
 # Nextcloud oc:permissions flag letters → human labels.
 # G = readable, W = writable, C = can create, D = can delete,

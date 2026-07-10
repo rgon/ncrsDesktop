@@ -2539,6 +2539,24 @@ impl Filesystem for NextCloudFs {
                         if reply.add(ino, off, kind, &name) { break; }
                     }
 
+                    // Pre-populate detail/shared/fileid maps before reply.ok() so that
+                    // Nautilus extension DETAIL queries arriving immediately after the
+                    // kernel receives the listing find fresh data. No retain() here to
+                    // avoid adding O(total_cached) latency to the readdir response; the
+                    // post-reply block below still runs retain() to evict stale entries.
+                    {
+                        let mut sh = shared.safe_lock();
+                        for p in &shared_paths { sh.insert(p.clone()); }
+                    }
+                    {
+                        let mut fi = fileids.safe_lock();
+                        for (p, fid) in &fileid_paths { fi.insert(p.clone(), *fid); }
+                    }
+                    {
+                        let mut dt = details.safe_lock();
+                        for (p, d) in &detail_entries { dt.insert(p.clone(), d.clone()); }
+                    }
+
                     log::info!("READDIR {} reply.ok() at {:?}", path.display(), t_readdir.elapsed());
                     reply.ok();
                     schedule_save_dir_cache(&cache);
