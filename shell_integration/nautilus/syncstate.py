@@ -285,12 +285,17 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
     def __init__(self):
         super().__init__()
         self._mount = _load_mount_point()
+        self._poll_running = False
         GLib.timeout_add_seconds(2, self._poll_changes)
 
     def _poll_changes(self) -> bool:
+        if self._poll_running:
+            return True
+        self._poll_running = True
         try:
             _POOL.submit(self._do_poll_changes)
         except Exception:
+            self._poll_running = False
             _log_error("_poll_changes submit")
         return True
 
@@ -340,6 +345,8 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             GLib.idle_add(_invalidate)
         except Exception:
             _log_error("_poll_changes")
+        finally:
+            self._poll_running = False
 
     def update_file_info(self, file_info):
         try:
