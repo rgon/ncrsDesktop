@@ -7,7 +7,7 @@
     import { listen } from "@tauri-apps/api/event";
 
     import {
-        mdiFolder, mdiAppsBox, mdiPlus, mdiAccountCog,
+        mdiFolder, mdiAppsBox, mdiAccountCog, mdiLogout,
         mdiChevronDown, mdiClose, mdiMagnify, mdiBell,
         mdiBellOutline, mdiAlertCircleOutline, mdiCog,
     } from '@mdi/js';
@@ -124,6 +124,12 @@
         await invoke("close_window");
     }
 
+    async function doLogout() {
+        await invoke("logout");
+        activeView = "login";
+        userInfo = null;
+    }
+
     async function openFolder() {
         await invoke("open_mount_folder");
     }
@@ -220,6 +226,11 @@
             loadInfo();
         });
 
+        const unlistenAuthCleared = listen("auth-cleared", () => {
+            activeView = "login";
+            userInfo = null;
+        });
+
         const storageInterval = setInterval(() => {
             invoke<StorageStats>("get_storage_stats").then(s => { storage = s; }).catch(() => {});
         }, 30_000);
@@ -244,6 +255,7 @@
             unlistenConflicts.then(f => f());
             unlistenPluginNav.then(f => f());
             unlistenLoginComplete.then(f => f());
+            unlistenAuthCleared.then(f => f());
             clearInterval(storageInterval);
             document.removeEventListener("pointerdown", clickOutListener);
             document.removeEventListener("keydown", escKeyListener);
@@ -291,8 +303,8 @@
                             <Icon class="w-4 h-4 mr-2" path={mdiAccountCog} /> {userInfo?.username ?? "—"}
                         </button></li>
                         <li class="text-xs text-gray-400 px-2 py-1 truncate">{userInfo?.server_url ?? ""}</li>
-                        <li><button onclick={() => false}>
-                            <Icon class="w-4 h-4 mr-2" path={mdiPlus} /> Add account
+                        <li><button onclick={doLogout}>
+                            <Icon class="w-4 h-4 mr-2" path={mdiLogout} /> Log out
                         </button></li>
                     </ul>
                 </div>

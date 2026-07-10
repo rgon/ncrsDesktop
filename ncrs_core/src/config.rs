@@ -274,6 +274,18 @@ pub fn save_password_to_keyring(username: &str, url: &str, password: &str) -> Re
     Ok(())
 }
 
+/// Remove the stored app password from the system keyring.
+pub fn delete_password_from_keyring(username: &str, url: &str) -> Result<(), String> {
+    let account = keyring_account(username, url);
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
+        .map_err(|e| format!("keyring init for {}: {}", account, e))?;
+    entry
+        .delete_password()
+        .map_err(|e| format!("keyring delete failed for {}: {}", account, e))?;
+    log::info!("deleted credentials from keyring for {}", account);
+    Ok(())
+}
+
 // ── Config loading ────────────────────────────────────────────────────────────
 
 pub fn load_config() -> Result<MountOptions, String> {

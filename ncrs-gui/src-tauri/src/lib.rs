@@ -112,6 +112,23 @@ async fn remount(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), 
     Ok(())
 }
 
+#[tauri::command]
+async fn logout(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    // Remove stored credentials so the next startup shows the login view.
+    if let Ok(opts) = ncrs_core::config::load_config() {
+        if let Some(user) = opts.username.as_deref() {
+            if let Err(e) = ncrs_core::config::delete_password_from_keyring(user, &opts.url) {
+                log::warn!("logout: keyring delete: {}", e);
+            }
+        }
+    }
+    // Clear in-memory state so remount won't reuse stale options.
+    *state.mount_options.lock().unwrap() = None;
+    *state.sync_state.lock().unwrap() = SyncState::Unmounted;
+    app.emit("auth-cleared", ()).ok();
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 pub struct UserInfo {
     pub username: String,
@@ -662,6 +679,7 @@ pub fn run() {
             get_storage_stats,
             get_plugin_metas,
             remount,
+            logout,
             get_config_values,
             save_config_values,
             get_app_version,
