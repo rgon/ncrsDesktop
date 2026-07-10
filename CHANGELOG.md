@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.8](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.7...ncrs-v0.1.8) (2026-07-10)
+
+
+### Features
+
+* **http:** probe HTTP/3 at startup, fall back to HTTP/2 if QUIC unavailable ([8adc9b2](https://github.com/rgon/ncrsDesktop/commit/8adc9b22765a3b51f5449f33458c333b57ac5b1e))
+* **settings:** add GNOME GIO intermediate auto-cleanup toggle ([7fa2692](https://github.com/rgon/ncrsDesktop/commit/7fa269218da1f2c84aa6692e0cd21d165dd2e645))
+
+
+### Bug Fixes
+
+* **core:** surface PROPFIND auth/network errors to readdir and GUI error log ([1c06516](https://github.com/rgon/ncrsDesktop/commit/1c065164e60df6aafa3b8b857958114814255b7b))
+* **http:** correct misleading http3 alt-svc comment and hint ([dfd851c](https://github.com/rgon/ncrsDesktop/commit/dfd851c8edf2558d22f954859c33d688497ed2b5))
+* **http:** remove http3_prior_knowledge; use alt-svc negotiation instead ([239809c](https://github.com/rgon/ncrsDesktop/commit/239809ccbe2a97b1fd92fb6a48237ad2a62c441b))
+
 ## [0.1.7](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.6...ncrs-v0.1.7) (2026-07-10)
 
 
