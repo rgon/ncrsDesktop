@@ -2268,22 +2268,24 @@ impl Filesystem for NextCloudFs {
             // Continuation pages (offset > 0): serve directly from cache, skip all heavy work.
             if offset > 0 {
                 let skip = (offset - 2) as usize;
-                let c = cache.safe_lock();
-                if let Some(entries) = c.get_cached_dir_readonly(&path) {
-                    for (i, entry) in entries.iter().enumerate().skip(skip) {
-                        let name = match entry.path.file_name().and_then(|n| n.to_str()) {
-                            Some(n) => n,
-                            None => continue,
-                        };
-                        let entry_path = path.join(name);
-                        if entry.is_dir && exclude_folders.contains(&entry_path) { continue; }
-                        let entry_ino = c.get_inode(&entry_path).unwrap_or(1);
-                        let kind =
-                            if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                        if reply.add(INodeNo(entry_ino), (i + 3) as u64, kind, name) {
-                            break;
-                        }
+                // Collect under a short lock, then reply outside it so concurrent
+                // getattr/lookup calls aren't blocked while the kernel drains pages.
+                let rows: Vec<(INodeNo, u64, FileType, String)> = {
+                    let c = cache.safe_lock();
+                    match c.get_cached_dir_readonly(&path) {
+                        Some(entries) => entries.iter().enumerate().skip(skip).filter_map(|(i, entry)| {
+                            let name = entry.path.file_name().and_then(|n| n.to_str())?.to_string();
+                            let entry_path = path.join(&name);
+                            if entry.is_dir && exclude_folders.contains(&entry_path) { return None; }
+                            let ino = c.get_inode(&entry_path).unwrap_or(1);
+                            let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
+                            Some((INodeNo(ino), (i + 3) as u64, kind, name))
+                        }).collect(),
+                        None => vec![],
                     }
+                };
+                for (ino, off, kind, name) in rows {
+                    if reply.add(ino, off, kind, &name) { break; }
                 }
                 reply.ok();
                 return;
@@ -2449,22 +2451,21 @@ impl Filesystem for NextCloudFs {
                         }
                     }
 
-                    {
+                    // Collect inode/kind/name under a short lock, then call reply.add()
+                    // outside it so concurrent getattr/lookup aren't blocked for all N entries.
+                    let reply_rows: Vec<(INodeNo, u64, FileType, String)> = {
                         let c = cache.safe_lock();
-                        for (i, entry) in entries.iter().enumerate() {
-                            let name = match entry.path.file_name().and_then(|n| n.to_str()) {
-                                Some(n) => n,
-                                None => continue,
-                            };
-                            let entry_path = path.join(name);
-                            if entry.is_dir && exclude_folders.contains(&entry_path) { continue; }
-                            let entry_ino = c.get_inode(&entry_path).unwrap_or(1);
-                            let kind =
-                                if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                            if reply.add(INodeNo(entry_ino), (i + 3) as u64, kind, name) {
-                                break;
-                            }
-                        }
+                        entries.iter().enumerate().filter_map(|(i, entry)| {
+                            let name = entry.path.file_name().and_then(|n| n.to_str())?.to_string();
+                            let entry_path = path.join(&name);
+                            if entry.is_dir && exclude_folders.contains(&entry_path) { return None; }
+                            let ino = c.get_inode(&entry_path).unwrap_or(1);
+                            let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
+                            Some((INodeNo(ino), (i + 3) as u64, kind, name))
+                        }).collect()
+                    };
+                    for (ino, off, kind, name) in reply_rows {
+                        if reply.add(ino, off, kind, &name) { break; }
                     }
 
                     log::info!("READDIR {} reply.ok() at {:?}", path.display(), t_readdir.elapsed());
