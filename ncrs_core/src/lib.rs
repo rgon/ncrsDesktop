@@ -1458,6 +1458,32 @@ pub struct NextCloudFs {
     cleanup_stale_gio_temps: bool,
 }
 
+/// Returns true if the server at `base_url` responds over QUIC within 3 s.
+/// Any HTTP status counts as success — we're testing transport, not auth.
+fn probe_http3(base_url: &str) -> bool {
+    let client = match reqwest::blocking::Client::builder()
+        .http3_prior_knowledge()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("HTTP/3 probe: could not build client: {}", e);
+            return false;
+        }
+    };
+    match client.head(base_url).send() {
+        Ok(resp) => {
+            log::info!("HTTP/3 probe succeeded ({}): {}", resp.status().as_u16(), base_url);
+            true
+        }
+        Err(e) => {
+            log::warn!("HTTP/3 probe failed, using HTTP/2: {}", e);
+            false
+        }
+    }
+}
+
 impl NextCloudFs {
     pub fn new(options: MountOptions) -> Result<Self, String> {
         let creds = options.credentials()?;
@@ -1522,12 +1548,18 @@ impl NextCloudFs {
         let fileids: ipc::FileIdMap = Arc::new(Mutex::new(HashMap::new()));
         let details: ipc::FileDetailMap = Arc::new(Mutex::new(HashMap::new()));
 
-        let http_builder = reqwest::blocking::Client::builder()
+        let base_url = notifications::base_url(&options.url);
+        let use_http3 = options.http3 && !options.offline && probe_http3(&base_url);
+
+        let mut http_builder = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(16);
-        let read_builder = reqwest::blocking::Client::builder()
+        let mut read_builder = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(8)
             .tcp_nodelay(true);
-        let _ = options.http3; // reserved; reqwest blocking client requires prior_knowledge for h3
+        if use_http3 {
+            http_builder = http_builder.http3_prior_knowledge();
+            read_builder = read_builder.http3_prior_knowledge();
+        }
         let http = http_builder.build()
             .map_err(|e| format!("HTTP client: {}", e))?;
         let http_read = read_builder.build()
@@ -1537,7 +1569,6 @@ impl NextCloudFs {
         log::info!("HTTP throttle: max {} concurrent requests", max_req);
         let is_offline = Arc::new(AtomicBool::new(options.offline));
 
-        let base_url = notifications::base_url(&options.url);
         let backend: Arc<dyn crate::backend::CloudBackend> = if options.offline {
             Arc::new(crate::nextcloud::NextcloudBackend::new_offline(
                 base_url.clone(),
@@ -1545,7 +1576,7 @@ impl NextCloudFs {
                 creds.clone(),
                 http.clone(),
                 http_read.clone(),
-                options.http3,
+                use_http3,
             ))
         } else {
             Arc::new(crate::nextcloud::NextcloudBackend::new(
@@ -1554,7 +1585,7 @@ impl NextCloudFs {
                 creds.clone(),
                 http.clone(),
                 http_read.clone(),
-                options.http3,
+                use_http3,
             )?)
         };
 
