@@ -130,7 +130,7 @@
                         </div>
                         <div class="flex flex-col gap-0.5 flex-shrink-0 self-start">
                             <button
-                                class="btn btn-ghost btn-xs p-0.5 opacity-50 hover:opacity-100"
+                                class="inline-flex items-center justify-center w-6 h-6 rounded opacity-40 hover:opacity-100 bg-transparent border-0 cursor-pointer"
                                 onclick={() => toggleError(i)}
                                 aria-label={expanded ? 'Collapse' : 'Show full path and message'}
                                 title={expanded ? 'Collapse' : 'Show full path and message'}
@@ -138,7 +138,7 @@
                                 <Icon class="w-3.5 h-3.5 transition-transform {expanded ? 'rotate-180' : ''}" path={mdiChevronDown} />
                             </button>
                             <button
-                                class="btn btn-ghost btn-xs p-0.5 opacity-50 hover:opacity-100"
+                                class="inline-flex items-center justify-center w-6 h-6 rounded opacity-40 hover:opacity-100 bg-transparent border-0 cursor-pointer"
                                 onclick={() => ondismissone(err.timestamp_ms)}
                                 aria-label="Dismiss"
                                 title="Dismiss"
@@ -168,7 +168,7 @@
                             <p class="text-xs opacity-80 mt-0.5">{desc.detail}</p>
                         </div>
                         <button
-                            class="btn btn-ghost btn-xs flex-shrink-0"
+                            class="inline-flex items-center justify-center w-6 h-6 rounded flex-shrink-0 opacity-40 hover:opacity-100 bg-transparent border-0 cursor-pointer self-start"
                             onclick={() => onresolve(conflict.id)}
                             aria-label="Dismiss"
                         >
