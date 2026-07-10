@@ -2309,8 +2309,11 @@ impl Filesystem for NextCloudFs {
 
                     let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
 
-                    {
-                        // Collect entry paths and allocate inodes (short cache lock)
+                    // Build per-entry metadata vectors and allocate inodes.
+                    // Map updates (retain+insert on shared/fileids/details/status) are
+                    // deferred to after reply.ok() so the kernel gets the directory listing
+                    // back without waiting for O(total_cached) retain() scans.
+                    let (shared_paths, fileid_paths, detail_entries, status_entries, cache_entries) = {
                         let (kept_dir, auto_cache_dir) = {
                             let mut c = cache.safe_lock();
                             for entry in entries.iter() {
@@ -2385,7 +2388,35 @@ impl Filesystem for NextCloudFs {
                             }
                         }
 
-                        // Evict stale entries for this directory, then insert fresh ones
+                        (shared_paths, fileid_paths, detail_entries, status_entries, cache_entries)
+                    };
+
+                    // Collect inode/kind/name under a short lock, then call reply.add()
+                    // outside it so concurrent getattr/lookup aren't blocked for all N entries.
+                    let reply_rows: Vec<(INodeNo, u64, FileType, String)> = {
+                        let c = cache.safe_lock();
+                        entries.iter().enumerate().filter_map(|(i, entry)| {
+                            let name = entry.path.file_name().and_then(|n| n.to_str())?.to_string();
+                            let entry_path = path.join(&name);
+                            if entry.is_dir && exclude_folders.contains(&entry_path) { return None; }
+                            let ino = c.get_inode(&entry_path).unwrap_or(1);
+                            let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
+                            Some((INodeNo(ino), (i + 3) as u64, kind, name))
+                        }).collect()
+                    };
+                    for (ino, off, kind, name) in reply_rows {
+                        if reply.add(ino, off, kind, &name) { break; }
+                    }
+
+                    log::info!("READDIR {} reply.ok() at {:?}", path.display(), t_readdir.elapsed());
+                    reply.ok();
+                    schedule_save_dir_cache(&cache);
+
+                    // ── Map updates (after reply.ok()) ────────────────────────────────
+                    // Evict stale entries for this directory, then insert fresh ones.
+                    // Runs after reply.ok() so O(total_cached) retain() scans don't
+                    // add latency before the kernel gets the directory listing back.
+                    {
                         let is_child_of_dir = |p: &PathBuf| p == &path || p.parent() == Some(&path);
                         {
                             let mut sh = shared.safe_lock();
@@ -2442,35 +2473,15 @@ impl Filesystem for NextCloudFs {
                             // dirty notifications via notify_push when they change.
                             // Inserting all N children here floods the CHANGES queue and
                             // triggers a cascade of GIO attribute invalidations in Nautilus.
-                            dirty.safe_lock().insert(path.clone());
+                            let mut d = dirty.safe_lock();
+                            d.insert(path.clone());
                             // Additionally dirty recently uploaded files so Nautilus re-queries
                             // them and picks up NC properties from the freshly populated detail_map.
                             for p in upload_paths {
-                                dirty.safe_lock().insert(p);
+                                d.insert(p);
                             }
                         }
                     }
-
-                    // Collect inode/kind/name under a short lock, then call reply.add()
-                    // outside it so concurrent getattr/lookup aren't blocked for all N entries.
-                    let reply_rows: Vec<(INodeNo, u64, FileType, String)> = {
-                        let c = cache.safe_lock();
-                        entries.iter().enumerate().filter_map(|(i, entry)| {
-                            let name = entry.path.file_name().and_then(|n| n.to_str())?.to_string();
-                            let entry_path = path.join(&name);
-                            if entry.is_dir && exclude_folders.contains(&entry_path) { return None; }
-                            let ino = c.get_inode(&entry_path).unwrap_or(1);
-                            let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                            Some((INodeNo(ino), (i + 3) as u64, kind, name))
-                        }).collect()
-                    };
-                    for (ino, off, kind, name) in reply_rows {
-                        if reply.add(ino, off, kind, &name) { break; }
-                    }
-
-                    log::info!("READDIR {} reply.ok() at {:?}", path.display(), t_readdir.elapsed());
-                    reply.ok();
-                    schedule_save_dir_cache(&cache);
 
                     if offset == 0 {
                         if !thumb_candidates.is_empty() {
