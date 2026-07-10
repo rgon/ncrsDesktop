@@ -461,13 +461,10 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# but avoids re-downloading the same file on repeated access.\n");
     content.push_str(&format!("cache_streamed_reads: {}\n", settings.cache_streamed_reads));
     content.push_str("# GTK/GIO apps write files atomically via a .goutputstream-* or .xdp-* temp file\n");
-    content.push_str("# that is renamed to the final name within seconds. When enabled, ncRS silently\n");
-    content.push_str("# deletes any such file still on the server after stale_gio_temp_mins minutes —\n");
-    content.push_str("# these are orphans left by a crashed copy operation.\n");
+    content.push_str("# that is renamed to the final name within seconds. When enabled, ncRS deletes\n");
+    content.push_str("# any such file found on the server immediately and never lists them to the file\n");
+    content.push_str("# manager. Orphans from crashed copies are cleaned up on the next directory open.\n");
     content.push_str(&format!("cleanup_stale_gio_temps: {}\n", settings.cleanup_stale_gio_temps));
-    content.push_str("# Age threshold for the cleanup above, in minutes. Values below 1 risk deleting\n");
-    content.push_str("# a file mid-write; values above 60 leave orphans sitting longer than needed.\n");
-    content.push_str("# Recommended range: 5–30. Default: 10.\n");
     content.push_str(&format!("stale_gio_temp_mins: {}\n", settings.stale_gio_temp_mins));
 
     if let Some(dir) = path.parent() {
