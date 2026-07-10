@@ -146,7 +146,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
         PathBuf::from(doc["mount_point"].as_str().unwrap_or("/media/ncrs_mount"));
     let log_user = doc["user"].as_str().unwrap_or("default_user").to_string();
     let aggressive_prefetch = doc["aggressive_prefetch"].as_bool().unwrap_or(false);
-    let http3 = doc["http3"].as_bool().unwrap_or(false);
+    let http3 = doc["http3"].as_bool().unwrap_or(true);
     let max_concurrent_requests = doc["max_concurrent_requests"].as_i64().unwrap_or(10) as usize;
     let optimistic_listing = doc["optimistic_listing"].as_bool().unwrap_or(true);
     let auto_keep_locally_modified_files = doc["auto_keep_locally_modified_files"].as_bool().unwrap_or(false);
@@ -343,7 +343,7 @@ impl Default for ConfigSettings {
                 .to_string_lossy()
                 .into_owned(),
             aggressive_prefetch: false,
-            http3: false,
+            http3: true,
             max_concurrent_requests: 10,
             optimistic_listing: true,
             auto_keep_locally_modified_files: false,
@@ -425,9 +425,16 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str(&format!("mount_point: {:?}\n", settings.mount_point));
     content.push_str(&format!("user: {:?}\n", log_user));
     content.push('\n');
+    content.push_str("# When enabled, ncRS pre-fetches metadata and thumbnails for every entry in a\n");
+    content.push_str("# directory as soon as it is listed, even before the files are opened. Speeds\n");
+    content.push_str("# up browsing but increases network traffic on large directories.\n");
     content.push_str(&format!("aggressive_prefetch: {}\n", settings.aggressive_prefetch));
     content.push_str(&format!("http3: {}\n", settings.http3));
     content.push_str(&format!("max_concurrent_requests: {}\n", settings.max_concurrent_requests));
+    content.push_str("# When enabled, directory listings are returned immediately from the local cache\n");
+    content.push_str("# while a background refresh fetches the latest contents from the server.\n");
+    content.push_str("# Keeps the file manager responsive; disable if you need listings to always\n");
+    content.push_str("# reflect the current server state before rendering.\n");
     content.push_str(&format!("optimistic_listing: {}\n", settings.optimistic_listing));
     content.push_str(&format!("auto_keep_locally_modified_files: {}\n", settings.auto_keep_locally_modified_files));
     content.push_str(&format!("auto_keep_cached_files: {}\n", settings.auto_keep_cached_files));
@@ -435,6 +442,9 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str(&format!("cache_max_size_bytes: {}\n", settings.cache_max_size_bytes));
     content.push_str(&format!("cache_auto_purge_days: {}\n", settings.cache_auto_purge_days));
     content.push_str(&format!("cache_cleanup_interval_secs: {}\n", settings.cache_cleanup_interval_secs));
+    content.push_str("# When enabled, file data read via streaming (e.g. media playback) is saved to\n");
+    content.push_str("# the local cache so subsequent opens are served from disk. Increases disk usage\n");
+    content.push_str("# but avoids re-downloading the same file on repeated access.\n");
     content.push_str(&format!("cache_streamed_reads: {}\n", settings.cache_streamed_reads));
 
     if let Some(dir) = path.parent() {
