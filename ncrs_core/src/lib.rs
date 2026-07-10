@@ -578,6 +578,10 @@ use std::sync::atomic::AtomicU64;
 static SAVE_SCHEDULED: AtomicU64 = AtomicU64::new(0);
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 
+fn is_gio_temp_file(name: &str) -> bool {
+    name.starts_with(".goutputstream-") || name.starts_with(".xdp-")
+}
+
 fn schedule_save_dir_cache(cache: &Arc<Mutex<FsCache>>) {
     let now = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1427,6 +1431,8 @@ pub struct NextCloudFs {
     cache_streamed_reads: bool,
     exclude_folders: HashSet<PathBuf>,
     thumb_inflight: Arc<Mutex<HashSet<PathBuf>>>,
+    cleanup_stale_gio_temps: bool,
+    stale_gio_temp_mins: u64,
 }
 
 impl NextCloudFs {
@@ -1592,6 +1598,8 @@ impl NextCloudFs {
             cache_streamed_reads: options.cache_streamed_reads,
             exclude_folders,
             thumb_inflight: Arc::new(Mutex::new(HashSet::new())),
+            cleanup_stale_gio_temps: options.cleanup_stale_gio_temps,
+            stale_gio_temp_mins: options.stale_gio_temp_mins,
         })
     }
 
@@ -2255,6 +2263,8 @@ impl Filesystem for NextCloudFs {
         let aggressive_prefetch = self.aggressive_prefetch;
         let exclude_folders = self.exclude_folders.clone();
         let thumb_inflight = self.thumb_inflight.clone();
+        let cleanup_stale_gio_temps = self.cleanup_stale_gio_temps;
+        let stale_gio_temp_mins = self.stale_gio_temp_mins;
 
         thread::spawn(move || {
             if offset == 0 {
@@ -2298,6 +2308,45 @@ impl Filesystem for NextCloudFs {
             match get_or_list_dir(&conn, &cache, path.clone()) {
                 Ok((entries, self_entry)) => {
                     log::info!("READDIR {} get_or_list_dir returned {} entries in {:?}", path.display(), entries.len(), t_readdir.elapsed());
+
+                    // GIO (GTK's I/O layer) writes files atomically via a temp file that is
+                    // renamed to the final name within seconds. If the originating app
+                    // crashed the temp stays on the server permanently. Filter them from
+                    // the listing so Nautilus's thumbnailer never reads them; when
+                    // cleanup_stale_gio_temps is on, delete the old ones in the background.
+                    if cleanup_stale_gio_temps {
+                        let threshold = stale_gio_temp_mins * 60;
+                        let stale: Vec<PathBuf> = entries.iter()
+                            .filter(|e| {
+                                let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                is_gio_temp_file(name) && e.modified
+                                    .and_then(|m| m.elapsed().ok())
+                                    .map(|a| a.as_secs() >= threshold)
+                                    .unwrap_or(false)
+                            })
+                            .map(|e| e.path.clone())
+                            .collect();
+                        if !stale.is_empty() {
+                            log::info!("purging {} stale GIO temp(s) in {}", stale.len(), path.display());
+                            let conn2 = conn.clone();
+                            thread::spawn(move || {
+                                for p in stale {
+                                    if let Err(e) = conn2.backend.delete(&p) {
+                                        log::debug!("stale GIO temp delete {}: {}", p.display(), e);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    // Shadow with a filtered Vec so downstream code (reply_rows, status
+                    // map, thumb_candidates) never sees GIO temp entries.
+                    let entries: Vec<RemoteEntry> = entries.iter()
+                        .filter(|e| {
+                            let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            !is_gio_temp_file(name)
+                        })
+                        .cloned()
+                        .collect();
 
                     // Kick off background PROPFINDs for child dirs (opt-in via
                     // aggressive_prefetch; off by default until the serialisation

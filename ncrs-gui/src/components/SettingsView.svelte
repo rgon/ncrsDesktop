@@ -15,6 +15,8 @@
         cache_auto_purge_days: number;
         cache_cleanup_interval_secs: number;
         cache_streamed_reads: boolean;
+        cleanup_stale_gio_temps: boolean;
+        stale_gio_temp_mins: number;
     }
 
     let { forced = false }: { forced?: boolean } = $props();

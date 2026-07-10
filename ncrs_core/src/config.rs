@@ -44,6 +44,10 @@ pub struct MountOptions {
     pub keep_paths: Vec<String>,
     #[serde(default)]
     pub exclude_folders: Vec<String>,
+    #[serde(default = "default_true")]
+    pub cleanup_stale_gio_temps: bool,
+    #[serde(default = "default_stale_gio_temp_mins")]
+    pub stale_gio_temp_mins: u64,
 }
 
 impl std::fmt::Debug for MountOptions {
@@ -122,6 +126,8 @@ fn default_cache_purge_days() -> u32 { 10 }
 
 fn default_cache_cleanup_interval() -> u64 { 3600 }
 
+fn default_stale_gio_temp_mins() -> u64 { 10 }
+
 // ── YAML parser ───────────────────────────────────────────────────────────────
 
 pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
@@ -162,8 +168,10 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let exclude_folders = doc["exclude_folders"].as_vec()
         .map(|v| v.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
+    let cleanup_stale_gio_temps = doc["cleanup_stale_gio_temps"].as_bool().unwrap_or(true);
+    let stale_gio_temp_mins = doc["stale_gio_temp_mins"].as_i64().map(|v| v as u64).unwrap_or(10);
 
-    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders })
+    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
@@ -332,6 +340,8 @@ pub struct ConfigSettings {
     pub cache_auto_purge_days: u32,
     pub cache_cleanup_interval_secs: u64,
     pub cache_streamed_reads: bool,
+    pub cleanup_stale_gio_temps: bool,
+    pub stale_gio_temp_mins: u64,
 }
 
 impl Default for ConfigSettings {
@@ -353,6 +363,8 @@ impl Default for ConfigSettings {
             cache_auto_purge_days: default_cache_purge_days(),
             cache_cleanup_interval_secs: default_cache_cleanup_interval(),
             cache_streamed_reads: false,
+            cleanup_stale_gio_temps: true,
+            stale_gio_temp_mins: 10,
         }
     }
 }
@@ -371,6 +383,8 @@ pub fn config_settings_from_opts(opts: &MountOptions) -> ConfigSettings {
         cache_auto_purge_days: opts.cache_auto_purge_days,
         cache_cleanup_interval_secs: opts.cache_cleanup_interval_secs,
         cache_streamed_reads: opts.cache_streamed_reads,
+        cleanup_stale_gio_temps: opts.cleanup_stale_gio_temps,
+        stale_gio_temp_mins: opts.stale_gio_temp_mins,
     }
 }
 
@@ -446,6 +460,15 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# the local cache so subsequent opens are served from disk. Increases disk usage\n");
     content.push_str("# but avoids re-downloading the same file on repeated access.\n");
     content.push_str(&format!("cache_streamed_reads: {}\n", settings.cache_streamed_reads));
+    content.push_str("# GTK/GIO apps write files atomically via a .goutputstream-* or .xdp-* temp file\n");
+    content.push_str("# that is renamed to the final name within seconds. When enabled, ncRS silently\n");
+    content.push_str("# deletes any such file still on the server after stale_gio_temp_mins minutes —\n");
+    content.push_str("# these are orphans left by a crashed copy operation.\n");
+    content.push_str(&format!("cleanup_stale_gio_temps: {}\n", settings.cleanup_stale_gio_temps));
+    content.push_str("# Age threshold for the cleanup above, in minutes. Values below 1 risk deleting\n");
+    content.push_str("# a file mid-write; values above 60 leave orphans sitting longer than needed.\n");
+    content.push_str("# Recommended range: 5–30. Default: 10.\n");
+    content.push_str(&format!("stale_gio_temp_mins: {}\n", settings.stale_gio_temp_mins));
 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
