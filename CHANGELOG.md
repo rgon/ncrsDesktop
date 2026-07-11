@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.11](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.10...ncrs-v0.1.11) (2026-07-11)
+
+
+### Bug Fixes
+
+* **core:** remove erroneous MKCOL 409 idempotent arm that silently dropped journal entries ([16d81e7](https://github.com/rgon/ncrsDesktop/commit/16d81e7438ba65c92462755becf5dae0ef5ddf02))
+* **nautilus:** log malformed FILE_CHANGES entries; set _poll_skip before clearing _poll_running ([e0f1562](https://github.com/rgon/ncrsDesktop/commit/e0f1562890e2e4d1cca2efb46d29ecf287f57a17))
+* **thumbnailer:** catch OSError from missing exiftool; use or-fallback for XDG_RUNTIME_DIR ([7c42d8d](https://github.com/rgon/ncrsDesktop/commit/7c42d8de732540d7dcc9df8cec9d9f12cf354ee9))
+
 ## [0.1.10](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.9...ncrs-v0.1.10) (2026-07-10)
 
 
