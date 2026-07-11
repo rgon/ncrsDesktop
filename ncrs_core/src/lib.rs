@@ -3502,8 +3502,21 @@ impl Filesystem for NextCloudFs {
                 entry.path = to.clone();
                 if let Some(dir) = c.dir_cache.get_mut(&new_parent_path) {
                     let mut files = (*dir.files).clone();
+                    // Remove any existing entry for the target path (overwrite semantics).
+                    files.retain(|f| f.path != to);
                     files.push(entry);
                     dir.files = Arc::new(files);
+                }
+            }
+            // Keep the inode-to-path map consistent with the rename. Without this,
+            // getattr(ino) resolves the inode to the old source path, finds nothing in
+            // dir_cache, and returns ENOENT — causing the renamed file to disappear.
+            if let Some(ino) = c.paths.remove(&from) {
+                c.inodes.insert(ino, to.clone());
+                if let Some(displaced) = c.paths.insert(to.clone(), ino) {
+                    if displaced != ino {
+                        c.inodes.remove(&displaced);
+                    }
                 }
             }
         }

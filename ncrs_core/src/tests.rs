@@ -1118,3 +1118,160 @@ password: "pass"
             }
         }
     }
+
+    // ── rename inode-map and dir-cache correctness ─────────────────────────────
+
+    /// Simulate exactly what the rename FUSE handler's cache-update block does, so
+    /// tests can exercise it without a live FUSE mount.
+    fn apply_rename(cache: &mut FsCache, from: &PathBuf, to: &PathBuf) {
+        let old_parent = from.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
+        let new_parent = to.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
+
+        let mut moved_entry = None;
+        if let Some(dir) = cache.dir_cache.get_mut(&old_parent) {
+            let (keep, removed): (Vec<_>, Vec<_>) =
+                dir.files.iter().cloned().partition(|e| &e.path != from);
+            dir.files = Arc::new(keep);
+            moved_entry = removed.into_iter().next();
+        }
+        if let Some(mut entry) = moved_entry {
+            entry.path = to.clone();
+            if let Some(dir) = cache.dir_cache.get_mut(&new_parent) {
+                let mut files = (*dir.files).clone();
+                files.retain(|f| &f.path != to);
+                files.push(entry);
+                dir.files = Arc::new(files);
+            }
+        }
+        if let Some(ino) = cache.paths.remove(from) {
+            cache.inodes.insert(ino, to.clone());
+            if let Some(displaced) = cache.paths.insert(to.clone(), ino) {
+                if displaced != ino {
+                    cache.inodes.remove(&displaced);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rename_inode_map_updated_after_same_dir_rename() {
+        let mut cache = make_test_cache();
+        let dir = PathBuf::from("/docs");
+        let src = dir.join(".goutputstream-abc123");
+        let dst = dir.join("report.txt");
+
+        cache.put_dir_cache(dir.clone(), None, None, vec![
+            make_dav_entry("docs/.goutputstream-abc123", None),
+            make_dav_entry("docs/report.txt", None),
+        ]);
+        let src_ino = cache.allocate_inode(src.clone());
+        let _dst_ino_old = cache.allocate_inode(dst.clone());
+
+        apply_rename(&mut cache, &src, &dst);
+
+        assert_eq!(cache.get_path(src_ino), Some(dst.clone()),
+            "inode previously assigned to temp file must resolve to renamed target");
+        assert!(cache.paths.get(&src).is_none(),
+            "source path must be removed from paths map");
+        assert_eq!(cache.paths.get(&dst), Some(&src_ino),
+            "target path must map to the renamed inode");
+    }
+
+    #[test]
+    fn rename_displaced_target_inode_removed() {
+        // When renaming A → B, if B already had an inode, that inode must be
+        // evicted from the maps so getattr(old_B_ino) doesn't ghost as B.
+        let mut cache = make_test_cache();
+        let dir = PathBuf::from("/docs");
+        let src = dir.join(".goutputstream-xyz");
+        let dst = dir.join("notes.md");
+
+        cache.put_dir_cache(dir.clone(), None, None, vec![
+            make_dav_entry("docs/.goutputstream-xyz", None),
+            make_dav_entry("docs/notes.md", None),
+        ]);
+        let src_ino = cache.allocate_inode(src.clone());
+        let old_dst_ino = cache.allocate_inode(dst.clone());
+        assert_ne!(src_ino, old_dst_ino);
+
+        apply_rename(&mut cache, &src, &dst);
+
+        assert!(cache.inodes.get(&old_dst_ino).is_none(),
+            "old inode for overwritten target must be evicted");
+    }
+
+    #[test]
+    fn rename_no_duplicate_target_in_dir_cache() {
+        // Renaming a GIO temp file over an existing file must leave exactly one
+        // entry for the target name — not two.
+        let mut cache = make_test_cache();
+        let dir = PathBuf::from("/");
+        let src = dir.join(".goutputstream-deadbeef");
+        let dst = dir.join("foo.txt");
+
+        cache.put_dir_cache(dir.clone(), None, None, vec![
+            make_dav_entry(".goutputstream-deadbeef", None),
+            make_dav_entry("foo.txt", None),
+        ]);
+        cache.allocate_inode(src.clone());
+        cache.allocate_inode(dst.clone());
+
+        apply_rename(&mut cache, &src, &dst);
+
+        let entries = cache.dir_cache.get(&dir).expect("dir must be in cache");
+        let foo_count = entries.files.iter()
+            .filter(|e| e.path.file_name().and_then(|n| n.to_str()) == Some("foo.txt"))
+            .count();
+        assert_eq!(foo_count, 1, "exactly one foo.txt entry must remain after rename");
+    }
+
+    #[test]
+    fn gio_atomic_save_inode_survives_rename() {
+        // Regression: GIO saves a file via .goutputstream-* → final-name rename.
+        // Before the fix, getattr on the renamed inode returned ENOENT because the
+        // inode still pointed at the temp-file name that had been removed from
+        // dir_cache, making the saved file disappear from the mounted directory.
+        let mut cache = make_test_cache();
+        let dir = PathBuf::from("/documents");
+        let temp = dir.join(".goutputstream-cafebabe");
+        let target = dir.join("document.odt");
+
+        // Existing file on server + temp file just created by GIO editor.
+        cache.put_dir_cache(dir.clone(), None, None, vec![
+            make_dav_entry("documents/document.odt", None),
+        ]);
+        let old_target_ino = cache.allocate_inode(target.clone());
+
+        // Simulate: FUSE create allocates inode for the temp file.
+        cache.put_dir_cache(dir.clone(), None, None, vec![
+            make_dav_entry("documents/document.odt", None),
+            make_dav_entry("documents/.goutputstream-cafebabe", None),
+        ]);
+        let temp_ino = cache.allocate_inode(temp.clone());
+        assert_ne!(temp_ino, old_target_ino);
+
+        // Simulate: FUSE rename(.goutputstream-cafebabe → document.odt).
+        apply_rename(&mut cache, &temp, &target);
+
+        // The inode the kernel holds for document.odt after the rename is temp_ino.
+        // getattr(temp_ino) must resolve to document.odt so the file is visible.
+        assert_eq!(cache.get_path(temp_ino), Some(target.clone()),
+            "temp-file inode must resolve to the final file name after atomic save");
+
+        let entries = cache.dir_cache.get(&dir).expect("dir must be in cache");
+        let odt_entries: Vec<_> = entries.files.iter()
+            .filter(|e| e.path == target)
+            .collect();
+        assert_eq!(odt_entries.len(), 1,
+            "exactly one document.odt must be in dir_cache after GIO atomic save");
+    }
+
+    #[test]
+    fn gio_temp_file_recognised_correctly() {
+        assert!(is_gio_temp_file(".goutputstream-cafebabe"));
+        assert!(is_gio_temp_file(".goutputstream-000000000000000a"));
+        assert!(is_gio_temp_file(".xdp-report.pdf-0123456789abcdef"));
+        assert!(!is_gio_temp_file("report.pdf"));
+        assert!(!is_gio_temp_file(".goutputstream"));
+        assert!(!is_gio_temp_file("goutputstream-abc"));
+    }
