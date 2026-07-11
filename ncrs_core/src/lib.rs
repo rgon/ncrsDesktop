@@ -2943,15 +2943,6 @@ impl Filesystem for NextCloudFs {
         reply.ok();
 
         if !self.conn.is_offline.load(Ordering::Relaxed) {
-            let body = match std::fs::read(&write_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("read staging file for flush: {}", e);
-                    self.status.safe_lock().remove(&remote_path);
-                    return;
-                }
-            };
-
             let conn = self.conn.clone();
             let cache = self.cache.clone();
             let dirty = self.dirty.clone();
@@ -2968,7 +2959,6 @@ impl Filesystem for NextCloudFs {
 
             thread::spawn(move || {
                 let _permit = conn.throttle.acquire();
-                let upload_size = body.len() as u64;
                 tmap.safe_lock().insert(remote_path.clone(), TransferProgress {
                     path: remote_path.clone(),
                     direction: TransferDirection::Upload,
@@ -2976,12 +2966,12 @@ impl Filesystem for NextCloudFs {
                     total_bytes: upload_size,
                 });
                 let etag_ref = original_etag.as_deref();
-                match conn.backend.put_file(&remote_path, body.clone(), etag_ref) {
+                match conn.backend.put_file_from_path(&remote_path, &write_path, etag_ref) {
                     Ok(result) => {
                         tmap.safe_lock().remove(&remote_path);
                         cache.safe_lock().uploading.remove(&remote_path);
                         log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_change_token);
-                        let new_size = body.len() as u64;
+                        let new_size = upload_size;
                         {
                             let mut c = cache.safe_lock();
                             let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
@@ -3009,13 +2999,13 @@ impl Filesystem for NextCloudFs {
                             if let Some(parent) = keep_path.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
-                            if std::fs::write(&keep_path, &body).is_ok() {
+                            if std::fs::copy(&write_path, &keep_path).is_ok() {
                                 cache.safe_lock().file_cache.insert(remote_path.clone(), FileCacheEntry {
                                     local_path: keep_path,
                                     remote_modified: Some(SystemTime::now()),
                                     etag: result.new_change_token,
                                     kept: true,
-                                    size: body.len() as u64,
+                                    size: upload_size,
                                 });
                                 smap.safe_lock().insert(remote_path.clone(), FileStatus::Kept);
                                 kept = true;
@@ -3038,7 +3028,7 @@ impl Filesystem for NextCloudFs {
                         log::warn!("CONFLICT on PUT {} — creating conflicted copy", remote_path.display());
                         push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                         let conflict_name = make_conflict_name(&remote_path);
-                        match conn.backend.put_file(&conflict_name, body, None) {
+                        match conn.backend.put_file_from_path(&conflict_name, &write_path, None) {
                             Ok(_) => log::info!("conflicted copy uploaded as {}", conflict_name.display()),
                             Err(e) => log::error!("failed to upload conflict copy: {}", e),
                         }

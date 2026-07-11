@@ -166,6 +166,17 @@ pub trait CloudBackend: Send + Sync + 'static {
         if_match: Option<&str>,
     ) -> Result<PutResult, BackendWriteError>;
 
+    fn put_file_from_path(
+        &self,
+        path: &Path,
+        staging_path: &Path,
+        if_match: Option<&str>,
+    ) -> Result<PutResult, BackendWriteError> {
+        let body = std::fs::read(staging_path)
+            .map_err(|e| BackendWriteError::Network(format!("staging read: {}", e)))?;
+        self.put_file(path, body, if_match)
+    }
+
     fn mkdir(&self, path: &Path) -> Result<(), BackendWriteError>;
 
     fn delete(&self, path: &Path) -> Result<(), BackendWriteError>;

@@ -298,6 +298,24 @@ impl CloudBackend for NextcloudBackend {
         .map_err(BackendWriteError::from)
     }
 
+    fn put_file_from_path(
+        &self,
+        path: &Path,
+        staging_path: &Path,
+        if_match: Option<&str>,
+    ) -> Result<PutResult, BackendWriteError> {
+        webdav_ops::put_file_from_path(
+            &self.http,
+            &self.base_url,
+            &self.creds,
+            path,
+            staging_path,
+            if_match,
+        )
+        .map(PutResult::from)
+        .map_err(BackendWriteError::from)
+    }
+
     fn mkdir(&self, path: &Path) -> Result<(), BackendWriteError> {
         webdav_ops::mkcol(
             &self.http,

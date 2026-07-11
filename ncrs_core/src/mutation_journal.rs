@@ -459,8 +459,8 @@ fn execute_op(
 
     match &entry.op {
         MutationOp::Put { remote_path, staging_path, if_match_etag } => {
-            let body = match std::fs::read(staging_path) {
-                Ok(b) => b,
+            let file_size = match std::fs::metadata(staging_path) {
+                Ok(m) => m.len(),
                 Err(e) => {
                     return ReplayResult::Conflict(ConflictKind::PermanentFailure {
                         description: format!("staging file unreadable for {}: {}", remote_path.display(), e),
@@ -468,7 +468,7 @@ fn execute_op(
                 }
             };
             let etag_ref = if_match_etag.as_deref();
-            match ctx.backend.put_file(remote_path, body.clone(), etag_ref) {
+            match ctx.backend.put_file_from_path(remote_path, staging_path, etag_ref) {
                 Ok(result) => {
                     log::info!("JOURNAL replay: PUT {} → token {:?}", remote_path.display(), result.new_change_token);
                     let mut c = cache.safe_lock();
@@ -477,7 +477,7 @@ fn execute_op(
                         let mut files = (*dir.files).clone();
                         if let Some(e) = files.iter_mut().find(|e| e.path == *remote_path) {
                             e.change_token = result.new_change_token;
-                            e.size = body.len() as u64;
+                            e.size = file_size;
                             e.modified = Some(SystemTime::now());
                         }
                         dir.files = Arc::new(files);
@@ -489,7 +489,7 @@ fn execute_op(
                 Err(BackendWriteError::Conflict) => {
                     log::warn!("JOURNAL replay: PUT {} conflict — creating conflicted copy", remote_path.display());
                     let conflict_name = crate::make_conflict_name(remote_path);
-                    let _ = ctx.backend.put_file(&conflict_name, body, None);
+                    let _ = ctx.backend.put_file_from_path(&conflict_name, staging_path, None);
                     crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                     ReplayResult::Conflict(ConflictKind::EditConflict {
                         local_path: remote_path.clone(),

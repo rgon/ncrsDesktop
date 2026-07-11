@@ -258,6 +258,103 @@ pub fn put_file_chunked(
     }
 }
 
+pub fn put_file_from_path(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    creds: &crate::auth::Credentials,
+    path: &Path,
+    staging_path: &Path,
+    if_match_etag: Option<&str>,
+) -> Result<PutResult, WriteError> {
+    let file_size = std::fs::metadata(staging_path)
+        .map_err(|e| WriteError::Network(format!("staging stat: {}", e)))?
+        .len() as usize;
+
+    if file_size <= CHUNK_SIZE {
+        let body = std::fs::read(staging_path)
+            .map_err(|e| WriteError::Network(format!("staging read: {}", e)))?;
+        return put_file(client, base_url, creds, path, body, if_match_etag);
+    }
+
+    let transfer_id = format!("ncrs-{}-{}", std::process::id(), std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+
+    let uploads_base = format!(
+        "{}/remote.php/dav/uploads/{}/{}",
+        base_url.trim_end_matches('/'),
+        percent_encoding::utf8_percent_encode(creds.username(), PATH_COMPONENT),
+        percent_encoding::utf8_percent_encode(&transfer_id, PATH_COMPONENT),
+    );
+
+    let resp = creds.apply(client
+        .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &uploads_base)
+        .timeout(WRITE_TIMEOUT))
+        .send()
+        .map_err(|e| WriteError::Network(format!("chunked MKCOL: {}", e)))?;
+    if !resp.status().is_success() && resp.status().as_u16() != 405 {
+        return Err(WriteError::Server(resp.status().as_u16(), resp.text().unwrap_or_default()));
+    }
+
+    let total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let mut file = std::fs::File::open(staging_path)
+        .map_err(|e| WriteError::Network(format!("staging open: {}", e)))?;
+
+    use std::io::Read;
+    for i in 0..total_chunks {
+        let chunk_size = CHUNK_SIZE.min(file_size - i * CHUNK_SIZE);
+        let mut chunk = vec![0u8; chunk_size];
+        file.read_exact(&mut chunk).map_err(|e| {
+            let _ = cleanup_chunked_upload(client, &uploads_base, creds);
+            WriteError::Network(format!("staging read chunk {}: {}", i, e))
+        })?;
+
+        let chunk_url = format!("{}/{:010}", uploads_base, i);
+        log::info!("CHUNKED_UPLOAD {}/{} ({} bytes)", i + 1, total_chunks, chunk.len());
+        let resp = creds.apply(client
+            .put(&chunk_url)
+            .timeout(CHUNK_UPLOAD_TIMEOUT))
+            .body(chunk)
+            .send()
+            .map_err(|e| {
+                let _ = cleanup_chunked_upload(client, &uploads_base, creds);
+                WriteError::Network(format!("chunk {} upload: {}", i, e))
+            })?;
+        let status = resp.status().as_u16();
+        if status != 200 && status != 201 && status != 204 {
+            let _ = cleanup_chunked_upload(client, &uploads_base, creds);
+            return Err(WriteError::Server(status, format!("chunk {}: {}", i, resp.text().unwrap_or_default())));
+        }
+    }
+
+    let dest_url = dav_url(base_url, creds.username(), path);
+    let assemble_url = format!("{}/.file", uploads_base);
+    let mut req = creds.apply(client
+        .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &assemble_url)
+        .timeout(WRITE_TIMEOUT))
+        .header("Destination", &dest_url)
+        .header("Overwrite", "T");
+
+    if let Some(etag) = if_match_etag {
+        req = req.header("If-Match", format!("\"{}\"", etag.trim_matches('"')));
+    }
+
+    let resp = req.send().map_err(|e| WriteError::Network(format!("chunked MOVE: {}", e)))?;
+    let status = resp.status().as_u16();
+    match status {
+        200 | 201 | 204 => {
+            let new_etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim_matches('"').to_string());
+            Ok(PutResult { new_etag })
+        }
+        412 => Err(WriteError::Conflict),
+        423 => Err(WriteError::Locked),
+        _ => Err(WriteError::Server(status, resp.text().unwrap_or_default())),
+    }
+}
+
 fn cleanup_chunked_upload(
     client: &reqwest::blocking::Client,
     uploads_url: &str,
