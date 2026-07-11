@@ -5,9 +5,20 @@
 # Run with:  scripts/e2e.sh   (or: docker compose -f docker/e2e/docker-compose.yml
 #            up --build --abort-on-container-exit --exit-code-from ncrs)
 services:
+  # Plain WebDAV via rclone (NOT Nextcloud): strong ETags and a configurable
+  # base path, served at the same layout the daemon writes to.
   webdav:
-    build: ./webdav
-    # No published ports — the daemon reaches it over the compose network.
+    image: rclone/rclone:1.71
+    command:
+      - serve
+      - webdav
+      - /data
+      - --addr=:80
+      - --baseurl=/remote.php/dav/files/testuser
+      - --user=testuser
+      - --pass=testpass
+    volumes:
+      - webdav-data:/data
 
   ncrs:
     build:
@@ -25,3 +36,6 @@ services:
       - SYS_ADMIN
     security_opt:
       - apparmor:unconfined
+
+volumes:
+  webdav-data:
