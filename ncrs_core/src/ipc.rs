@@ -445,12 +445,16 @@ fn handle_client(
             //   basename \t status \t sharing \t perms \t owner \t size
             match strip_mount(Path::new(path_str), &mount_point) {
                 Some(remote_dir) => {
-                    let shared = shared_set.safe_lock();
-                    let details = detail_map.safe_lock();
-                    let sm = status_map.safe_lock();
-                    let records = detaildir_records(
-                        &remote_dir, &details, &sm, &shared, creds.username(),
-                    );
+                    // Hold the status/detail/shared locks only while building the
+                    // record vector; the (potentially multi-MB) join for a huge
+                    // directory then runs without blocking the FUSE layer, which
+                    // needs these same locks for getattr/readdir.
+                    let records = {
+                        let shared = shared_set.safe_lock();
+                        let details = detail_map.safe_lock();
+                        let sm = status_map.safe_lock();
+                        detaildir_records(&remote_dir, &details, &sm, &shared, creds.username())
+                    };
                     log::debug!("IPC DETAILDIR {} → {} children", path_str, records.len());
                     records.join("\x1e")
                 }
