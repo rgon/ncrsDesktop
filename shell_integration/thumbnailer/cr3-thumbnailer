@@ -50,7 +50,7 @@ def write_thumbnail(pixbuf):
 
 def ipc(cmd, timeout=10):
     sock = os.path.join(
-        os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}'),
+        os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}',
         'ncrs.sock',
     )
     try:
@@ -97,7 +97,7 @@ try:
         capture_output=True,
         timeout=30,
     )
-except subprocess.TimeoutExpired:
+except (subprocess.TimeoutExpired, OSError):
     sys.exit(1)
 
 if result.returncode != 0 or not result.stdout:
