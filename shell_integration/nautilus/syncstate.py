@@ -365,8 +365,10 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                         elif kind == "R":
                             old_path, new_path = path.split("\x1e", 1)
                             os.rename(old_path, new_path)
-                    except (OSError, ValueError):
+                    except OSError:
                         pass
+                    except ValueError:
+                        _log_error(f"malformed FILE_CHANGES entry: {entry!r}")
 
             # Overlay icon refresh
             resp = _send_command("CHANGES")
@@ -390,10 +392,10 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         except Exception:
             _log_error("_poll_changes")
         finally:
-            self._poll_running = False
-            # Back off when idle (max 4 skips = 10 s effective interval);
-            # reset immediately when any change is detected.
+            # Set _poll_skip before clearing _poll_running so the GLib timer
+            # cannot observe _poll_running=False with a stale _poll_skip value.
             self._poll_skip = 0 if had_changes else min(self._poll_skip + 1, 4)
+            self._poll_running = False
 
     def update_file_info_full(self, provider, handle, closure, file_info):
         try:
