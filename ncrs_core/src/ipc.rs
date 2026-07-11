@@ -168,9 +168,26 @@ fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>,
     else { own.unwrap_or(FileStatus::Remote).as_str() }
 }
 
+/// Rolled-up child-status counts for one directory, matching the aggregation
+/// in [`dir_status_from_children`] (total children, how many are local, whether
+/// all local children are pinned, how many are uploading).
+#[derive(Clone, Copy, Default)]
+struct DirAgg {
+    total: usize,
+    local: usize,
+    all_kept: bool,
+    uploading: usize,
+}
+
 /// Build the `DETAILDIR` reply records (one per direct child of `remote_dir`).
 /// Each record is `basename\tstatus\tsharing\tperms\towner\tsize`. Kept as a
 /// free function so it can be unit-tested without a live socket.
+///
+/// Directory children need the same rolled-up status as `dir_status_from_children`,
+/// which scans the whole status map. Calling it once per subdirectory would be
+/// O(subdirs × status_map); instead we aggregate every subdirectory's children
+/// in a single pass, making the whole batch O(status_map + children) and keeping
+/// the status-map lock held for as little time as possible (the FUSE layer needs it).
 fn detaildir_records(
     remote_dir: &Path,
     details: &std::collections::HashMap<PathBuf, FileDetail>,
@@ -178,6 +195,56 @@ fn detaildir_records(
     shared: &std::collections::HashSet<PathBuf>,
     username: &str,
 ) -> Vec<String> {
+    // One entry per direct-child directory; `all_kept` starts true.
+    let mut dir_agg: std::collections::HashMap<&Path, DirAgg> = std::collections::HashMap::new();
+    for (child, detail) in details.iter() {
+        if detail.is_dir && child.parent() == Some(remote_dir) {
+            dir_agg.entry(child.as_path()).or_insert(DirAgg {
+                all_kept: true,
+                ..DirAgg::default()
+            });
+        }
+    }
+    if !dir_agg.is_empty() {
+        for (p, s) in sm.iter() {
+            if let Some(agg) = p.parent().and_then(|par| dir_agg.get_mut(par)) {
+                agg.total += 1;
+                match s {
+                    FileStatus::Kept | FileStatus::Synced => agg.local += 1,
+                    FileStatus::Cached => {
+                        agg.local += 1;
+                        agg.all_kept = false;
+                    }
+                    FileStatus::Uploading => agg.uploading += 1,
+                    _ => agg.all_kept = false,
+                }
+            }
+        }
+    }
+
+    let dir_status = |dir: &Path| -> &'static str {
+        let own = sm.get(dir).copied();
+        if own == Some(FileStatus::Downloading) {
+            return "downloading";
+        }
+        if own == Some(FileStatus::Uploading) {
+            return "uploading";
+        }
+        let a = dir_agg.get(dir).copied().unwrap_or(DirAgg {
+            all_kept: true,
+            ..DirAgg::default()
+        });
+        if a.uploading > 0 {
+            "uploading"
+        } else if a.total > 0 && a.local == a.total {
+            if a.all_kept { "kept" } else { "cached" }
+        } else if a.local > 0 {
+            "partial"
+        } else {
+            own.unwrap_or(FileStatus::Remote).as_str()
+        }
+    };
+
     let mut records = Vec::new();
     for (child, detail) in details.iter() {
         if child.parent() != Some(remote_dir) {
@@ -188,7 +255,7 @@ fn detaildir_records(
             None => continue,
         };
         let status = if detail.is_dir {
-            dir_status_from_children(sm, child)
+            dir_status(child)
         } else {
             sm.get(child).copied().unwrap_or(FileStatus::Remote).as_str()
         };
@@ -652,6 +719,57 @@ mod tests {
         let shared = HashSet::new();
         let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, "alice");
         assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn detaildir_dir_status_matches_per_child_reference() {
+        // /d has two subdirs; each subdir's status must equal what the
+        // per-subdirectory reference (dir_status_from_children) would compute.
+        let mut details = HashMap::new();
+        details.insert(PathBuf::from("/d/allkept"), detail("", "a", "A", 0, true));
+        details.insert(PathBuf::from("/d/mixed"), detail("", "a", "A", 0, true));
+        details.insert(PathBuf::from("/d/uploading"), detail("", "a", "A", 0, true));
+        details.insert(PathBuf::from("/d/f.txt"), detail("", "a", "A", 3, false));
+
+        let mut sm = HashMap::new();
+        // allkept: every child pinned → "kept"
+        sm.insert(PathBuf::from("/d/allkept/a"), FileStatus::Kept);
+        sm.insert(PathBuf::from("/d/allkept/b"), FileStatus::Synced);
+        // mixed: one cached, one remote → "partial"
+        sm.insert(PathBuf::from("/d/mixed/a"), FileStatus::Cached);
+        sm.insert(PathBuf::from("/d/mixed/b"), FileStatus::Remote);
+        // uploading: one uploading child → "uploading"
+        sm.insert(PathBuf::from("/d/uploading/a"), FileStatus::Uploading);
+        sm.insert(PathBuf::from("/d/uploading/b"), FileStatus::Kept);
+        // the flat file
+        sm.insert(PathBuf::from("/d/f.txt"), FileStatus::Kept);
+
+        let shared = HashSet::new();
+        let recs = detaildir_records(Path::new("/d"), &details, &sm, &shared, "a");
+        let status_of = |name: &str| -> String {
+            recs.iter()
+                .find(|r| r.starts_with(&format!("{}\t", name)))
+                .unwrap()
+                .split('\t')
+                .nth(1)
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(status_of("allkept"), "kept");
+        assert_eq!(status_of("mixed"), "partial");
+        assert_eq!(status_of("uploading"), "uploading");
+        assert_eq!(status_of("f.txt"), "kept");
+
+        // Cross-check every subdir against the per-child reference implementation.
+        for sub in ["/d/allkept", "/d/mixed", "/d/uploading"] {
+            let name = sub.rsplit('/').next().unwrap();
+            assert_eq!(
+                status_of(name),
+                dir_status_from_children(&sm, Path::new(sub)),
+                "batched status for {} must match dir_status_from_children",
+                sub
+            );
+        }
     }
 
     #[test]
