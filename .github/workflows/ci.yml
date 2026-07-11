@@ -49,3 +49,16 @@ jobs:
 
       - name: Run tests
         run: cargo test -p ncrs_core
+
+  e2e:
+    name: e2e (data-loss)
+    if: "!startsWith(github.event.head_commit.message, 'chore(release)')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Runs the ncrs CLI daemon against a real (non-Nextcloud) WebDAV server
+      # over FUSE and asserts no data loss across CRUD / move / delete.
+      # ubuntu-latest ships docker + compose and exposes /dev/fuse.
+      - name: Run e2e suite
+        run: scripts/e2e.sh
