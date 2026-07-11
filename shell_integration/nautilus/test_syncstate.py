@@ -458,6 +458,7 @@ class TestInfoProviderSyncCache(unittest.TestCase):
             syncstate._dir_cache.clear()
             syncstate._dir_cache_ts.clear()
             syncstate._dir_inflight.clear()
+            syncstate._dir_pending.clear()
 
     def tearDown(self):
         syncstate._POOL.submit = self._orig_submit
@@ -534,6 +535,35 @@ class TestInfoProviderSyncCache(unittest.TestCase):
         res = prov.update_file_info_full(None, None, None, fi)
         self.assertEqual(res, syncstate.Nautilus.OperationResult.COMPLETE)
         self.assertEqual(calls, [])
+
+    def test_invalidation_scoped_to_requested_children(self):
+        # A huge directory must repaint only the files Nautilus actually asked
+        # about, never every child. Defer the fetch so several requests pile up
+        # into the pending set before it lands.
+        submitted = []
+        syncstate._POOL.submit = lambda fn, *a: submitted.append((fn, a))
+        looked_up = []
+        orig_lookup = syncstate.Nautilus.FileInfo.lookup
+        orig_newpath = syncstate.Gio.File.new_for_path
+        syncstate.Nautilus.FileInfo.lookup = lambda gfile: looked_up.append(gfile) or None
+        syncstate.Gio.File.new_for_path = lambda p: p
+        try:
+            children = [f"f{i}" for i in range(1000)]
+            syncstate._send_command = lambda cmd: "\x1e".join(
+                f"{n}\tremote\t\t\t\t0" for n in children
+            )
+            prov = self._make_provider()
+            # Only two of the 1000 children are requested (as if visible).
+            prov.update_file_info_full(None, None, None, _FakeFileInfo("/mnt/ncrs/dir/f1"))
+            prov.update_file_info_full(None, None, None, _FakeFileInfo("/mnt/ncrs/dir/f2"))
+            self.assertEqual(len(submitted), 1, "one DETAILDIR fetch for the directory")
+            fn, args = submitted[0]
+            fn(*args)  # run the deferred fetch; idle_add runs inline
+            # Exactly the two requested children were invalidated, not all 1000.
+            self.assertEqual(set(looked_up), {"/mnt/ncrs/dir/f1", "/mnt/ncrs/dir/f2"})
+        finally:
+            syncstate.Nautilus.FileInfo.lookup = orig_lookup
+            syncstate.Gio.File.new_for_path = orig_newpath
 
     def test_dir_cache_is_bounded(self):
         # Browsing many directories must not grow the cache without bound.

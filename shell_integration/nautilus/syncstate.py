@@ -221,6 +221,11 @@ _DIR_CACHE_MAX = 512
 _dir_cache: dict = {}  # dir path → {basename: (sync, sharing, perms, owner, size)}
 _dir_cache_ts: dict = {}  # dir path → monotonic timestamp of last fetch
 _dir_inflight: set = set()  # dirs with a fetch in progress
+# Basenames that Nautilus requested while a directory's fetch was still cold (so
+# they were painted empty). Only these need repainting once the fetch lands —
+# bounded by Nautilus's visible window, not the whole directory. Without this a
+# huge directory would invalidate every child on the main thread.
+_dir_pending: dict = {}  # dir path → set(basename)
 _cache_lock = threading.Lock()
 
 
@@ -233,6 +238,7 @@ def _evict_dir_cache_locked() -> None:
     for old in sorted(_dir_cache_ts, key=_dir_cache_ts.get)[:over]:
         _dir_cache.pop(old, None)
         _dir_cache_ts.pop(old, None)
+        _dir_pending.pop(old, None)
 
 
 def _parse_detaildir(resp: str) -> dict:
@@ -520,13 +526,17 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 fresh = (time.monotonic() - _dir_cache_ts.get(parent, 0.0)) < _DIR_CACHE_TTL
                 if entry is not None:
                     ent = entry.get(name)
+                # A (re)fetch runs whenever the cache is not fresh. Record this
+                # file so it — and only it — gets repainted when the fetch lands.
+                if not fresh:
+                    _dir_pending.setdefault(parent, set()).add(name)
 
             if ent is not None:
                 self._apply_detail(file_info, ent)
 
             # Warm (or refresh) the whole directory in the background on a miss
-            # or once the cache has gone stale; the fetch invalidates the
-            # children so Nautilus repaints them from the populated cache.
+            # or once the cache has gone stale; the fetch repaints the requested
+            # children from the populated cache.
             if ent is None or not fresh:
                 self._ensure_dir_fetch(parent)
 
@@ -590,16 +600,26 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
     def _do_dir_fetch(self, parent):
         try:
             resp = _send_command(f"DETAILDIR {parent}")
-            if resp.startswith("error"):
+            if not resp or resp.startswith("error"):
                 return
             parsed = _parse_detaildir(resp)
             with _cache_lock:
                 _dir_cache[parent] = parsed
                 _dir_cache_ts[parent] = time.monotonic()
                 _evict_dir_cache_locked()
+                pending = _dir_pending.pop(parent, None)
+
+            # Repaint only the children Nautilus asked about while the fetch was
+            # in flight (bounded by the visible window), never the whole folder —
+            # a huge directory must not invalidate tens of thousands of files on
+            # the main thread. Children that scroll into view later trigger a
+            # fresh update_file_info that hits the now-warm cache directly.
+            names = [n for n in pending if n in parsed] if pending else []
+            if not names:
+                return
 
             def _invalidate_children():
-                for child_name in parsed:
+                for child_name in names:
                     try:
                         child = os.path.join(parent, child_name)
                         fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(child))
@@ -615,6 +635,8 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         finally:
             with _cache_lock:
                 _dir_inflight.discard(parent)
+                # Drop any names a failed fetch left behind so they can't leak.
+                _dir_pending.pop(parent, None)
 
 
 # ── Menu provider ─────────────────────────────────────────────────────────────
