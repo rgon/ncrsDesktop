@@ -4,6 +4,8 @@
 ///
 ///   STATUS <absolute-local-path>\n   → local|synced|remote|unknown[,shared]
 ///   DETAIL <absolute-local-path>\n   → status\tsharing\tperms\towner\tsize
+///   DETAILDIR <absolute-local-dir>\n → per-child records (0x1e-joined) of
+///                                       basename\tstatus\tsharing\tperms\towner\tsize
 ///   SEARCH <term>\n                  → JSON array of SearchResultGroup
 ///   WEBURL <absolute-local-path>\n   → Nextcloud web URL for the file
 ///   ERRORS\n                         → JSON array of SyncError
@@ -315,6 +317,56 @@ fn handle_client(
                 None => {
                     log::debug!("IPC DETAIL {} → not under mount", path_str);
                     "unknown\t\t\t\t0".to_string()
+                }
+            }
+        } else if let Some(path_str) = trimmed.strip_prefix("DETAILDIR ") {
+            // Batched form of DETAIL: return one record per direct child of the
+            // given directory so the Nautilus extension can warm a whole folder
+            // with a single round-trip instead of one query per file.
+            // Reply: records joined by 0x1e; each record is
+            //   basename \t status \t sharing \t perms \t owner \t size
+            match strip_mount(Path::new(path_str), &mount_point) {
+                Some(remote_dir) => {
+                    let shared = shared_set.safe_lock();
+                    let details = detail_map.safe_lock();
+                    let sm = status_map.safe_lock();
+                    let mut records: Vec<String> = Vec::new();
+                    for (child, detail) in details.iter() {
+                        if child.parent() != Some(remote_dir.as_path()) {
+                            continue;
+                        }
+                        let name = match child.file_name().and_then(|n| n.to_str()) {
+                            Some(n) => n,
+                            None => continue,
+                        };
+                        let status = if detail.is_dir {
+                            dir_status_from_children(&sm, child)
+                        } else {
+                            sm.get(child).copied().unwrap_or(FileStatus::Remote).as_str()
+                        };
+                        let is_shared = shared.contains(child);
+                        let sharing = if !is_shared {
+                            ""
+                        } else {
+                            match detail.owner_id.as_deref() {
+                                Some(owner) if owner == creds.username() => "Shared by you",
+                                Some(_) => "Shared with you",
+                                None => "Shared",
+                            }
+                        };
+                        let perms = detail.permissions.as_deref().unwrap_or("");
+                        let owner = detail.owner_display_name.as_deref().unwrap_or("");
+                        records.push(format!(
+                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            name, status, sharing, perms, owner, detail.size
+                        ));
+                    }
+                    log::debug!("IPC DETAILDIR {} → {} children", path_str, records.len());
+                    records.join("\x1e")
+                }
+                None => {
+                    log::debug!("IPC DETAILDIR {} → not under mount", path_str);
+                    String::new()
                 }
             }
         } else if let Some(path_str) = trimmed.strip_prefix("WEBURL ") {
