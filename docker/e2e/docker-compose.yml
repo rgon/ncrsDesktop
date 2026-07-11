@@ -1,0 +1,27 @@
+# End-to-end test stack: a real (non-Nextcloud) WebDAV server and the ncrs CLI
+# daemon that FUSE-mounts it. The `ncrs` service runs the data-loss scenarios
+# and its exit code is the suite result.
+#
+# Run with:  scripts/e2e.sh   (or: docker compose -f docker/e2e/docker-compose.yml
+#            up --build --abort-on-container-exit --exit-code-from ncrs)
+services:
+  webdav:
+    build: ./webdav
+    # No published ports — the daemon reaches it over the compose network.
+
+  ncrs:
+    build:
+      context: ../..
+      dockerfile: docker/e2e/ncrs/Dockerfile
+    depends_on:
+      - webdav
+    environment:
+      WEBDAV_HOST: webdav
+      RUST_LOG: info
+    # FUSE inside the container needs the fuse device and mount capability.
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined

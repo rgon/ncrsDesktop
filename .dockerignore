@@ -1,0 +1,9 @@
+# Keep the Docker build context small (the e2e ncrs image builds from repo root).
+target
+**/target
+node_modules
+**/node_modules
+dist
+.git
+*.deb
+main.rs.bak
