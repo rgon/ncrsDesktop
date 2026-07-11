@@ -325,7 +325,7 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
 
     def _poll_changes(self) -> bool:
         if self._poll_skip > 0:
-            self._poll_skip -= 1
+            self._poll_skip = max(0, self._poll_skip - 1)
             return True
         if self._poll_running:
             return True
