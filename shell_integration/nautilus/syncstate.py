@@ -268,6 +268,59 @@ def _invalidate_path(path: str) -> bool:
     return GLib.SOURCE_REMOVE
 
 
+# When more than this many entries in one directory change at once, mark the
+# whole directory stale (one DETAILDIR on next access) instead of issuing a
+# DETAIL per entry — past this point the batch fetch is the cheaper option.
+_CHANGE_PATCH_MAX = 16
+
+
+def _patch_cache_entry(path: str) -> bool:
+    """Refresh one path's cached record via a single DETAIL, leaving the rest of
+    its directory's cache intact. No-op (returns False) when the directory is
+    not cached or the query fails. Runs on a pool thread — it blocks on the
+    socket, so must never be called from the GTK main thread."""
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    with _cache_lock:
+        if parent not in _dir_cache:
+            return False  # directory not warm — nothing to patch
+    detail = _send_command(f"DETAIL {path}")
+    if not detail or detail.startswith("error"):
+        return False
+    parts = detail.split("\t")  # status \t sharing \t perms \t owner \t size
+    if len(parts) < 5:
+        return False
+    rec = (parts[0], parts[1], parts[2], parts[3], parts[4])
+    with _cache_lock:
+        entry = _dir_cache.get(parent)
+        if entry is None:
+            return False
+        entry[name] = rec
+    return True
+
+
+def _refresh_changed_paths(paths) -> None:
+    """Refresh changed paths' cached records in place with targeted DETAIL
+    queries so a single change never re-fetches a whole large directory. When
+    many entries in the same directory change at once, fall back to marking that
+    directory stale (a single DETAILDIR on the next access). Runs on a pool
+    thread."""
+    by_dir: dict = {}
+    for p in paths:
+        by_dir.setdefault(os.path.dirname(p), []).append(p)
+    for parent, changed in by_dir.items():
+        with _cache_lock:
+            cached = parent in _dir_cache
+        if not cached:
+            continue  # directory not warm — the next open fetches it once
+        if len(changed) > _CHANGE_PATCH_MAX:
+            with _cache_lock:
+                _dir_cache_ts.pop(parent, None)  # bulk change → one DETAILDIR
+            continue
+        for p in changed:
+            _patch_cache_entry(p)
+
+
 _POLL_KEEP_ATTEMPTS: dict = {}
 _keep_poll_active: set = set()
 
@@ -437,7 +490,11 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
     def _do_poll_changes(self):
         had_changes = False
         try:
-            # Targeted VFS ops to generate kernel inotify events
+            # Paths whose metadata/status changed in place — refreshed with a
+            # targeted DETAIL per entry rather than a whole-directory re-fetch.
+            refresh_paths = []
+
+            # Structural changes → VFS ops that generate kernel inotify events.
             fc_resp = _send_command("FILE_CHANGES")
             if fc_resp and not fc_resp.startswith("error"):
                 entries = [e for e in fc_resp.split("\t") if ":" in e]
@@ -452,9 +509,9 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                         elif kind == "D":
                             os.unlink(path)
                         elif kind == "M":
-                            # os.utime() on a FUSE path triggers a WebDAV PROPPATCH
-                            # via the kernel→FUSE→daemon chain; signal Nautilus instead.
-                            GLib.idle_add(_invalidate_path, path)
+                            # Content/metadata changed in place; refresh just this
+                            # entry instead of invalidating the whole directory.
+                            refresh_paths.append(path)
                         elif kind == "DA":
                             os.mkdir(path, 0o755)
                         elif kind == "DD":
@@ -467,30 +524,35 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                     except ValueError:
                         _log_error(f"malformed FILE_CHANGES entry: {entry!r}")
 
-            # Overlay icon refresh
+            # Directories/files the daemon flagged (e.g. from notify_push).
             resp = _send_command("CHANGES")
-            if not resp or resp.startswith("error"):
-                return
-            paths = [p for p in resp.split("\t") if p]
-            if paths:
-                had_changes = True
-                # Force each changed file's directory to re-fetch so the stale
-                # cached record is replaced on the next request.
-                with _cache_lock:
-                    for p in paths:
-                        _dir_cache_ts.pop(os.path.dirname(p), None)
+            if resp and not resp.startswith("error"):
+                changed = [p for p in resp.split("\t") if p]
+                if changed:
+                    had_changes = True
+                refresh_paths.extend(changed)
 
-            def _invalidate():
-                for p in paths:
-                    try:
-                        fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(p))
-                        if fi is not None:
-                            fi.invalidate_extension_info()
-                    except Exception:
-                        pass
-                return GLib.SOURCE_REMOVE
+            if refresh_paths:
+                # De-duplicate while preserving order.
+                seen = set()
+                refresh_paths = [
+                    p for p in refresh_paths if not (p in seen or seen.add(p))
+                ]
+                # Patch the changed entries in place; only a directory with many
+                # simultaneous changes falls back to a single DETAILDIR re-fetch.
+                _refresh_changed_paths(refresh_paths)
 
-            GLib.idle_add(_invalidate)
+                def _invalidate():
+                    for p in refresh_paths:
+                        try:
+                            fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(p))
+                            if fi is not None:
+                                fi.invalidate_extension_info()
+                        except Exception:
+                            pass
+                    return GLib.SOURCE_REMOVE
+
+                GLib.idle_add(_invalidate)
         except Exception:
             _log_error("_poll_changes")
         finally:

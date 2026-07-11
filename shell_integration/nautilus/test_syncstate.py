@@ -635,5 +635,108 @@ class TestDaemonVersionCheck(unittest.TestCase):
         self.assertIn("warning", err.lower())
 
 
+class TestTargetedChangeRefresh(unittest.TestCase):
+    """A change refreshes just its own cache entry (one DETAIL), never a whole
+    directory — unless many entries in one directory change at once."""
+
+    def setUp(self):
+        self._orig_send = syncstate._send_command
+        with syncstate._cache_lock:
+            syncstate._dir_cache.clear()
+            syncstate._dir_cache_ts.clear()
+            syncstate._dir_inflight.clear()
+            syncstate._dir_pending.clear()
+
+    def tearDown(self):
+        syncstate._send_command = self._orig_send
+        with syncstate._cache_lock:
+            syncstate._dir_cache.clear()
+            syncstate._dir_cache_ts.clear()
+
+    def test_patch_cache_entry_updates_single_record(self):
+        syncstate._dir_cache["/d"] = {"f": ("remote", "", "", "", "0")}
+        syncstate._dir_cache_ts["/d"] = 123.0
+        calls = []
+        syncstate._send_command = lambda cmd: calls.append(cmd) or "kept\t\tRGDNVW\tAlice\t100"
+        self.assertTrue(syncstate._patch_cache_entry("/d/f"))
+        self.assertEqual(
+            syncstate._dir_cache["/d"]["f"], ("kept", "", "RGDNVW", "Alice", "100")
+        )
+        self.assertEqual(calls, ["DETAIL /d/f"])
+        # The rest of the directory's cache — and its freshness — is untouched.
+        self.assertEqual(syncstate._dir_cache_ts["/d"], 123.0)
+
+    def test_patch_cache_entry_noop_when_dir_not_cached(self):
+        calls = []
+        syncstate._send_command = lambda cmd: calls.append(cmd) or "kept\t\t\t\t0"
+        self.assertFalse(syncstate._patch_cache_entry("/x/y"))
+        self.assertEqual(calls, [], "must not query the daemon for an uncached dir")
+
+    def test_small_change_set_is_targeted(self):
+        syncstate._dir_cache["/d"] = {
+            "a": ("remote", "", "", "", "0"),
+            "b": ("remote", "", "", "", "0"),
+        }
+        syncstate._dir_cache_ts["/d"] = 500.0
+        calls = []
+        syncstate._send_command = lambda cmd: calls.append(cmd) or "kept\t\tRG\tAlice\t7"
+        syncstate._refresh_changed_paths(["/d/a", "/d/b"])
+        self.assertEqual(sorted(calls), ["DETAIL /d/a", "DETAIL /d/b"])
+        self.assertNotIn("DETAILDIR /d", calls)
+        self.assertIn("/d", syncstate._dir_cache_ts, "dir stays fresh, not refetched")
+        self.assertEqual(syncstate._dir_cache["/d"]["a"][0], "kept")
+
+    def test_bulk_change_set_falls_back_to_whole_dir(self):
+        syncstate._dir_cache["/d"] = {}
+        syncstate._dir_cache_ts["/d"] = 500.0
+        calls = []
+        syncstate._send_command = lambda cmd: calls.append(cmd) or "kept\t\t\t\t0"
+        many = [f"/d/f{i}" for i in range(syncstate._CHANGE_PATCH_MAX + 1)]
+        syncstate._refresh_changed_paths(many)
+        # Past the threshold: no per-file DETAIL; the dir is marked stale so the
+        # next access does a single DETAILDIR.
+        self.assertEqual(calls, [])
+        self.assertNotIn("/d", syncstate._dir_cache_ts)
+
+    def test_refresh_uncached_dir_is_noop(self):
+        calls = []
+        syncstate._send_command = lambda cmd: calls.append(cmd) or "kept\t\t\t\t0"
+        syncstate._refresh_changed_paths(["/nope/a", "/nope/b"])
+        self.assertEqual(calls, [])
+
+    def test_poll_changes_patches_entry_without_refetching_dir(self):
+        # End-to-end through the poll: a CHANGES entry refreshes just that entry
+        # and the directory's cache timestamp is preserved (no DETAILDIR).
+        parent = "/mnt/ncrs/dir"
+        syncstate._dir_cache[parent] = {"f": ("remote", "", "", "", "0")}
+        ts = 999.0
+        syncstate._dir_cache_ts[parent] = ts
+        calls = []
+
+        def fake(cmd):
+            calls.append(cmd)
+            if cmd == "FILE_CHANGES":
+                return ""
+            if cmd == "CHANGES":
+                return f"{parent}/f"
+            if cmd.startswith("DETAIL "):
+                return "kept\tShared by you\tRGDNVW\tAlice\t100"
+            return "error"
+
+        syncstate._send_command = fake
+        prov = syncstate.NcrsInfoProvider.__new__(syncstate.NcrsInfoProvider)
+        prov._mount = "/mnt/ncrs"
+        prov._mount_prefix = "/mnt/ncrs/"
+        prov._poll_running = True
+        prov._poll_skip = 0
+        prov._do_poll_changes()
+
+        self.assertEqual(syncstate._dir_cache[parent]["f"][0], "kept")
+        self.assertEqual(syncstate._dir_cache[parent]["f"][3], "Alice")
+        self.assertEqual(syncstate._dir_cache_ts[parent], ts, "dir not marked stale")
+        self.assertIn(f"DETAIL {parent}/f", calls)
+        self.assertNotIn(f"DETAILDIR {parent}", calls)
+
+
 if __name__ == "__main__":
     unittest.main()
