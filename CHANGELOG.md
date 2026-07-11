@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.12](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.11...ncrs-v0.1.12) (2026-07-11)
+
+
+### Features
+
+* **ipc:** add DETAILDIR batch command for directory metadata ([f15d22d](https://github.com/rgon/ncrsDesktop/commit/f15d22d46fb7720265b40237d3c56ea5f5c8dce8))
+* **ipc:** add DETAILDIR to batch a directory's child metadata into one reply ([e1eb509](https://github.com/rgon/ncrsDesktop/commit/e1eb509cc744703b1471c691bdb4a5a99462d90c))
+* **ipc:** add VERSION handshake so daemon/extension protocol mismatch is logged ([8e13f37](https://github.com/rgon/ncrsDesktop/commit/8e13f37b93bd19725eb183b8bab709d9da1050cf))
+* **issues:** add Clear all button for conflicts in the warnings tab ([4a49942](https://github.com/rgon/ncrsDesktop/commit/4a499429f66362f0da9ec77f3cfca26b44166f3e))
+
+
+### Bug Fixes
+
+* **nautilus:** clamp _poll_skip to 0 to prevent negative value if pool resets it mid-decrement ([38c80aa](https://github.com/rgon/ncrsDesktop/commit/38c80aad3e40e8abbafdc767380d64e8f75cf15f))
+* **nautilus:** refuse dev install when the packaged extension copy exists to avoid GObject type collision ([b3ae4f9](https://github.com/rgon/ncrsDesktop/commit/b3ae4f9a5caf76d299e16fbc4b2dc2246b4ea494))
+* **thumbnailer:** route by is_remote instead of is_local so slow/absent daemon falls through to exiftool ([881bcf3](https://github.com/rgon/ncrsDesktop/commit/881bcf3894f5d25ba67a533e23b907e05cd70d15))
+
+
+### Performance Improvements
+
+* **ipc:** aggregate DETAILDIR directory statuses in one pass instead of O(subdirs*N) scans ([0b7fe71](https://github.com/rgon/ncrsDesktop/commit/0b7fe71f5ea3f6075a04d5bd1c33fb81342e1bce))
+* **nautilus:** bound the directory metadata cache and precompute the mount prefix ([d44e126](https://github.com/rgon/ncrsDesktop/commit/d44e1266619e3219139a22f277690a0f3046ffa2))
+* **nautilus:** serve file info synchronously from a per-directory cache to fix slow listings and handle=(nil) spam ([e11853d](https://github.com/rgon/ncrsDesktop/commit/e11853d8f00c5d138eed1561a874dcef424d903c))
+* **upload:** stream PUT from staging file instead of loading into RAM ([07dc81a](https://github.com/rgon/ncrsDesktop/commit/07dc81a47b8ec5b4369fd0610e6e017e9727362d))
+
 ## [0.1.11](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.10...ncrs-v0.1.11) (2026-07-11)
 
 
