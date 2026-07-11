@@ -21,6 +21,7 @@
         conflicts = [],
         pendingMutations = 0,
         onclear,
+        onclearconflicts,
         ondismissone,
         onresolve,
     }: {
@@ -28,6 +29,7 @@
         conflicts: ConflictRecord[];
         pendingMutations: number;
         onclear: () => void;
+        onclearconflicts: () => void;
         ondismissone: (timestamp_ms: number) => void;
         onresolve: (id: number) => void;
     } = $props();
@@ -151,11 +153,10 @@
             {/if}
 
             {#if conflicts.length > 0}
-                {#if errors.length > 0}
-                    <div class="flex items-center px-1 pt-2 pb-1">
-                        <span class="text-xs text-gray-500">{conflicts.length} conflict{conflicts.length !== 1 ? 's' : ''}</span>
-                    </div>
-                {/if}
+                <div class="flex items-center justify-between px-1 pb-1" class:pt-2={errors.length > 0}>
+                    <span class="text-xs text-gray-500">{conflicts.length} conflict{conflicts.length !== 1 ? 's' : ''}</span>
+                    <button class="btn btn-ghost btn-xs" onclick={onclearconflicts}>Clear all</button>
+                </div>
                 {#each conflicts as conflict (conflict.id)}
                     {@const desc = describeConflict(conflict.kind)}
                     <div class="alert alert-warning shadow-none rounded-lg mb-1.5 py-2 px-3"

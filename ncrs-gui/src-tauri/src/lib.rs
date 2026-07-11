@@ -249,6 +249,11 @@ fn resolve_conflict(state: State<Arc<AppState>>, id: u64) {
 }
 
 #[tauri::command]
+fn clear_conflicts(state: State<Arc<AppState>>) {
+    state.journal.lock().unwrap().resolve_all_conflicts();
+}
+
+#[tauri::command]
 async fn get_storage_stats() -> Result<StorageStats, String> {
     tokio::task::spawn_blocking(|| {
         let sock = ncrs_core::ipc::socket_path();
@@ -680,6 +685,7 @@ pub fn run() {
             get_pending_mutations,
             get_conflicts,
             resolve_conflict,
+            clear_conflicts,
             fetch_search_providers,
             search_nextcloud,
             get_storage_stats,

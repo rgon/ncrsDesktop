@@ -273,6 +273,13 @@ impl MutationJournal {
         self.save_conflicts();
     }
 
+    pub fn resolve_all_conflicts(&mut self) {
+        for c in &mut self.conflicts {
+            c.resolved = true;
+        }
+        self.save_conflicts();
+    }
+
     pub fn unresolved_conflicts(&self) -> Vec<&ConflictRecord> {
         self.conflicts.iter().filter(|c| !c.resolved).collect()
     }

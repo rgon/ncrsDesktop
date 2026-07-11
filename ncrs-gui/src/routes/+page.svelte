@@ -188,6 +188,11 @@
         conflicts = conflicts.filter(c => c.id !== id);
     }
 
+    async function clearConflicts() {
+        await invoke("clear_conflicts");
+        conflicts = [];
+    }
+
     async function handleRemount() {
         await invoke("remount");
     }
@@ -400,7 +405,7 @@
                 />
 
             {:else if activeView === "issues"}
-                <IssuesView {errors} {conflicts} {pendingMutations} onclear={clearErrors} ondismissone={dismissError} onresolve={resolveConflict} />
+                <IssuesView {errors} {conflicts} {pendingMutations} onclear={clearErrors} onclearconflicts={clearConflicts} ondismissone={dismissError} onresolve={resolveConflict} />
 
             {:else if activeView === "plugins"}
                 <PluginsView onselect={(id) => { activeView = `plugin:${id}`; }} />
