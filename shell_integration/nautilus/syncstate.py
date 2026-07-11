@@ -213,10 +213,26 @@ def _human_size(n: int) -> str:
 # single DETAILDIR query in the background, then invalidates the children so
 # Nautilus repaints them from the now-populated cache.
 _DIR_CACHE_TTL = 30.0  # seconds
+# Cap the number of cached directories so a long-lived Nautilus process that
+# browses thousands of folders cannot grow this without bound. When exceeded,
+# the least-recently-fetched directories are evicted; revisiting one simply
+# re-fetches it with a single DETAILDIR.
+_DIR_CACHE_MAX = 512
 _dir_cache: dict = {}  # dir path → {basename: (sync, sharing, perms, owner, size)}
 _dir_cache_ts: dict = {}  # dir path → monotonic timestamp of last fetch
 _dir_inflight: set = set()  # dirs with a fetch in progress
 _cache_lock = threading.Lock()
+
+
+def _evict_dir_cache_locked() -> None:
+    """Trim the directory cache to _DIR_CACHE_MAX. Caller must hold _cache_lock."""
+    over = len(_dir_cache) - _DIR_CACHE_MAX
+    if over <= 0:
+        return
+    # Evict the oldest-fetched directories; ties broken arbitrarily.
+    for old in sorted(_dir_cache_ts, key=_dir_cache_ts.get)[:over]:
+        _dir_cache.pop(old, None)
+        _dir_cache_ts.pop(old, None)
 
 
 def _parse_detaildir(resp: str) -> dict:
@@ -354,6 +370,8 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
     def __init__(self):
         super().__init__()
         self._mount = _load_mount_point()
+        # Precomputed once; used to test every path in the update hot path.
+        self._mount_prefix = (self._mount + "/") if self._mount else None
         self._poll_running = False
         self._poll_skip = 0  # 2-second ticks to skip when idle (adaptive backoff)
         # Handshake off the main thread so a slow/absent daemon never stalls load.
@@ -489,7 +507,7 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
 
             path = file_info.get_location().get_path()
             if path is None or not (
-                path == self._mount or path.startswith(self._mount + "/")
+                path == self._mount or path.startswith(self._mount_prefix)
             ):
                 return Nautilus.OperationResult.COMPLETE
 
@@ -578,6 +596,7 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             with _cache_lock:
                 _dir_cache[parent] = parsed
                 _dir_cache_ts[parent] = time.monotonic()
+                _evict_dir_cache_locked()
 
             def _invalidate_children():
                 for child_name in parsed:

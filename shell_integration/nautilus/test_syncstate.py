@@ -467,6 +467,7 @@ class TestInfoProviderSyncCache(unittest.TestCase):
     def _make_provider(self, mount="/mnt/ncrs"):
         prov = syncstate.NcrsInfoProvider.__new__(syncstate.NcrsInfoProvider)
         prov._mount = mount
+        prov._mount_prefix = mount + "/"
         prov._poll_running = False
         prov._poll_skip = 0
         return prov
@@ -533,6 +534,29 @@ class TestInfoProviderSyncCache(unittest.TestCase):
         res = prov.update_file_info_full(None, None, None, fi)
         self.assertEqual(res, syncstate.Nautilus.OperationResult.COMPLETE)
         self.assertEqual(calls, [])
+
+    def test_dir_cache_is_bounded(self):
+        # Browsing many directories must not grow the cache without bound.
+        orig_max = syncstate._DIR_CACHE_MAX
+        syncstate._DIR_CACHE_MAX = 8
+        try:
+            # each DETAILDIR returns one child so every dir warms deterministically
+            syncstate._send_command = lambda cmd: "child\tremote\t\t\t\t0"
+            prov = self._make_provider()
+            for i in range(50):
+                prov.update_file_info_full(
+                    None, None, None, _FakeFileInfo(f"/mnt/ncrs/dir{i}/child")
+                )
+            with syncstate._cache_lock:
+                self.assertLessEqual(len(syncstate._dir_cache), syncstate._DIR_CACHE_MAX)
+                # cache and timestamp maps stay consistent
+                self.assertEqual(
+                    set(syncstate._dir_cache), set(syncstate._dir_cache_ts)
+                )
+                # the most recently fetched directory is retained
+                self.assertIn("/mnt/ncrs/dir49", syncstate._dir_cache)
+        finally:
+            syncstate._DIR_CACHE_MAX = orig_max
 
 
 class TestDaemonVersionCheck(unittest.TestCase):
