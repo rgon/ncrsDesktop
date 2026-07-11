@@ -160,6 +160,49 @@ fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>,
     else { own.unwrap_or(FileStatus::Remote).as_str() }
 }
 
+/// Build the `DETAILDIR` reply records (one per direct child of `remote_dir`).
+/// Each record is `basename\tstatus\tsharing\tperms\towner\tsize`. Kept as a
+/// free function so it can be unit-tested without a live socket.
+fn detaildir_records(
+    remote_dir: &Path,
+    details: &std::collections::HashMap<PathBuf, FileDetail>,
+    sm: &std::collections::HashMap<PathBuf, FileStatus>,
+    shared: &std::collections::HashSet<PathBuf>,
+    username: &str,
+) -> Vec<String> {
+    let mut records = Vec::new();
+    for (child, detail) in details.iter() {
+        if child.parent() != Some(remote_dir) {
+            continue;
+        }
+        let name = match child.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let status = if detail.is_dir {
+            dir_status_from_children(sm, child)
+        } else {
+            sm.get(child).copied().unwrap_or(FileStatus::Remote).as_str()
+        };
+        let sharing = if !shared.contains(child) {
+            ""
+        } else {
+            match detail.owner_id.as_deref() {
+                Some(owner) if owner == username => "Shared by you",
+                Some(_) => "Shared with you",
+                None => "Shared",
+            }
+        };
+        let perms = detail.permissions.as_deref().unwrap_or("");
+        let owner = detail.owner_display_name.as_deref().unwrap_or("");
+        records.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            name, status, sharing, perms, owner, detail.size
+        ));
+    }
+    records
+}
+
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
@@ -330,37 +373,9 @@ fn handle_client(
                     let shared = shared_set.safe_lock();
                     let details = detail_map.safe_lock();
                     let sm = status_map.safe_lock();
-                    let mut records: Vec<String> = Vec::new();
-                    for (child, detail) in details.iter() {
-                        if child.parent() != Some(remote_dir.as_path()) {
-                            continue;
-                        }
-                        let name = match child.file_name().and_then(|n| n.to_str()) {
-                            Some(n) => n,
-                            None => continue,
-                        };
-                        let status = if detail.is_dir {
-                            dir_status_from_children(&sm, child)
-                        } else {
-                            sm.get(child).copied().unwrap_or(FileStatus::Remote).as_str()
-                        };
-                        let is_shared = shared.contains(child);
-                        let sharing = if !is_shared {
-                            ""
-                        } else {
-                            match detail.owner_id.as_deref() {
-                                Some(owner) if owner == creds.username() => "Shared by you",
-                                Some(_) => "Shared with you",
-                                None => "Shared",
-                            }
-                        };
-                        let perms = detail.permissions.as_deref().unwrap_or("");
-                        let owner = detail.owner_display_name.as_deref().unwrap_or("");
-                        records.push(format!(
-                            "{}\t{}\t{}\t{}\t{}\t{}",
-                            name, status, sharing, perms, owner, detail.size
-                        ));
-                    }
+                    let records = detaildir_records(
+                        &remote_dir, &details, &sm, &shared, creds.username(),
+                    );
                     log::debug!("IPC DETAILDIR {} → {} children", path_str, records.len());
                     records.join("\x1e")
                 }
@@ -554,5 +569,71 @@ fn handle_client(
         if writeln!(write_half, "{}", reply).is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn detail(perms: &str, owner_id: &str, owner_name: &str, size: u64, is_dir: bool) -> FileDetail {
+        FileDetail {
+            permissions: Some(perms.to_string()),
+            owner_id: Some(owner_id.to_string()),
+            owner_display_name: Some(owner_name.to_string()),
+            size,
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn detaildir_lists_only_direct_children_with_fields() {
+        let mut details = HashMap::new();
+        details.insert(PathBuf::from("/dir/a.txt"), detail("RGDNVW", "alice", "Alice", 100, false));
+        details.insert(PathBuf::from("/dir/sub"), detail("RGDNVCK", "alice", "Alice", 4096, true));
+        details.insert(PathBuf::from("/dir/sub/deep.txt"), detail("RG", "bob", "Bob", 5, false)); // grandchild, excluded
+        details.insert(PathBuf::from("/other/x.txt"), detail("RG", "bob", "Bob", 7, false)); // other dir, excluded
+
+        let mut sm = HashMap::new();
+        sm.insert(PathBuf::from("/dir/a.txt"), FileStatus::Kept);
+
+        let mut shared = HashSet::new();
+        shared.insert(PathBuf::from("/dir/a.txt"));
+
+        let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, "alice");
+        assert_eq!(recs.len(), 2, "only direct children of /dir");
+
+        let by_name: HashMap<&str, &String> =
+            recs.iter().map(|r| (r.split('\t').next().unwrap(), r)).collect();
+
+        // a.txt: kept, shared by you (owner == username), perms mapped verbatim, size 100
+        assert_eq!(by_name["a.txt"], &"a.txt\tkept\tShared by you\tRGDNVW\tAlice\t100".to_string());
+        // sub: directory status derived from children (none in sm → remote), not shared
+        let sub = by_name["sub"];
+        assert!(sub.starts_with("sub\t"), "record starts with basename");
+        assert!(sub.contains("\t\t"), "empty sharing field when not shared");
+        assert!(sub.ends_with("\t4096"), "size preserved");
+    }
+
+    #[test]
+    fn detaildir_empty_dir_yields_no_records() {
+        let details = HashMap::new();
+        let sm = HashMap::new();
+        let shared = HashSet::new();
+        let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, "alice");
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn detaildir_shared_with_you_when_owner_differs() {
+        let mut details = HashMap::new();
+        details.insert(PathBuf::from("/dir/f"), detail("RG", "bob", "Bob", 1, false));
+        let sm = HashMap::new();
+        let mut shared = HashSet::new();
+        shared.insert(PathBuf::from("/dir/f"));
+        let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, "alice");
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].contains("\tShared with you\t"));
     }
 }
