@@ -75,10 +75,13 @@ if os.path.exists(xdg_path):
 # ── 2. Route based on whether the file is locally available ───────────────────
 # Ask STATUS first (cheap, usually instant) to decide between the fast local
 # path (exiftool) and the slow remote path (THUMBNAIL fetches from NC server).
+# None (daemon slow/down) is treated as non-remote: exiftool is tried first,
+# and if the file truly isn't local, the FUSE read will fail and exiftool exits
+# non-zero — no silent download triggered.
 status = ipc(f'STATUS {src_path}', timeout=3)
-is_local = status in ('kept', 'cached', 'synced')
+is_remote = status in ('remote', 'downloading')
 
-if not is_local:
+if is_remote:
     # ── 2b. Remote file: ask daemon to fetch preview from Nextcloud ───────────
     reply = ipc(f'THUMBNAIL {src_path}', timeout=15)
     if reply == 'ok' and os.path.exists(xdg_path):
