@@ -403,5 +403,137 @@ class TestUploadingStatus(unittest.TestCase):
         self.assertTrue(syncstate._EMBLEM_REMOTE)
 
 
+class _FakeFileInfo:
+    """Records emblems and attributes set by the extension."""
+
+    def __init__(self, path, scheme="file"):
+        self._path = path
+        self._scheme = scheme
+        self.emblems = []
+        self.attrs = {}
+
+    def get_uri_scheme(self):
+        return self._scheme
+
+    def get_location(self):
+        return types.SimpleNamespace(get_path=lambda: self._path)
+
+    def add_emblem(self, name):
+        self.emblems.append(name)
+
+    def add_string_attribute(self, key, value):
+        self.attrs[key] = value
+
+
+class TestParseDetailDir(unittest.TestCase):
+    def test_parses_records(self):
+        resp = "a.txt\tkept\tShared by you\tRGDNVW\tAlice\t100"
+        resp += "\x1e" + "sub\tremote\t\t\t\t4096"
+        parsed = syncstate._parse_detaildir(resp)
+        self.assertEqual(parsed["a.txt"], ("kept", "Shared by you", "RGDNVW", "Alice", "100"))
+        self.assertEqual(parsed["sub"], ("remote", "", "", "", "4096"))
+
+    def test_empty_response(self):
+        self.assertEqual(syncstate._parse_detaildir(""), {})
+
+    def test_skips_malformed_records(self):
+        parsed = syncstate._parse_detaildir("short\tonly\ttwo\x1ea\tkept\ts\tp\to\t5")
+        self.assertNotIn("short", parsed)
+        self.assertIn("a", parsed)
+
+
+class TestInfoProviderSyncCache(unittest.TestCase):
+    """The InfoProvider must answer synchronously (COMPLETE) and warm the whole
+    directory with a single DETAILDIR call rather than one query per file."""
+
+    def setUp(self):
+        # Run pool tasks and idle callbacks inline so the test is deterministic.
+        self._orig_submit = syncstate._POOL.submit
+        self._orig_idle = syncstate.GLib.idle_add
+        self._orig_send = syncstate._send_command
+        syncstate._POOL.submit = lambda fn, *a: (fn(*a), None)[1]
+        syncstate.GLib.idle_add = lambda fn, *a: (fn(*a), None)[1]
+        # Reset module cache
+        with syncstate._cache_lock:
+            syncstate._dir_cache.clear()
+            syncstate._dir_cache_ts.clear()
+            syncstate._dir_inflight.clear()
+
+    def tearDown(self):
+        syncstate._POOL.submit = self._orig_submit
+        syncstate.GLib.idle_add = self._orig_idle
+        syncstate._send_command = self._orig_send
+
+    def _make_provider(self, mount="/mnt/ncrs"):
+        prov = syncstate.NcrsInfoProvider.__new__(syncstate.NcrsInfoProvider)
+        prov._mount = mount
+        prov._poll_running = False
+        prov._poll_skip = 0
+        return prov
+
+    def test_one_detaildir_call_warms_all_children(self):
+        calls = []
+
+        def fake_send(cmd):
+            calls.append(cmd)
+            if cmd.startswith("DETAILDIR "):
+                return (
+                    "a.txt\tkept\t\tRGDNVW\tAlice\t100"
+                    "\x1e" + "b.txt\tremote\t\t\t\t0"
+                )
+            return "error"
+
+        syncstate._send_command = fake_send
+        prov = self._make_provider()
+
+        # First request for a.txt: cache miss → COMPLETE + one DETAILDIR fetch.
+        fi_a = _FakeFileInfo("/mnt/ncrs/dir/a.txt")
+        res = prov.update_file_info_full(None, None, None, fi_a)
+        self.assertEqual(res, syncstate.Nautilus.OperationResult.COMPLETE)
+
+        # Exactly one DETAILDIR was issued for the parent directory.
+        self.assertEqual(calls, ["DETAILDIR /mnt/ncrs/dir"])
+
+        # A second file in the same dir must NOT trigger another socket call.
+        fi_b = _FakeFileInfo("/mnt/ncrs/dir/b.txt")
+        res = prov.update_file_info_full(None, None, None, fi_b)
+        self.assertEqual(res, syncstate.Nautilus.OperationResult.COMPLETE)
+        self.assertEqual(calls, ["DETAILDIR /mnt/ncrs/dir"], "cache hit: no extra query")
+
+        # And b.txt was served synchronously from the warmed cache.
+        self.assertEqual(fi_b.attrs.get("ncrs_sync"), "Remote")
+
+    def test_cache_hit_applies_metadata(self):
+        syncstate._send_command = lambda cmd: "f\tkept\tShared by you\tRGDNVW\tAlice\t2048"
+        prov = self._make_provider()
+        # First call is a cache miss: it paints nothing but warms the directory.
+        prov.update_file_info_full(None, None, None, _FakeFileInfo("/mnt/ncrs/dir/f"))
+        # Nautilus re-requests after the invalidation; now it is a cache hit.
+        fi = _FakeFileInfo("/mnt/ncrs/dir/f")
+        prov.update_file_info_full(None, None, None, fi)
+        self.assertEqual(fi.attrs.get("ncrs_sync"), "Kept locally")
+        self.assertEqual(fi.attrs.get("ncrs_owner"), "Alice")
+        self.assertEqual(fi.attrs.get("ncrs_permissions"), syncstate._human_perms("RGDNVW"))
+        self.assertIn(syncstate._EMBLEM_SHARED, fi.emblems)
+
+    def test_outside_mount_returns_complete_without_query(self):
+        calls = []
+        syncstate._send_command = lambda cmd: calls.append(cmd) or "error"
+        prov = self._make_provider()
+        fi = _FakeFileInfo("/home/user/elsewhere/x.txt")
+        res = prov.update_file_info_full(None, None, None, fi)
+        self.assertEqual(res, syncstate.Nautilus.OperationResult.COMPLETE)
+        self.assertEqual(calls, [], "files outside the mount must not hit the daemon")
+
+    def test_non_file_scheme_ignored(self):
+        calls = []
+        syncstate._send_command = lambda cmd: calls.append(cmd) or "error"
+        prov = self._make_provider()
+        fi = _FakeFileInfo("/mnt/ncrs/dir/a.txt", scheme="recent")
+        res = prov.update_file_info_full(None, None, None, fi)
+        self.assertEqual(res, syncstate.Nautilus.OperationResult.COMPLETE)
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

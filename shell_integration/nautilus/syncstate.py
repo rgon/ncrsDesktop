@@ -201,8 +201,38 @@ def _human_size(n: int) -> str:
     return f"{n:.1f} PiB"
 
 
+# ── Per-directory detail cache ───────────────────────────────────────────────
+# The InfoProvider answers Nautilus synchronously from this cache so it never
+# blocks the file view on a per-file socket round-trip. A cache miss paints the
+# file immediately with no metadata and warms the *whole* directory with a
+# single DETAILDIR query in the background, then invalidates the children so
+# Nautilus repaints them from the now-populated cache.
+_DIR_CACHE_TTL = 30.0  # seconds
+_dir_cache: dict = {}  # dir path → {basename: (sync, sharing, perms, owner, size)}
+_dir_cache_ts: dict = {}  # dir path → monotonic timestamp of last fetch
+_dir_inflight: set = set()  # dirs with a fetch in progress
+_cache_lock = threading.Lock()
+
+
+def _parse_detaildir(resp: str) -> dict:
+    result = {}
+    if not resp:
+        return result
+    for rec in resp.split("\x1e"):
+        parts = rec.split("\t")
+        if len(parts) < 6:
+            continue
+        result[parts[0]] = (parts[1], parts[2], parts[3], parts[4], parts[5])
+    return result
+
+
 def _invalidate_path(path: str) -> bool:
     try:
+        # Force the parent directory to re-fetch on the next request so the
+        # freshly-changed file picks up its new status/metadata.
+        parent = os.path.dirname(path)
+        with _cache_lock:
+            _dir_cache_ts.pop(parent, None)
         fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(path))
         if fi is not None:
             fi.invalidate_extension_info()
@@ -377,6 +407,11 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             paths = [p for p in resp.split("\t") if p]
             if paths:
                 had_changes = True
+                # Force each changed file's directory to re-fetch so the stale
+                # cached record is replaced on the next request.
+                with _cache_lock:
+                    for p in paths:
+                        _dir_cache_ts.pop(os.path.dirname(p), None)
 
             def _invalidate():
                 for p in paths:
@@ -398,81 +433,126 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             self._poll_running = False
 
     def update_file_info_full(self, provider, handle, closure, file_info):
+        # Answer synchronously (return COMPLETE, never call the async
+        # update_complete_invoke — that is only for IN_PROGRESS results and
+        # calling it on a synchronous return triggers Nautilus's "Unexpected
+        # plugin response: handle=(nil)" and drops the completion).
         try:
             if not self._mount:
-                Nautilus.info_provider_update_complete_invoke(
-                    closure, provider, handle, Nautilus.OperationResult.COMPLETE)
                 return Nautilus.OperationResult.COMPLETE
 
             if file_info.get_uri_scheme() != "file":
-                Nautilus.info_provider_update_complete_invoke(
-                    closure, provider, handle, Nautilus.OperationResult.COMPLETE)
                 return Nautilus.OperationResult.COMPLETE
 
             path = file_info.get_location().get_path()
             if path is None or not (
                 path == self._mount or path.startswith(self._mount + "/")
             ):
-                Nautilus.info_provider_update_complete_invoke(
-                    closure, provider, handle, Nautilus.OperationResult.COMPLETE)
                 return Nautilus.OperationResult.COMPLETE
 
-            _POOL.submit(self._do_update_file_info, provider, handle, closure, file_info, path)
-            return Nautilus.OperationResult.IN_PROGRESS
+            parent = os.path.dirname(path)
+            name = os.path.basename(path)
+            ent = None
+            fresh = False
+            with _cache_lock:
+                entry = _dir_cache.get(parent)
+                fresh = (time.monotonic() - _dir_cache_ts.get(parent, 0.0)) < _DIR_CACHE_TTL
+                if entry is not None:
+                    ent = entry.get(name)
+
+            if ent is not None:
+                self._apply_detail(file_info, ent)
+
+            # Warm (or refresh) the whole directory in the background on a miss
+            # or once the cache has gone stale; the fetch invalidates the
+            # children so Nautilus repaints them from the populated cache.
+            if ent is None or not fresh:
+                self._ensure_dir_fetch(parent)
+
+            return Nautilus.OperationResult.COMPLETE
         except Exception:
             _log_error("update_file_info_full")
             return Nautilus.OperationResult.FAILED
 
-    def _do_update_file_info(self, provider, handle, closure, file_info, path):
+    def cancel_update(self, provider, handle):
+        # We answer synchronously, so there is never an outstanding async
+        # operation to cancel. Present so nautilus-python does not warn.
+        pass
+
+    def _apply_detail(self, file_info, ent):
+        sync, sharing, perms, owner, size_str = ent
         try:
-            detail = _send_command(f"DETAIL {path}")
-            parts = detail.split("\t")
-            sync = parts[0] if len(parts) > 0 else "unknown"
-            sharing = parts[1] if len(parts) > 1 else ""
-            perms = parts[2] if len(parts) > 2 else ""
-            owner = parts[3] if len(parts) > 3 else ""
-            size_str = parts[4] if len(parts) > 4 else "0"
+            if sync == "kept":
+                file_info.add_emblem(_EMBLEM_KEPT)
+            elif sync == "cached":
+                file_info.add_emblem(_EMBLEM_CACHED)
+            elif sync == "local":
+                file_info.add_emblem(_EMBLEM_KEPT)
+            elif sync == "downloading":
+                file_info.add_emblem(_EMBLEM_REMOTE)
+            elif sync == "uploading":
+                file_info.add_emblem(_EMBLEM_UPLOADING)
+            elif sync == "partial":
+                file_info.add_emblem(_EMBLEM_PARTIAL)
+            if sharing:
+                file_info.add_emblem(_EMBLEM_SHARED)
 
-            def _apply():
-                try:
-                    if sync == "kept":
-                        file_info.add_emblem(_EMBLEM_KEPT)
-                    elif sync == "cached":
-                        file_info.add_emblem(_EMBLEM_CACHED)
-                    elif sync == "local":
-                        file_info.add_emblem(_EMBLEM_KEPT)
-                    elif sync == "downloading":
-                        file_info.add_emblem(_EMBLEM_REMOTE)
-                    elif sync == "uploading":
-                        file_info.add_emblem(_EMBLEM_UPLOADING)
-                    elif sync == "partial":
-                        file_info.add_emblem(_EMBLEM_PARTIAL)
-                    if sharing:
-                        file_info.add_emblem(_EMBLEM_SHARED)
+            file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
+            file_info.add_string_attribute("ncrs_sharing", sharing)
+            file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
+            file_info.add_string_attribute("ncrs_owner", owner)
+            try:
+                size_val = int(size_str)
+                file_info.add_string_attribute(
+                    "ncrs_size", _human_size(size_val) if size_val > 0 else ""
+                )
+            except ValueError:
+                file_info.add_string_attribute("ncrs_size", "")
+        except Exception:
+            _log_error("_apply_detail")
 
-                    file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
-                    file_info.add_string_attribute("ncrs_sharing", sharing)
-                    file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
-                    file_info.add_string_attribute("ncrs_owner", owner)
+    def _ensure_dir_fetch(self, parent):
+        with _cache_lock:
+            if parent in _dir_inflight:
+                return
+            fresh = (time.monotonic() - _dir_cache_ts.get(parent, 0.0)) < _DIR_CACHE_TTL
+            if fresh and parent in _dir_cache:
+                return
+            _dir_inflight.add(parent)
+        try:
+            _POOL.submit(self._do_dir_fetch, parent)
+        except Exception:
+            with _cache_lock:
+                _dir_inflight.discard(parent)
+            _log_error("_ensure_dir_fetch submit")
+
+    def _do_dir_fetch(self, parent):
+        try:
+            resp = _send_command(f"DETAILDIR {parent}")
+            if resp.startswith("error"):
+                return
+            parsed = _parse_detaildir(resp)
+            with _cache_lock:
+                _dir_cache[parent] = parsed
+                _dir_cache_ts[parent] = time.monotonic()
+
+            def _invalidate_children():
+                for child_name in parsed:
                     try:
-                        size_val = int(size_str)
-                        file_info.add_string_attribute(
-                            "ncrs_size", _human_size(size_val) if size_val > 0 else ""
-                        )
-                    except ValueError:
-                        file_info.add_string_attribute("ncrs_size", "")
-                except Exception:
-                    _log_error("_apply update_file_info")
-                finally:
-                    Nautilus.info_provider_update_complete_invoke(
-                        closure, provider, handle, Nautilus.OperationResult.COMPLETE)
+                        child = os.path.join(parent, child_name)
+                        fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(child))
+                        if fi is not None:
+                            fi.invalidate_extension_info()
+                    except Exception:
+                        pass
                 return GLib.SOURCE_REMOVE
 
-            GLib.idle_add(_apply)
+            GLib.idle_add(_invalidate_children)
         except Exception:
-            _log_error(f"_do_update_file_info({path})")
-            Nautilus.info_provider_update_complete_invoke(
-                closure, provider, handle, Nautilus.OperationResult.FAILED)
+            _log_error(f"_do_dir_fetch({parent})")
+        finally:
+            with _cache_lock:
+                _dir_inflight.discard(parent)
 
 
 # ── Menu provider ─────────────────────────────────────────────────────────────
