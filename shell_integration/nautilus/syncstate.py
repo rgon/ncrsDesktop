@@ -50,6 +50,11 @@ _EMBLEM_UPLOADING = "emblem-synchronizing"  # circular arrows — upload in prog
 
 SOCKET_TIMEOUT = 2.0  # seconds
 
+# IPC protocol version. Must match PROTOCOL_VERSION in ncrs_core/src/ipc.rs.
+# Announced to the daemon on connect so a half-updated install (new daemon +
+# old extension, or vice-versa) is reported instead of silently misbehaving.
+PROTOCOL_VERSION = 2
+
 _POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="ncrs-nautilus")
 
 # Nextcloud oc:permissions flag letters → human labels.
@@ -351,7 +356,45 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         self._mount = _load_mount_point()
         self._poll_running = False
         self._poll_skip = 0  # 2-second ticks to skip when idle (adaptive backoff)
+        # Handshake off the main thread so a slow/absent daemon never stalls load.
+        _POOL.submit(self._check_daemon_version)
         GLib.timeout_add_seconds(2, self._poll_changes)
+
+    def _check_daemon_version(self) -> None:
+        """Announce our protocol version and warn if the daemon's differs."""
+        try:
+            resp = _send_command(f"VERSION {PROTOCOL_VERSION}")
+            daemon_proto = resp.split("\t")[0] if resp else ""
+            if not resp or resp.startswith("error") or daemon_proto in ("", "unknown"):
+                print(
+                    f"[ncrs-nautilus] warning: the ncRS daemon did not report a protocol "
+                    f"version (extension protocol v{PROTOCOL_VERSION}). It is likely an older "
+                    f"build without DETAILDIR support — update the daemon to match the extension.",
+                    file=sys.stderr,
+                )
+                return
+            try:
+                daemon_v = int(daemon_proto)
+            except ValueError:
+                print(
+                    f"[ncrs-nautilus] warning: unexpected VERSION reply from daemon: {resp!r}",
+                    file=sys.stderr,
+                )
+                return
+            if daemon_v != PROTOCOL_VERSION:
+                print(
+                    f"[ncrs-nautilus] warning: daemon protocol v{daemon_v} does not match "
+                    f"extension protocol v{PROTOCOL_VERSION}. Update both to the same ncRS "
+                    f"release; metadata may be missing or stale until then.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[ncrs-nautilus] connected to ncRS daemon (protocol v{daemon_v})",
+                    file=sys.stderr,
+                )
+        except Exception:
+            _log_error("_check_daemon_version")
 
     def _poll_changes(self) -> bool:
         if self._poll_skip > 0:

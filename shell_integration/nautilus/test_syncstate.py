@@ -535,5 +535,51 @@ class TestInfoProviderSyncCache(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class TestDaemonVersionCheck(unittest.TestCase):
+    """The extension announces its protocol version and warns on a mismatch or
+    an old daemon that doesn't understand VERSION."""
+
+    def setUp(self):
+        self._orig_send = syncstate._send_command
+
+    def tearDown(self):
+        syncstate._send_command = self._orig_send
+
+    def _run_check(self, reply):
+        sent = []
+        syncstate._send_command = lambda cmd: (sent.append(cmd), reply)[1]
+        prov = syncstate.NcrsInfoProvider.__new__(syncstate.NcrsInfoProvider)
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            prov._check_daemon_version()
+        return sent, buf.getvalue()
+
+    def test_announces_own_protocol_version(self):
+        sent, _ = self._run_check(f"{syncstate.PROTOCOL_VERSION}\t0.1.10")
+        self.assertEqual(sent, [f"VERSION {syncstate.PROTOCOL_VERSION}"])
+
+    def test_matching_version_no_warning(self):
+        _, err = self._run_check(f"{syncstate.PROTOCOL_VERSION}\t0.1.10")
+        self.assertNotIn("warning", err.lower())
+        self.assertIn(f"protocol v{syncstate.PROTOCOL_VERSION}", err)
+
+    def test_mismatched_version_warns(self):
+        _, err = self._run_check(f"{syncstate.PROTOCOL_VERSION + 1}\t9.9.9")
+        self.assertIn("warning", err.lower())
+        self.assertIn("does not match", err)
+
+    def test_old_daemon_without_version_command_warns(self):
+        # Pre-VERSION daemons reply "unknown" to an unrecognised command.
+        _, err = self._run_check("unknown")
+        self.assertIn("warning", err.lower())
+        self.assertIn("older build", err)
+
+    def test_connection_error_warns(self):
+        _, err = self._run_check("error: connection failed")
+        self.assertIn("warning", err.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

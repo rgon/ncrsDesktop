@@ -18,6 +18,7 @@
 ///   STATE\n                           → paused|syncing|idle (daemon-wide sync state)
 ///   PAUSE\n / RESUME\n                → ok (suspend/resume background sync)
 ///   THUMBNAIL <abs-path>\n           → ok | error: <msg>  (fetch NC preview → XDG thumb cache)
+///   VERSION <n>\n                     → <daemon-protocol>\t<pkg-version>  (n = extension protocol)
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,13 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
 const MAX_IPC_CLIENTS: usize = 64;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// IPC protocol version. Bump whenever the daemon⇄extension contract changes
+/// (a new command, a changed reply format). The Nautilus extension announces
+/// its own copy of this on connect via `VERSION`; a mismatch is logged so a
+/// half-updated install (new daemon + old extension, or vice-versa) is obvious.
+/// Keep in sync with `PROTOCOL_VERSION` in shell_integration/nautilus/syncstate.py.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 const QUERY_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ').add(b'#').add(b'%').add(b'&').add(b'+').add(b'=').add(b'?');
@@ -559,6 +567,27 @@ fn handle_client(
             paused.store(false, Ordering::Relaxed);
             log::info!("sync resumed via IPC");
             "ok".to_string()
+        } else if let Some(ver_str) = trimmed.strip_prefix("VERSION ") {
+            // The extension announces its protocol version on connect. Print it
+            // and warn if it does not match the daemon so a half-updated install
+            // is visible in the logs. Reply with our own protocol + package
+            // version so the extension can warn on its side too.
+            match ver_str.trim().parse::<u32>() {
+                Ok(v) if v == PROTOCOL_VERSION => {
+                    log::info!("Nautilus extension connected (protocol v{})", v);
+                }
+                Ok(v) => {
+                    log::warn!(
+                        "Nautilus extension protocol v{} does not match daemon protocol v{} — \
+                         update ncRS so the daemon and Nautilus extension are the same release",
+                        v, PROTOCOL_VERSION
+                    );
+                }
+                Err(_) => {
+                    log::warn!("Nautilus extension sent malformed VERSION: {:?}", ver_str.trim());
+                }
+            }
+            format!("{}\t{}", PROTOCOL_VERSION, env!("CARGO_PKG_VERSION"))
         } else if let Some(msg) = trimmed.strip_prefix("LOG ") {
             log::info!("[nautilus] {}", msg);
             "ok".to_string()
