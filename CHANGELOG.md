@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.13](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.12...ncrs-v0.1.13) (2026-07-11)
+
+
+### Bug Fixes
+
+* **build:** sync Cargo.lock to workspace version 0.1.12 ([6ac52f7](https://github.com/rgon/ncrsDesktop/commit/6ac52f7590988baf7f4da5b18daeb1a5a0c098eb))
+* **fuse:** update inode map on rename so saved files don't vanish ([233b5db](https://github.com/rgon/ncrsDesktop/commit/233b5dbf63c62a4faacee613d01247762ef90113))
+
 ## [0.1.12](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.11...ncrs-v0.1.12) (2026-07-11)
 
 
