@@ -2703,7 +2703,7 @@ impl Filesystem for NextCloudFs {
                         if !already {
                             let conn2 = conn.clone();
                             thread::spawn(move || {
-                                thread::sleep(Duration::from_millis(500));
+                                thread::sleep(Duration::from_millis(200));
                                 preview::prefetch_directory_thumbnails(
                                     &conn2.http,
                                     &conn2.base_url,

@@ -28,7 +28,11 @@ const FILE_PATH_ENCODE: &AsciiSet = &CONTROLS
 const PREVIEW_SIZE: u32 = 128;
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-const THUMB_BATCH: usize = 2;
+// Server-cached previews (has_preview=true) are pre-generated JPEGs served as static
+// files — cheap for the server. Fetch up to 8 concurrently with only a tiny gap
+// between batches so we race ahead of Nautilus's per-file thumbnail checks.
+const THUMB_BATCH: usize = 8;
+const THUMB_BATCH_GAP_MS: u64 = 100;
 // On-demand RAW preview generation (nc:has-preview=false) is expensive server-side
 // (ImageMagick decoding). Process one at a time and pause between requests so the
 // server keeps PHP workers free for FUSE HTTP operations.
@@ -135,7 +139,7 @@ fn fetch_preview_bytes(
     remote_path: &Path,
     fileid: u64,
 ) -> Result<Vec<u8>, String> {
-    log::debug!("GET_THUMB fileId={} {}", fileid, remote_path.display());
+    let t0 = std::time::Instant::now();
     let url = format!("{}/core/preview", base);
     let size = PREVIEW_SIZE.to_string();
     let fid_str = fileid.to_string();
@@ -150,7 +154,9 @@ fn fetch_preview_bytes(
     if !resp.status().is_success() {
         return Err(format!("preview API returned {}", resp.status()));
     }
-    resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+    let bytes = resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())?;
+    log::debug!("GET_THUMB fileId={} {}ms {} {}", fileid, t0.elapsed().as_millis(), bytes.len(), remote_path.display());
+    Ok(bytes)
 }
 
 /// NC's preview API returns JPEG even for JPEG source files. Convert to PNG
@@ -225,6 +231,8 @@ pub fn prefetch_thumbnail(
         log::debug!("thumbnail {}: no fileid, skipping", remote_path.display());
         return;
     };
+
+    let t_total = std::time::Instant::now();
     let raw = match fetch_preview_bytes(client, base, creds, remote_path, fileid) {
         Ok(d) => d,
         Err(e) => {
@@ -232,6 +240,7 @@ pub fn prefetch_thumbnail(
             return;
         }
     };
+    let t_after_fetch = t_total.elapsed().as_millis();
 
     let png = match ensure_png(raw) {
         Ok(d) => d,
@@ -240,6 +249,7 @@ pub fn prefetch_thumbnail(
             return;
         }
     };
+    let t_after_convert = t_total.elapsed().as_millis();
 
     let mtime_s = mtime
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
@@ -272,6 +282,7 @@ pub fn prefetch_thumbnail(
     // Remove any stale fail-cache entries so Nautilus picks up the thumbnail
     // instead of indefinitely skipping the file because of a past failure.
     evict_fail_cache(&uri);
+    log::debug!("thumbnail done fetch={}ms convert={}ms total={}ms {}", t_after_fetch, t_after_convert - t_after_fetch, t_total.elapsed().as_millis(), remote_path.display());
 }
 
 pub fn prefetch_directory_thumbnails(
@@ -293,10 +304,10 @@ pub fn prefetch_directory_thumbnails(
         .filter(|(path, _, has_preview, _)| !*has_preview && is_raw_image(path))
         .collect();
 
-    // ── Fast path: server-cached previews (batch, 1 s gap) ───────────────────
+    // ── Fast path: server-cached previews (batch, short gap) ────────────────
     for (i, chunk) in server_cached.chunks(THUMB_BATCH).enumerate() {
         if i > 0 {
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_millis(THUMB_BATCH_GAP_MS));
         }
         while active_streams.load(Ordering::Relaxed) > 0 {
             std::thread::sleep(Duration::from_millis(500));
