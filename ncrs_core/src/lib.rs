@@ -1830,22 +1830,27 @@ impl NextCloudFs {
     pub fn thumbnail_callback(&self) -> ipc::ThumbnailCallback {
         let conn = self.conn.clone();
         let fileids = self.fileids.clone();
+        let thumb_inflight = self.thumb_inflight.clone();
         Arc::new(move |remote_path: PathBuf| {
-            let fileid = fileids.safe_lock().get(&remote_path).copied();
-            let mount_path = conn.mount_point.join(
-                remote_path.strip_prefix("/").unwrap_or(&remote_path)
-            );
-            let mtime = std::fs::metadata(&mount_path).ok()
-                .and_then(|m| m.modified().ok());
-            crate::preview::prefetch_thumbnail(
-                &conn.http,
-                &conn.base_url,
-                &conn.creds,
-                &conn.mount_point,
-                &remote_path,
-                mtime,
-                fileid,
-            );
+            let already_inflight = !thumb_inflight.safe_lock().insert(remote_path.clone());
+            if !already_inflight {
+                let fileid = fileids.safe_lock().get(&remote_path).copied();
+                let mount_path = conn.mount_point.join(
+                    remote_path.strip_prefix("/").unwrap_or(&remote_path)
+                );
+                let mtime = std::fs::metadata(&mount_path).ok()
+                    .and_then(|m| m.modified().ok());
+                crate::preview::prefetch_thumbnail(
+                    &conn.http,
+                    &conn.base_url,
+                    &conn.creds,
+                    &conn.mount_point,
+                    &remote_path,
+                    mtime,
+                    fileid,
+                );
+                thumb_inflight.safe_lock().remove(&remote_path);
+            }
             let uri = crate::preview::file_uri(&conn.mount_point, &remote_path);
             crate::preview::xdg_thumbnail_path(&uri).exists()
         })
