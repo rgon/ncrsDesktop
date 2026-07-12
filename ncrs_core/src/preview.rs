@@ -100,6 +100,26 @@ fn xdg_thumb_path(file_uri: &str) -> PathBuf {
     xdg_thumb_dir().join(format!("{}.png", hash))
 }
 
+/// Remove any XDG fail-cache entries for `file_uri` so Nautilus retries
+/// thumbnailing after the daemon successfully pre-fetches a preview.
+/// Each entry lives at `thumbnails/fail/<appname>/<md5>.png`.
+fn evict_fail_cache(file_uri: &str) {
+    let hash = format!("{:x}", md5::compute(file_uri));
+    let filename = format!("{}.png", hash);
+    let fail_root = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("thumbnails")
+        .join("fail");
+    let Ok(apps) = std::fs::read_dir(&fail_root) else { return };
+    for app in apps.flatten() {
+        let entry = app.path().join(&filename);
+        if entry.exists() {
+            let _ = std::fs::remove_file(&entry);
+            log::debug!("evicted fail cache {}", entry.display());
+        }
+    }
+}
+
 /// Public accessor for the XDG thumbnail cache path for a given file URI.
 /// The thumbnailer script uses this to find what the daemon has pre-fetched.
 pub fn xdg_thumbnail_path(file_uri: &str) -> PathBuf {
@@ -224,7 +244,11 @@ pub fn prefetch_thumbnail(
     if let Err(e) = std::fs::rename(&tmp, &thumb) {
         log::debug!("rename thumbnail {}: {}", thumb.display(), e);
         let _ = std::fs::remove_file(&tmp);
+        return;
     }
+    // Remove any stale fail-cache entries so Nautilus picks up the thumbnail
+    // instead of indefinitely skipping the file because of a past failure.
+    evict_fail_cache(&uri);
 }
 
 pub fn prefetch_directory_thumbnails(
