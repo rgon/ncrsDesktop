@@ -135,24 +135,39 @@ fn fetch_preview_bytes(
     remote_path: &str,
     fileid: Option<u64>,
 ) -> Result<Vec<u8>, String> {
-    log::debug!("GET_THUMB {}", remote_path);
+    let fid = fileid.ok_or_else(|| "no fileid — cannot fetch preview".to_string())?;
+    log::debug!("GET_THUMB fileId={} {}", fid, remote_path);
     let url = format!("{}/core/preview", base);
     let size = PREVIEW_SIZE.to_string();
-    let req = client.get(&url).timeout(API_TIMEOUT);
-    let req = if let Some(fid) = fileid {
-        let fid_str = fid.to_string();
-        req.query(&[("fileId", &fid_str), ("x", &size), ("y", &size), ("mimeFallback", &"true".to_string()), ("a", &"0".to_string())])
-    } else {
-        req.query(&[("file", &remote_path.to_string()), ("x", &size), ("y", &size), ("a", &"1".to_string())])
-    };
-    let resp = creds.apply(req)
-        .send()
-        .map_err(|e| e.to_string())?;
+    let fid_str = fid.to_string();
+    let resp = creds.apply(
+        client.get(&url)
+            .timeout(API_TIMEOUT)
+            .query(&[("fileId", &fid_str as &str), ("x", &size as &str), ("y", &size as &str), ("a", "0")])
+    )
+    .send()
+    .map_err(|e| e.to_string())?;
 
     if !resp.status().is_success() {
         return Err(format!("preview API returned {}", resp.status()));
     }
     resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+}
+
+/// NC's preview API returns JPEG even for JPEG source files. Convert to PNG
+/// so the result can be written to the XDG thumbnail cache, which requires PNG.
+pub(crate) fn ensure_png(data: Vec<u8>) -> Result<Vec<u8>, String> {
+    if data.len() >= 8 && data[..8] == PNG_SIG {
+        return Ok(data);
+    }
+    if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
+        let img = image::load_from_memory(&data).map_err(|e| format!("jpeg decode: {}", e))?;
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .map_err(|e| format!("png encode: {}", e))?;
+        return Ok(out);
+    }
+    Err(format!("unexpected preview format (first bytes: {:02x?})", &data[..data.len().min(4)])    )
 }
 
 // ── XDG thumbnail PNG writer ──────────────────────────────────────────────────
@@ -207,7 +222,15 @@ pub fn prefetch_thumbnail(
         return;
     }
 
-    let png = match fetch_preview_bytes(client, base, creds, &remote_path.to_string_lossy(), fileid) {
+    let raw = match fetch_preview_bytes(client, base, creds, &remote_path.to_string_lossy(), fileid) {
+        Ok(d) => d,
+        Err(e) => {
+            log::debug!("thumbnail {}: {}", remote_path.display(), e);
+            return;
+        }
+    };
+
+    let png = match ensure_png(raw) {
         Ok(d) => d,
         Err(e) => {
             log::debug!("thumbnail {}: {}", remote_path.display(), e);
@@ -223,10 +246,7 @@ pub fn prefetch_thumbnail(
     let data = match inject_png_text_chunks(&png, &[("Thumb::URI", &uri), ("Thumb::MTime", &mtime_s)]) {
         Some(d) => d,
         None => {
-            // Nextcloud's preview API is expected to return PNG; JPEG (FFD8) means
-            // the server returned a raw JPEG pass-through instead of a scaled preview.
-            let hint = if png.starts_with(&[0xFF, 0xD8]) { " (got JPEG)" } else { "" };
-            log::debug!("thumbnail {}: not a valid PNG{}, skipping", remote_path.display(), hint);
+            log::debug!("thumbnail {}: inject_png_text_chunks failed (corrupt PNG?)", remote_path.display());
             return;
         }
     };
