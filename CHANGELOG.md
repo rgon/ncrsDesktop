@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.15](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.14...ncrs-v0.1.15) (2026-07-12)
+
+
+### Bug Fixes
+
+* **preview:** percent-encode file: URIs so XDG thumbnail hashes match Nautilus ([ed1a42d](https://github.com/rgon/ncrsDesktop/commit/ed1a42d796349797052ff15d28f37320fa198c14))
+
 ## [0.1.14](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.13...ncrs-v0.1.14) (2026-07-12)
 
 
