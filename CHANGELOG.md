@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.16](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.15...ncrs-v0.1.16) (2026-07-12)
+
+
+### Bug Fixes
+
+* **preview:** evict XDG fail-cache entries when thumbnail is written ([c662680](https://github.com/rgon/ncrsDesktop/commit/c662680414452afd58b19b7000786275522261c5))
+
 ## [0.1.15](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.14...ncrs-v0.1.15) (2026-07-12)
 
 
