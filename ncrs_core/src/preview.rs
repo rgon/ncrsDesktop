@@ -133,13 +133,12 @@ fn fetch_preview_bytes(
     base: &str,
     creds: &crate::auth::Credentials,
     remote_path: &Path,
-    fileid: Option<u64>,
+    fileid: u64,
 ) -> Result<Vec<u8>, String> {
-    let fid = fileid.ok_or_else(|| "no fileid — cannot fetch preview".to_string())?;
-    log::debug!("GET_THUMB fileId={} {}", fid, remote_path.display());
+    log::debug!("GET_THUMB fileId={} {}", fileid, remote_path.display());
     let url = format!("{}/core/preview", base);
     let size = PREVIEW_SIZE.to_string();
-    let fid_str = fid.to_string();
+    let fid_str = fileid.to_string();
     let resp = creds.apply(
         client.get(&url)
             .timeout(API_TIMEOUT)
@@ -156,7 +155,7 @@ fn fetch_preview_bytes(
 
 /// NC's preview API returns JPEG even for JPEG source files. Convert to PNG
 /// so the result can be written to the XDG thumbnail cache, which requires PNG.
-pub(crate) fn ensure_png(data: Vec<u8>) -> Result<Vec<u8>, String> {
+fn ensure_png(data: Vec<u8>) -> Result<Vec<u8>, String> {
     if data.len() >= 8 && data[..8] == PNG_SIG {
         return Ok(data);
     }
@@ -222,6 +221,10 @@ pub fn prefetch_thumbnail(
         return;
     }
 
+    let Some(fileid) = fileid else {
+        log::debug!("thumbnail {}: no fileid, skipping", remote_path.display());
+        return;
+    };
     let raw = match fetch_preview_bytes(client, base, creds, remote_path, fileid) {
         Ok(d) => d,
         Err(e) => {
