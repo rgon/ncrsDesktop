@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.19](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.18...ncrs-v0.1.19) (2026-07-12)
+
+
+### Performance Improvements
+
+* **preview:** increase thumbnail throughput; add fetch/convert timing logs ([738fe16](https://github.com/rgon/ncrsDesktop/commit/738fe167957deac999fc3441cd961b98b73064d0))
+
 ## [0.1.18](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.17...ncrs-v0.1.18) (2026-07-12)
 
 
