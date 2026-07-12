@@ -3,6 +3,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
+// Characters that must be percent-encoded in file: URI path segments.
+// Matches what GLib's g_filename_to_uri encodes so our XDG cache keys
+// agree with what Nautilus (GIO) computes when looking up thumbnails.
+const FILE_PATH_ENCODE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
 const PREVIEW_SIZE: u32 = 128;
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -59,7 +81,11 @@ fn is_raw_image(path: &Path) -> bool {
 pub fn file_uri(mount_point: &Path, remote_path: &Path) -> String {
     let rel = remote_path.strip_prefix("/").unwrap_or(remote_path);
     let full = mount_point.join(rel);
-    format!("file://{}", full.display())
+    // Percent-encode the path so the URI matches what GLib/Nautilus produces.
+    // Without this, paths with spaces produce a different MD5 hash than Nautilus
+    // expects, so pre-fetched thumbnails are never found in the XDG cache.
+    let encoded = utf8_percent_encode(&full.to_string_lossy(), FILE_PATH_ENCODE).to_string();
+    format!("file://{}", encoded)
 }
 
 fn xdg_thumb_dir() -> PathBuf {
@@ -247,5 +273,52 @@ pub fn prefetch_directory_thumbnails(
             std::thread::sleep(Duration::from_millis(500));
         }
         prefetch_thumbnail(client, base, creds, mount_point, path, *mtime, *fileid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_uri_encodes_spaces() {
+        let mount = Path::new("/home/user/ncrs/logoclc");
+        let remote = Path::new("/marketing/Content by LOGO/photo.jpg");
+        let uri = file_uri(mount, remote);
+        assert_eq!(
+            uri,
+            "file:///home/user/ncrs/logoclc/marketing/Content%20by%20LOGO/photo.jpg"
+        );
+    }
+
+    #[test]
+    fn file_uri_encodes_special_chars() {
+        let mount = Path::new("/mnt");
+        let remote = Path::new("/dir/file#1.jpg");
+        let uri = file_uri(mount, remote);
+        assert!(!uri.contains(' '), "URI must not contain raw spaces");
+        assert!(uri.contains("%23"), "# must be encoded as %23");
+    }
+
+    #[test]
+    fn file_uri_plain_ascii_unchanged() {
+        let mount = Path::new("/home/user/ncrs");
+        let remote = Path::new("/docs/report.pdf");
+        let uri = file_uri(mount, remote);
+        assert_eq!(uri, "file:///home/user/ncrs/docs/report.pdf");
+    }
+
+    #[test]
+    fn xdg_thumbnail_path_matches_encoded_uri() {
+        // Thumbnail path must be keyed on the percent-encoded URI so Nautilus/GIO
+        // can find it. Before the fix file_uri() returned an unencoded URI whose
+        // MD5 hash differed from what Nautilus computed for paths with spaces.
+        let mount = Path::new("/mnt/ncrs");
+        let remote = Path::new("/my folder/photo.jpg");
+        let uri = file_uri(mount, remote);
+        assert!(uri.contains("%20"), "space must be encoded so Nautilus finds the thumbnail");
+        let path = xdg_thumbnail_path(&uri);
+        let expected_hash = format!("{:x}", md5::compute(uri.as_bytes()));
+        assert_eq!(path.file_stem().unwrap().to_str().unwrap(), expected_hash);
     }
 }
