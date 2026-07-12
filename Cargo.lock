@@ -2850,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "nc_passwords"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "log",
  "ncrs_plugin",
@@ -2863,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs-gui"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "dirs",
  "env_logger",
@@ -2884,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs_core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "clap",
  "crc32fast",
@@ -2911,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs_plugin"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "serde",
  "serde_json",
