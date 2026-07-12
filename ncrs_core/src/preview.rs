@@ -1,3 +1,4 @@
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -283,6 +284,21 @@ pub fn prefetch_thumbnail(
     // instead of indefinitely skipping the file because of a past failure.
     evict_fail_cache(&uri);
     log::debug!("thumbnail done fetch={}ms convert={}ms total={}ms {}", t_after_fetch, t_after_convert - t_after_fetch, t_total.elapsed().as_millis(), remote_path.display());
+
+    // Touch the file's atime on the FUSE mount (atime only, mtime unchanged so the
+    // XDG Thumb::MTime chunk stays valid). The FUSE setattr handler returns success
+    // without forwarding atime-only changes to the server, which causes the kernel
+    // to emit IN_ATTRIB via fsnotify. Nautilus's GFileMonitor sees the event,
+    // re-reads the file, finds the thumbnail in the XDG cache, and shows it — no
+    // F5 required.
+    let fuse_path = mount_point.join(remote_path.strip_prefix("/").unwrap_or(remote_path));
+    if let Ok(cstr) = std::ffi::CString::new(fuse_path.as_os_str().as_bytes()) {
+        let times = [
+            libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW },
+            libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
+        ];
+        unsafe { libc::utimensat(libc::AT_FDCWD, cstr.as_ptr(), times.as_ptr(), 0); }
+    }
 }
 
 pub fn prefetch_directory_thumbnails(
