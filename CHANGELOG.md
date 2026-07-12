@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.14](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.13...ncrs-v0.1.14) (2026-07-12)
+
+
+### Performance Improvements
+
+* **ipc:** drop status/detail locks before joining DETAILDIR reply so huge dirs don't stall FUSE ([7632fae](https://github.com/rgon/ncrsDesktop/commit/7632fae39a72a552de5278c3b21da6a8c4ece92a))
+* **nautilus:** patch changed cache entries in place instead of refetching the whole directory on notify_push updates ([049e167](https://github.com/rgon/ncrsDesktop/commit/049e167b3fb69e0d175165bd38af8793749c31f1))
+* **nautilus:** repaint only requested children after a fetch to avoid O(dir) invalidation on the main thread ([608625c](https://github.com/rgon/ncrsDesktop/commit/608625c9cce20321a1250d256ef075023045375f))
+
 ## [0.1.13](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.12...ncrs-v0.1.13) (2026-07-11)
 
 
