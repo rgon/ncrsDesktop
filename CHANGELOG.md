@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.20](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.19...ncrs-v0.1.20) (2026-07-12)
+
+
+### Features
+
+* **preview:** touch FUSE atime after thumbnail write to auto-refresh Nautilus ([5ccd830](https://github.com/rgon/ncrsDesktop/commit/5ccd830948ed9730dcdb0ef172acb0f68ebeff3c))
+
 ## [0.1.19](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.18...ncrs-v0.1.19) (2026-07-12)
 
 
