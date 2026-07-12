@@ -176,7 +176,7 @@ fn probe_api(
     let req = client.get(&url);
     let req = if let Some(fid) = fileid {
         let fid_str = fid.to_string();
-        req.query(&[("fileId", &fid_str as &str), ("x", size), ("y", size), ("mimeFallback", "true"), ("a", "0")])
+        req.query(&[("fileId", &fid_str as &str), ("x", size), ("y", size), ("a", "0")])
     } else {
         req.query(&[("file", remote_path), ("x", size), ("y", size), ("a", "1")])
     };

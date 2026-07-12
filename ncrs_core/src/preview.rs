@@ -132,11 +132,11 @@ fn fetch_preview_bytes(
     client: &reqwest::blocking::Client,
     base: &str,
     creds: &crate::auth::Credentials,
-    remote_path: &str,
+    remote_path: &Path,
     fileid: Option<u64>,
 ) -> Result<Vec<u8>, String> {
     let fid = fileid.ok_or_else(|| "no fileid — cannot fetch preview".to_string())?;
-    log::debug!("GET_THUMB fileId={} {}", fid, remote_path);
+    log::debug!("GET_THUMB fileId={} {}", fid, remote_path.display());
     let url = format!("{}/core/preview", base);
     let size = PREVIEW_SIZE.to_string();
     let fid_str = fid.to_string();
@@ -162,12 +162,12 @@ pub(crate) fn ensure_png(data: Vec<u8>) -> Result<Vec<u8>, String> {
     }
     if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
         let img = image::load_from_memory(&data).map_err(|e| format!("jpeg decode: {}", e))?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(data.len() * 4);
         img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
             .map_err(|e| format!("png encode: {}", e))?;
         return Ok(out);
     }
-    Err(format!("unexpected preview format (first bytes: {:02x?})", &data[..data.len().min(4)])    )
+    Err(format!("unexpected preview format (first bytes: {:02x?})", &data[..data.len().min(4)]))
 }
 
 // ── XDG thumbnail PNG writer ──────────────────────────────────────────────────
@@ -222,7 +222,7 @@ pub fn prefetch_thumbnail(
         return;
     }
 
-    let raw = match fetch_preview_bytes(client, base, creds, &remote_path.to_string_lossy(), fileid) {
+    let raw = match fetch_preview_bytes(client, base, creds, remote_path, fileid) {
         Ok(d) => d,
         Err(e) => {
             log::debug!("thumbnail {}: {}", remote_path.display(), e);
