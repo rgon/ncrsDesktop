@@ -1,11 +1,19 @@
 # Changelog
 
+## [0.1.17](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.16...ncrs-v0.1.17) (2026-07-12)
+
+
+### Bug Fixes
+
+* **preview:** convert NC JPEG preview response to PNG for XDG thumbnail cache ([f19f259](https://github.com/rgon/ncrsDesktop/commit/f19f259))
+* **preview:** only use fileId-based NC preview API; drop unreliable path-based fallback ([f19f259](https://github.com/rgon/ncrsDesktop/commit/f19f259))
+
 ## [0.1.16](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.15...ncrs-v0.1.16) (2026-07-12)
 
 
 ### Bug Fixes
 
-* **preview:** evict XDG fail-cache entries when thumbnail is written ([c662680](https://github.com/rgon/ncrsDesktop/commit/c662680414452afd58b19b7000786275522261c5))
+* **preview:** evict XDG fail-cache entries when daemon successfully writes a thumbnail ([c662680](https://github.com/rgon/ncrsDesktop/commit/c662680))
 
 ## [0.1.15](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.14...ncrs-v0.1.15) (2026-07-12)
 
