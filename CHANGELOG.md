@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.21](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.20...ncrs-v0.1.21) (2026-07-13)
+
+
+### Features
+
+* **calendar:** add nc_calendar plugin with GOA/CalDAV auto-registration ([e58b41e](https://github.com/rgon/ncrsDesktop/commit/e58b41e476d4c232a6a2db4264ceca240ebe8eaa))
+* **fuse:** serve MIME type via user.xdg.mime.type xattr to skip GIO content sniffing ([53a1f18](https://github.com/rgon/ncrsDesktop/commit/53a1f18407e7c839cc56318b5a6fad119b263a5e))
+* **thumbnailer:** add ncrs-thumbnailer for PDF with evince fallback for local files ([180dc35](https://github.com/rgon/ncrsDesktop/commit/180dc35a14f716b5ab6c47e4836a09da5a897c6a))
+
+
+### Bug Fixes
+
+* **calendar:** manage own GOA account; never reuse manually-added entries ([7289db0](https://github.com/rgon/ncrsDesktop/commit/7289db015bf6b35c341c3f0f08eded613fc73acd))
+* **cicd:** pin pnpm version ([896c25b](https://github.com/rgon/ncrsDesktop/commit/896c25b18d07a5f9feb4a40ca2bd0ae2a704f6ad))
+* **ci:** install pnpm via npm instead of pnpm/action-setup ([c270559](https://github.com/rgon/ncrsDesktop/commit/c270559a4cff74dbec5b1d7f90dbd81a5a28a737))
+* **preview:** prefetch thumbnails for previewable files lacking server-cached previews ([b09cc6c](https://github.com/rgon/ncrsDesktop/commit/b09cc6c3f8ac1fdf64972f70d8f162ab1ed24193))
+
+
+### Performance Improvements
+
+* **fuse:** raise attr TTL to 30 s to avoid per-second kernel re-queries ([8fc19cf](https://github.com/rgon/ncrsDesktop/commit/8fc19cfc0ccf3057b4b8e8cb7b41a92a8e417293))
+* **fuse:** release cache lock before scanning dir entries in getattr and lookup ([52cf175](https://github.com/rgon/ncrsDesktop/commit/52cf175b68e7308c01224ca64077d5eefe442e44))
+
 ## [0.1.20](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.19...ncrs-v0.1.20) (2026-07-12)
 
 
