@@ -1896,41 +1896,38 @@ impl Filesystem for NextCloudFs {
             }
         }
 
-        let mut c = self.cache.safe_lock();
-        let entries = match c.get_cached_dir_readonly(&parent_path) {
+        let entries = match self.cache.safe_lock().get_cached_dir_readonly(&parent_path) {
             Some(files) => files,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
+            None => { reply.error(Errno::ENOENT); return; }
+            // Arc cloned; guard drops here, releasing the lock before the scan.
         };
 
-        for entry in entries.iter() {
-            let entry_name = entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if entry_name == name_str {
-                let target_path = parent_path.join(&name_str);
-                let ino = c.allocate_inode(target_path.clone());
-                let attr = make_file_attr(ino, entry);
-                drop(c);
-                if entry.ext.flag("is_shared") {
-                    self.shared.safe_lock().insert(target_path.clone());
-                }
-                if let Some(fid) = entry.ext.int("fileid") {
-                    self.fileids.safe_lock().insert(target_path.clone(), fid);
-                }
-                self.details.safe_lock().insert(target_path.clone(), ipc::FileDetail {
-                    permissions: entry.ext.str("permissions").map(str::to_string),
-                    owner_id: entry.ext.str("owner_id").map(str::to_string),
-                    owner_display_name: entry.ext.str("owner_display_name").map(str::to_string),
-                    size: entry.size,
-                    is_dir: entry.is_dir,
-                });
-                if !entry.is_dir {
-                    self.status.safe_lock().entry(target_path).or_insert(FileStatus::Remote);
-                }
-                reply.entry(&TTL, &attr, Generation(0));
-                return;
+        let found = entries.iter().find(|e| {
+            e.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == name_str
+        });
+
+        if let Some(entry) = found {
+            let target_path = parent_path.join(&name_str);
+            let ino = self.cache.safe_lock().allocate_inode(target_path.clone());
+            let attr = make_file_attr(ino, entry);
+            if entry.ext.flag("is_shared") {
+                self.shared.safe_lock().insert(target_path.clone());
             }
+            if let Some(fid) = entry.ext.int("fileid") {
+                self.fileids.safe_lock().insert(target_path.clone(), fid);
+            }
+            self.details.safe_lock().insert(target_path.clone(), ipc::FileDetail {
+                permissions: entry.ext.str("permissions").map(str::to_string),
+                owner_id: entry.ext.str("owner_id").map(str::to_string),
+                owner_display_name: entry.ext.str("owner_display_name").map(str::to_string),
+                size: entry.size,
+                is_dir: entry.is_dir,
+            });
+            if !entry.is_dir {
+                self.status.safe_lock().entry(target_path).or_insert(FileStatus::Remote);
+            }
+            reply.entry(&TTL, &attr, Generation(0));
+            return;
         }
         reply.error(Errno::ENOENT);
     }
@@ -1964,18 +1961,21 @@ impl Filesystem for NextCloudFs {
         let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
 
-        let c = self.cache.safe_lock();
-        let entries = match c.get_cached_dir_readonly(&parent) {
-            Some(files) => files,
-            None => {
-                if c.dir_cache.contains_key(&path) || path == Path::new("/") {
-                    drop(c);
-                    reply.attr(&TTL, &make_dir_attr(ino.0));
-                } else {
-                    reply.error(Errno::ENOENT);
+        let entries = {
+            let c = self.cache.safe_lock();
+            match c.get_cached_dir_readonly(&parent) {
+                Some(files) => files,
+                None => {
+                    if c.dir_cache.contains_key(&path) || path == Path::new("/") {
+                        drop(c);
+                        reply.attr(&TTL, &make_dir_attr(ino.0));
+                    } else {
+                        reply.error(Errno::ENOENT);
+                    }
+                    return;
                 }
-                return;
             }
+            // Arc is cloned by get_cached_dir_readonly; guard drops here.
         };
 
         for entry in entries.iter() {
