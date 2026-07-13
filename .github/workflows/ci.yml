@@ -43,16 +43,6 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install pnpm
-        run: npm install -g pnpm@11
-
-      - name: Install Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: ncrs-gui/pnpm-lock.yaml
-
       - name: Run tests
         run: cargo test -p ncrs_core
 
