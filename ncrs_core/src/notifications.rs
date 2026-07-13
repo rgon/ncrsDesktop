@@ -74,11 +74,19 @@ pub fn fetch_notifications(
         "{}/ocs/v2.php/apps/notifications/api/v2/notifications?format=json",
         base
     );
-    let resp = creds.apply(client(http3)
-        .get(&url))
-        .header("OCS-APIREQUEST", "true")
-        .send()
-        .map_err(|e| e.to_string())?;
+    let send = |h3: bool| {
+        creds.apply(client(h3).get(&url))
+            .header("OCS-APIREQUEST", "true")
+            .send()
+    };
+    let resp = match send(http3) {
+        Ok(r) => r,
+        Err(e) if http3 => {
+            log::debug!("notifications HTTP/3 failed, retrying with HTTP/2: {e}");
+            send(false).map_err(|e| e.to_string())?
+        }
+        Err(e) => return Err(e.to_string()),
+    };
 
     if !resp.status().is_success() {
         return Err(format!("notifications API returned {}", resp.status()));
@@ -97,10 +105,18 @@ pub fn dismiss_notification(
         "{}/ocs/v2.php/apps/notifications/api/v2/notifications/{}",
         base, notification_id
     );
-    creds.apply(client(http3)
-        .delete(&url))
-        .header("OCS-APIREQUEST", "true")
-        .send()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    let send = |h3: bool| {
+        creds.apply(client(h3).delete(&url))
+            .header("OCS-APIREQUEST", "true")
+            .send()
+    };
+    match send(http3) {
+        Ok(_) => Ok(()),
+        Err(e) if http3 => {
+            log::debug!("dismiss HTTP/3 failed, retrying with HTTP/2: {e}");
+            send(false).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
