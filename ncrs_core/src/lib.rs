@@ -73,6 +73,11 @@ const GHOST_TTL: Duration = Duration::from_secs(10);
 // parallel rather than sequentially, cutting per-directory latency from O(N*RTT)
 // to O(RTT) for any set of small files opened concurrently.
 const OPEN_PREFETCH_MAX_BYTES: u64 = 512 * 1024;
+// Files up to this size are eagerly downloaded in parallel during readdir so
+// that GLib MIME magic-byte detection finds data ready instead of triggering
+// sequential network fetches.  Sized to cover any file GLib would read for
+// detection (max 16 KiB) while staying small enough to download speculatively.
+const READDIR_PREFETCH_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) enum GhostKind {
@@ -1572,10 +1577,15 @@ pub struct NextCloudFs {
     exclude_folders: HashSet<PathBuf>,
     thumb_inflight: Arc<Mutex<HashSet<PathBuf>>>,
     cleanup_stale_gio_temps: bool,
+    // Streams started by readdir for small remote files so open() can reuse them.
+    // Value is (target_len_bytes, stream_arc).
+    readdir_prefetch: Arc<Mutex<HashMap<PathBuf, (u64, Arc<(Mutex<StreamState>, Condvar)>)>>>,
 }
 
-/// Returns true if the server at `base_url` responds over QUIC within 3 s.
-/// Any HTTP status counts as success — we're testing transport, not auth.
+/// Returns true only when the server at `base_url` actually responds over QUIC
+/// (i.e. the response version is HTTP/3). reqwest 0.13 silently falls back to
+/// HTTP/1.1 when QUIC fails, so checking the response version is necessary to
+/// distinguish a real H3 connection from a silent downgrade.
 fn probe_http3(base_url: &str) -> bool {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1600,9 +1610,13 @@ fn probe_http3(base_url: &str) -> bool {
             }
         };
         match client.head(base_url).send().await {
-            Ok(resp) => {
-                log::info!("HTTP/3 probe succeeded ({}): {}", resp.status().as_u16(), base_url);
+            Ok(resp) if resp.version() == reqwest::Version::HTTP_3 => {
+                log::info!("HTTP/3 probe succeeded: {}", base_url);
                 true
+            }
+            Ok(resp) => {
+                log::warn!("HTTP/3 probe: got {:?} instead of HTTP/3, using HTTP/2", resp.version());
+                false
             }
             Err(e) => {
                 log::warn!("HTTP/3 probe failed, using HTTP/2: {:?}", e);
@@ -1791,6 +1805,7 @@ impl NextCloudFs {
             exclude_folders,
             thumb_inflight: Arc::new(Mutex::new(HashSet::new())),
             cleanup_stale_gio_temps: options.cleanup_stale_gio_temps,
+            readdir_prefetch: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2180,11 +2195,15 @@ impl Filesystem for NextCloudFs {
             None
         };
 
-        // For small read-only non-cached files, kick off the download now so that
-        // multiple concurrent open() calls (e.g. GLib MIME magic-byte detection
-        // scanning a directory) run their downloads in parallel.  The ReadAheadBuf
-        // is picked up by the existing wait-in-thread path in read().
+        // For small read-only non-cached files, reuse a readdir-triggered stream
+        // if available (parallel downloads started during readdir), otherwise kick
+        // off a fresh download.  The ReadAheadBuf is picked up by read().
         let prefetch_buf = if !writable && local.is_none() {
+            // Check if readdir already started a download for this file.
+            let from_readdir = self.readdir_prefetch.safe_lock().remove(&path);
+            if let Some((target_len, stream)) = from_readdir {
+                Some(ReadAheadBuf { start: 0, stream, target_len })
+            } else {
             let file_size = self.cache.safe_lock().find_entry(&path).map(|e| e.size).unwrap_or(0);
             if file_size > 0 && file_size <= OPEN_PREFETCH_MAX_BYTES {
                 let stream = Arc::new((
@@ -2267,6 +2286,7 @@ impl Filesystem for NextCloudFs {
             } else {
                 None
             }
+            } // else branch of `if let Some(from_readdir)`
         } else {
             None
         };
@@ -2682,6 +2702,7 @@ impl Filesystem for NextCloudFs {
         let thumb_inflight = self.thumb_inflight.clone();
         let cleanup_stale_gio_temps = self.cleanup_stale_gio_temps;
         let elog = self.error_log.clone();
+        let readdir_prefetch = self.readdir_prefetch.clone();
 
         thread::spawn(move || {
             if offset == 0 {
@@ -2976,6 +2997,7 @@ impl Filesystem for NextCloudFs {
                         };
                         if !already {
                             let conn2 = conn.clone();
+                            let path_for_thumb = path.clone();
                             thread::spawn(move || {
                                 thread::sleep(Duration::from_millis(200));
                                 preview::prefetch_directory_thumbnails(
@@ -2986,8 +3008,71 @@ impl Filesystem for NextCloudFs {
                                     &thumb_candidates,
                                     &conn2.active_streams,
                                 );
-                                thumb_inflight.safe_lock().remove(&path);
+                                thumb_inflight.safe_lock().remove(&path_for_thumb);
                             });
+                        }
+                    }
+
+                    // Kick off parallel downloads for all small remote files in this
+                    // directory.  GLib MIME magic-byte detection opens each file for
+                    // a 16 KiB read; by starting downloads during readdir the data is
+                    // ready (or nearly so) by the time GLib calls open() + read().
+                    if offset == 0 {
+                        // Build a size lookup from entries; use status_entries (not cache_entries,
+                        // which has already been consumed) to filter for Remote-only files.
+                        let size_by_path: HashMap<PathBuf, u64> = entries.iter()
+                            .filter(|e| !e.is_dir && e.size > 0 && e.size <= READDIR_PREFETCH_MAX_BYTES)
+                            .filter_map(|e| {
+                                let name = e.path.file_name()?.to_str()?;
+                                Some((path.join(name), e.size))
+                            })
+                            .collect();
+                        let candidates: Vec<(PathBuf, u64)> = status_entries.iter()
+                            .filter(|(_, s)| matches!(s, FileStatus::Remote))
+                            .filter_map(|(p, _)| size_by_path.get(p).map(|&sz| (p.clone(), sz)))
+                            .collect();
+                        if !candidates.is_empty() {
+                            let mut pf = readdir_prefetch.safe_lock();
+                            // Evict finished streams for this directory before inserting new ones.
+                            pf.retain(|p, (_, s)| {
+                                if p.parent() != Some(path.as_path()) { return true; }
+                                !s.0.lock().unwrap().done
+                            });
+                            for (ep, file_size) in candidates {
+                                if pf.contains_key(&ep) { continue; }
+                                let target_len = file_size;
+                                let stream = Arc::new((
+                                    Mutex::new(StreamState { data: Vec::with_capacity(target_len as usize), done: false }),
+                                    Condvar::new(),
+                                ));
+                                pf.insert(ep.clone(), (target_len, Arc::clone(&stream)));
+                                let conn3 = conn.clone();
+                                thread::spawn(move || {
+                                    let (ref mtx, ref cv) = *stream;
+                                    let _throttle = conn3.prefetch_throttle.acquire();
+                                    match do_range_read_stream(&conn3, &ep, 0, target_len as usize, false) {
+                                        Ok((mut resp, _permit)) => {
+                                            let mut chunk = [0u8; 4096];
+                                            loop {
+                                                use std::io::Read;
+                                                match resp.read(&mut chunk) {
+                                                    Ok(0) => break,
+                                                    Ok(n) => {
+                                                        mtx.lock().unwrap().data.extend_from_slice(&chunk[..n]);
+                                                        cv.notify_all();
+                                                    }
+                                                    Err(_) => break,
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::debug!("readdir prefetch {}: {}", ep.display(), e);
+                                        }
+                                    }
+                                    mtx.lock().unwrap().done = true;
+                                    cv.notify_all();
+                                });
+                            }
                         }
                     }
                 }
