@@ -4,7 +4,7 @@ members = [
   "ncrs-gui/src-tauri",
   "plugins/ncrs_plugin",
   "plugins/nc_passwords",
-  "plugins/nc_calendar",
+  "plugins/nc_gnome_integration",
 ]
 resolver = "2"
 

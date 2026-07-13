@@ -3,14 +3,14 @@
     // by the ncrs-gui vite alias at build time; these imports aren't resolvable
     // from the plugin's location during static analysis.
     import Icon from "$components/Icon.svelte";
-    import { mdiCalendar } from "@mdi/js";
+    import { mdiAccountSync } from "@mdi/js";
 </script>
 
 <div class="flex flex-col items-center justify-center flex-grow gap-4 p-8">
-    <Icon class="w-16 h-16 text-blue-500" path={mdiCalendar} />
-    <h2 class="text-lg font-semibold">Calendar Connected</h2>
+    <Icon class="w-16 h-16 text-blue-500" path={mdiAccountSync} />
+    <h2 class="text-lg font-semibold">GNOME Online Accounts Connected</h2>
     <p class="text-sm text-gray-500 text-center max-w-sm">
-        Your Nextcloud calendar is registered with GNOME Online Accounts. Open
-        GNOME Calendar to view your events.
+        Your Nextcloud account is registered with GNOME Online Accounts.
+        Calendar, Contacts, and other GNOME apps can access it automatically.
     </p>
 </div>

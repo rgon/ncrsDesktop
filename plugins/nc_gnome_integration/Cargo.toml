@@ -1,5 +1,5 @@
 [package]
-name = "nc_calendar"
+name = "nc_gnome_integration"
 version.workspace = true
 edition = "2021"
 

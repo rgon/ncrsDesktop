@@ -3,15 +3,15 @@ pub mod secret;
 
 use ncrs_plugin::{NcrsPlugin, PluginMeta};
 
-pub struct NcCalendarPlugin;
+pub struct NcGnomeIntegrationPlugin;
 
-impl NcrsPlugin for NcCalendarPlugin {
+impl NcrsPlugin for NcGnomeIntegrationPlugin {
     fn meta(&self) -> PluginMeta {
         PluginMeta {
-            id: "nc_calendar".into(),
-            name: "Calendar".into(),
-            description: "Syncs Nextcloud calendar with GNOME Online Accounts".into(),
-            icon: "mdiCalendar".into(),
+            id: "nc_gnome_integration".into(),
+            name: "GNOME Integration".into(),
+            description: "Registers Nextcloud as a GNOME Online Account for Calendar, Contacts, and more".into(),
+            icon: "mdiAccountSync".into(),
             version: "0.1.0".into(),
         }
     }
@@ -27,11 +27,11 @@ pub fn set_credentials(base_url: &str, username: &str, password: &str) {
         match goa::ensure_account(&base_url, &username) {
             Ok(entry) => {
                 if let Err(e) = secret::store_credentials(&entry.id, &password).await {
-                    log::error!("nc_calendar: failed to store credentials: {e:#}");
+                    log::error!("nc_gnome_integration: failed to store credentials: {e:#}");
                 }
             }
             Err(e) => {
-                log::error!("nc_calendar: failed to ensure GOA account: {e:#}");
+                log::error!("nc_gnome_integration: failed to ensure GOA account: {e:#}");
             }
         }
     });
@@ -43,12 +43,12 @@ pub fn clear_credentials(base_url: &str) {
         match goa::remove_managed_account(&base_url) {
             Ok(Some(id)) => {
                 if let Err(e) = secret::delete_credentials(&id).await {
-                    log::error!("nc_calendar: failed to delete credentials: {e:#}");
+                    log::error!("nc_gnome_integration: failed to delete credentials: {e:#}");
                 }
             }
             Ok(None) => {}
             Err(e) => {
-                log::error!("nc_calendar: failed to remove GOA account: {e:#}");
+                log::error!("nc_gnome_integration: failed to remove GOA account: {e:#}");
             }
         }
     });
@@ -61,19 +61,19 @@ mod tests {
 
     #[test]
     fn plugin_meta_has_correct_id() {
-        let plugin = NcCalendarPlugin;
+        let plugin = NcGnomeIntegrationPlugin;
         let meta = plugin.meta();
-        assert_eq!(meta.id, "nc_calendar");
-        assert_eq!(meta.name, "Calendar");
+        assert_eq!(meta.id, "nc_gnome_integration");
+        assert_eq!(meta.name, "GNOME Integration");
     }
 
     #[test]
     fn plugin_meta_serializes() {
-        let plugin = NcCalendarPlugin;
+        let plugin = NcGnomeIntegrationPlugin;
         let meta = plugin.meta();
         let json = serde_json::to_string(&meta).unwrap();
         let back: ncrs_plugin::PluginMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, meta.id);
-        assert_eq!(back.icon, "mdiCalendar");
+        assert_eq!(back.icon, "mdiAccountSync");
     }
 }

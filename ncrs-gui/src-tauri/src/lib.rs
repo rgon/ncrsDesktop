@@ -117,7 +117,7 @@ async fn logout(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
     // Remove stored credentials so the next startup shows the login view.
     if let Ok(opts) = ncrs_core::config::load_config() {
         let base_url = ncrs_core::notifications::base_url(&opts.url);
-        nc_calendar::clear_credentials(&base_url);
+        nc_gnome_integration::clear_credentials(&base_url);
         if let Some(user) = opts.username.as_deref() {
             if let Err(e) = ncrs_core::config::delete_password_from_keyring(user, &opts.url) {
                 log::warn!("logout: keyring delete: {}", e);
@@ -712,8 +712,8 @@ pub fn run() {
         .setup(move |app| {
             nc_passwords::setup(app.handle());
             log::info!("plugin setup done: nc_passwords");
-            nc_calendar::setup(app.handle());
-            log::info!("plugin setup done: nc_calendar");
+            nc_gnome_integration::setup(app.handle());
+            log::info!("plugin setup done: nc_gnome_integration");
             let state_listener = app_state_setup.clone();
             spawn(start_ncfs_daemon(app.handle().clone(), app_state_setup));
 
@@ -896,7 +896,7 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     let user = opts.username.clone().unwrap_or_default();
     let pass = opts.password.clone().unwrap_or_default();
     nc_passwords::set_credentials(&app, &base_url, &user, &pass);
-    nc_calendar::set_credentials(&base_url, &user, &pass);
+    nc_gnome_integration::set_credentials(&base_url, &user, &pass);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 

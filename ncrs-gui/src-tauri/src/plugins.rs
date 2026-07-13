@@ -8,7 +8,7 @@ type WryRuntime = Wry<EventLoopMessage>;
 pub fn all_plugins() -> Vec<Box<dyn NcrsPlugin>> {
     vec![
         Box::new(nc_passwords::NcPasswordsPlugin),
-        Box::new(nc_calendar::NcCalendarPlugin),
+        Box::new(nc_gnome_integration::NcGnomeIntegrationPlugin),
     ]
 }
 
@@ -54,7 +54,7 @@ mod tests {
         let metas = all_metas();
         assert!(!metas.is_empty());
         assert!(metas.iter().any(|m| m.id == "nc_passwords"));
-        assert!(metas.iter().any(|m| m.id == "nc_calendar"));
+        assert!(metas.iter().any(|m| m.id == "nc_gnome_integration"));
     }
 
     #[test]

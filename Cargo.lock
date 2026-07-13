@@ -2851,7 +2851,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nc_calendar"
+name = "nc_gnome_integration"
 version = "0.1.19"
 dependencies = [
  "anyhow",
@@ -2885,7 +2885,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "log",
- "nc_calendar",
+ "nc_gnome_integration",
  "nc_passwords",
  "ncrs_core",
  "ncrs_plugin",
