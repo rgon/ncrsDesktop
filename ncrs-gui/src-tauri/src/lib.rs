@@ -102,12 +102,57 @@ fn get_sync_state(state: State<Arc<AppState>>) -> String {
 
 #[tauri::command]
 async fn remount(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    {
-        let ss = state.sync_state.lock().unwrap();
-        if !matches!(*ss, SyncState::Unmounted | SyncState::Error(_)) {
-            return Err("Can only remount when unmounted or in error".into());
+    // If a FUSE mount is active, unmount it before restarting so a changed
+    // mount path (or any other saved config change) takes effect cleanly.
+    let needs_unmount = !state.attached.load(std::sync::atomic::Ordering::Relaxed)
+        && !matches!(
+            *state.sync_state.lock().unwrap(),
+            SyncState::Unmounted | SyncState::Error(_) | SyncState::Wiped
+        );
+
+    if needs_unmount {
+        let mp = state
+            .mount_options
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|o| o.mount_point.to_string_lossy().into_owned());
+
+        if let Some(mp) = mp {
+            log::info!("remount: unmounting {} before restart", mp);
+            let mp2 = mp.clone();
+            let clean = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("fusermount")
+                    .args(["-u", &mp2])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            if !clean {
+                let mp2 = mp.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::process::Command::new("fusermount")
+                        .args(["-uz", &mp2])
+                        .status();
+                })
+                .await
+                .ok();
+            }
+            // Wait for the FUSE thread to register the unmount (up to 5 s).
+            for _ in 0..50 {
+                if matches!(
+                    *state.sync_state.lock().unwrap(),
+                    SyncState::Unmounted | SyncState::Error(_)
+                ) {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
         }
     }
+
     *state.sync_state.lock().unwrap() = SyncState::Idle;
     state.paused.store(false, std::sync::atomic::Ordering::Relaxed);
     app.emit("sync-state-changed", "idle").ok();
