@@ -320,6 +320,13 @@ pub fn prefetch_directory_thumbnails(
         .filter(|(path, _, has_preview, _)| !*has_preview && is_raw_image(path))
         .collect();
 
+    // Other previewable types (PDF, video, audio…) without a server-cached preview.
+    // The NC preview API generates these on-demand; rate-limit like RAW to avoid
+    // starving PHP workers of capacity for FUSE ops.
+    let on_demand_previewable: Vec<_> = entries.iter()
+        .filter(|(path, _, has_preview, _)| !*has_preview && !is_raw_image(path) && is_previewable(path))
+        .collect();
+
     // ── Fast path: server-cached previews (batch, short gap) ────────────────
     for (i, chunk) in server_cached.chunks(THUMB_BATCH).enumerate() {
         if i > 0 {
@@ -337,9 +344,10 @@ pub fn prefetch_directory_thumbnails(
         });
     }
 
-    // ── Slow path: on-demand RAW (sequential, generous gap) ──────────────────
+    // ── Slow path: on-demand RAW + other previewable (sequential, generous gap) ─
     // One request at a time so the server always has workers left for FUSE ops.
-    for (i, (path, mtime, _, fileid)) in on_demand_raw.iter().enumerate() {
+    let on_demand: Vec<_> = on_demand_raw.iter().chain(on_demand_previewable.iter()).collect();
+    for (i, (path, mtime, _, fileid)) in on_demand.iter().enumerate() {
         if i > 0 {
             std::thread::sleep(Duration::from_secs(RAW_THUMB_INTERVAL_SECS));
         }
