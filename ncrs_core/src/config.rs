@@ -145,6 +145,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
         .ok_or("Missing 'url' in config")?
         .to_string();
     let username = doc["username"].as_str().map(str::to_string);
+    let url = crate::login_flow::normalize_webdav_url(&url, username.as_deref().unwrap_or(""));
     let password = doc["password"].as_str().map(str::to_string);
     let bearer_token = doc["bearer_token"].as_str().map(str::to_string);
     let auth_command = doc["auth_command"].as_str().map(str::to_string);

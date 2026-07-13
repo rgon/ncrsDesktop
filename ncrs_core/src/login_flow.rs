@@ -129,3 +129,99 @@ pub fn webdav_url(server: &str, login_name: &str) -> String {
     let encoded = percent_encoding::utf8_percent_encode(login_name, percent_encoding::NON_ALPHANUMERIC).to_string();
     format!("{}/remote.php/dav/files/{}/", server, encoded)
 }
+
+/// Normalize a user-supplied `url` config field to the canonical
+/// `https://server/remote.php/dav/files/USERNAME/` form.
+///
+/// Accepts bare domains, sub-path installs, and any partial NC path prefix so
+/// users can paste any format and the daemon will connect correctly.  When
+/// `username` is empty the URL is returned unchanged (the caller must validate).
+pub fn normalize_webdav_url(url: &str, username: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() || username.trim().is_empty() {
+        return url.to_string();
+    }
+    webdav_url(url, username)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_bare_domain() {
+        assert_eq!(
+            normalize_webdav_url("https://cloud.example.com", "alice"),
+            "https://cloud.example.com/remote.php/dav/files/alice/",
+        );
+    }
+
+    #[test]
+    fn normalize_bare_domain_trailing_slash() {
+        assert_eq!(
+            normalize_webdav_url("https://cloud.example.com/", "alice"),
+            "https://cloud.example.com/remote.php/dav/files/alice/",
+        );
+    }
+
+    #[test]
+    fn normalize_subpath_install() {
+        assert_eq!(
+            normalize_webdav_url("https://example.com/nextcloud", "alice"),
+            "https://example.com/nextcloud/remote.php/dav/files/alice/",
+        );
+    }
+
+    #[test]
+    fn normalize_partial_remote_php() {
+        assert_eq!(
+            normalize_webdav_url("https://cloud.example.com/remote.php", "alice"),
+            "https://cloud.example.com/remote.php/dav/files/alice/",
+        );
+    }
+
+    #[test]
+    fn normalize_partial_remote_php_dav() {
+        assert_eq!(
+            normalize_webdav_url("https://cloud.example.com/remote.php/dav", "alice"),
+            "https://cloud.example.com/remote.php/dav/files/alice/",
+        );
+    }
+
+    #[test]
+    fn normalize_full_url_idempotent() {
+        let full = "https://cloud.example.com/remote.php/dav/files/alice/";
+        assert_eq!(normalize_webdav_url(full, "alice"), full);
+    }
+
+    #[test]
+    fn normalize_subpath_full_url_idempotent() {
+        let full = "https://example.com/nextcloud/remote.php/dav/files/alice/";
+        assert_eq!(normalize_webdav_url(full, "alice"), full);
+    }
+
+    #[test]
+    fn normalize_special_chars_in_username() {
+        let result = normalize_webdav_url("https://cloud.example.com", "alice@domain.com");
+        assert_eq!(result, "https://cloud.example.com/remote.php/dav/files/alice%40domain%2Ecom/");
+    }
+
+    #[test]
+    fn normalize_empty_username_no_change() {
+        let url = "https://cloud.example.com";
+        assert_eq!(normalize_webdav_url(url, ""), url);
+    }
+
+    #[test]
+    fn normalize_empty_url_no_change() {
+        assert_eq!(normalize_webdav_url("", "alice"), "");
+    }
+
+    #[test]
+    fn normalize_index_php_prefix() {
+        assert_eq!(
+            normalize_webdav_url("https://cloud.example.com/index.php/login/v2", "alice"),
+            "https://cloud.example.com/remote.php/dav/files/alice/",
+        );
+    }
+}
