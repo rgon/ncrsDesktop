@@ -38,3 +38,4 @@ env_logger = "0.11"
 dirs = "6.0.0"
 ncrs_plugin = { path = "../../plugins/ncrs_plugin" }
 nc_passwords = { path = "../../plugins/nc_passwords" }
+nc_calendar = { path = "../../plugins/nc_calendar" }

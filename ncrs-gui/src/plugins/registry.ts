@@ -1,6 +1,8 @@
 import type { Component } from 'svelte';
 // @ts-ignore -- plugin component lives outside src/, resolved by Vite alias
 import PasswordsView from '$plugins/nc_passwords/frontend/PasswordsView.svelte';
+// @ts-ignore -- plugin component lives outside src/, resolved by Vite alias
+import CalendarView from '$plugins/nc_calendar/frontend/CalendarView.svelte';
 
 export interface PluginRegistryEntry {
     component: Component;
@@ -8,6 +10,7 @@ export interface PluginRegistryEntry {
 
 const registry: Record<string, PluginRegistryEntry> = {
     'nc_passwords': { component: PasswordsView as unknown as Component },
+    'nc_calendar': { component: CalendarView as unknown as Component },
 };
 
 export function getPluginComponent(id: string): PluginRegistryEntry | undefined {

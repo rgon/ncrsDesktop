@@ -6,7 +6,10 @@ use tauri_runtime_wry::Wry;
 type WryRuntime = Wry<EventLoopMessage>;
 
 pub fn all_plugins() -> Vec<Box<dyn NcrsPlugin>> {
-    vec![Box::new(nc_passwords::NcPasswordsPlugin)]
+    vec![
+        Box::new(nc_passwords::NcPasswordsPlugin),
+        Box::new(nc_calendar::NcCalendarPlugin),
+    ]
 }
 
 pub fn all_metas() -> Vec<PluginMeta> {
@@ -51,6 +54,7 @@ mod tests {
         let metas = all_metas();
         assert!(!metas.is_empty());
         assert!(metas.iter().any(|m| m.id == "nc_passwords"));
+        assert!(metas.iter().any(|m| m.id == "nc_calendar"));
     }
 
     #[test]
