@@ -49,7 +49,7 @@ impl<T> MutexExt<T> for Mutex<T> {
     }
 }
 
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(30);
 const DIR_CACHE_TTL: Duration = Duration::from_secs(10);
 const OPTIMISTIC_TTL_CONNECTED: Duration = Duration::from_secs(86400);
 const OPTIMISTIC_TTL_FALLBACK: Duration = Duration::from_secs(300);
