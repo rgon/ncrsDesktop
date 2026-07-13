@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.22](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.21...ncrs-v0.1.22) (2026-07-13)
+
+
+### Bug Fixes
+
+* **ci:** drop unused node/pnpm steps from test job ([e592f89](https://github.com/rgon/ncrsDesktop/commit/e592f8944e334a96f2c244e8d39c7260d45008a9))
+
 ## [0.1.21](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.20...ncrs-v0.1.21) (2026-07-13)
 
 
