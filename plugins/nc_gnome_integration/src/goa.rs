@@ -146,6 +146,7 @@ pub(crate) fn ensure_account_at(
                 "PresentationIdentity".to_string(),
                 format!("{}@{}", username, host),
             ),
+            ("IsTemporary".to_string(), "false".to_string()),
             (
                 "Uri".to_string(),
                 format!("{}/remote.php/webdav", base_url_trimmed),
@@ -212,6 +213,37 @@ pub fn ensure_account(base_url: &str, username: &str) -> anyhow::Result<AccountE
         .join("goa-1.0")
         .join("accounts.conf");
     ensure_account_at(&path, base_url, username)
+}
+
+/// Ask goa-daemon to re-verify credentials for an account that may be stuck in
+/// AttentionNeeded state (e.g., from a prior race between accounts.conf and keyring writes).
+/// Best-effort: failures are logged at debug level and do not propagate.
+pub fn trigger_credential_recheck(account_id: &str) {
+    let path = format!("/org/gnome/OnlineAccounts/Accounts/{}", account_id);
+    tokio::task::spawn_blocking(move || {
+        match std::process::Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.gnome.OnlineAccounts",
+                "--object-path",
+                &path,
+                "--method",
+                "org.gnome.OnlineAccounts.Account.EnsureCredentials",
+            ])
+            .output()
+        {
+            Ok(out) if !out.status.success() => {
+                log::debug!(
+                    "nc_gnome_integration: EnsureCredentials: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Err(e) => log::debug!("nc_gnome_integration: EnsureCredentials: {e}"),
+            _ => {}
+        }
+    });
 }
 
 pub fn remove_managed_account(base_url: &str) -> anyhow::Result<Option<String>> {

@@ -24,16 +24,21 @@ pub fn set_credentials(base_url: &str, username: &str, password: &str) {
     let username = username.to_string();
     let password = password.to_string();
     tokio::spawn(async move {
-        match goa::ensure_account(&base_url, &username) {
-            Ok(entry) => {
-                if let Err(e) = secret::store_credentials(&entry.id, &password).await {
-                    log::error!("nc_gnome_integration: failed to store credentials: {e:#}");
-                }
-            }
-            Err(e) => {
-                log::error!("nc_gnome_integration: failed to ensure GOA account: {e:#}");
-            }
+        // Credentials must land in the keyring BEFORE accounts.conf is written.
+        // goa-daemon watches accounts.conf via inotify and immediately tries to
+        // authenticate the new account; if the keyring entry doesn't exist yet
+        // it marks the account AttentionNeeded=true and won't recover on its own.
+        if let Err(e) = secret::store_credentials(goa::NCRS_ACCOUNT_ID, &password).await {
+            log::error!("nc_gnome_integration: failed to store credentials: {e:#}");
+            return;
         }
+        if let Err(e) = goa::ensure_account(&base_url, &username) {
+            log::error!("nc_gnome_integration: failed to ensure GOA account: {e:#}");
+            return;
+        }
+        // For accounts that already existed and were in AttentionNeeded state,
+        // signal goa-daemon to re-verify now that the keyring entry is fresh.
+        goa::trigger_credential_recheck(goa::NCRS_ACCOUNT_ID);
     });
 }
 
