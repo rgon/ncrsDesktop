@@ -67,6 +67,12 @@ fn effective_dir_ttl(optimistic_listing: bool, notify_push_connected: &AtomicBoo
 }
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const GHOST_TTL: Duration = Duration::from_secs(10);
+// Files at or below this size are downloaded eagerly in open() so that parallel
+// open() calls run parallel downloads.  This makes MIME magic-byte detection
+// (which GLib 2.80 triggers for any file with an unrecognised extension) run in
+// parallel rather than sequentially, cutting per-directory latency from O(N*RTT)
+// to O(RTT) for any set of small files opened concurrently.
+const OPEN_PREFETCH_MAX_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) enum GhostKind {
@@ -2174,12 +2180,103 @@ impl Filesystem for NextCloudFs {
             None
         };
 
+        // For small read-only non-cached files, kick off the download now so that
+        // multiple concurrent open() calls (e.g. GLib MIME magic-byte detection
+        // scanning a directory) run their downloads in parallel.  The ReadAheadBuf
+        // is picked up by the existing wait-in-thread path in read().
+        let prefetch_buf = if !writable && local.is_none() {
+            let file_size = self.cache.safe_lock().find_entry(&path).map(|e| e.size).unwrap_or(0);
+            if file_size > 0 && file_size <= OPEN_PREFETCH_MAX_BYTES {
+                let stream = Arc::new((
+                    Mutex::new(StreamState { data: Vec::with_capacity(file_size as usize), done: false }),
+                    Condvar::new(),
+                ));
+                let buf = ReadAheadBuf {
+                    start: 0,
+                    stream: Arc::clone(&stream),
+                    target_len: file_size,
+                };
+                let conn = self.conn.clone();
+                let cache = self.cache.clone();
+                let status = self.status.clone();
+                let dirty = self.dirty.clone();
+                let auto_keep = self.auto_keep_cached_files;
+                let cache_streamed = self.cache_streamed_reads;
+                let path_clone = path.clone();
+                thread::spawn(move || {
+                    let (ref mtx, ref cv) = *stream;
+                    match do_range_read_stream(&conn, &path_clone, 0, file_size as usize, false) {
+                        Ok((mut resp, _permit)) => {
+                            let mut chunk = [0u8; 4096];
+                            loop {
+                                use std::io::Read;
+                                match resp.read(&mut chunk) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        mtx.lock().unwrap().data.extend_from_slice(&chunk[..n]);
+                                        cv.notify_all();
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            // Promote to persistent file_cache if fully downloaded.
+                            if cache_streamed {
+                                let ss = mtx.lock().unwrap();
+                                if ss.data.len() as u64 == file_size {
+                                    let data = ss.data.clone();
+                                    drop(ss);
+                                    let (target_dir, kept) = {
+                                        let c = cache.safe_lock();
+                                        if auto_keep { (c.kept_dir.clone(), true) } else { (c.auto_cache_dir.clone(), false) }
+                                    };
+                                    let rel = path_clone.strip_prefix("/").unwrap_or(&path_clone);
+                                    let local_path = target_dir.join(rel);
+                                    if let Some(p) = local_path.parent() { let _ = std::fs::create_dir_all(p); }
+                                    if std::fs::write(&local_path, &data).is_ok() {
+                                        let mut c = cache.safe_lock();
+                                        let mod_time = c.remote_modified_for(&path_clone);
+                                        let etag = c.remote_etag_for(&path_clone);
+                                        c.file_cache.insert(path_clone.clone(), FileCacheEntry {
+                                            local_path: local_path.clone(),
+                                            remote_modified: mod_time,
+                                            etag,
+                                            kept,
+                                            size: file_size,
+                                        });
+                                        drop(c);
+                                        save_file_cache(&cache);
+                                        let file_status = if kept { FileStatus::Kept } else { FileStatus::Cached };
+                                        status.safe_lock().insert(path_clone.clone(), file_status);
+                                        dirty.safe_lock().insert(path_clone.clone());
+                                        log::debug!("prefetch→cache {} ({}B)", path_clone.display(), file_size);
+                                    }
+                                    mtx.lock().unwrap().done = true;
+                                    cv.notify_all();
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("open prefetch {}: {}", path_clone.display(), e);
+                        }
+                    }
+                    mtx.lock().unwrap().done = true;
+                    cv.notify_all();
+                });
+                Some(buf)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         self.open_files.safe_lock().insert(
             fh,
             OpenFile {
                 remote_path: path,
                 local,
-                buf: None,
+                buf: prefetch_buf,
                 write_path,
                 dirty: false,
                 original_etag: etag,
@@ -2272,6 +2369,51 @@ impl Filesystem for NextCloudFs {
                                 guard = g;
                                 if result.timed_out() && !guard.done {
                                     log::warn!("read wait timeout at offset {}", off);
+                                    reply.error(Errno::EIO);
+                                    return;
+                                }
+                            }
+                        });
+                        return;
+                    }
+                    // Condition 3: read request starts within the buf range but exceeds
+                    // target_len (common for MIME magic detection which requests 16 KiB
+                    // from small prefetched files).  Wait for the download to finish, then
+                    // serve however many bytes are available — POSIX allows short reads.
+                    if off >= ra.start && off < ra.start + ra.target_len {
+                        if ss.done {
+                            let o = (off - ra.start) as usize;
+                            let e = ss.data.len().min(o.saturating_add(sz));
+                            reply.data(if o < ss.data.len() { &ss.data[o..e] } else { &[] });
+                            drop(ss);
+                            drop(files);
+                            return;
+                        }
+                        let shared = Arc::clone(&ra.stream);
+                        let start = ra.start;
+                        drop(ss);
+                        drop(files);
+                        thread::spawn(move || {
+                            let (ref mtx, ref cv) = *shared;
+                            let mut guard = mtx.lock().unwrap();
+                            let deadline = Instant::now() + Duration::from_secs(30);
+                            loop {
+                                if guard.done {
+                                    let o = (off - start) as usize;
+                                    let e = guard.data.len().min(o.saturating_add(sz));
+                                    reply.data(if o < guard.data.len() { &guard.data[o..e] } else { &[] });
+                                    return;
+                                }
+                                let remaining = deadline.saturating_duration_since(Instant::now());
+                                if remaining.is_zero() {
+                                    log::warn!("prefetch wait timeout at offset {}", off);
+                                    reply.error(Errno::EIO);
+                                    return;
+                                }
+                                let (g, res) = cv.wait_timeout(guard, remaining).unwrap();
+                                guard = g;
+                                if res.timed_out() && !guard.done {
+                                    log::warn!("prefetch wait timeout at offset {}", off);
                                     reply.error(Errno::EIO);
                                     return;
                                 }
