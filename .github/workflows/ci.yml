@@ -44,9 +44,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 11
+        run: npm install -g pnpm@11
 
       - name: Install Node.js
         uses: actions/setup-node@v6
@@ -120,9 +118,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 11
+        run: npm install -g pnpm@11
 
       - name: Install Node.js
         uses: actions/setup-node@v6
