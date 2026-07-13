@@ -701,7 +701,7 @@ fn open_main_window(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::init();
+    // Logging is handled by tauri-plugin-log (see plugin registration below).
     let app_state = Arc::new(AppState::default());
     let app_state_setup = app_state.clone();
     let app_state_menu = app_state.clone();
@@ -717,6 +717,11 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             open_main_window(app);
         }))
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Warn)
+                .build(),
+        )
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
