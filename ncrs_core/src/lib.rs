@@ -1571,27 +1571,39 @@ pub struct NextCloudFs {
 /// Returns true if the server at `base_url` responds over QUIC within 3 s.
 /// Any HTTP status counts as success — we're testing transport, not auth.
 fn probe_http3(base_url: &str) -> bool {
-    let client = match reqwest::blocking::Client::builder()
-        .http3_prior_knowledge()
-        .timeout(std::time::Duration::from_secs(3))
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
     {
-        Ok(c) => c,
+        Ok(rt) => rt,
         Err(e) => {
-            log::warn!("HTTP/3 probe: could not build client: {}", e);
+            log::warn!("HTTP/3 probe: could not build runtime: {}", e);
             return false;
         }
     };
-    match client.head(base_url).send() {
-        Ok(resp) => {
-            log::info!("HTTP/3 probe succeeded ({}): {}", resp.status().as_u16(), base_url);
-            true
+    rt.block_on(async {
+        let client = match reqwest::Client::builder()
+            .http3_prior_knowledge()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("HTTP/3 probe: could not build client: {}", e);
+                return false;
+            }
+        };
+        match client.head(base_url).send().await {
+            Ok(resp) => {
+                log::info!("HTTP/3 probe succeeded ({}): {}", resp.status().as_u16(), base_url);
+                true
+            }
+            Err(e) => {
+                log::warn!("HTTP/3 probe failed, using HTTP/2: {:?}", e);
+                false
+            }
         }
-        Err(e) => {
-            log::warn!("HTTP/3 probe failed, using HTTP/2: {}", e);
-            false
-        }
-    }
+    })
 }
 
 impl NextCloudFs {

@@ -22,6 +22,7 @@ env_logger = "0.11.10"
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking", "json", "http2", "http3", "charset", "rustls-tls-native-roots",
 ] }
+tokio = { version = "1", features = ["rt", "time", "net", "macros"] }
 percent-encoding = "2"
 md5 = "0.7"
 crc32fast = "1"
