@@ -76,15 +76,6 @@ impl AccountsConf {
         out
     }
 
-    fn find_account_for_server(&self, base_url: &str) -> Option<&AccountSection> {
-        self.sections
-            .iter()
-            .filter(|s| s.name.starts_with("Account "))
-            .find(|s| {
-                s.get("Uri").map_or(false, |v| v.starts_with(base_url))
-                    || s.get("CalDavUri").map_or(false, |v| v.starts_with(base_url))
-            })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,16 +122,15 @@ pub(crate) fn ensure_account_at(
 ) -> anyhow::Result<AccountEntry> {
     let mut conf = read_conf(path);
 
-    if let Some(section) = conf.find_account_for_server(base_url) {
-        let id = section
-            .name
-            .strip_prefix("Account ")
-            .unwrap_or(&section.name)
-            .to_string();
-        let is_ncrs_managed = section.get(NCRS_MANAGED_KEY) == Some("true");
+    // Only manage our own account — never reuse a manually-added one.
+    let already_exists = conf
+        .sections
+        .iter()
+        .any(|s| s.name == format!("Account {}", NCRS_ACCOUNT_ID));
+    if already_exists {
         return Ok(AccountEntry {
-            id,
-            is_ncrs_managed,
+            id: NCRS_ACCOUNT_ID.to_string(),
+            is_ncrs_managed: true,
         });
     }
 
@@ -277,33 +267,6 @@ mod tests {
         assert_eq!(conf.sections[0].get("Key"), Some("val=ue"));
     }
 
-    // --- find_account_for_server ---
-
-    #[test]
-    fn find_account_matches_by_uri_prefix() {
-        let text = "[Account cloud_0]\nUri=https://cloud.example.com/remote.php/webdav\n";
-        let conf = AccountsConf::parse(text);
-        let found = conf.find_account_for_server("https://cloud.example.com");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().name, "Account cloud_0");
-    }
-
-    #[test]
-    fn find_account_matches_by_caldav_uri() {
-        let text = "[Account cloud_0]\nCalDavUri=https://cloud.example.com/remote.php/dav\n";
-        let conf = AccountsConf::parse(text);
-        let found = conf.find_account_for_server("https://cloud.example.com");
-        assert!(found.is_some());
-    }
-
-    #[test]
-    fn find_account_no_match() {
-        let text = "[Account cloud_0]\nUri=https://other.example.com/remote.php/webdav\n";
-        let conf = AccountsConf::parse(text);
-        let found = conf.find_account_for_server("https://cloud.example.com");
-        assert!(found.is_none());
-    }
-
     // --- ensure_account_at ---
 
     #[test]
@@ -324,25 +287,45 @@ mod tests {
     }
 
     #[test]
-    fn ensure_account_returns_existing_without_write() {
+    fn ensure_account_returns_our_own_account_without_write() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("accounts.conf");
 
-        // Write a conf with a matching account
-        let content = "[Account existing_account_0]\nProvider=owncloud\nUri=https://cloud.example.com/remote.php/webdav\n\n";
-        std::fs::write(&path, content).unwrap();
+        // Pre-existing ncrs-managed account — should be returned as-is.
+        let content = format!(
+            "[Account {}]\nProvider=owncloud\nUri=https://cloud.example.com/remote.php/webdav\nNcrsManaged=true\n\n",
+            NCRS_ACCOUNT_ID
+        );
+        std::fs::write(&path, &content).unwrap();
 
         let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let entry = ensure_account_at(&path, "https://cloud.example.com", "alice").unwrap();
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert_eq!(mtime_before, mtime_after, "should not rewrite when our account already exists");
+        assert_eq!(entry.id, NCRS_ACCOUNT_ID);
+        assert!(entry.is_ncrs_managed);
+    }
+
+    #[test]
+    fn ensure_account_ignores_manual_account_with_same_server() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("accounts.conf");
+
+        // Manual account for the same server — must NOT be reused.
+        let content = "[Account account_manual_0]\nProvider=owncloud\nUri=https://cloud.example.com/remote.php/webdav\n\n";
+        std::fs::write(&path, content).unwrap();
 
         let entry = ensure_account_at(&path, "https://cloud.example.com", "alice").unwrap();
 
-        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Must have created our own managed account, not returned the manual one.
+        assert_eq!(entry.id, NCRS_ACCOUNT_ID);
+        assert!(entry.is_ncrs_managed);
 
-        assert_eq!(
-            mtime_before, mtime_after,
-            "file should not have been written when account already exists"
-        );
-        assert_eq!(entry.id, "existing_account_0");
+        // Both accounts should now coexist in the file.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("[Account account_manual_0]"), "manual account must be preserved");
+        assert!(contents.contains(&format!("[Account {}]", NCRS_ACCOUNT_ID)), "our account must be created");
     }
 
     #[test]
