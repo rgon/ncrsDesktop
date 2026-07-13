@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""ncrs document thumbnailer.
+
+Registered via /usr/share/thumbnailers/ncrs.thumbnailer for PDF and related
+document formats.  Intercepts requests for remote files and uses the Nextcloud
+preview API (a small pre-generated thumbnail) instead of downloading the full
+document.
+
+Priority order:
+
+  1. XDG cache hit — daemon pre-fetched it; just write to %o.
+  2a. STATUS says file is remote → THUMBNAIL IPC: daemon fetches NC preview.
+  2b. STATUS says file is local  → delegate to evince-thumbnailer.
+"""
+import hashlib
+import os
+import socket
+import subprocess
+import sys
+from urllib.parse import unquote
+
+import gi
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import GdkPixbuf
+
+
+def ipc(cmd, timeout=10):
+    sock = os.path.join(
+        os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}',
+        'ncrs.sock',
+    )
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(sock)
+            s.sendall((cmd + '\n').encode())
+            return s.makefile('rb').readline().decode(errors='replace').strip()
+    except Exception:
+        return None
+
+
+def main():
+    size    = int(sys.argv[1])
+    src_uri = sys.argv[2]   # file:// URI, percent-encoded
+    dst     = sys.argv[3]   # output path Nautilus will read
+
+    src_path = unquote(src_uri[7:] if src_uri.startswith('file://') else src_uri)
+
+    CACHE_HOME = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
+    xdg_dir  = os.path.join(CACHE_HOME, 'thumbnails', 'normal')
+    xdg_path = os.path.join(xdg_dir, hashlib.md5(src_uri.encode()).hexdigest() + '.png')
+
+    def write_thumbnail(pixbuf):
+        w, h = pixbuf.get_width(), pixbuf.get_height()
+        long = max(w, h)
+        if long > size:
+            if w >= h:
+                pixbuf = pixbuf.scale_simple(size, max(1, size * h // w), GdkPixbuf.InterpType.BILINEAR)
+            else:
+                pixbuf = pixbuf.scale_simple(max(1, size * w // h), size, GdkPixbuf.InterpType.BILINEAR)
+        mtime = str(int(os.stat(src_path).st_mtime))
+        pixbuf.savev(dst, 'png',
+                     ['tEXt::Thumb::URI', 'tEXt::Thumb::MTime'],
+                     [src_uri, mtime])
+
+    # ── 1. XDG cache hit (daemon pre-fetched) ────────────────────────────────────
+    if os.path.exists(xdg_path):
+        try:
+            write_thumbnail(GdkPixbuf.Pixbuf.new_from_file(xdg_path))
+            sys.exit(0)
+        except Exception:
+            pass  # corrupted cache entry — fall through
+
+    # ── 2. Route based on whether the file is locally available ──────────────────
+    status = ipc(f'STATUS {src_path}', timeout=3)
+    is_remote = status in ('remote', 'downloading')
+
+    if is_remote:
+        # ── 2a. Remote file: ask daemon to fetch preview from Nextcloud ──────────
+        reply = ipc(f'THUMBNAIL {src_path}', timeout=15)
+        if reply == 'ok' and os.path.exists(xdg_path):
+            try:
+                write_thumbnail(GdkPixbuf.Pixbuf.new_from_file(xdg_path))
+                sys.exit(0)
+            except Exception:
+                pass
+        sys.exit(1)
+
+    # ── 2b. Local file: delegate to evince-thumbnailer ───────────────────────────
+    try:
+        result = subprocess.run(
+            ['evince-thumbnailer', '-s', str(size), src_uri, dst],
+            timeout=60,
+        )
+        sys.exit(result.returncode)
+    except (subprocess.TimeoutExpired, OSError):
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

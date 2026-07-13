@@ -1,0 +1,4 @@
+[Thumbnailer Entry]
+TryExec=/usr/bin/ncrs-thumbnailer
+Exec=/usr/bin/ncrs-thumbnailer %s %u %o
+MimeType=application/pdf;application/x-bzpdf;application/x-ext-pdf;application/x-gzpdf;application/x-xzpdf;
