@@ -274,6 +274,19 @@ pub struct TransferProgress {
 
 pub type TransferMap = Arc<Mutex<HashMap<PathBuf, TransferProgress>>>;
 
+fn is_transient_network_err(e: &str) -> bool {
+    e.starts_with("network:")
+        || e.contains("connection reset")
+        || e.contains("Connection reset")
+        || e.contains("Connection refused")
+        || e.contains("broken pipe")
+        || e.contains("Broken pipe")
+}
+
+fn is_timeout_err(e: &str) -> bool {
+    e.contains("timeout") || e.contains("Timeout") || e.contains("timed out")
+}
+
 fn error_to_errno(err: &str) -> Errno {
     if err.contains("401") || err.contains("403") || err.contains("Unauthorized") || err.contains("Forbidden") {
         Errno::EACCES
@@ -283,6 +296,10 @@ fn error_to_errno(err: &str) -> Errno {
         // Return the real ENOSPC so callers stop retrying immediately; EIO would
         // cause thumbnail generators and media apps to spin in a 1-per-second loop.
         Errno::ENOSPC
+    } else if is_timeout_err(err) {
+        Errno::ETIMEDOUT
+    } else if is_transient_network_err(err) {
+        Errno::EAGAIN
     } else {
         Errno::EIO
     }
@@ -295,12 +312,29 @@ fn list_dir_propfind(
     log::debug!("LIST {}", path.display());
     let (tx, rx) = mpsc::channel();
     let c = conn.clone();
+    const MAX_RETRIES: u32 = 2;
     thread::spawn(move || {
         let _permit = c.throttle.acquire();
-        let _ = tx.send(c.backend.list_dir(&path, PROPFIND_TIMEOUT)
-            .map_err(|e| e.to_string()));
+        let mut delay = Duration::from_millis(500);
+        let mut result = Err(String::new());
+        for attempt in 0..=MAX_RETRIES {
+            result = c.backend.list_dir(&path, PROPFIND_TIMEOUT).map_err(|e| e.to_string());
+            match &result {
+                Ok(_) => break,
+                Err(e) if attempt < MAX_RETRIES && (is_transient_network_err(e) || is_timeout_err(e)) => {
+                    log::warn!("PROPFIND {} failed (attempt {}/{}): {} — retrying in {:?}",
+                        path.display(), attempt + 1, MAX_RETRIES + 1, e, delay);
+                    thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_secs(8));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(result);
     });
-    rx.recv_timeout(PROPFIND_TIMEOUT + Duration::from_secs(1))
+    // Outer timeout covers all retry attempts plus a small margin.
+    let outer = PROPFIND_TIMEOUT * (MAX_RETRIES + 1) + Duration::from_secs(2);
+    rx.recv_timeout(outer)
         .unwrap_or_else(|_| Err("WebDAV PROPFIND timeout".into()))
 }
 
@@ -1168,20 +1202,45 @@ pub(crate) fn ensure_file_cached(
     if let Some(parent) = local_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let file =
-        std::fs::File::create(&local_path).map_err(|e| format!("create cache file: {}", e))?;
-    if let Err(e) = open_file_timeout(conn, remote_path.clone(), file, transfers.cloned()) {
-        if let Some(tm) = transfers { tm.safe_lock().remove(&remote_path); }
-        if let Err(rm_err) = std::fs::remove_file(&local_path) {
-            log::error!("CRITICAL: cannot remove partial download {}: {} — zeroing to prevent serving corrupt data", local_path.display(), rm_err);
-            if let Ok(f) = std::fs::File::create(&local_path) {
-                let _ = f.set_len(0);
+
+    const DOWNLOAD_RETRIES: u32 = 2;
+    let mut dl_delay = Duration::from_millis(500);
+    let mut dl_attempt = 0u32;
+    loop {
+        let file =
+            std::fs::File::create(&local_path).map_err(|e| format!("create cache file: {}", e))?;
+        match open_file_timeout(conn, remote_path.clone(), file, transfers.cloned()) {
+            Ok(()) => break,
+            Err(e) => {
+                if let Some(tm) = transfers { tm.safe_lock().remove(&remote_path); }
+                if let Err(rm_err) = std::fs::remove_file(&local_path) {
+                    log::error!("CRITICAL: cannot remove partial download {}: {} — zeroing to prevent serving corrupt data", local_path.display(), rm_err);
+                    if let Ok(f) = std::fs::File::create(&local_path) {
+                        let _ = f.set_len(0);
+                    }
+                }
+                if dl_attempt < DOWNLOAD_RETRIES && is_transient_network_err(&e) {
+                    log::warn!("download {} failed (attempt {}/{}): {} — retrying in {:?}",
+                        remote_path.display(), dl_attempt + 1, DOWNLOAD_RETRIES + 1, e, dl_delay);
+                    if let Some(tm) = transfers {
+                        tm.safe_lock().insert(remote_path.clone(), TransferProgress {
+                            path: remote_path.clone(),
+                            direction: TransferDirection::Download,
+                            bytes_done: 0,
+                            total_bytes: file_size,
+                        });
+                    }
+                    thread::sleep(dl_delay);
+                    dl_delay = (dl_delay * 2).min(Duration::from_secs(4));
+                    dl_attempt += 1;
+                    continue;
+                }
+                cache.safe_lock().file_cache.remove(&remote_path);
+                status.safe_lock().insert(remote_path.clone(), FileStatus::Remote);
+                dirty.safe_lock().insert(remote_path);
+                return Err(e);
             }
         }
-        cache.safe_lock().file_cache.remove(&remote_path);
-        status.safe_lock().insert(remote_path.clone(), FileStatus::Remote);
-        dirty.safe_lock().insert(remote_path);
-        return Err(e);
     }
 
     if let Some(tm) = transfers { tm.safe_lock().remove(&remote_path); }
@@ -3637,23 +3696,39 @@ fn do_range_read_stream<'a>(
     if conn.is_offline.load(Ordering::Relaxed) {
         return Err("file not available offline".into());
     }
-    let permit = if throttle { Some(conn.read_throttle.acquire()) } else { None };
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
-    let resp = conn.http_read
-        .get(&url)
-        .timeout(DOWNLOAD_TIMEOUT)
-        .header("Range", format!("bytes={}-{}", offset, end))
-        ;
-    let resp = conn.creds.apply(resp)
-        .send()
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    if status == reqwest::StatusCode::PARTIAL_CONTENT || status.is_success() {
-        Ok((resp, permit))
-    } else {
-        Err(format!("range read returned {}", status))
+    let mut delay = Duration::from_millis(500);
+    for attempt in 0u32..=2 {
+        let permit = if throttle { Some(conn.read_throttle.acquire()) } else { None };
+        let req = conn.http_read
+            .get(&url)
+            .timeout(DOWNLOAD_TIMEOUT)
+            .header("Range", format!("bytes={}-{}", offset, end));
+        match conn.creds.apply(req).send() {
+            Ok(resp) => {
+                let status = resp.status();
+                return if status == reqwest::StatusCode::PARTIAL_CONTENT || status.is_success() {
+                    Ok((resp, permit))
+                } else {
+                    Err(format!("range read returned {}", status))
+                };
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if attempt < 2 && (is_transient_network_err(&msg) || is_timeout_err(&msg)) {
+                    log::warn!("range read {} failed (attempt {}/3): {} — retrying in {:?}",
+                        path.display(), attempt + 1, msg, delay);
+                    drop(permit);
+                    thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_secs(4));
+                    continue;
+                }
+                return Err(msg);
+            }
+        }
     }
+    unreachable!()
 }
 
 fn read_exact_from_stream(resp: &mut reqwest::blocking::Response, need: usize) -> Result<Vec<u8>, String> {
