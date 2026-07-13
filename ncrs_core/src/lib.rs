@@ -27,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
 pub use config::{configuration_parser, MountOptions};
@@ -1985,6 +1985,64 @@ impl Filesystem for NextCloudFs {
             }
         }
         reply.error(Errno::ENOENT);
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        if name.as_encoded_bytes() != b"user.xdg.mime.type" {
+            reply.error(Errno::ENODATA);
+            return;
+        }
+        let path = match self.cache.safe_lock().get_path(ino.0) {
+            Some(p) => p,
+            None => { reply.error(Errno::ENOENT); return; }
+        };
+        let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let entries = match self.cache.safe_lock().get_cached_dir_readonly(&parent) {
+            Some(e) => e,
+            None => { reply.error(Errno::ENODATA); return; }
+        };
+        let ct = entries.iter()
+            .find(|e| e.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == file_name)
+            .and_then(|e| e.content_type.clone());
+        match ct {
+            Some(ct) => {
+                let bytes = ct.as_bytes().to_vec();
+                if size == 0 {
+                    reply.size(bytes.len() as u32);
+                } else if size as usize >= bytes.len() {
+                    reply.data(&bytes);
+                } else {
+                    reply.error(Errno::ERANGE);
+                }
+            }
+            None => reply.error(Errno::ENODATA),
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let path = match self.cache.safe_lock().get_path(ino.0) {
+            Some(p) => p,
+            None => { reply.error(Errno::ENOENT); return; }
+        };
+        let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let entries = match self.cache.safe_lock().get_cached_dir_readonly(&parent) {
+            Some(e) => e,
+            None => { if size == 0 { reply.size(0); } else { reply.data(b""); } return; }
+        };
+        let has_ct = entries.iter()
+            .find(|e| e.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == file_name)
+            .map(|e| e.content_type.is_some())
+            .unwrap_or(false);
+        let list: &[u8] = if has_ct { b"user.xdg.mime.type\0" } else { b"" };
+        if size == 0 {
+            reply.size(list.len() as u32);
+        } else if size as usize >= list.len() {
+            reply.data(list);
+        } else {
+            reply.error(Errno::ERANGE);
+        }
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
