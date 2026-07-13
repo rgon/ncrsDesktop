@@ -56,9 +56,10 @@
   flex-shrink: 0;
 }
 
-.nc-dot-idle   { background: var(--nc-success); }
-.nc-dot-paused { background: var(--nc-text-3); }
-.nc-dot-error  { background: var(--nc-error); }
+.nc-dot-idle     { background: var(--nc-success); }
+.nc-dot-paused   { background: var(--nc-text-3); }
+.nc-dot-error    { background: var(--nc-error); }
+.nc-dot-degraded { background: var(--nc-warning); }
 
 .nc-dot-syncing {
   background: transparent;

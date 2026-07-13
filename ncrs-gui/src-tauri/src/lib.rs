@@ -31,6 +31,8 @@ pub struct AppState {
     pub attached: std::sync::atomic::AtomicBool,
     /// Set to true to cancel an in-progress login flow poll loop.
     pub login_flow_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Mirrors the notify_push connection flag; false when HPB is unavailable.
+    pub hpb_connected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for AppState {
@@ -47,6 +49,7 @@ impl Default for AppState {
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             attached: std::sync::atomic::AtomicBool::new(false),
             login_flow_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hpb_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -92,7 +95,8 @@ fn get_sync_state(state: State<Arc<AppState>>) -> String {
         SyncState::Paused => "paused".into(),
         SyncState::Unmounted => "unmounted".into(),
         SyncState::Wiped => "wiped".into(),
-        SyncState::Error(ref e) => format!("error: {}", e),
+        SyncState::Error(ref e) => format!("error:{}", e),
+        SyncState::Degraded(ref r) => format!("degraded:{}", r),
     }
 }
 
@@ -582,7 +586,7 @@ fn rerender_tray_menu(
         builder = builder.item(&wiped_i);
     } else {
         let pause_text = match sync_state {
-            SyncState::Idle => "Pause Sync",
+            SyncState::Idle | SyncState::Degraded(_) => "Pause Sync",
             SyncState::Paused => "Resume Sync",
             SyncState::Syncing => "Pause Sync",
             SyncState::Unmounted | SyncState::Wiped => unreachable!(),
@@ -615,6 +619,7 @@ enum TrayIcon {
     Paused,
     Syncing,
     Error,
+    Warning,
 }
 
 impl TrayIcon {
@@ -624,17 +629,19 @@ impl TrayIcon {
             SyncState::Paused | SyncState::Unmounted | SyncState::Wiped => TrayIcon::Paused,
             SyncState::Syncing => TrayIcon::Syncing,
             SyncState::Error(_) => TrayIcon::Error,
+            SyncState::Degraded(_) => TrayIcon::Warning,
         }
     }
 }
 
 fn load_icon(kind: TrayIcon) -> Image<'static> {
-    static ICONS: [std::sync::OnceLock<Image<'static>>; 4] = [const { std::sync::OnceLock::new() }; 4];
+    static ICONS: [std::sync::OnceLock<Image<'static>>; 5] = [const { std::sync::OnceLock::new() }; 5];
     let (slot, bytes): (usize, &'static [u8]) = match kind {
         TrayIcon::Idle => (0, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.idle.png"))),
         TrayIcon::Paused => (1, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.paused.png"))),
         TrayIcon::Syncing => (2, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.syncing.png"))),
         TrayIcon::Error => (3, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.error.png"))),
+        TrayIcon::Warning => (4, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/tray_icon.warning.png"))),
     };
     ICONS[slot]
         .get_or_init(|| Image::from_bytes(bytes).expect("embedded tray icon is valid PNG"))
@@ -748,6 +755,7 @@ pub fn run() {
                     "wiped" => TrayIcon::Error,
                     "unmounted" | "paused" => TrayIcon::Paused,
                     "syncing" => TrayIcon::Syncing,
+                    p if p.starts_with("degraded:") => TrayIcon::Warning,
                     _ => TrayIcon::Idle,
                 };
                 let _ = tray.set_icon(Some(load_icon(icon_kind)));
@@ -923,8 +931,10 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
         let fuse_app = app.clone();
         let fuse_state = state.clone();
         let fuse_paused = state.paused.clone();
+        let hpb_flag = state.hpb_connected.clone();
+        state.hpb_connected.store(false, std::sync::atomic::Ordering::Relaxed);
         thread::spawn(move || {
-            let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal), Some(fuse_paused));
+            let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal), Some(fuse_paused), Some(hpb_flag));
             match &result {
                 Ok(()) => {
                     log::info!("FUSE unmounted cleanly");
@@ -946,10 +956,47 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
                 Err(e) => {
                     log::error!("FUSE error: {}", e);
                     *fuse_state.sync_state.lock().unwrap() = SyncState::Error(e.clone());
-                    fuse_app.emit("sync-state-changed", format!("error: {}", e)).ok();
+                    fuse_app.emit("sync-state-changed", format!("error:{}", e)).ok();
                 }
             }
             let _ = shutdown_tx.send(true);
+        });
+
+        // HPB status monitor — emit degraded/idle when notify_push connects or disconnects.
+        // 30s grace period gives the watcher time to establish the connection before
+        // we declare it missing.
+        let hpb_state = state.clone();
+        let hpb_flag = state.hpb_connected.clone();
+        let hpb_app = app.clone();
+        let hpb_shutdown = shutdown_rx.clone();
+        spawn(async move {
+            sleep(Duration::from_secs(30)).await;
+            if *hpb_shutdown.borrow() { return; }
+            // After the grace period, treat "still disconnected" as degraded.
+            let mut prev_connected = true;
+            loop {
+                if *hpb_shutdown.borrow() { break; }
+                let connected = hpb_flag.load(std::sync::atomic::Ordering::Relaxed);
+                if connected != prev_connected {
+                    prev_connected = connected;
+                    if connected {
+                        let mut ss = hpb_state.sync_state.lock().unwrap();
+                        if matches!(*ss, SyncState::Degraded(_)) {
+                            *ss = SyncState::Idle;
+                            drop(ss);
+                            hpb_app.emit("sync-state-changed", "idle").ok();
+                        }
+                    } else {
+                        let mut ss = hpb_state.sync_state.lock().unwrap();
+                        if matches!(*ss, SyncState::Idle) {
+                            *ss = SyncState::Degraded("high-performance backend not connected".into());
+                            drop(ss);
+                            hpb_app.emit("sync-state-changed", "degraded:high-performance backend not connected").ok();
+                        }
+                    }
+                }
+                sleep(Duration::from_secs(5)).await;
+            }
         });
     }
 

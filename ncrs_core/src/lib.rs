@@ -193,6 +193,8 @@ pub enum SyncState {
     Unmounted,
     Wiped,
     Error(String),
+    /// Partially operational: sync works but a subsystem (e.g. notify_push) is unavailable.
+    Degraded(String),
 }
 
 impl std::fmt::Display for SyncState {
@@ -204,6 +206,7 @@ impl std::fmt::Display for SyncState {
             SyncState::Unmounted => write!(f, "unmounted"),
             SyncState::Wiped => write!(f, "wiped"),
             SyncState::Error(e) => write!(f, "error:{}", e),
+            SyncState::Degraded(r) => write!(f, "degraded:{}", r),
         }
     }
 }
@@ -3735,7 +3738,7 @@ fn build_fuse_options() -> Vec<MountOption> {
     ]
 }
 
-pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>, paused: Option<Arc<AtomicBool>>) -> Result<(), String> {
+pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>, paused: Option<Arc<AtomicBool>>, hpb_connected: Option<Arc<AtomicBool>>) -> Result<(), String> {
     // Must run before anything that touches shared resources (the IPC socket,
     // cache dirs, journal): a refused second instance must leave the running
     // daemon's state untouched.
@@ -3904,14 +3907,28 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                 );
             }));
 
+            log::info!("notify_push: starting change watcher");
             // Sync watcher connection status and pause state
             let np_connected = filesystem.notify_push_connected_flag();
             let sync_offline = offline_flag.clone();
             let sync_paused = filesystem.paused_flag();
             let watcher_shutdown = filesystem.shutdown_flag();
             thread::spawn(move || {
+                let mut was_connected = false;
                 while !watcher_shutdown.load(Ordering::Relaxed) {
-                    np_connected.store(watcher.is_connected(), Ordering::Relaxed);
+                    let connected = watcher.is_connected();
+                    np_connected.store(connected, Ordering::Relaxed);
+                    if let Some(ref ext) = hpb_connected {
+                        ext.store(connected, Ordering::Relaxed);
+                    }
+                    if connected != was_connected {
+                        if connected {
+                            log::info!("notify_push: high-performance backend connected");
+                        } else {
+                            log::warn!("notify_push: high-performance backend disconnected — falling back to 5-minute poll interval");
+                        }
+                        was_connected = connected;
+                    }
                     watcher.set_paused(
                         sync_offline.load(Ordering::Relaxed)
                             || sync_paused.load(Ordering::Relaxed),

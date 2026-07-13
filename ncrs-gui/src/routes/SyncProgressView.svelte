@@ -39,7 +39,8 @@
     const dotClass = $derived(() => {
         if (hasTransfers || syncState === "syncing") return "nc-dot nc-dot-syncing";
         if (syncState === "paused") return "nc-dot nc-dot-paused";
-        if (syncState === "unmounted" || syncState === "wiped" || syncState.startsWith("error")) return "nc-dot nc-dot-error";
+        if (syncState === "unmounted" || syncState === "wiped" || syncState.startsWith("error:")) return "nc-dot nc-dot-error";
+        if (syncState.startsWith("degraded:")) return "nc-dot nc-dot-degraded";
         return "nc-dot nc-dot-idle";
     });
 
@@ -58,7 +59,10 @@
             case "unmounted": return "Unmounted";
             case "wiped":     return "Wiped by server";
             case "idle":      return "Up to date";
-            default:          return syncState.startsWith("error:") ? syncState.slice(7) : syncState;
+            default:
+                if (syncState.startsWith("error:")) return syncState.slice(6);
+                if (syncState.startsWith("degraded:")) return "Degraded — " + syncState.slice(9);
+                return syncState;
         }
     });
 
