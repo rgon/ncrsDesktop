@@ -3908,7 +3908,23 @@ impl Filesystem for NextCloudFs {
             let conn = self.conn.clone();
             let journal = self.journal.clone();
             let elog = self.error_log.clone();
+            let cache = self.cache.clone();
             thread::spawn(move || {
+                // If the source was just created via create() + flush(), the PUT runs
+                // asynchronously and the file may not yet exist on the server when this
+                // MOVE fires.  Wait until the uploading guard is cleared before sending
+                // the MOVE, so the server has the file content in place first.
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                loop {
+                    if !cache.safe_lock().uploading.contains(&from) {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        log::warn!("MOVE {} → {}: timed out waiting for in-flight PUT", from.display(), to.display());
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
                 let _permit = conn.throttle.acquire();
                 match conn.backend.rename(&from, &to) {
                     Ok(()) => {
