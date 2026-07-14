@@ -1058,7 +1058,7 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     // Notification polling — async on Tokio runtime, no dedicated OS thread
     match opts.credentials() {
         Err(e) => log::warn!("notification polling disabled: credentials unavailable: {}", e),
-        Ok(poll_creds) => {
+        Ok(mut poll_creds) => {
             let poll_state = state.clone();
             let poll_app = app.clone();
             let poll_url = opts.url.clone();
@@ -1081,9 +1081,27 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
                             poll_app.emit("notifications-updated", notifs).ok();
                         }
                         Ok(Err(e)) if e.contains("401") || e.contains("Unauthorized") || e.contains("not logged in") => {
-                            log::warn!("fetch notifications: {}", e);
-                            *poll_state.auth_error.lock().unwrap() = Some(e.clone());
-                            poll_app.emit("sync-state-changed", format!("error:authentication failed — re-login required")).ok();
+                            // Reload credentials from keyring — the password may have been
+                            // updated by a new login without the polling loop restarting.
+                            match tokio::task::spawn_blocking(ncrs_core::config::load_config).await {
+                                Ok(Ok(fresh)) => match fresh.credentials() {
+                                    Ok(fresh_creds) if fresh_creds.secret() != poll_creds.secret() => {
+                                        log::info!("notification poll: reloaded credentials after 401");
+                                        poll_creds = fresh_creds;
+                                        // Don't surface as error yet — retry next cycle with fresh creds.
+                                    }
+                                    _ => {
+                                        log::warn!("fetch notifications: {}", e);
+                                        *poll_state.auth_error.lock().unwrap() = Some(e.clone());
+                                        poll_app.emit("sync-state-changed", "error:authentication failed — re-login required").ok();
+                                    }
+                                },
+                                _ => {
+                                    log::warn!("fetch notifications: {}", e);
+                                    *poll_state.auth_error.lock().unwrap() = Some(e.clone());
+                                    poll_app.emit("sync-state-changed", "error:authentication failed — re-login required").ok();
+                                }
+                            }
                         }
                         Ok(Err(e)) => log::warn!("fetch notifications: {}", e),
                         Err(e) => log::warn!("notification poll panicked: {}", e),

@@ -268,6 +268,12 @@ pub fn save_password_to_keyring(username: &str, url: &str, password: &str) -> Re
     let account = keyring_account(username, url);
     let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
         .map_err(|e| format!("keyring init for {}: {}", account, e))?;
+    // Explicitly delete any existing entry before writing to prevent duplicate
+    // secret-service items, which cause get_password() to return stale credentials.
+    match entry.delete_password() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(e) => log::debug!("keyring pre-delete for {}: {}", account, e),
+    }
     entry
         .set_password(password)
         .map_err(|e| format!("keyring save failed for {}: {}", account, e))?;
