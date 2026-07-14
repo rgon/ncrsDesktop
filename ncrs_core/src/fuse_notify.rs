@@ -3,6 +3,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
+const FUSE_NOTIFY_STORE: i32 = 3;
 const FUSE_NOTIFY_DELETE: i32 = 6;
 
 #[repr(C)]
@@ -17,6 +18,14 @@ struct FuseNotifyInvalInodeOut {
     ino: u64,
     off: i64,
     len: i64,
+}
+
+#[repr(C)]
+struct FuseNotifyStoreOut {
+    nodeid: u64,
+    offset: u64,
+    size: u32,
+    padding: u32,
 }
 
 #[repr(C)]
@@ -77,6 +86,28 @@ impl FuseNotifier {
         } else {
             Ok(())
         }
+    }
+
+    /// Push `data` into the kernel's page cache for the given inode at `offset`.
+    /// After this call, a userspace read at the same range is served by the kernel
+    /// without ever calling our FUSE read() handler — zero network round-trips.
+    pub fn notify_store(&self, ino: u64, offset: u64, data: &[u8]) -> io::Result<()> {
+        let body_size = std::mem::size_of::<FuseNotifyStoreOut>();
+        let header = FuseOutHeader {
+            len: (std::mem::size_of::<FuseOutHeader>() + body_size + data.len()) as u32,
+            error: FUSE_NOTIFY_STORE,
+            unique: 0,
+        };
+        let body = FuseNotifyStoreOut { nodeid: ino, offset, size: data.len() as u32, padding: 0 };
+        let header_slice = unsafe {
+            std::slice::from_raw_parts(&header as *const _ as *const u8, std::mem::size_of::<FuseOutHeader>())
+        };
+        let body_slice = unsafe {
+            std::slice::from_raw_parts(&body as *const _ as *const u8, body_size)
+        };
+        let iov = [io::IoSlice::new(header_slice), io::IoSlice::new(body_slice), io::IoSlice::new(data)];
+        let rc = unsafe { libc::writev(self.fd.as_raw_fd(), iov.as_ptr() as *const libc::iovec, 3) };
+        if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 
     pub fn notify_delete(&self, parent: u64, child: u64, name: &[u8]) -> io::Result<()> {

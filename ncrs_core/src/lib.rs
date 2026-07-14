@@ -72,12 +72,6 @@ const GHOST_TTL: Duration = Duration::from_secs(10);
 // (which GLib 2.80 triggers for any file with an unrecognised extension) run in
 // parallel rather than sequentially, cutting per-directory latency from O(N*RTT)
 // to O(RTT) for any set of small files opened concurrently.
-const OPEN_PREFETCH_MAX_BYTES: u64 = 512 * 1024;
-// Files up to this size are eagerly downloaded in parallel during readdir so
-// that GLib MIME magic-byte detection finds data ready instead of triggering
-// sequential network fetches.  Sized to cover any file GLib would read for
-// detection (max 16 KiB) while staying small enough to download speculatively.
-const READDIR_PREFETCH_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) enum GhostKind {
@@ -193,6 +187,10 @@ struct OpenFile {
     write_path: Option<PathBuf>,
     dirty: bool,
     original_etag: Option<String>,
+    // Present when this fh was opened with O_NOATIME|O_NOFOLLOW — GLib's exclusive
+    // MIME magic-byte detection signature.  read() at offset 0 returns magic bytes
+    // derived from this content type without touching the network.
+    mime_detect_ct: Option<String>,
 }
 
 
@@ -296,6 +294,98 @@ fn is_transient_network_err(e: &str) -> bool {
 
 fn is_timeout_err(e: &str) -> bool {
     e.contains("timeout") || e.contains("Timeout") || e.contains("timed out")
+}
+
+/// Return the minimal magic byte sequence that identifies a given MIME type.
+///
+/// # Background — GLib 2.80 MIME detection and FUSE latency
+///
+/// GLib 2.80 (shipped in Ubuntu 24.04, Fedora 40, and later) removed the
+/// `user.xdg.mime.type` extended-attribute check it previously used for fast
+/// MIME type resolution.  For any file whose extension is unrecognised or
+/// ambiguous, GLib now falls back to *magic-byte detection*: it opens the file
+/// and reads up to 16 KB from the start to inspect the binary signature.
+///
+/// On a local filesystem that read is a microsecond.  On a WebDAV-backed FUSE
+/// mount each read triggers a full round-trip download from the remote server
+/// (~280 ms over a typical home internet connection).  A directory with dozens
+/// of files that have unusual extensions (e.g. Spanish tax forms with numeric
+/// extensions like `.036`, `.190`, `.349`) therefore takes 10+ seconds to list
+/// in Nautilus — one download per file, serialised by GLib's detection loop.
+///
+/// # Detection signal — O_NOATIME
+///
+/// GLib's magic-byte path always opens files with `O_NOATIME | O_NOFOLLOW |
+/// O_CLOEXEC`.  Normal applications (text editors, media players, scripts)
+/// never combine these flags on a read-only open.  This gives us a reliable
+/// way to identify the opens without tracking per-process intent.
+///
+/// Note: the Linux kernel handles `O_NOFOLLOW` at the VFS layer (it fails the
+/// open if the final path component is a symlink) and strips the flag before
+/// forwarding the request to the FUSE driver.  `O_CLOEXEC` is always handled
+/// by the kernel fd table and is never visible to FUSE.  So by the time the
+/// open request arrives in our handler only `O_NOATIME` remains as the
+/// distinguishing flag.
+///
+/// # Our fix
+///
+/// When `open()` sees a read-only, non-locally-cached file opened with
+/// `O_NOATIME`, it marks the file handle with `mime_detect_ct` — the
+/// content-type string already present in our in-memory dir cache (fetched
+/// from the `{DAV:}getcontenttype` property during the previous PROPFIND).
+/// If the server did not supply a content-type, we fall back to
+/// `"application/octet-stream"` so the handle is always marked.
+///
+/// When `read()` is then called at offset 0 on such a handle, instead of
+/// initiating any network I/O we return the few bytes from this table that
+/// match the magic signature for the content-type.  GLib receives a valid
+/// answer, classifies the file, and closes the handle — without us ever
+/// touching the network.  The whole exchange takes microseconds instead of
+/// hundreds of milliseconds.
+///
+/// # Forward-compatibility
+///
+/// Any content-type not listed below falls through to `b"# text\n"`, which
+/// GLib recognises as `text/plain`.  This is an acceptable fallback: it
+/// prevents the download and gives the file a usable icon.  GLib's
+/// extension-based detection (which runs before magic-byte detection) already
+/// handles the vast majority of common file types, so this function is only
+/// reached for genuinely obscure extensions.
+fn mime_magic_bytes(content_type: &str) -> &'static [u8] {
+    let ct = content_type.split(';').next().unwrap_or(content_type).trim();
+    match ct {
+        "application/pdf"                   => b"%PDF-",
+        "image/jpeg"                        => b"\xFF\xD8\xFF\xE0",
+        "image/png"                         => b"\x89PNG\r\n\x1a\n",
+        "image/gif"                         => b"GIF89a",
+        "image/webp"                        => b"RIFF",
+        "image/bmp"                         => b"BM",
+        "image/tiff"                        => b"II*\x00",
+        "application/zip"
+        | "application/x-zip-compressed"
+        | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        | "application/epub+zip"            => b"PK\x03\x04",
+        "application/gzip"
+        | "application/x-gzip"             => b"\x1f\x8b",
+        "application/x-bzip2"              => b"BZh",
+        "application/x-7z-compressed"      => b"7z\xbc\xaf'\x1c",
+        "application/x-rar-compressed"
+        | "application/vnd.rar"            => b"Rar!\x1a\x07",
+        "application/ogg"
+        | "audio/ogg"
+        | "video/ogg"                      => b"OggS",
+        "video/mp4"                        => b"\x00\x00\x00\x18ftyp",
+        "audio/mpeg"                       => b"\xFF\xFB",
+        "audio/flac"                       => b"fLaC",
+        "audio/wav"                        => b"RIFF",
+        "application/vnd.ms-excel"
+        | "application/msword"
+        | "application/vnd.ms-powerpoint" => b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1",
+        // text/* and everything else → printable ASCII, detected as text/plain
+        _ => b"# text\n",
+    }
 }
 
 fn error_to_errno(err: &str) -> Errno {
@@ -1577,9 +1667,6 @@ pub struct NextCloudFs {
     exclude_folders: HashSet<PathBuf>,
     thumb_inflight: Arc<Mutex<HashSet<PathBuf>>>,
     cleanup_stale_gio_temps: bool,
-    // Streams started by readdir for small remote files so open() can reuse them.
-    // Value is (target_len_bytes, stream_arc).
-    readdir_prefetch: Arc<Mutex<HashMap<PathBuf, (u64, Arc<(Mutex<StreamState>, Condvar)>)>>>,
 }
 
 /// Returns true only when the server at `base_url` actually responds over QUIC
@@ -1805,7 +1892,6 @@ impl NextCloudFs {
             exclude_folders,
             thumb_inflight: Arc::new(Mutex::new(HashSet::new())),
             cleanup_stale_gio_temps: options.cleanup_stale_gio_temps,
-            readdir_prefetch: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2195,98 +2281,28 @@ impl Filesystem for NextCloudFs {
             None
         };
 
-        // For small read-only non-cached files, reuse a readdir-triggered stream
-        // if available (parallel downloads started during readdir), otherwise kick
-        // off a fresh download.  The ReadAheadBuf is picked up by read().
-        let prefetch_buf = if !writable && local.is_none() {
-            // Check if readdir already started a download for this file.
-            let from_readdir = self.readdir_prefetch.safe_lock().remove(&path);
-            if let Some((target_len, stream)) = from_readdir {
-                Some(ReadAheadBuf { start: 0, stream, target_len })
-            } else {
-            let file_size = self.cache.safe_lock().find_entry(&path).map(|e| e.size).unwrap_or(0);
-            if file_size > 0 && file_size <= OPEN_PREFETCH_MAX_BYTES {
-                let stream = Arc::new((
-                    Mutex::new(StreamState { data: Vec::with_capacity(file_size as usize), done: false }),
-                    Condvar::new(),
-                ));
-                let buf = ReadAheadBuf {
-                    start: 0,
-                    stream: Arc::clone(&stream),
-                    target_len: file_size,
-                };
-                let conn = self.conn.clone();
-                let cache = self.cache.clone();
-                let status = self.status.clone();
-                let dirty = self.dirty.clone();
-                let auto_keep = self.auto_keep_cached_files;
-                let cache_streamed = self.cache_streamed_reads;
-                let path_clone = path.clone();
-                thread::spawn(move || {
-                    let (ref mtx, ref cv) = *stream;
-                    match do_range_read_stream(&conn, &path_clone, 0, file_size as usize, false) {
-                        Ok((mut resp, _permit)) => {
-                            let mut chunk = [0u8; 4096];
-                            loop {
-                                use std::io::Read;
-                                match resp.read(&mut chunk) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        mtx.lock().unwrap().data.extend_from_slice(&chunk[..n]);
-                                        cv.notify_all();
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                            // Promote to persistent file_cache if fully downloaded.
-                            if cache_streamed {
-                                let ss = mtx.lock().unwrap();
-                                if ss.data.len() as u64 == file_size {
-                                    let data = ss.data.clone();
-                                    drop(ss);
-                                    let (target_dir, kept) = {
-                                        let c = cache.safe_lock();
-                                        if auto_keep { (c.kept_dir.clone(), true) } else { (c.auto_cache_dir.clone(), false) }
-                                    };
-                                    let rel = path_clone.strip_prefix("/").unwrap_or(&path_clone);
-                                    let local_path = target_dir.join(rel);
-                                    if let Some(p) = local_path.parent() { let _ = std::fs::create_dir_all(p); }
-                                    if std::fs::write(&local_path, &data).is_ok() {
-                                        let mut c = cache.safe_lock();
-                                        let mod_time = c.remote_modified_for(&path_clone);
-                                        let etag = c.remote_etag_for(&path_clone);
-                                        c.file_cache.insert(path_clone.clone(), FileCacheEntry {
-                                            local_path: local_path.clone(),
-                                            remote_modified: mod_time,
-                                            etag,
-                                            kept,
-                                            size: file_size,
-                                        });
-                                        drop(c);
-                                        save_file_cache(&cache);
-                                        let file_status = if kept { FileStatus::Kept } else { FileStatus::Cached };
-                                        status.safe_lock().insert(path_clone.clone(), file_status);
-                                        dirty.safe_lock().insert(path_clone.clone());
-                                        log::debug!("prefetch→cache {} ({}B)", path_clone.display(), file_size);
-                                    }
-                                    mtx.lock().unwrap().done = true;
-                                    cv.notify_all();
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::debug!("open prefetch {}: {}", path_clone.display(), e);
-                        }
-                    }
-                    mtx.lock().unwrap().done = true;
-                    cv.notify_all();
+        // Intercept GLib 2.80+ magic-byte detection opens. See the doc-comment on
+        // mime_magic_bytes() for the full explanation. Summary: GLib opens files with
+        // O_NOATIME when it cannot determine the MIME type from the extension alone.
+        // On a remote FUSE mount that would trigger a WebDAV download (~280 ms) per
+        // file. We detect the flag, look up the content-type that was already fetched
+        // during the PROPFIND, and mark the handle so read() can respond with synthetic
+        // magic bytes instead. O_NOFOLLOW and O_CLOEXEC are both stripped by the kernel
+        // before the request reaches FUSE, so O_NOATIME is the only reliable signal.
+        let is_mime_detect = !writable && local.is_none()
+            && (flags.0 & libc::O_NOATIME != 0);
+        let mime_detect_ct = if is_mime_detect {
+            let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+            let ct = self.cache.safe_lock()
+                .get_cached_dir_readonly(&parent)
+                .and_then(|entries| {
+                    entries.iter().find(|e| e.path == path)
+                        .and_then(|e| e.content_type.clone())
                 });
-                Some(buf)
-            } else {
-                None
-            }
-            } // else branch of `if let Some(from_readdir)`
+            // Fall back to octet-stream when the server did not supply a content-type
+            // so that every O_NOATIME open is intercepted — no file is ever downloaded
+            // solely to satisfy GLib's magic-byte check.
+            Some(ct.unwrap_or_else(|| "application/octet-stream".to_string()))
         } else {
             None
         };
@@ -2296,10 +2312,11 @@ impl Filesystem for NextCloudFs {
             OpenFile {
                 remote_path: path,
                 local,
-                buf: prefetch_buf,
+                buf: None,
                 write_path,
                 dirty: false,
                 original_etag: etag,
+                mime_detect_ct,
             },
         );
         reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -2331,6 +2348,17 @@ impl Filesystem for NextCloudFs {
         {
             let files = self.open_files.safe_lock();
             if let Some(of) = files.get(&fh.0) {
+                // GLib 2.80+ MIME detection: serve synthetic magic bytes instead of
+                // downloading the file. The content-type was captured at open() from the
+                // PROPFIND dir cache. Zero network I/O; see mime_magic_bytes() for details.
+                if let Some(ref ct) = of.mime_detect_ct {
+                    if off == 0 {
+                        let magic = mime_magic_bytes(ct);
+                        let end = magic.len().min(sz);
+                        reply.data(&magic[..end]);
+                        return;
+                    }
+                }
                 if let Some(ref local) = of.local {
                     if let Ok(f) = std::fs::File::open(local) {
                         let mut buf = vec![0u8; sz];
@@ -2702,7 +2730,6 @@ impl Filesystem for NextCloudFs {
         let thumb_inflight = self.thumb_inflight.clone();
         let cleanup_stale_gio_temps = self.cleanup_stale_gio_temps;
         let elog = self.error_log.clone();
-        let readdir_prefetch = self.readdir_prefetch.clone();
 
         thread::spawn(move || {
             if offset == 0 {
@@ -2997,7 +3024,6 @@ impl Filesystem for NextCloudFs {
                         };
                         if !already {
                             let conn2 = conn.clone();
-                            let path_for_thumb = path.clone();
                             thread::spawn(move || {
                                 thread::sleep(Duration::from_millis(200));
                                 preview::prefetch_directory_thumbnails(
@@ -3008,71 +3034,8 @@ impl Filesystem for NextCloudFs {
                                     &thumb_candidates,
                                     &conn2.active_streams,
                                 );
-                                thumb_inflight.safe_lock().remove(&path_for_thumb);
+                                thumb_inflight.safe_lock().remove(&path);
                             });
-                        }
-                    }
-
-                    // Kick off parallel downloads for all small remote files in this
-                    // directory.  GLib MIME magic-byte detection opens each file for
-                    // a 16 KiB read; by starting downloads during readdir the data is
-                    // ready (or nearly so) by the time GLib calls open() + read().
-                    if offset == 0 {
-                        // Build a size lookup from entries; use status_entries (not cache_entries,
-                        // which has already been consumed) to filter for Remote-only files.
-                        let size_by_path: HashMap<PathBuf, u64> = entries.iter()
-                            .filter(|e| !e.is_dir && e.size > 0 && e.size <= READDIR_PREFETCH_MAX_BYTES)
-                            .filter_map(|e| {
-                                let name = e.path.file_name()?.to_str()?;
-                                Some((path.join(name), e.size))
-                            })
-                            .collect();
-                        let candidates: Vec<(PathBuf, u64)> = status_entries.iter()
-                            .filter(|(_, s)| matches!(s, FileStatus::Remote))
-                            .filter_map(|(p, _)| size_by_path.get(p).map(|&sz| (p.clone(), sz)))
-                            .collect();
-                        if !candidates.is_empty() {
-                            let mut pf = readdir_prefetch.safe_lock();
-                            // Evict finished streams for this directory before inserting new ones.
-                            pf.retain(|p, (_, s)| {
-                                if p.parent() != Some(path.as_path()) { return true; }
-                                !s.0.lock().unwrap().done
-                            });
-                            for (ep, file_size) in candidates {
-                                if pf.contains_key(&ep) { continue; }
-                                let target_len = file_size;
-                                let stream = Arc::new((
-                                    Mutex::new(StreamState { data: Vec::with_capacity(target_len as usize), done: false }),
-                                    Condvar::new(),
-                                ));
-                                pf.insert(ep.clone(), (target_len, Arc::clone(&stream)));
-                                let conn3 = conn.clone();
-                                thread::spawn(move || {
-                                    let (ref mtx, ref cv) = *stream;
-                                    let _throttle = conn3.prefetch_throttle.acquire();
-                                    match do_range_read_stream(&conn3, &ep, 0, target_len as usize, false) {
-                                        Ok((mut resp, _permit)) => {
-                                            let mut chunk = [0u8; 4096];
-                                            loop {
-                                                use std::io::Read;
-                                                match resp.read(&mut chunk) {
-                                                    Ok(0) => break,
-                                                    Ok(n) => {
-                                                        mtx.lock().unwrap().data.extend_from_slice(&chunk[..n]);
-                                                        cv.notify_all();
-                                                    }
-                                                    Err(_) => break,
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::debug!("readdir prefetch {}: {}", ep.display(), e);
-                                        }
-                                    }
-                                    mtx.lock().unwrap().done = true;
-                                    cv.notify_all();
-                                });
-                            }
                         }
                     }
                 }
@@ -3460,6 +3423,7 @@ impl Filesystem for NextCloudFs {
                                     remote_path: PathBuf::new(),
                                     local: None, buf: None, write_path: None,
                                     dirty: false, original_etag: None,
+                                    mime_detect_ct: None,
                                 });
                                 log::info!("ghost create: {} (inotify trigger)", full_path.display());
                                 reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
@@ -3531,6 +3495,7 @@ impl Filesystem for NextCloudFs {
                 write_path: Some(write_path),
                 dirty: false,
                 original_etag: None,
+                mime_detect_ct: None,
             },
         );
 

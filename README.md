@@ -19,52 +19,6 @@ Performs as good in an actual business than in a recently created personal cloud
 | QUIC/HTTP3 Support         | ❌ | ❌ | ✅ |
 
 
-```
----------
-+ [x] customize cache pruning frequency
-+ [x] add option in our yaml to keep paths by default, without requiring the user to specify them (log an error if not found, but don't panic the application)
-+ [ ] allow setting the mount path with ~ and $HOME
-+ [ ] auto-create the mountpoint directory if it does not exist
-+ [ ] review: is it possible that this extension makes my nautilus hang? In which case would it cause it?
-
-+ [ ] configuration as cli flags? As yaml? review all.
-+ [ ] Enterprise OAuth2 login with authd-shared token for automatic login for multi-user computers and zero touch provisioning to new machines
-+ [ ] get from gnome keyring from authd
-
-+ [ ] Feature parity with the NC browser file explorer/mobile app (share, file options, view who shared, keep remote permissions etc)
-    + add/remove from favorites
-    + details
-    + rename/move or copy
-    + send/share (same as details view)
-    + 'sync'
-
-+ [x] test write to a file, check in nextcloud
-    + [x] uploading icon
-    + [x] keep a local copy of the file if written by us (configurable)
-    + [x] can we make files within FUSE be actual filesystem/inode links, instead of passing through our rust code?
-        + to actual TODO
-    + [x] test locally updating a synced file
-    + [x] test remotely updating a synced file
-
-    + [ ] test both to emulate a race
-    + [ ] test with emulate no network access, showing the local cached copy --emulate-no-network-in 15s
-    + [ ] diffing algorithm? -> ask which copy we want to save/save conflicting copy separately -> choose conflict resolution strategy
-    + [ ] ensure that the 'uploading/downloading' section in the dash app reacts to the rest
-    
-    + [ ] test moving -> ensure it's a move/rename operation and not just a delete/copy
-
-+ [ ] pause sync/unmount behaviour
-    + [x] impl
-    + [ ] manual test
-
-+ [ ] manually review tests
-
-+ [ ] CI/CD
-    + [x] choose appimage/flatpak/snap -> does not play well with FUSE mount, unix socket IPC, nautilus... use apt
-    + [ ] Ship a .deb built with cargo-deb (for the Rust daemon
-
-```
-
 ## Server tips
 Server-side recommendation: If you have shell access to your Nextcloud server, you shall enable background thumbnail pre-generation with occ preview:pre-generate. 
 
@@ -73,12 +27,19 @@ This makes the server generate thumbnails during idle time rather than on-demand
 If not, disable thumbnails with the ncrs cli flag.
 
 ## Usage
+Install the .deb file:
+```
+cd Downloads
+sudo apt install ./ncrs_*_amd64.deb
+```
+And open it from your applications list or the terminal `ncrs-gui & disown`
 
-### Dependencies
-
+### Dependencies (shall be automatically requested by the .deb)
 ```sh
 sudo apt-get install fuse3 libfuse3-dev libxdo-dev
 ```
+
+### Development dependencies
 Rust: https://rustup.rs/
 
 For the Nautilus extension (optional):
@@ -87,6 +48,8 @@ sudo apt-get install python3-nautilus
 ```
 
 ### First-time setup
+You may directly set it up using the GUI, including 'Authorize Device'-type login from the web browser. But you may configure it -fully or partially- using the config file, which is especially useful for fleet deployment.
+
 
 **Create the config file** — run the daemon once to generate the skeleton, then fill it in:
 ```sh
@@ -98,42 +61,38 @@ The file looks like this; use an [app password](https://docs.nextcloud.com/serve
 ```yaml
 url: https://cloud.example.com/remote.php/dav/files/YOUR_USERNAME/
 username: youruser
-password: xxxx-xxxx-xxxx-xxxx   # app password
+password: xxxx-xxxx-xxxx-xxxx   # app password (optional) or fetched/saved from the system keyring
 mount_point: /home/you/ncrs
 user: youruser
 ```
 
 ### Provisioning (corporate / multi-user)
 
-The `.deb` (built by `scripts/build-deb.sh`, published on releases) is designed for fleet deployment:
+The `.deb` (built by `scripts/build-deb.sh` will allow fleet config. For 
 
 - **Config is per-user** at `~/.config/ncrs/config.yaml` (XDG; there is no system-wide config). A template ships at `/usr/share/doc/ncrs/config.yaml.example`, or generate one with `ncrs --print-default-config`.
-- **Push per-user config files** with your config-management tool (e.g. Ansible `template` to each user's `~/.config/ncrs/config.yaml`), or pre-fill `/etc/skel/.config/ncrs/config.yaml` so new accounts start provisioned. Always use per-user [app passwords](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) or an `auth_command` — never a shared credential.
-- **The GUI tray app autostarts at login** via `/etc/xdg/autostart/ncrs-gui.desktop`. Per-user opt-out: copy that file to `~/.config/autostart/` and add `Hidden=true`. On unprovisioned machines the app stays in the tray and shows a "configuration missing" notification; it writes the config template on first run.
-- **Headless alternative**: `systemctl --user enable --now ncrs.service` runs the daemon without the GUI. The two coexist: when the GUI starts and finds the service already serving the IPC socket, it attaches as a client — mirroring sync state, errors, and transfers in the tray and forwarding pause/resume — instead of mounting a second time. Quitting an attached tray leaves the service's mount untouched.
+- **Push per-user config files** with your config-management tool (e.g. Ansible `template` to each user's `~/.config/ncrs/config.yaml`). You may pre-fill `/etc/skel/.config/ncrs/config.yaml` so new accounts start provisioned. If setting the password on the config file, always use per-user [app passwords](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) or an `auth_command` — never a shared credential.
+- **The GUI tray app autostarts at login** via `/etc/xdg/autostart/ncrs-gui.desktop` and runs the systemctl service. 
+- **Headless alternative**: `systemctl --user enable --now ncrs.service` runs the daemon without the GUI. The two coexist: when the GUI starts and finds the service already serving the IPC socket, it attaches as a client — mirroring sync state, errors, and transfers in the tray and forwarding pause/resume — instead of mounting a second time. Quitting an attached tray will unmount it, however.
 
-### Running
+### Development running
 
 **GUI + daemon** (the normal way):
 ```sh
 ./runui.sh
 ```
-This starts the Tauri tray app; the daemon mounts WebDAV at your configured `mount_point` automatically. Downloaded files are cached in `~/.cache/ncrs/`.
+This starts the Tauri tray app; the daemon mounts WebDAV at your configured `mount_point` automatically. 
+
+It will also install the shell integrations etc: `./shell_integration/nautilus/install.sh` to show sync-state emblems (cloud = remote-only, tick = local) on files in the mount.
+
+Downloaded files are cached in `~/.cache/ncrs/`.
 
 **Daemon only** (headless / for systemd):
 ```sh
 RUST_LOG=info cargo run -p ncrs_core
 ```
 
-### Nautilus integration
-
-Install the shell extension to show sync-state emblems (cloud = remote-only, tick = local) on files in the mount:
-```sh
-./shell_integration/nautilus/install.sh
-nautilus -q   # restart Nautilus
-```
-
-Uninstall:
+#### Uninstall extension:
 ```sh
 rm ~/.local/share/nautilus-python/extensions/syncstate.py
 nautilus -q
@@ -161,6 +120,7 @@ Package build + verification (what CI runs; `--container` needs Docker or Podman
 ```
 
 ## TODO (development progress tracker):
+```
 + [x] base tauri tray icons https://github.com/tauri-apps/tray-icon
 + [x] HTML tauri settings ui with tray icon support
 	+ [x] open window only when clicking about
@@ -187,108 +147,135 @@ Package build + verification (what CI runs; `--container` needs Docker or Podman
 + [-] play notification sound: requires rodio in separate thread https://github.com/RustAudio/rodio/blob/f1eaaa4a6346933fc8a58d5fd1ace170946b3a94/examples/music_ogg.rs
 + [x] non-functional primimtive Svelte/tailwindcss UI 
 
-----
-
-+ [ ] rust fuse impl?
++ [x] rust fuse impl?
 	fuser = { version = "0.13.0", features = ["serializable"] }
 	https://github.com/cberner/fuser
 	or:
 	https://github.com/ubnt-intrepid/polyfuse
-    + [ ]https://xethub.com/blog/nfs-fuse-why-we-built-nfs-server-rust
-+ [ ] simple login ui with tauri, 2 crates/modules
++ [x] simple login ui with tauri, 2 crates/modules
 
-+ [ ] cross-platform review: what do we need to change?
-----
-+ [ ] QOL:
-    + [ ] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
-	+ [ ] View user login info/status: HPB Connection, DAV Connection. Turn orange if HPB NOK.
-	-- tauri settings
-	+ [ ] main Settings:
-    	+ [ ] edit configuration/save yaml - ensure it can be provisioned
++ [x] RELEASE:
+    + [x] Systemd service
+    + [x] systemd service installer
+    + [x] release: snap/appimage/flatpak/what? but only in Github Actions
 
-		+ [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
-		-- cache
-		+ [ ] cache options: max size, algorithm: FIFO/LIFO
-		+ [ ] option to pre-fetch folders up to certain size or not
-	+ [ ] other config:
-		+ [ ] play notification sound
-		+ [ ] show sync notifications
-		+ [ ] ?
-	+ [ ] Setup flow:
-		+ config exists? -> load: ok|err ->
-		+ ask for login flow in browser: https://github.com/traxys/nextcloud-passwords-client
-		+ save as yaml, lock yaml file permissions
-	+ [ ] Set status! Online/offline etc
-
-+ [ ] network error handling: EAGAIN|ETIMEDOUT https://pubs.opengroup.org/onlinepubs/009695399/functions/read.html
-
-+ [ ] RELEASE:
-    + [ ] Systemd service
-    + [ ] systemd service installer
-    + [ ] release: snap/appimage/flatpak/what? but only in Github Actions
-
-+ [ ] UX:
-    + [ ] Icon mode: sync status || avatar and user status, errors
-    + [ ] implement 'desktop apps'?
-    + [ ] Nextcloud integration with clock-in clock-out!! (DUMB spanish regulation) -> separate app? Same app that fetches conn info? Generate png icon with status?
-
-### Functionality/Service TODO
 + [x] Tray icon
-+ [ ] VFS File handling https://github.com/nextcloud/desktop/issues/3668
++ [x] VFS Webdav mount
+	+ [x] VFS File handling https://github.com/nextcloud/desktop/issues/3668
 > FUSE is not a good solution when network is involved because the normal file API you end up using to access FUSE filesystems is not able to cope with network errors. (?)
 > https://github.com/nextcloud/desktop/issues/3668#issuecomment-905330846
-+ [ ] VFS Webdav mount
-	+ [ ] Proper VFS with files openable through terminal
+	that's wrong tho
+	+ [x] Proper VFS with files openable through terminal
 
-+ [ ] Nextcloud notifications API
-+ [ ] nautilus-nextcloud icon support
-	+ [ ] simple, modular RPC api for multiple file browsers: fetch 'recency' of files given path or dir
-	+ [ ] Basic PY implementation https://linuxconfig.org/how-to-write-nautilus-extensions-with-nautilus-python
++ [x] Nextcloud notifications API
++ [x] nautilus-nextcloud icon support
+	+ [x] simple, modular RPC api for multiple file browsers: fetch 'recency' of files given path or dir
+	+ [x] Basic PY implementation https://linuxconfig.org/how-to-write-nautilus-extensions-with-nautilus-python
 	https://gnome.pages.gitlab.gnome.org/nautilus-python/nautilus-python-migrating-to-4.html
 	see: https://github.com/nextcloud/desktop/blob/master/shell_integration/nautilus/syncstate.py
 
-+ [ ] Implement files HPB push API (native Nextcloud Desktop API). Would be faster than rclone NC/WebDav [source](https://www.reddit.com/r/NextCloud/comments/ueby94/rclone_as_desktop_sync_client_replacement/)
-	+ [ ] support multiple backends: webdav, HPB...
++ [x] Implement files HPB push API (native Nextcloud Desktop API). Would be faster than rclone NC/WebDav [source](https://www.reddit.com/r/NextCloud/comments/ueby94/rclone_as_desktop_sync_client_replacement/)
 	HPB appears to use csync https://docs.nextcloud.com/desktop/3.4/architecture.html
 	'csync (this project) is a client-only file synchronizer for users using existing protocols like smb or sftp'
 	-> probably smart to use remotefs-webdav and remotefs-rs, for the inbuilt SFTP support
 
-	+ [ ] HPB here: https://github.com/nextcloud/notify_push/
+	+ [x] HPB here: https://github.com/nextcloud/notify_push/
 	It runs a websockets server on cloud.your.domain/push/ws
 	There's an existing test client in rust! https://github.com/nextcloud/notify_push/blob/main/test_client/src/main.rs
 
-+ Can we implement webdav and HPB? -> yes it does seem like it!
++ [x] mass deployment / cli setup ensure working. Warn only apppassword https://docs.nextcloud.com/desktop/3.9/advancedusage.html#mass-deployment-and-account-creation
++ [x] HTTP/3 to avoid network overhead
 
-+ [ ] mass deployment / cli setup ensure working. Warn only apppassword https://docs.nextcloud.com/desktop/3.9/advancedusage.html#mass-deployment-and-account-creation
 
-+ [ ] local cache implementation:
-> + fetch file request: get etag/modification date. Do this first by folder (test!)
-> + if etag changed, fetch to nc-raw
-> + ln -s from fuse to /mount/nc-raw/
-> + save etags in DB 
-> + save file structure in db. React file structure using notify_sync (fast traversal)
-> + query db to perform cache logic and prune next file request asynchronously (prioritize latency!)
++ [x] customize cache pruning frequency
++ [x] add option in our yaml to keep paths by default, without requiring the user to specify them (log an error if not found, but don't panic the application)
++ [x] allow setting the mount path with ~ and $HOME
++ [x] auto-create the mountpoint directory if it does not exist
++ [x] review: is it possible that this extension makes my nautilus hang? In which case would it cause it?
 
++ [x] configuration as cli flags? As yaml? review all.
++ [x] get from gnome keyring
+
++ [x] Feature parity with the NC browser file explorer/mobile app (share, file options, view who shared, keep remote permissions etc)
+
++ [x] test write to a file, check in nextcloud
+    + [x] uploading icon
+    + [x] keep a local copy of the file if written by us (configurable)
+    + [x] can we make files within FUSE be actual filesystem/inode links, instead of passing through our rust code?
+        + to actual TODO
+    + [x] test locally updating a synced file
+    + [x] test remotely updating a synced file
+
+    + [x] test both to emulate a race
+    + [x] test with emulate no network access, showing the local cached copy --emulate-no-network-in 15s
+    + [x] ensure that the 'uploading/downloading' section in the dash app reacts to the rest
+
++ [x] pause sync/unmount behaviour
+    + [x] impl
++ [x] CI/CD
+    + [x] choose appimage/flatpak/snap -> does not play well with FUSE mount, unix socket IPC, nautilus... use apt
+    + [x] Ship a .deb built with cargo-deb (for the Rust daemon
+
++ [x] local cache implementation:
+	> + fetch file request: get etag/modification date. Do this first by folder (test!)
+	> + if etag changed, fetch to nc-raw
+	> + ln -s from fuse to /mount/nc-raw/
+	> + save etags in DB 
+	> + save file structure in db. React file structure using notify_sync (fast traversal)
+	> + query db to perform cache logic and prune next file request asynchronously (prioritize latency!)
+	NOTE: no need for a DB, be unix-like, make the FS be the DB
+
++ [x] fix `fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf` without setting it - removed allow_other fuse mount option
+
++ [x] network error handling: EAGAIN|ETIMEDOUT https://pubs.opengroup.org/onlinepubs/009695399/functions/read.html
+
++ [x] share account details with gnome-online-accounts so that we don't need dual login. Get gnome-calendar working 
+
++ [ ] eval performant cache if needed
 	with tokio_uring! https://gist.github.com/munro/14219f9a671484a8fe820eb35d26bb80
 	+ https://github.com/foyer-rs/foyer
 	+ https://docs.rs/freqfs/0.4.3/freqfs/
 	+ https://github.com/pedrocr/syncer
 	+ https://forum.autonomi.community/t/syncer-a-caching-fuse-based-filesystem-in-rust/32018
 	+ https://github.com/kahing/catfs
-	TDD this!
-Choose DB:
-https://github.com/cberner/redb
-https://github.com/rusqlite/rusqlite
-Turso Limbo
 
 + [ ] E2E Encryption
 + [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
-> This vs GVfs
-+ Webdav is super slow (~5/10s delay)
-+ Potential for local cache
++ [ ] cross-platform review: what do we need to change?
 
-### Known bugs
-+ [ ] fix `fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf` without setting it
++ [x] UX:
+    + [x] Icon mode: sync status || avatar and user status, errors
+    + [x] implement 'desktop apps'?
+    + [ ] Nextcloud integration with clock-in clock-out!! (DUMB spanish regulation) -> separate app? Same app that fetches conn info? Generate png icon with status?
+
++ [ ] QOL:
+    + [x] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
+	+ [x] View user login info/status: HPB Connection, DAV Connection. Turn orange if HPB NOK.
+	+ [x] main Settings in tauri gui
+	+ [x] Set status! Online/offline etc
+    	+ [x] edit configuration/save yaml - ensure it can be provisioned
+		-- cache
+		+ [x] cache options: max size
+		+ [x] option to pre-fetch folders up to certain size or not
+                + [ ] cache algorithm: FIFO/LIFO
+		+ [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
+	+ [ ] other config:
+		+ [ ] play notification sound
+	+ [ ] Setup flow:
+		+ config exists? -> load: ok|err ->
+		+ ask for login flow in browser: https://github.com/traxys/nextcloud-passwords-client
+		+ save as yaml, lock yaml file permissions
+
++ [ ] merge login with authd login if machines use nc-idam-provided OAuth2 token
+
++ [ ] missing test surface:
+    + [ ] diffing algorithm? -> ask which copy we want to save/save conflicting copy separately -> choose conflict resolution strategy
+    + [ ] test moving -> ensure it's a move/rename operation and not just a delete/copy
+
++ [ ] manually review tests
+
+```
+
 
 
 ## Future
