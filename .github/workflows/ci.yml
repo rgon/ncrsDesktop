@@ -44,9 +44,6 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-
       - name: Run tests
         run: cargo test -p ncrs_core
 
@@ -111,9 +108,6 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
 
       - name: Install pnpm
         run: npm install -g pnpm@11
