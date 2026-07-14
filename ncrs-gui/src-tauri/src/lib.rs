@@ -33,6 +33,9 @@ pub struct AppState {
     pub login_flow_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Mirrors the notify_push connection flag; false when HPB is unavailable.
     pub hpb_connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the GUI detects a server auth failure (e.g. 401 from notifications API).
+    /// Survives attached_poll_loop state overwrites; cleared on successful auth.
+    pub auth_error: Mutex<Option<String>>,
 }
 
 impl Default for AppState {
@@ -50,6 +53,7 @@ impl Default for AppState {
             attached: std::sync::atomic::AtomicBool::new(false),
             login_flow_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hpb_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            auth_error: Mutex::new(None),
         }
     }
 }
@@ -176,6 +180,7 @@ async fn logout(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), S
     // Clear in-memory state so remount won't reuse stale options.
     *state.mount_options.lock().unwrap() = None;
     *state.sync_state.lock().unwrap() = SyncState::Unmounted;
+    *state.auth_error.lock().unwrap() = None;
     app.emit("auth-cleared", ()).ok();
     Ok(())
 }
@@ -719,7 +724,7 @@ pub fn run() {
         }))
         .plugin(
             tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Warn)
+                .level(log::LevelFilter::Info)
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
@@ -1051,31 +1056,42 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     }
 
     // Notification polling — async on Tokio runtime, no dedicated OS thread
-    if let Ok(poll_creds) = opts.credentials() {
-        let poll_state = state.clone();
-        let poll_app = app.clone();
-        let poll_url = opts.url.clone();
-        let poll_http3 = opts.http3;
-        let notif_shutdown = shutdown_rx.clone();
-        spawn(async move {
-            let base = ncrs_core::notifications::base_url(&poll_url);
-            loop {
-                if *notif_shutdown.borrow() { break; }
-                let b = base.clone();
-                let c = poll_creds.clone();
-                match tokio::task::spawn_blocking(move || {
-                    ncrs_core::notifications::fetch_notifications(&b, &c, poll_http3)
-                }).await {
-                    Ok(Ok(notifs)) => {
-                        *poll_state.notifications.lock().unwrap() = notifs.clone();
-                        poll_app.emit("notifications-updated", notifs).ok();
+    match opts.credentials() {
+        Err(e) => log::warn!("notification polling disabled: credentials unavailable: {}", e),
+        Ok(poll_creds) => {
+            let poll_state = state.clone();
+            let poll_app = app.clone();
+            let poll_url = opts.url.clone();
+            let poll_http3 = opts.http3;
+            let notif_shutdown = shutdown_rx.clone();
+            log::info!("notification polling starting for {}", ncrs_core::notifications::base_url(&poll_url));
+            spawn(async move {
+                let base = ncrs_core::notifications::base_url(&poll_url);
+                loop {
+                    if *notif_shutdown.borrow() { break; }
+                    let b = base.clone();
+                    let c = poll_creds.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        ncrs_core::notifications::fetch_notifications(&b, &c, poll_http3)
+                    }).await {
+                        Ok(Ok(notifs)) => {
+                            log::info!("notifications fetched: {} item(s)", notifs.len());
+                            *poll_state.auth_error.lock().unwrap() = None;
+                            *poll_state.notifications.lock().unwrap() = notifs.clone();
+                            poll_app.emit("notifications-updated", notifs).ok();
+                        }
+                        Ok(Err(e)) if e.contains("401") || e.contains("Unauthorized") || e.contains("not logged in") => {
+                            log::warn!("fetch notifications: {}", e);
+                            *poll_state.auth_error.lock().unwrap() = Some(e.clone());
+                            poll_app.emit("sync-state-changed", format!("error:authentication failed — re-login required")).ok();
+                        }
+                        Ok(Err(e)) => log::warn!("fetch notifications: {}", e),
+                        Err(e) => log::warn!("notification poll panicked: {}", e),
                     }
-                    Ok(Err(e)) => log::warn!("fetch notifications: {}", e),
-                    Err(e) => log::warn!("notification poll panicked: {}", e),
+                    sleep(Duration::from_secs(30)).await;
                 }
-                sleep(Duration::from_secs(30)).await;
-            }
-        });
+            });
+        }
     }
 
     // Error log polling — check every 2s, emit event + desktop notification on new errors
@@ -1193,12 +1209,25 @@ async fn attached_poll_loop(
         let new_state = match replies.first().map(String::as_str) {
             Some("paused") => SyncState::Paused,
             Some("syncing") => SyncState::Syncing,
+            Some("unmounted") => SyncState::Unmounted,
+            Some("wiped") => SyncState::Wiped,
+            Some(s) if s.starts_with("error:") => SyncState::Error(s["error:".len()..].to_string()),
+            Some(s) if s.starts_with("degraded:") => SyncState::Degraded(s["degraded:".len()..].to_string()),
             _ => SyncState::Idle,
         };
         let changed = {
             let mut ss = state.sync_state.lock().unwrap();
-            if *ss != new_state {
-                *ss = new_state.clone();
+            // Don't overwrite a GUI-detected auth error with Idle from the daemon —
+            // the daemon may be serving from cache and appear healthy while creds are invalid.
+            let auth_err_active = matches!(*ss, SyncState::Error(_))
+                && state.auth_error.lock().unwrap().is_some();
+            let effective = if auth_err_active && matches!(new_state, SyncState::Idle) {
+                ss.clone()
+            } else {
+                new_state.clone()
+            };
+            if *ss != effective {
+                *ss = effective.clone();
                 true
             } else {
                 false
