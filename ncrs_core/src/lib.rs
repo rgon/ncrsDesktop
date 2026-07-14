@@ -343,6 +343,21 @@ fn is_timeout_err(e: &str) -> bool {
 /// touching the network.  The whole exchange takes microseconds instead of
 /// hundreds of milliseconds.
 ///
+/// # Guard against corrupting file copies
+///
+/// `O_NOATIME` is also set by copy tools (`cp`, Nautilus's `g_file_copy`) on
+/// the source file to avoid updating its access time, so those opens also
+/// trigger `mime_detect_ct` in `open()`.  Without a guard, `read()` would
+/// serve magic bytes in place of real content, producing a tiny corrupted
+/// destination file.
+///
+/// The distinguishing signal is the **read size**: GLib always requests
+/// exactly 16384 bytes (`MAGIC_BYTES_BUFFER_SIZE` in `gcontenttype.c`)
+/// regardless of the file's actual size.  Copy tools use much larger buffers
+/// (`cp` uses 131072 bytes; GIO's `g_file_copy` uses 65536 bytes).  `read()`
+/// therefore only intercepts when `sz <= 16384 && off == 0`; larger reads fall
+/// through to the normal network-fetch path and serve real content.
+///
 /// # Forward-compatibility
 ///
 /// Any content-type not listed below falls through to `b"# text\n"`, which
@@ -2351,11 +2366,24 @@ impl Filesystem for NextCloudFs {
                 // GLib 2.80+ MIME detection: serve synthetic magic bytes instead of
                 // downloading the file. The content-type was captured at open() from the
                 // PROPFIND dir cache. Zero network I/O; see mime_magic_bytes() for details.
+                //
+                // Guard: GLib always requests exactly 16384 bytes for magic detection.
+                // Copy tools (cp, Nautilus/GIO g_file_copy) use 65536+ byte buffers.
+                // Only intercepting small reads keeps copies correct.
                 if let Some(ref ct) = of.mime_detect_ct {
-                    if off == 0 {
+                    if off == 0 && sz <= 16384 {
                         let magic = mime_magic_bytes(ct);
                         let end = magic.len().min(sz);
                         reply.data(&magic[..end]);
+                        return;
+                    }
+                    // Copy-sized read (sz > 16384) on a handle that was opened while the
+                    // file was NOT in the local cache (mime_detect_ct being set proves this).
+                    // If we are offline, we have no real content to serve — fail now rather
+                    // than letting the file_cache return a stale/poisoned entry or letting
+                    // ensure_file_cached produce an EIO after a wasted round-trip.
+                    if self.conn.is_offline.load(Ordering::Relaxed) {
+                        reply.error(Errno::EACCES);
                         return;
                     }
                 }
@@ -2505,6 +2533,12 @@ impl Filesystem for NextCloudFs {
         let read_ahead = self.read_ahead_bytes;
         let cache_streamed = self.cache_streamed_reads;
         let file_total_size = self.cache.safe_lock().find_entry(&path).map(|e| e.size).unwrap_or(0);
+        // True when the file was not locally cached at open() time. For such handles
+        // there is no guarantee the file_cache has valid content, so the ensure_file_cached
+        // fallback must be skipped — a range-read failure means the copy must fail.
+        let is_mime_detect_open = self.open_files.safe_lock()
+            .get(&fh.0)
+            .map_or(false, |of| of.mime_detect_ct.is_some());
 
         thread::spawn(move || {
             let fetch = std::cmp::max(sz, read_ahead);
@@ -2635,6 +2669,16 @@ impl Filesystem for NextCloudFs {
                     }
                 }
                 Err(e) => {
+                    // For handles opened while the file was not cached (mime-detect opens),
+                    // skip ensure_file_cached entirely — the file_cache may hold a stale or
+                    // poisoned entry and we have no valid content to offer. Propagate the
+                    // range-read error so the copy fails cleanly.
+                    if is_mime_detect_open {
+                        log::error!("range read failed on uncached file {}: {}", path.display(), e);
+                        push_error(&elog, path.clone(), SyncErrorKind::NetworkError, format!("download failed: {}", e));
+                        reply.error(error_to_errno(&e));
+                        return;
+                    }
                     log::warn!("range read failed, falling back to full download: {}", e);
                     match ensure_file_cached(&conn, &cache, &status, &dirty, path.clone(), Some(&tmap), auto_keep_cached) {
                         Ok(local) => {

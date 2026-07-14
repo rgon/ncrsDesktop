@@ -72,6 +72,16 @@ GLib receives a valid answer, classifies the file correctly, and closes the
 handle. No data is fetched from the server. The round-trip cost drops from
 ~280 ms to a few microseconds.
 
+**Guard against corrupting copies** — `O_NOATIME` is also used by copy tools
+(`cp`, Nautilus's `g_file_copy`) on the source file to avoid updating its
+access time. Without a guard, the copy would receive magic bytes instead of
+real content and write a tiny corrupted file to the destination. The
+distinguishing signal is the **read size**: GLib always requests exactly 16384
+bytes (`MAGIC_BYTES_BUFFER_SIZE` in `gcontenttype.c`), while copy tools use
+much larger buffers (`cp` uses 131072 bytes, GIO uses 65536 bytes). `read()`
+only intercepts when `sz <= 16384 && off == 0`; larger reads fall through to
+the real download path.
+
 **Result:** a directory with 266 files (37 with unusual extensions) that
 previously took 10–12 seconds to list in Nautilus now lists in under 100 ms.
 
