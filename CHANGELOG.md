@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.25](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.24...ncrs-v0.1.25) (2026-07-14)
+
+
+### Bug Fixes
+
+* **ci:** remove global sccache rustc-wrapper; bump sccache-action to v0.0.10 ([9100bf0](https://github.com/rgon/ncrsDesktop/commit/9100bf05824d69f20801d11915e50ceef794d3e2))
+
 ## [0.1.24](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.23...ncrs-v0.1.24) (2026-07-14)
 
 
