@@ -394,7 +394,7 @@
         </header>
 
         <!-- ── Sync status strip ────────────────────────────────────────── -->
-        <SyncProgressView {syncState} {transfers} {storage} onremount={handleRemount} />
+        <SyncProgressView {syncState} {transfers} {storage} onremount={handleRemount} onlogout={handleLogout} />
 
         <!-- ── Content ─────────────────────────────────────────────────── -->
         <div class="nc-content">
