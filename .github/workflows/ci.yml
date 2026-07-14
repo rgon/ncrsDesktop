@@ -35,7 +35,11 @@ jobs:
             python3-nautilus \
             dpkg-dev \
             desktop-file-utils \
-            lintian
+            lintian \
+            mold
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -99,7 +103,11 @@ jobs:
             python3-nautilus \
             dpkg-dev \
             desktop-file-utils \
-            lintian
+            lintian \
+            mold
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
