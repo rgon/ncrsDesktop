@@ -3284,6 +3284,7 @@ impl Filesystem for NextCloudFs {
                 return;
             }
         };
+        log::info!("[{}] FLUSH {} size={} etag={:?}", self.log_user, remote_path.display(), upload_size, original_etag);
 
         // Update dir_cache size synchronously so getattr returns the correct size
         // before the background PUT thread has a chance to run.
@@ -3872,6 +3873,21 @@ impl Filesystem for NextCloudFs {
                 moved_entry = removed.into_iter().next();
             }
             if let Some(mut entry) = moved_entry {
+                // rename() can arrive at the FUSE dispatcher concurrently with flush() or
+                // even before it (multi-threaded fuser dispatches ops in parallel).  When
+                // the source was just created via create(), its dir-cache size is 0 until
+                // flush() does its synchronous update — which may not have run yet.  Read
+                // the staging file's actual size so the optimistic update shows the right
+                // byte count immediately.
+                let staged_size = self.open_files.safe_lock()
+                    .values()
+                    .find(|of| of.remote_path == from)
+                    .and_then(|of| of.write_path.as_ref())
+                    .and_then(|wp| std::fs::metadata(wp).ok())
+                    .map(|m| m.len());
+                if let Some(sz) = staged_size {
+                    entry.size = sz;
+                }
                 entry.path = to.clone();
                 if let Some(dir) = c.dir_cache.get_mut(&new_parent_path) {
                     let mut files = (*dir.files).clone();
@@ -3914,6 +3930,10 @@ impl Filesystem for NextCloudFs {
                 // asynchronously and the file may not yet exist on the server when this
                 // MOVE fires.  Wait until the uploading guard is cleared before sending
                 // the MOVE, so the server has the file content in place first.
+                let waiting = cache.safe_lock().uploading.contains(&from);
+                if waiting {
+                    log::info!("MOVE {} → {}: waiting for in-flight PUT to complete", from.display(), to.display());
+                }
                 let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 loop {
                     if !cache.safe_lock().uploading.contains(&from) {
@@ -3926,6 +3946,7 @@ impl Filesystem for NextCloudFs {
                     thread::sleep(Duration::from_millis(50));
                 }
                 let _permit = conn.throttle.acquire();
+                log::info!("MOVE {} → {}: sending WebDAV MOVE", from.display(), to.display());
                 match conn.backend.rename(&from, &to) {
                     Ok(()) => {
                         log::info!("MOVE {} → {}", from.display(), to.display());
