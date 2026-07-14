@@ -5,6 +5,8 @@
 
     import { invoke } from "@tauri-apps/api/core";
     import { listen } from "@tauri-apps/api/event";
+    import { attachConsole } from "@tauri-apps/plugin-log";
+    attachConsole();
 
     import {
         mdiFolder, mdiAppsBox, mdiAccountCog, mdiLogout,
