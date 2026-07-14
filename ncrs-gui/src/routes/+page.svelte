@@ -206,8 +206,10 @@
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     onMount(() => {
-        loadInfo();
-
+        // Register all event listeners first, then load initial state once the backend
+        // confirms registration. This prevents the race where the first notification-poll
+        // event fires before our listener is set up and loadInfo()'s get_notifications
+        // call races against an in-flight HTTP fetch.
         const unlistenSync = listen<string>("sync-state-changed", (e) => {
             syncState = e.payload;
         });
@@ -246,6 +248,12 @@
             userInfo = null;
             loadInfo();
         });
+
+        Promise.all([
+            unlistenSync, unlistenNotifs, unlistenErrors, unlistenTransfers,
+            unlistenJournal, unlistenConflicts, unlistenPluginNav,
+            unlistenLoginComplete, unlistenAuthCleared,
+        ]).then(() => loadInfo());
 
         const storageInterval = setInterval(() => {
             invoke<StorageStats>("get_storage_stats").then(s => { storage = s; }).catch(() => {});
