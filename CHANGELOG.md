@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.24](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.23...ncrs-v0.1.24) (2026-07-14)
+
+
+### Features
+
+* **cli:** add --url/--username/--password overrides and remove http3 probe ([a24a1f0](https://github.com/rgon/ncrsDesktop/commit/a24a1f0e8c02a669cc322ba9cbfb4cb8f99e4e17))
+
+
+### Bug Fixes
+
+* **fuse:** use staging file size in rename optimistic update; add flush/move logging ([5c90ded](https://github.com/rgon/ncrsDesktop/commit/5c90dedf9d227d8d7ddc658e81cae7c61ca7ce98))
+* **fuse:** wait for in-flight PUT before issuing MOVE on rename ([dd7432f](https://github.com/rgon/ncrsDesktop/commit/dd7432f34121acdb0e1114f81194efe30708e079))
+* **ui:** register event listeners before loading initial state to avoid notification race ([8219529](https://github.com/rgon/ncrsDesktop/commit/821952947de27a10a7c0ede88c6210cd9f4da642))
+
 ## [0.1.23](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.22...ncrs-v0.1.23) (2026-07-14)
 
 
