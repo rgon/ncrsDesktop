@@ -16,6 +16,18 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     mount_point: Option<PathBuf>,
 
+    /// Override WebDAV URL from config
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+
+    /// Override username from config
+    #[arg(long, value_name = "USER")]
+    username: Option<String>,
+
+    /// Override password from config
+    #[arg(long, value_name = "PASS")]
+    password: Option<String>,
+
     /// Disable optimistic directory listing (re-list every 10s instead of relying on notify_push)
     #[arg(long)]
     no_optimistic_listing: bool,
@@ -66,6 +78,16 @@ fn main() {
 
     if let Some(mp) = cli.mount_point {
         opts.mount_point = mp;
+    }
+    if let Some(username) = cli.username {
+        opts.username = Some(username);
+    }
+    if let Some(url) = cli.url {
+        let username = opts.username.as_deref().unwrap_or("");
+        opts.url = ncrs_core::login_flow::normalize_webdav_url(&url, username);
+    }
+    if let Some(password) = cli.password {
+        opts.password = Some(password);
     }
     if cli.offline {
         opts.offline = true;

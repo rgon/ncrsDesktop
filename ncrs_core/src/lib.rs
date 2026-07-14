@@ -1684,49 +1684,6 @@ pub struct NextCloudFs {
     cleanup_stale_gio_temps: bool,
 }
 
-/// Returns true only when the server at `base_url` actually responds over QUIC
-/// (i.e. the response version is HTTP/3). reqwest 0.13 silently falls back to
-/// HTTP/1.1 when QUIC fails, so checking the response version is necessary to
-/// distinguish a real H3 connection from a silent downgrade.
-fn probe_http3(base_url: &str) -> bool {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            log::warn!("HTTP/3 probe: could not build runtime: {}", e);
-            return false;
-        }
-    };
-    rt.block_on(async {
-        let client = match reqwest::Client::builder()
-            .http3_prior_knowledge()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("HTTP/3 probe: could not build client: {}", e);
-                return false;
-            }
-        };
-        match client.head(base_url).send().await {
-            Ok(resp) if resp.version() == reqwest::Version::HTTP_3 => {
-                log::info!("HTTP/3 probe succeeded: {}", base_url);
-                true
-            }
-            Ok(resp) => {
-                log::warn!("HTTP/3 probe: got {:?} instead of HTTP/3, using HTTP/2", resp.version());
-                false
-            }
-            Err(e) => {
-                log::warn!("HTTP/3 probe failed, using HTTP/2: {:?}", e);
-                false
-            }
-        }
-    })
-}
 
 impl NextCloudFs {
     pub fn new(options: MountOptions) -> Result<Self, String> {
@@ -1807,7 +1764,7 @@ impl NextCloudFs {
         let details: ipc::FileDetailMap = Arc::new(Mutex::new(HashMap::new()));
 
         let base_url = notifications::base_url(&options.url);
-        let use_http3 = options.http3 && !options.offline && probe_http3(&base_url);
+        let use_http3 = options.http3 && !options.offline;
 
         let mut http_builder = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(16);
