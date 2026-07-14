@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.1.23](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.22...ncrs-v0.1.23) (2026-07-14)
+
+
+### Features
+
+* **config:** auto-normalize DAV URL from any user-supplied format ([1f582b6](https://github.com/rgon/ncrsDesktop/commit/1f582b6ba38341d6b439ac5f7a50852754409db0))
+* **hpb:** add degraded state and orange tray icon for notify_push failures ([0cfa568](https://github.com/rgon/ncrsDesktop/commit/0cfa568196cc4aedf7c725cdb19974e4b0c5896c))
+* **logging:** replace env_logger with tauri-plugin-log to surface warnings in DevTools ([fd341e9](https://github.com/rgon/ncrsDesktop/commit/fd341e90918222f406362113fd7422f57bfe2198))
+* **logging:** wire @tauri-apps/plugin-log JS package and attachConsole for DevTools output ([9eff244](https://github.com/rgon/ncrsDesktop/commit/9eff2442d0bbc62aeabcaec7f70908b5e1df9328))
+
+
+### Bug Fixes
+
+* **auth:** surface 401 as error state and fix attached_poll_loop swallowing daemon errors ([5d44377](https://github.com/rgon/ncrsDesktop/commit/5d44377564fbdf54f64382549032d25c5d1c15c3))
+* **fuse:** fallback to octet-stream for MIME opens with no server content-type ([08e5673](https://github.com/rgon/ncrsDesktop/commit/08e5673e7ddf7c49f714be670db0b5cbbf190150))
+* **fuse:** guard MIME magic intercept to sz&lt;=16384 to avoid corrupting file copies ([7ec0e7a](https://github.com/rgon/ncrsDesktop/commit/7ec0e7a7e06d9fe5477c5a07cf9199f8c1ad552c))
+* **goa:** write keyring credentials before accounts.conf to eliminate auth race ([70e5aa5](https://github.com/rgon/ncrsDesktop/commit/70e5aa578936b4e42f8893a799da8e0e7774cc1b))
+* **http3-probe:** require HTTP/3 response version; reqwest 0.13 silently falls back to HTTP/1.1 ([a276b23](https://github.com/rgon/ncrsDesktop/commit/a276b23b2da99518e34e8af65c64208c14c73a0d))
+* **http3-probe:** use async reqwest client with dedicated runtime for reliable H3 detection ([1bc9476](https://github.com/rgon/ncrsDesktop/commit/1bc9476609fff125fddfee4fe089ac3643a7a217))
+* **http3:** fall back to HTTP/2 when HTTP/3 connection fails in notifications ([3b217c5](https://github.com/rgon/ncrsDesktop/commit/3b217c538d8d510ef0641db9d9cc2aa590970897))
+* **keyring:** delete before save and refresh creds on 401 in notification poll ([d9ff15b](https://github.com/rgon/ncrsDesktop/commit/d9ff15bc19cc2c0849079da5233bc08cd24d219a))
+* **logout:** preserve server URL in login form after re-login flow ([e58ccaa](https://github.com/rgon/ncrsDesktop/commit/e58ccaa58ba5b789353cac037b02feb1ba372719))
+* **net:** retry transient network errors and map timeout/network to ETIMEDOUT/EAGAIN ([bd1e882](https://github.com/rgon/ncrsDesktop/commit/bd1e8826305d7fa48876cf20b9e58f601d4bc410))
+* **read:** fail copy immediately when uncached file unreachable instead of serving stale cache ([7ec0e7a](https://github.com/rgon/ncrsDesktop/commit/7ec0e7a7e06d9fe5477c5a07cf9199f8c1ad552c))
+* **remount:** unmount active FUSE mount before restarting so mount path changes take effect ([27931d4](https://github.com/rgon/ncrsDesktop/commit/27931d4fca349877e5f8d1896daaeb4c2bf6a632))
+* **ui:** show 'Log in' button for auth errors instead of 'Remount' ([3144987](https://github.com/rgon/ncrsDesktop/commit/31449872c6e1295a161e284447713eae0b746f77))
+* **webdav:** use Overwrite: T in MOVE so rename atomically replaces existing destinations: WebDAV move had different behaviour to POSIX move. ([d7ccaa3](https://github.com/rgon/ncrsDesktop/commit/d7ccaa3459ae526614d0c9e29f5b08b0ef46e731))
+
+
+### Performance Improvements
+
+* **fuse:** intercept GLib MIME detection opens with synthetic magic bytes ([08e5673](https://github.com/rgon/ncrsDesktop/commit/08e5673e7ddf7c49f714be670db0b5cbbf190150))
+* **fuse:** prefetch small files on open() to parallelise MIME magic-byte detection ([9cc6505](https://github.com/rgon/ncrsDesktop/commit/9cc65059f614f0b03847445a25676bf44a923bd4))
+
 ## [0.1.22](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.21...ncrs-v0.1.22) (2026-07-13)
 
 
