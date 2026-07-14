@@ -199,6 +199,10 @@
         await invoke("remount");
     }
 
+    async function handleLogout() {
+        await doLogout();
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     onMount(() => {
@@ -239,8 +243,8 @@
         });
 
         const unlistenAuthCleared = listen("auth-cleared", () => {
-            activeView = "login";
             userInfo = null;
+            loadInfo();
         });
 
         const storageInterval = setInterval(() => {
