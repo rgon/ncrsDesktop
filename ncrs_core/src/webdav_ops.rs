@@ -159,7 +159,7 @@ pub fn move_resource(
         .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &src_url)
         .timeout(WRITE_TIMEOUT))
         .header("Destination", &dst_url)
-        .header("Overwrite", "F")
+        .header("Overwrite", "T")
         .send()
         .map_err(|e| WriteError::Network(e.to_string()))?;
 
