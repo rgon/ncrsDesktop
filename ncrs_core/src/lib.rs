@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -46,6 +46,20 @@ trait MutexExt<T> {
 impl<T> MutexExt<T> for Mutex<T> {
     fn safe_lock(&self) -> std::sync::MutexGuard<'_, T> {
         self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+trait RwLockExt<T> {
+    fn safe_read(&self) -> RwLockReadGuard<'_, T>;
+    fn safe_write(&self) -> RwLockWriteGuard<'_, T>;
+}
+
+impl<T> RwLockExt<T> for RwLock<T> {
+    fn safe_read(&self) -> RwLockReadGuard<'_, T> {
+        self.read().unwrap_or_else(|e| e.into_inner())
+    }
+    fn safe_write(&self) -> RwLockWriteGuard<'_, T> {
+        self.write().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -1006,7 +1020,7 @@ fn run_cache_cleanup(
                     let mut c = cache.safe_lock();
                     c.file_cache.remove(&f.remote_path);
                     drop(c);
-                    status.safe_lock().insert(f.remote_path.clone(), FileStatus::Remote);
+                    status.safe_write().insert(f.remote_path.clone(), FileStatus::Remote);
                     dirty.safe_lock().insert(f.remote_path);
                     total_size -= f.size;
                     freed += f.size;
@@ -1026,7 +1040,7 @@ fn run_cache_cleanup(
                 let mut c = cache.safe_lock();
                 c.file_cache.remove(&f.remote_path);
                 drop(c);
-                status.safe_lock().insert(f.remote_path.clone(), FileStatus::Remote);
+                status.safe_write().insert(f.remote_path.clone(), FileStatus::Remote);
                 dirty.safe_lock().insert(f.remote_path);
                 total_size -= f.size;
                 freed += f.size;
@@ -1067,9 +1081,9 @@ fn apply_dir_detail_maps(path: &Path, entries: &[RemoteEntry], arcs: &DirDetailA
             is_dir: entry.is_dir,
         }));
     }
-    { let mut sh = arcs.shared.safe_lock(); for p in shared_paths { sh.insert(p); } }
-    { let mut fi = arcs.fileids.safe_lock(); for (p, fid) in fileid_paths { fi.insert(p, fid); } }
-    { let mut dt = arcs.details.safe_lock(); for (p, d) in detail_entries { dt.insert(p, d); } }
+    { let mut sh = arcs.shared.safe_write(); for p in shared_paths { sh.insert(p); } }
+    { let mut fi = arcs.fileids.safe_write(); for (p, fid) in fileid_paths { fi.insert(p, fid); } }
+    { let mut dt = arcs.details.safe_write(); for (p, d) in detail_entries { dt.insert(p, d); } }
     arcs.dirty.safe_lock().insert(path.to_path_buf());
 }
 
@@ -1291,7 +1305,7 @@ pub(crate) fn ensure_file_cached(
                         }
                         drop(c);
                         save_file_cache(cache);
-                        status.safe_lock().insert(remote_path.clone(), FileStatus::Kept);
+                        status.safe_write().insert(remote_path.clone(), FileStatus::Kept);
                         dirty.safe_lock().insert(remote_path);
                         return Ok(new_path);
                     }
@@ -1301,7 +1315,7 @@ pub(crate) fn ensure_file_cached(
         }
     }
 
-    status.safe_lock().insert(remote_path.clone(), FileStatus::Downloading);
+    status.safe_write().insert(remote_path.clone(), FileStatus::Downloading);
     dirty.safe_lock().insert(remote_path.clone());
 
     if let Some(tm) = transfers {
@@ -1352,7 +1366,7 @@ pub(crate) fn ensure_file_cached(
                     continue;
                 }
                 cache.safe_lock().file_cache.remove(&remote_path);
-                status.safe_lock().insert(remote_path.clone(), FileStatus::Remote);
+                status.safe_write().insert(remote_path.clone(), FileStatus::Remote);
                 dirty.safe_lock().insert(remote_path);
                 return Err(e);
             }
@@ -1372,7 +1386,7 @@ pub(crate) fn ensure_file_cached(
         );
     }
     save_file_cache(cache);
-    status.safe_lock().insert(remote_path.clone(), final_status);
+    status.safe_write().insert(remote_path.clone(), final_status);
     dirty.safe_lock().insert(remote_path);
     Ok(local_path)
 }
@@ -1757,11 +1771,11 @@ impl NextCloudFs {
         inodes.insert(1, PathBuf::from("/"));
         paths.insert(PathBuf::from("/"), 1);
 
-        let status: StatusMap = Arc::new(Mutex::new(HashMap::new()));
+        let status: StatusMap = Arc::new(RwLock::new(HashMap::new()));
         let dirty: ipc::DirtySet = Arc::new(Mutex::new(std::collections::HashSet::new()));
-        let shared: ipc::SharedSet = Arc::new(Mutex::new(std::collections::HashSet::new()));
-        let fileids: ipc::FileIdMap = Arc::new(Mutex::new(HashMap::new()));
-        let details: ipc::FileDetailMap = Arc::new(Mutex::new(HashMap::new()));
+        let shared: ipc::SharedSet = Arc::new(RwLock::new(std::collections::HashSet::new()));
+        let fileids: ipc::FileIdMap = Arc::new(RwLock::new(HashMap::new()));
+        let details: ipc::FileDetailMap = Arc::new(RwLock::new(HashMap::new()));
 
         let base_url = notifications::base_url(&options.url);
         let use_http3 = options.http3 && !options.offline;
@@ -1968,7 +1982,7 @@ impl NextCloudFs {
                 }
             }
             save_file_cache(&cache);
-            status.safe_lock().insert(remote_path, FileStatus::Remote);
+            status.safe_write().insert(remote_path, FileStatus::Remote);
         })
     }
 
@@ -1987,7 +2001,7 @@ impl NextCloudFs {
         Arc::new(move |remote_path: PathBuf| {
             let already_inflight = !thumb_inflight.safe_lock().insert(remote_path.clone());
             if !already_inflight {
-                let fileid = fileids.safe_lock().get(&remote_path).copied();
+                let fileid = fileids.safe_read().get(&remote_path).copied();
                 let mount_path = conn.mount_point.join(
                     remote_path.strip_prefix("/").unwrap_or(&remote_path)
                 );
@@ -2064,12 +2078,12 @@ impl Filesystem for NextCloudFs {
             let ino = self.cache.safe_lock().allocate_inode(target_path.clone());
             let attr = make_file_attr(ino, entry);
             if entry.ext.flag("is_shared") {
-                self.shared.safe_lock().insert(target_path.clone());
+                self.shared.safe_write().insert(target_path.clone());
             }
             if let Some(fid) = entry.ext.int("fileid") {
-                self.fileids.safe_lock().insert(target_path.clone(), fid);
+                self.fileids.safe_write().insert(target_path.clone(), fid);
             }
-            self.details.safe_lock().insert(target_path.clone(), ipc::FileDetail {
+            self.details.safe_write().insert(target_path.clone(), ipc::FileDetail {
                 permissions: entry.ext.str("permissions").map(str::to_string),
                 owner_id: entry.ext.str("owner_id").map(str::to_string),
                 owner_display_name: entry.ext.str("owner_display_name").map(str::to_string),
@@ -2077,7 +2091,7 @@ impl Filesystem for NextCloudFs {
                 is_dir: entry.is_dir,
             });
             if !entry.is_dir {
-                self.status.safe_lock().entry(target_path).or_insert(FileStatus::Remote);
+                self.status.safe_write().entry(target_path).or_insert(FileStatus::Remote);
             }
             reply.entry(&TTL, &attr, Generation(0));
             return;
@@ -2609,7 +2623,7 @@ impl Filesystem for NextCloudFs {
                                     drop(c);
                                     save_file_cache(&cache);
                                     let file_status = if kept { FileStatus::Kept } else { FileStatus::Cached };
-                                    status.safe_lock().insert(path.clone(), file_status);
+                                    status.safe_write().insert(path.clone(), file_status);
                                     dirty.safe_lock().insert(path.clone());
                                     log::info!("stream→cache {} ({}B, {})", path.display(), file_total_size, if kept { "kept" } else { "cached" });
                                     open_files.safe_lock().entry(fh.0).and_modify(|of| {
@@ -2931,15 +2945,15 @@ impl Filesystem for NextCloudFs {
                     // avoid adding O(total_cached) latency to the readdir response; the
                     // post-reply block below still runs retain() to evict stale entries.
                     {
-                        let mut sh = shared.safe_lock();
+                        let mut sh = shared.safe_write();
                         for p in &shared_paths { sh.insert(p.clone()); }
                     }
                     {
-                        let mut fi = fileids.safe_lock();
+                        let mut fi = fileids.safe_write();
                         for (p, fid) in &fileid_paths { fi.insert(p.clone(), *fid); }
                     }
                     {
-                        let mut dt = details.safe_lock();
+                        let mut dt = details.safe_write();
                         for (p, d) in &detail_entries { dt.insert(p.clone(), d.clone()); }
                     }
 
@@ -2954,17 +2968,17 @@ impl Filesystem for NextCloudFs {
                     {
                         let is_child_of_dir = |p: &PathBuf| p == &path || p.parent() == Some(&path);
                         {
-                            let mut sh = shared.safe_lock();
+                            let mut sh = shared.safe_write();
                             sh.retain(|p| !is_child_of_dir(p));
                             for p in shared_paths { sh.insert(p); }
                         }
                         {
-                            let mut fi = fileids.safe_lock();
+                            let mut fi = fileids.safe_write();
                             fi.retain(|p, _| !is_child_of_dir(p));
                             for (p, fid) in fileid_paths { fi.insert(p, fid); }
                         }
                         {
-                            let mut dt = details.safe_lock();
+                            let mut dt = details.safe_write();
                             dt.retain(|p, _| !is_child_of_dir(p));
                             for (p, d) in detail_entries { dt.insert(p, d); }
                         }
@@ -2973,7 +2987,7 @@ impl Filesystem for NextCloudFs {
                         // the upload emblem persists, and (b) be dirtied individually so
                         // Nautilus re-queries their NC properties from the fresh detail_map.
                         let upload_paths: Vec<PathBuf> = {
-                            let st = status.safe_lock();
+                            let st = status.safe_read();
                             status_entries.iter()
                                 .filter_map(|(p, _)| {
                                     if matches!(st.get(p),
@@ -2987,7 +3001,7 @@ impl Filesystem for NextCloudFs {
                                 .collect()
                         };
                         {
-                            let mut st = status.safe_lock();
+                            let mut st = status.safe_write();
                             st.retain(|p, _| !is_child_of_dir(p));
                             let upload_set: std::collections::HashSet<&PathBuf> =
                                 upload_paths.iter().collect();
@@ -3266,7 +3280,7 @@ impl Filesystem for NextCloudFs {
         );
 
         if !self.conn.is_offline.load(Ordering::Relaxed) {
-            self.status.safe_lock().insert(remote_path.clone(), FileStatus::Uploading);
+            self.status.safe_write().insert(remote_path.clone(), FileStatus::Uploading);
             self.dirty.safe_lock().insert(remote_path.clone());
         }
         reply.ok();
@@ -3336,14 +3350,14 @@ impl Filesystem for NextCloudFs {
                                     kept: true,
                                     size: upload_size,
                                 });
-                                smap.safe_lock().insert(remote_path.clone(), FileStatus::Kept);
+                                smap.safe_write().insert(remote_path.clone(), FileStatus::Kept);
                                 kept = true;
                             }
                             if !kept {
-                                smap.safe_lock().insert(remote_path.clone(), FileStatus::Synced);
+                                smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
                             }
                         } else {
-                            smap.safe_lock().insert(remote_path.clone(), FileStatus::Synced);
+                            smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
                         }
                         let _ = std::fs::remove_file(&write_path);
                         dirty.safe_lock().insert(remote_path.clone());
@@ -3353,7 +3367,7 @@ impl Filesystem for NextCloudFs {
                     Err(backend::BackendWriteError::Conflict) => {
                         tmap.safe_lock().remove(&remote_path);
                         cache.safe_lock().uploading.remove(&remote_path);
-                        smap.safe_lock().remove(&remote_path);
+                        smap.safe_write().remove(&remote_path);
                         log::warn!("CONFLICT on PUT {} — creating conflicted copy", remote_path.display());
                         push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                         let conflict_name = make_conflict_name(&remote_path);
@@ -3372,7 +3386,7 @@ impl Filesystem for NextCloudFs {
                     Err(ref e) => {
                         tmap.safe_lock().remove(&remote_path);
                         cache.safe_lock().uploading.remove(&remote_path);
-                        smap.safe_lock().remove(&remote_path);
+                        smap.safe_write().remove(&remote_path);
                         log::error!("PUT {} failed (journaled): {}", remote_path.display(), e);
                         let kind = match e {
                             backend::BackendWriteError::Conflict => SyncErrorKind::UploadFailed,

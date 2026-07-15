@@ -23,7 +23,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
@@ -50,14 +50,28 @@ impl<T> MutexExt<T> for Mutex<T> {
     }
 }
 
+trait RwLockExt<T> {
+    fn safe_read(&self) -> RwLockReadGuard<'_, T>;
+    fn safe_write(&self) -> RwLockWriteGuard<'_, T>;
+}
+
+impl<T> RwLockExt<T> for RwLock<T> {
+    fn safe_read(&self) -> RwLockReadGuard<'_, T> {
+        self.read().unwrap_or_else(|e| e.into_inner())
+    }
+    fn safe_write(&self) -> RwLockWriteGuard<'_, T> {
+        self.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 pub type KeepCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type EvictCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type PrefetchCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 /// Synchronously fetch the Nextcloud preview for a remote path and write it to
 /// the XDG thumbnail cache. Returns `true` if the thumbnail is now available.
 pub type ThumbnailCallback = Arc<dyn Fn(PathBuf) -> bool + Send + Sync>;
-pub type SharedSet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
-pub type FileIdMap = Arc<Mutex<std::collections::HashMap<PathBuf, u64>>>;
+pub type SharedSet = Arc<RwLock<std::collections::HashSet<PathBuf>>>;
+pub type FileIdMap = Arc<RwLock<std::collections::HashMap<PathBuf, u64>>>;
 
 #[derive(Clone, Default)]
 pub struct FileDetail {
@@ -68,7 +82,7 @@ pub struct FileDetail {
     pub is_dir: bool,
 }
 
-pub type FileDetailMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileDetail>>>;
+pub type FileDetailMap = Arc<RwLock<std::collections::HashMap<PathBuf, FileDetail>>>;
 pub type DirtySet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
 
 #[derive(Clone)]
@@ -135,7 +149,7 @@ impl FileStatus {
 }
 
 /// Thread-safe store of path → status, updated by the FUSE layer.
-pub type StatusMap = Arc<Mutex<std::collections::HashMap<PathBuf, FileStatus>>>;
+pub type StatusMap = Arc<RwLock<std::collections::HashMap<PathBuf, FileStatus>>>;
 
 fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>, dir: &Path) -> &'static str {
     let own = sm.get(dir).copied();
@@ -387,15 +401,15 @@ fn handle_client(
         let reply = if let Some(path_str) = trimmed.strip_prefix("STATUS ") {
             match strip_mount(Path::new(path_str), &mount_point) {
                 Some(remote) => {
-                    let detail = detail_map.safe_lock().get(&remote).cloned();
-                    let sm = status_map.safe_lock();
+                    let detail = detail_map.safe_read().get(&remote).cloned();
+                    let sm = status_map.safe_read();
                     let status = if detail.as_ref().map_or(false, |d| d.is_dir) {
                         dir_status_from_children(&sm, &remote)
                     } else {
                         sm.get(&remote).copied().unwrap_or(FileStatus::Remote).as_str()
                     };
                     drop(sm);
-                    let shared = shared_set.safe_lock().contains(&remote);
+                    let shared = shared_set.safe_read().contains(&remote);
                     if shared {
                         format!("{},shared", status)
                     } else {
@@ -407,10 +421,10 @@ fn handle_client(
         } else if let Some(path_str) = trimmed.strip_prefix("DETAIL ") {
             match strip_mount(Path::new(path_str), &mount_point) {
                 Some(remote) => {
-                    let is_shared = shared_set.safe_lock().contains(&remote);
-                    let detail = detail_map.safe_lock().get(&remote).cloned()
+                    let is_shared = shared_set.safe_read().contains(&remote);
+                    let detail = detail_map.safe_read().get(&remote).cloned()
                         .unwrap_or_default();
-                    let sm = status_map.safe_lock();
+                    let sm = status_map.safe_read();
                     let status = if detail.is_dir {
                         dir_status_from_children(&sm, &remote)
                     } else {
@@ -450,9 +464,9 @@ fn handle_client(
                     // directory then runs without blocking the FUSE layer, which
                     // needs these same locks for getattr/readdir.
                     let records = {
-                        let shared = shared_set.safe_lock();
-                        let details = detail_map.safe_lock();
-                        let sm = status_map.safe_lock();
+                        let shared = shared_set.safe_read();
+                        let details = detail_map.safe_read();
+                        let sm = status_map.safe_read();
                         detaildir_records(&remote_dir, &details, &sm, &shared, creds.username())
                     };
                     log::debug!("IPC DETAILDIR {} → {} children", path_str, records.len());
@@ -466,7 +480,7 @@ fn handle_client(
         } else if let Some(path_str) = trimmed.strip_prefix("WEBURL ") {
             match strip_mount(Path::new(path_str), &mount_point) {
                 Some(remote) => {
-                    let is_dir = detail_map.safe_lock().get(&remote)
+                    let is_dir = detail_map.safe_read().get(&remote)
                         .map_or(false, |d| d.is_dir);
                     let dir_path = if is_dir {
                         remote.to_string_lossy().to_string()
@@ -475,7 +489,7 @@ fn handle_client(
                             .to_string_lossy().to_string()
                     };
                     let encoded = utf8_percent_encode(&dir_path, QUERY_ENCODE).to_string();
-                    match fileid_map.safe_lock().get(&remote) {
+                    match fileid_map.safe_read().get(&remote) {
                         Some(fid) => format!("{}/apps/files/files/{}?dir={}", base_url, fid, encoded),
                         None => format!("{}/apps/files/files?dir={}", base_url, encoded),
                     }
@@ -540,7 +554,7 @@ fn handle_client(
         } else if let Some(path_str) = trimmed.strip_prefix("KEEP ") {
             match (strip_mount(Path::new(path_str), &mount_point), &keep_cb) {
                 (Some(remote), Some(cb)) => {
-                    status_map.safe_lock().insert(remote.clone(), FileStatus::Downloading);
+                    status_map.safe_write().insert(remote.clone(), FileStatus::Downloading);
                     dirty_set.safe_lock().insert(remote.clone());
                     let cb = cb.clone();
                     let sm = status_map.clone();
@@ -550,8 +564,8 @@ fn handle_client(
                         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
                             log::error!("KEEP callback panicked: {:?}", e);
                         }
-                        if sm.safe_lock().get(&r).copied() == Some(FileStatus::Downloading) {
-                            sm.safe_lock().insert(r.clone(), FileStatus::Kept);
+                        if sm.safe_read().get(&r).copied() == Some(FileStatus::Downloading) {
+                            sm.safe_write().insert(r.clone(), FileStatus::Kept);
                         }
                         ds.safe_lock().insert(r);
                     });
