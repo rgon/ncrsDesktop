@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-trait MutexExt<T> {
+pub(crate) trait MutexExt<T> {
     fn safe_lock(&self) -> std::sync::MutexGuard<'_, T>;
 }
 
