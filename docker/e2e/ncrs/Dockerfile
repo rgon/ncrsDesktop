@@ -3,8 +3,8 @@
 # Builds the headless ncrs CLI daemon and runs the end-to-end data-loss suite
 # against a real (non-Nextcloud) WebDAV server. Build context is the repo root.
 #
-# Pass --build-arg PREBUILT_BINARY=1 (with docker/e2e/ncrs/ncrs in the context)
-# to skip the Rust compilation stage and use a pre-built binary instead.
+# Pass --build-arg PREBUILT_BINARY=1 (with docker/e2e/ncrs/ncrs.deb in the context)
+# to skip the Rust compilation stage and extract the binary from a pre-built .deb.
 
 ARG PREBUILT_BINARY=0
 
@@ -18,9 +18,10 @@ COPY . .
 RUN cargo build --release -p ncrs_core --bin ncrs \
     && cp target/release/ncrs /ncrs
 
-# ---- pre-built binary injected via build context (PREBUILT_BINARY=1) --------
-FROM scratch AS build-1
-COPY docker/e2e/ncrs/ncrs /ncrs
+# ---- pre-built .deb injected via build context (PREBUILT_BINARY=1) ----------
+FROM debian:bookworm-slim AS build-1
+COPY docker/e2e/ncrs/ncrs.deb /ncrs.deb
+RUN dpkg-deb --extract /ncrs.deb /deb && cp /deb/usr/bin/ncrs /ncrs
 
 # ---- select which path was used ---------------------------------------------
 FROM build-${PREBUILT_BINARY} AS binary

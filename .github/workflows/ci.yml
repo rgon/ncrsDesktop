@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       # Must be job-level so the sccache daemon starts with the GHA backend
       # enabled. Step-level env is too late — the daemon is already running.
@@ -31,6 +31,7 @@ jobs:
             target/release/ncrs
             target/release/ncrs-open
             target/release/ncrs-gui
+            dist/
           key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
 
       - name: Cache Cargo registry and git sources
@@ -98,6 +99,10 @@ jobs:
           RUSTC_WRAPPER: sccache
         run: cargo test -p ncrs_core
 
+      - name: Build .deb
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-deb.sh --skip-build
+
   e2e:
     name: e2e (data-loss)
     needs: [build]
@@ -115,12 +120,11 @@ jobs:
             target/release/ncrs
             target/release/ncrs-open
             target/release/ncrs-gui
+            dist/
           key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
 
-      - name: Stage binary for Docker build context
-        run: |
-          chmod +x target/release/ncrs
-          cp target/release/ncrs docker/e2e/ncrs/ncrs
+      - name: Stage .deb for Docker build context
+        run: cp dist/ncrs_*.deb docker/e2e/ncrs/ncrs.deb
 
       - name: Run e2e suite
         env:
@@ -170,13 +174,11 @@ jobs:
             target/release/ncrs
             target/release/ncrs-open
             target/release/ncrs-gui
+            dist/
           key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
 
       - name: Fix binary permissions
         run: chmod +x target/release/ncrs target/release/ncrs-open target/release/ncrs-gui
-
-      - name: Build .deb
-        run: bash scripts/build-deb.sh --skip-build
 
       - name: Test .deb
         run: bash scripts/test-deb.sh --container
