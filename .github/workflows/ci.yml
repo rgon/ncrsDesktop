@@ -1,10 +1,5 @@
 name: CI
 
-# One workflow so the release build can depend on the same test + e2e jobs
-# instead of re-running them. e2e (which compiles the daemon and drives a FUSE
-# mount over a real WebDAV server) runs once per commit and gates both the
-# ordinary build check and the release.
-
 on:
   push:
     branches: [master]
@@ -14,7 +9,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: read
 
 jobs:
   build:
@@ -26,14 +20,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Binaries are keyed by everything that affects compilation output.
-      # release-please PRs and their squash-merge commits produce identical
-      # source trees → cache hit on the merge, skipping the full Rust build.
-      - name: Restore release binaries from cache
+      # Keyed by everything that affects compilation output. Also serves as the
+      # cross-job transport for e2e and build-release (replaces upload-artifact,
+      # which has proven unreliable for binary blobs on these runners).
+      - name: Restore or cache release binaries
         id: binary-cache
         uses: actions/cache@v6
         with:
-          path: cached-binaries/
+          path: |
+            target/release/ncrs
+            target/release/ncrs-open
+            target/release/ncrs-gui
           key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
 
       - name: Cache Cargo registry and git sources
@@ -101,28 +98,6 @@ jobs:
           RUSTC_WRAPPER: sccache
         run: cargo test -p ncrs_core
 
-      - name: Save binaries to cache
-        if: steps.binary-cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p cached-binaries
-          cp target/release/ncrs target/release/ncrs-open target/release/ncrs-gui cached-binaries/
-
-      - name: Restore binaries to target/release
-        if: steps.binary-cache.outputs.cache-hit == 'true'
-        run: |
-          mkdir -p target/release
-          cp cached-binaries/ncrs cached-binaries/ncrs-open cached-binaries/ncrs-gui target/release/
-
-      - name: Upload release binaries
-        uses: actions/upload-artifact@v7
-        with:
-          name: ncrs-release-binaries
-          path: |
-            target/release/ncrs
-            target/release/ncrs-open
-            target/release/ncrs-gui
-          retention-days: 7
-
   e2e:
     name: e2e (data-loss)
     needs: [build]
@@ -133,11 +108,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Download release binaries
-        uses: actions/download-artifact@v7
+      - name: Restore release binaries
+        uses: actions/cache@v6
         with:
-          name: ncrs-release-binaries
-          path: .
+          path: |
+            target/release/ncrs
+            target/release/ncrs-open
+            target/release/ncrs-gui
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
 
       - name: Stage binary for Docker build context
         run: |
@@ -185,11 +163,14 @@ jobs:
             desktop-file-utils \
             lintian
 
-      - name: Download release binaries
-        uses: actions/download-artifact@v7
+      - name: Restore release binaries
+        uses: actions/cache@v6
         with:
-          name: ncrs-release-binaries
-          path: .
+          path: |
+            target/release/ncrs
+            target/release/ncrs-open
+            target/release/ncrs-gui
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
 
       - name: Fix binary permissions
         run: chmod +x target/release/ncrs target/release/ncrs-open target/release/ncrs-gui
