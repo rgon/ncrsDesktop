@@ -3019,16 +3019,24 @@ impl Filesystem for NextCloudFs {
                             for (p, d) in &detail_entries { dt.insert(p.clone(), d.clone()); }
                         }
                         // Rebuild ChildrenMap[path] with the fresh child set.
+                        // Use retain+extend instead of clear+rebuild so that concurrent
+                        // lookup() insertions that arrived between the old_child_set
+                        // snapshot and this write-lock acquire are not silently dropped.
                         {
+                            let new_set: std::collections::HashSet<PathBuf> = detail_entries
+                                .iter()
+                                .filter_map(|(p, _)| {
+                                    if p.parent() == Some(path.as_path()) { Some(p.clone()) } else { None }
+                                })
+                                .collect();
                             let mut cm = children_map.safe_write();
                             let entry = cm.entry(path.clone())
                                 .or_insert_with(std::collections::HashSet::new);
-                            entry.clear();
-                            for (p, _) in &detail_entries {
-                                if p.parent() == Some(path.as_path()) {
-                                    entry.insert(p.clone());
-                                }
-                            }
+                            // Keep entries NOT in old_child_set (concurrent insertions)
+                            // and entries present in both old and new sets (surviving files).
+                            // Remove entries in old_child_set that the fresh PROPFIND no longer lists.
+                            entry.retain(|p| !old_child_set.contains(p) || new_set.contains(p));
+                            entry.extend(new_set);
                         }
                         // Collect paths with in-flight or just-completed upload status before
                         // we clear smap.  These must (a) survive the PROPFIND status reset so
@@ -3048,9 +3056,10 @@ impl Filesystem for NextCloudFs {
                                 })
                                 .collect()
                         };
-                        // status: evict old children (O(old_dir_size)), re-insert fresh
+                        // status: evict dir + old children (O(old_dir_size)), re-insert fresh
                         {
                             let mut st = status.safe_write();
+                            st.remove(&path);
                             for p in &old_child_set { st.remove(p); }
                             let upload_set: std::collections::HashSet<&PathBuf> =
                                 upload_paths.iter().collect();
