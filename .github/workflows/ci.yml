@@ -21,7 +21,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Binaries are keyed by everything that affects compilation output.
+      # release-please PRs and their squash-merge commits produce identical
+      # source trees → cache hit on the merge, skipping the full Rust build.
+      - name: Restore release binaries from cache
+        id: binary-cache
+        uses: actions/cache@v4
+        with:
+          path: cached-binaries/
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
+
       - name: Install system dependencies
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y \
@@ -36,15 +47,19 @@ jobs:
             mold
 
       - name: Set up sccache
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Install Rust stable
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install pnpm
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         run: npm install -g pnpm@11
 
       - name: Install Node.js
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -52,22 +67,37 @@ jobs:
           cache-dependency-path: ncrs-gui/pnpm-lock.yaml
 
       - name: Build GUI frontend
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         run: |
           cd ncrs-gui
           pnpm install --frozen-lockfile
           pnpm build
 
       - name: Build release binaries
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: sccache
         run: cargo build --release -p ncrs_core -p ncrs-gui --features ncrs-gui/custom-protocol
 
       - name: Run unit tests
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: sccache
         run: cargo test -p ncrs_core
+
+      - name: Save binaries to cache
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p cached-binaries
+          cp target/release/ncrs target/release/ncrs-open target/release/ncrs-gui cached-binaries/
+
+      - name: Restore binaries to target/release
+        if: steps.binary-cache.outputs.cache-hit == 'true'
+        run: |
+          mkdir -p target/release
+          cp cached-binaries/ncrs cached-binaries/ncrs-open cached-binaries/ncrs-gui target/release/
 
       - name: Upload release binaries
         uses: actions/upload-artifact@v4
@@ -77,11 +107,14 @@ jobs:
             target/release/ncrs
             target/release/ncrs-open
             target/release/ncrs-gui
-          retention-days: 1
+          retention-days: 7
 
   e2e:
     name: e2e (data-loss)
     needs: [build]
+    # Release-please PRs only change CHANGELOG + version; the code that e2e
+    # exercises is identical to what already passed on the preceding code push.
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-please--')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
