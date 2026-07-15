@@ -23,9 +23,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use crate::RwLockExt;
 
 const MAX_IPC_CLIENTS: usize = 64;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -47,20 +48,6 @@ trait MutexExt<T> {
 impl<T> MutexExt<T> for Mutex<T> {
     fn safe_lock(&self) -> std::sync::MutexGuard<'_, T> {
         self.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-trait RwLockExt<T> {
-    fn safe_read(&self) -> RwLockReadGuard<'_, T>;
-    fn safe_write(&self) -> RwLockWriteGuard<'_, T>;
-}
-
-impl<T> RwLockExt<T> for RwLock<T> {
-    fn safe_read(&self) -> RwLockReadGuard<'_, T> {
-        self.read().unwrap_or_else(|e| e.into_inner())
-    }
-    fn safe_write(&self) -> RwLockWriteGuard<'_, T> {
-        self.write().unwrap_or_else(|e| e.into_inner())
     }
 }
 
