@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.27](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.26...ncrs-v0.1.27) (2026-07-15)
+
+
+### Bug Fixes
+
+* **ci:** bump GHA actions to latest versions ([02998c9](https://github.com/rgon/ncrsDesktop/commit/02998c9e66d11b12f38e4b8b611bb93074b516a6))
+* **ci:** cache release binaries; skip e2e for release-please PRs ([c8b46d6](https://github.com/rgon/ncrsDesktop/commit/c8b46d6a78e3118ab99d51b0a6b5ea37c5923594))
+
 ## [0.1.26](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.25...ncrs-v0.1.26) (2026-07-15)
 
 
