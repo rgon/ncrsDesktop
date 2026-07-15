@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.30](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.29...ncrs-v0.1.30) (2026-07-15)
+
+
+### Bug Fixes
+
+* **ci:** update debian version for CI test to run correctly, fix build and cache usage ([c0d099d](https://github.com/rgon/ncrsDesktop/commit/c0d099de1cff713dcc8d5885e37e12ac3497b805))
+
 ## [0.1.29](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.28...ncrs-v0.1.29) (2026-07-15)
 
 
