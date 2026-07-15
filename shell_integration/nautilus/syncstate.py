@@ -93,7 +93,7 @@ def _load_mount_point(config_path: str | None = None) -> str | None:
         )
         config_path = os.path.join(config_home, "ncrs", "config.yaml")
     try:
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             for line in f:
                 key, sep, rest = line.strip().partition(":")
                 if sep and key.strip() == "mount_point":
