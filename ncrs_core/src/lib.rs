@@ -2989,51 +2989,48 @@ impl Filesystem for NextCloudFs {
                     schedule_save_dir_cache(&cache);
 
                     // ── Map updates (after reply.ok()) ────────────────────────────────
-                    // Evict stale entries using the ChildrenMap index: O(old_dir_size)
-                    // targeted removal instead of O(N_total) retain scans.
+                    // The pre-reply block already inserted all fresh entries into shared,
+                    // fileids, and details. Here we only need to evict entries that are in
+                    // the OLD child set but absent from the fresh PROPFIND (truly deleted
+                    // files), and rebuild children_map[path] atomically with details.
                     {
-                        // Snapshot old direct children before any mutation.
-                        let old_child_set: std::collections::HashSet<PathBuf> = {
-                            let cm = children_map.safe_read();
-                            cm.get(&path).cloned().unwrap_or_default()
+                        // V7: take the old child set without cloning — swaps in an empty
+                        // HashSet, transfers ownership of the old set, no heap allocation.
+                        let old_child_set: HashSet<PathBuf> = {
+                            let mut cm = children_map.safe_write();
+                            cm.get_mut(&path).map(std::mem::take).unwrap_or_default()
                         };
 
-                        // shared/fileids: evict dir + old children, re-insert fresh
+                        // Build fresh direct-child set from PROPFIND result.
+                        let new_set: HashSet<PathBuf> = detail_entries
+                            .iter()
+                            .filter_map(|(p, _)| {
+                                if p.parent() == Some(path.as_path()) { Some(p.clone()) } else { None }
+                            })
+                            .collect();
+
+                        // V6: evict only truly stale children (deleted/moved away).
+                        // Fresh entries are already in the maps from the pre-reply block.
                         {
                             let mut sh = shared.safe_write();
-                            sh.remove(&path);
-                            for p in &old_child_set { sh.remove(p); }
-                            for p in shared_paths { sh.insert(p); }
+                            for p in &old_child_set { if !new_set.contains(p) { sh.remove(p); } }
                         }
                         {
                             let mut fi = fileids.safe_write();
-                            fi.remove(&path);
-                            for p in &old_child_set { fi.remove(p); }
-                            for (p, fid) in fileid_paths { fi.insert(p, fid); }
+                            for p in &old_child_set { if !new_set.contains(p) { fi.remove(p); } }
                         }
-                        // details + children_map: update in one scope so DETAILDIR never
-                        // observes fresh detail_map paired with stale children_map — a gap
-                        // between two separate write scopes would let new files appear in
-                        // detail_map but be missing from children_map, silently omitting them
-                        // from the DETAILDIR reply.  Lock order matches apply_dir_detail_maps
-                        // (dt before cm) to prevent deadlock.
+                        // details + children_map: evict stale, rebuild children_map atomically.
+                        // Combined scope prevents DETAILDIR from observing fresh detail_map
+                        // paired with stale children_map. Lock order (dt before cm) matches
+                        // apply_dir_detail_maps to prevent deadlock.
                         {
-                            let new_set: std::collections::HashSet<PathBuf> = detail_entries
-                                .iter()
-                                .filter_map(|(p, _)| {
-                                    if p.parent() == Some(path.as_path()) { Some(p.clone()) } else { None }
-                                })
-                                .collect();
                             let mut dt = details.safe_write();
                             let mut cm = children_map.safe_write();
-                            dt.remove(&path);
-                            for p in &old_child_set { dt.remove(p); }
-                            for (p, d) in &detail_entries { dt.insert(p.clone(), d.clone()); }
+                            for p in &old_child_set { if !new_set.contains(p) { dt.remove(p); } }
                             let entry = cm.entry(path.clone())
                                 .or_insert_with(std::collections::HashSet::new);
-                            // Keep entries NOT in old_child_set (concurrent lookup() insertions)
-                            // and entries present in both old and new sets (surviving files).
-                            // Remove entries in old_child_set absent from the fresh PROPFIND.
+                            // Keep concurrent lookup() insertions (not in old_child_set)
+                            // and surviving files (in both old and new). Add fresh entries.
                             entry.retain(|p| !old_child_set.contains(p) || new_set.contains(p));
                             entry.extend(new_set);
                         }
@@ -3715,6 +3712,16 @@ impl Filesystem for NextCloudFs {
             }
         }
 
+        // Keep in-memory maps consistent with the delete so DETAILDIR/STATUS no longer
+        // return stale records for the deleted path before the next readdir of the parent.
+        if let Some(set) = self.children_map.safe_write().get_mut(&parent_path) {
+            set.remove(&remote_path);
+        }
+        self.details.safe_write().remove(&remote_path);
+        self.status.safe_write().remove(&remote_path);
+        self.shared.safe_write().remove(&remote_path);
+        self.fileids.safe_write().remove(&remote_path);
+
         self.dirty.safe_lock().insert(parent_path);
         reply.ok();
 
@@ -3937,6 +3944,32 @@ impl Filesystem for NextCloudFs {
                 }
             }
         }
+        // Keep in-memory maps consistent with the rename so DETAILDIR/STATUS reflect the new
+        // path immediately, without waiting for the next readdir of either directory.
+        {
+            let mut cm = self.children_map.safe_write();
+            if let Some(set) = cm.get_mut(&old_parent_path) { set.remove(&from); }
+            cm.entry(new_parent_path.clone())
+                .or_insert_with(HashSet::new)
+                .insert(to.clone());
+        }
+        {
+            let mut dt = self.details.safe_write();
+            if let Some(detail) = dt.remove(&from) { dt.insert(to.clone(), detail); }
+        }
+        {
+            let mut st = self.status.safe_write();
+            if let Some(s) = st.remove(&from) { st.insert(to.clone(), s); }
+        }
+        {
+            let mut sh = self.shared.safe_write();
+            if sh.remove(&from) { sh.insert(to.clone()); }
+        }
+        {
+            let mut fi = self.fileids.safe_write();
+            if let Some(fid) = fi.remove(&from) { fi.insert(to.clone(), fid); }
+        }
+
         let same_parent = old_parent_path == new_parent_path;
         self.dirty.safe_lock().insert(old_parent_path);
         if !same_parent {

@@ -305,6 +305,26 @@ pub fn prefetch_thumbnail(
     }
 }
 
+fn prefetch_slow_path(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    creds: &crate::auth::Credentials,
+    mount_point: &Path,
+    items: &[&(PathBuf, Option<SystemTime>, bool, Option<u64>)],
+    interval: Duration,
+    active_streams: &AtomicUsize,
+) {
+    for (i, (path, mtime, _, fileid)) in items.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(interval);
+        }
+        while active_streams.load(Ordering::Relaxed) > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        prefetch_thumbnail(client, base, creds, mount_point, path, *mtime, *fileid);
+    }
+}
+
 pub fn prefetch_directory_thumbnails(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -349,25 +369,11 @@ pub fn prefetch_directory_thumbnails(
     }
 
     // ── Slow path RAW: expensive ImageMagick decoding, one at a time ────────────
-    for (i, (path, mtime, _, fileid)) in on_demand_raw.iter().enumerate() {
-        if i > 0 {
-            std::thread::sleep(Duration::from_secs(RAW_THUMB_INTERVAL_SECS));
-        }
-        while active_streams.load(Ordering::Relaxed) > 0 {
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        prefetch_thumbnail(client, base, creds, mount_point, path, *mtime, *fileid);
-    }
+    prefetch_slow_path(client, base, creds, mount_point, &on_demand_raw,
+        Duration::from_secs(RAW_THUMB_INTERVAL_SECS), active_streams);
     // ── Slow path other (PDF, video, audio): cheaper server-side, tighter gap ──
-    for (i, (path, mtime, _, fileid)) in on_demand_previewable.iter().enumerate() {
-        if i > 0 {
-            std::thread::sleep(Duration::from_millis(ON_DEMAND_PREVIEWABLE_INTERVAL_MS));
-        }
-        while active_streams.load(Ordering::Relaxed) > 0 {
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        prefetch_thumbnail(client, base, creds, mount_point, path, *mtime, *fileid);
-    }
+    prefetch_slow_path(client, base, creds, mount_point, &on_demand_previewable,
+        Duration::from_millis(ON_DEMAND_PREVIEWABLE_INTERVAL_MS), active_streams);
 }
 
 #[cfg(test)]

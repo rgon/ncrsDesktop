@@ -676,12 +676,11 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 _evict_dir_cache_locked()
                 pending = _dir_pending.pop(parent, None)
 
-            # Repaint only the children Nautilus asked about while the fetch was
-            # in flight (bounded by the visible window), never the whole folder —
-            # a huge directory must not invalidate tens of thousands of files on
-            # the main thread. Children that scroll into view later trigger a
-            # fresh update_file_info that hits the now-warm cache directly.
-            names = [n for n in pending if n in parsed] if pending else []
+            # Repaint all fetched children so that files beyond _DIR_PENDING_MAX
+            # (which were not added to pending) still receive their emblems.
+            # The cost is one GLib idle call per child on the first directory open;
+            # each call hits the now-warm cache and completes in O(1).
+            names = list(parsed.keys())
             if not names:
                 return
 

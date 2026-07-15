@@ -155,6 +155,21 @@ fn dir_status_from_children(
                 _ => { all_kept = false; }
             }
         }
+    } else {
+        // ChildrenMap not yet populated for this directory (e.g. readdir in progress
+        // or dir accessed only via individual file opens before the first FUSE readdir).
+        // Fall back to scanning status_map directly — O(N_total) but only on a cold cache.
+        for (p, s) in sm.iter() {
+            if p.parent() == Some(dir) {
+                total += 1;
+                match s {
+                    FileStatus::Kept | FileStatus::Synced => local += 1,
+                    FileStatus::Cached => { local += 1; all_kept = false; }
+                    FileStatus::Uploading => uploading += 1,
+                    _ => { all_kept = false; }
+                }
+            }
+        }
     }
     if uploading > 0 { return "uploading"; }
     if total > 0 && local == total {
@@ -192,10 +207,23 @@ fn detaildir_records(
     children: &std::collections::HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
     username: &str,
 ) -> Vec<String> {
-    let dir_children = match children.get(remote_dir) {
-        Some(c) => c,
-        None => return Vec::new(),
+    // Use the ChildrenMap index when populated; fall back to an O(N_total) detail_map scan
+    // for the rare case where children_map has no entry (e.g. readdir reply.ok() sent but
+    // post-reply rebuild not yet run, or directory accessed only via individual lookups).
+    let dir_children_owned: Vec<PathBuf>;
+    let dir_children: &[PathBuf] = if let Some(c) = children.get(remote_dir) {
+        dir_children_owned = c.iter().cloned().collect();
+        &dir_children_owned
+    } else {
+        dir_children_owned = details.keys()
+            .filter(|p| p.parent() == Some(remote_dir))
+            .cloned()
+            .collect();
+        &dir_children_owned
     };
+    if dir_children.is_empty() {
+        return Vec::new();
+    }
 
     // Aggregate status for each direct-child directory using the children index
     // (O(dir_size + sum of subdir sizes) instead of two O(N_total) scans).
@@ -558,8 +586,11 @@ fn handle_client(
                         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
                             log::error!("KEEP callback panicked: {:?}", e);
                         }
-                        if sm.safe_read().get(&r).copied() == Some(FileStatus::Downloading) {
-                            sm.safe_write().insert(r.clone(), FileStatus::Kept);
+                        {
+                            let mut sm_w = sm.safe_write();
+                            if sm_w.get(&r).copied() == Some(FileStatus::Downloading) {
+                                sm_w.insert(r.clone(), FileStatus::Kept);
+                            }
                         }
                         ds.safe_lock().insert(r);
                     });
