@@ -97,7 +97,7 @@ jobs:
         if: steps.binary-cache.outputs.cache-hit != 'true'
         env:
           RUSTC_WRAPPER: sccache
-        run: cargo test -p ncrs_core
+        run: cargo test --release -p ncrs_core
 
       - name: Build .deb
         if: steps.binary-cache.outputs.cache-hit != 'true'
