@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use crate::RwLockExt;
+use crate::{MutexExt, RwLockExt};
 
 const MAX_IPC_CLIENTS: usize = 64;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -40,16 +40,6 @@ pub const PROTOCOL_VERSION: u32 = 2;
 
 const QUERY_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ').add(b'#').add(b'%').add(b'&').add(b'+').add(b'=').add(b'?');
-
-trait MutexExt<T> {
-    fn safe_lock(&self) -> std::sync::MutexGuard<'_, T>;
-}
-
-impl<T> MutexExt<T> for Mutex<T> {
-    fn safe_lock(&self) -> std::sync::MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
 
 pub type KeepCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type EvictCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
