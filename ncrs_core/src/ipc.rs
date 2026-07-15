@@ -83,6 +83,7 @@ pub struct FileDetail {
 }
 
 pub type FileDetailMap = Arc<RwLock<std::collections::HashMap<PathBuf, FileDetail>>>;
+pub type ChildrenMap = Arc<RwLock<std::collections::HashMap<PathBuf, std::collections::HashSet<PathBuf>>>>;
 pub type DirtySet = Arc<Mutex<std::collections::HashSet<PathBuf>>>;
 
 #[derive(Clone)]
@@ -151,7 +152,11 @@ impl FileStatus {
 /// Thread-safe store of path → status, updated by the FUSE layer.
 pub type StatusMap = Arc<RwLock<std::collections::HashMap<PathBuf, FileStatus>>>;
 
-fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>, dir: &Path) -> &'static str {
+fn dir_status_from_children(
+    sm: &std::collections::HashMap<PathBuf, FileStatus>,
+    dir: &Path,
+    children: &std::collections::HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
+) -> &'static str {
     let own = sm.get(dir).copied();
     if own == Some(FileStatus::Downloading) {
         return "downloading";
@@ -163,10 +168,10 @@ fn dir_status_from_children(sm: &std::collections::HashMap<PathBuf, FileStatus>,
     let mut local = 0usize;
     let mut all_kept = true;
     let mut uploading = 0usize;
-    for (p, s) in sm.iter() {
-        if p.parent() == Some(dir) {
+    if let Some(child_set) = children.get(dir) {
+        for p in child_set {
             total += 1;
-            match s {
+            match sm.get(p).copied().unwrap_or(FileStatus::Remote) {
                 FileStatus::Kept | FileStatus::Synced => local += 1,
                 FileStatus::Cached => { local += 1; all_kept = false; }
                 FileStatus::Uploading => uploading += 1,
@@ -207,30 +212,34 @@ fn detaildir_records(
     details: &std::collections::HashMap<PathBuf, FileDetail>,
     sm: &std::collections::HashMap<PathBuf, FileStatus>,
     shared: &std::collections::HashSet<PathBuf>,
+    children: &std::collections::HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
     username: &str,
 ) -> Vec<String> {
-    // One entry per direct-child directory; `all_kept` starts true.
+    let dir_children = match children.get(remote_dir) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    // Aggregate status for each direct-child directory using the children index
+    // (O(dir_size + sum of subdir sizes) instead of two O(N_total) scans).
     let mut dir_agg: std::collections::HashMap<&Path, DirAgg> = std::collections::HashMap::new();
-    for (child, detail) in details.iter() {
-        if detail.is_dir && child.parent() == Some(remote_dir) {
-            dir_agg.entry(child.as_path()).or_insert(DirAgg {
-                all_kept: true,
-                ..DirAgg::default()
-            });
-        }
-    }
-    if !dir_agg.is_empty() {
-        for (p, s) in sm.iter() {
-            if let Some(agg) = p.parent().and_then(|par| dir_agg.get_mut(par)) {
-                agg.total += 1;
-                match s {
-                    FileStatus::Kept | FileStatus::Synced => agg.local += 1,
-                    FileStatus::Cached => {
-                        agg.local += 1;
-                        agg.all_kept = false;
+    for child in dir_children {
+        if let Some(detail) = details.get(child) {
+            if detail.is_dir {
+                let agg = dir_agg.entry(child.as_path()).or_insert(DirAgg {
+                    all_kept: true,
+                    ..DirAgg::default()
+                });
+                if let Some(grandchildren) = children.get(child) {
+                    for gc in grandchildren {
+                        agg.total += 1;
+                        match sm.get(gc).copied().unwrap_or(FileStatus::Remote) {
+                            FileStatus::Kept | FileStatus::Synced => agg.local += 1,
+                            FileStatus::Cached => { agg.local += 1; agg.all_kept = false; }
+                            FileStatus::Uploading => agg.uploading += 1,
+                            _ => { agg.all_kept = false; }
+                        }
                     }
-                    FileStatus::Uploading => agg.uploading += 1,
-                    _ => agg.all_kept = false,
                 }
             }
         }
@@ -260,10 +269,11 @@ fn detaildir_records(
     };
 
     let mut records = Vec::new();
-    for (child, detail) in details.iter() {
-        if child.parent() != Some(remote_dir) {
-            continue;
-        }
+    for child in dir_children {
+        let detail = match details.get(child) {
+            Some(d) => d,
+            None => continue,
+        };
         let name = match child.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
             None => continue,
@@ -295,7 +305,7 @@ fn detaildir_records(
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, children_map: ChildrenMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -329,6 +339,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let shared = shared_set.clone();
             let fids = fileid_map.clone();
             let details = detail_map.clone();
+            let children = children_map.clone();
             let dirty = dirty_set.clone();
             let creds_clone = creds.clone();
             let burl = base_url.clone();
@@ -345,7 +356,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let active = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, dirty, creds_clone, burl, cb, ev, pf, th, elog, tmap, jrnl, fcq, sstats, pause_flag);
+                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, elog, tmap, jrnl, fcq, sstats, pause_flag);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -371,6 +382,7 @@ fn handle_client(
     shared_set: SharedSet,
     fileid_map: FileIdMap,
     detail_map: FileDetailMap,
+    children_map: ChildrenMap,
     dirty_set: DirtySet,
     creds: crate::auth::Credentials,
     base_url: String,
@@ -403,11 +415,13 @@ fn handle_client(
                 Some(remote) => {
                     let detail = detail_map.safe_read().get(&remote).cloned();
                     let sm = status_map.safe_read();
+                    let cm = children_map.safe_read();
                     let status = if detail.as_ref().map_or(false, |d| d.is_dir) {
-                        dir_status_from_children(&sm, &remote)
+                        dir_status_from_children(&sm, &remote, &cm)
                     } else {
                         sm.get(&remote).copied().unwrap_or(FileStatus::Remote).as_str()
                     };
+                    drop(cm);
                     drop(sm);
                     let shared = shared_set.safe_read().contains(&remote);
                     if shared {
@@ -425,11 +439,13 @@ fn handle_client(
                     let detail = detail_map.safe_read().get(&remote).cloned()
                         .unwrap_or_default();
                     let sm = status_map.safe_read();
+                    let cm = children_map.safe_read();
                     let status = if detail.is_dir {
-                        dir_status_from_children(&sm, &remote)
+                        dir_status_from_children(&sm, &remote, &cm)
                     } else {
                         sm.get(&remote).copied().unwrap_or(FileStatus::Remote).as_str()
                     };
+                    drop(cm);
                     drop(sm);
                     let sharing = if !is_shared {
                         ""
@@ -467,7 +483,8 @@ fn handle_client(
                         let shared = shared_set.safe_read();
                         let details = detail_map.safe_read();
                         let sm = status_map.safe_read();
-                        detaildir_records(&remote_dir, &details, &sm, &shared, creds.username())
+                        let cm = children_map.safe_read();
+                        detaildir_records(&remote_dir, &details, &sm, &shared, &cm, creds.username())
                     };
                     log::debug!("IPC DETAILDIR {} → {} children", path_str, records.len());
                     records.join("\x1e")
@@ -701,6 +718,18 @@ mod tests {
         }
     }
 
+    fn build_children(details: &HashMap<PathBuf, FileDetail>) -> HashMap<PathBuf, HashSet<PathBuf>> {
+        let mut cm: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+        for path in details.keys() {
+            if let Some(parent) = path.parent() {
+                cm.entry(parent.to_path_buf())
+                    .or_insert_with(HashSet::new)
+                    .insert(path.clone());
+            }
+        }
+        cm
+    }
+
     #[test]
     fn detaildir_lists_only_direct_children_with_fields() {
         let mut details = HashMap::new();
@@ -715,7 +744,8 @@ mod tests {
         let mut shared = HashSet::new();
         shared.insert(PathBuf::from("/dir/a.txt"));
 
-        let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, "alice");
+        let children = build_children(&details);
+        let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, &children, "alice");
         assert_eq!(recs.len(), 2, "only direct children of /dir");
 
         let by_name: HashMap<&str, &String> =
@@ -735,7 +765,8 @@ mod tests {
         let details = HashMap::new();
         let sm = HashMap::new();
         let shared = HashSet::new();
-        let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, "alice");
+        let children = HashMap::new();
+        let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, &children, "alice");
         assert!(recs.is_empty());
     }
 
@@ -762,8 +793,21 @@ mod tests {
         // the flat file
         sm.insert(PathBuf::from("/d/f.txt"), FileStatus::Kept);
 
+        // Build children map including subdir grandchildren for status aggregation
+        let mut children: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+        children.entry(PathBuf::from("/d")).or_insert_with(HashSet::new).insert(PathBuf::from("/d/allkept"));
+        children.entry(PathBuf::from("/d")).or_insert_with(HashSet::new).insert(PathBuf::from("/d/mixed"));
+        children.entry(PathBuf::from("/d")).or_insert_with(HashSet::new).insert(PathBuf::from("/d/uploading"));
+        children.entry(PathBuf::from("/d")).or_insert_with(HashSet::new).insert(PathBuf::from("/d/f.txt"));
+        children.entry(PathBuf::from("/d/allkept")).or_insert_with(HashSet::new).insert(PathBuf::from("/d/allkept/a"));
+        children.entry(PathBuf::from("/d/allkept")).or_insert_with(HashSet::new).insert(PathBuf::from("/d/allkept/b"));
+        children.entry(PathBuf::from("/d/mixed")).or_insert_with(HashSet::new).insert(PathBuf::from("/d/mixed/a"));
+        children.entry(PathBuf::from("/d/mixed")).or_insert_with(HashSet::new).insert(PathBuf::from("/d/mixed/b"));
+        children.entry(PathBuf::from("/d/uploading")).or_insert_with(HashSet::new).insert(PathBuf::from("/d/uploading/a"));
+        children.entry(PathBuf::from("/d/uploading")).or_insert_with(HashSet::new).insert(PathBuf::from("/d/uploading/b"));
+
         let shared = HashSet::new();
-        let recs = detaildir_records(Path::new("/d"), &details, &sm, &shared, "a");
+        let recs = detaildir_records(Path::new("/d"), &details, &sm, &shared, &children, "a");
         let status_of = |name: &str| -> String {
             recs.iter()
                 .find(|r| r.starts_with(&format!("{}\t", name)))
@@ -783,7 +827,7 @@ mod tests {
             let name = sub.rsplit('/').next().unwrap();
             assert_eq!(
                 status_of(name),
-                dir_status_from_children(&sm, Path::new(sub)),
+                dir_status_from_children(&sm, Path::new(sub), &children),
                 "batched status for {} must match dir_status_from_children",
                 sub
             );
@@ -797,7 +841,8 @@ mod tests {
         let sm = HashMap::new();
         let mut shared = HashSet::new();
         shared.insert(PathBuf::from("/dir/f"));
-        let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, "alice");
+        let children = build_children(&details);
+        let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, &children, "alice");
         assert_eq!(recs.len(), 1);
         assert!(recs[0].contains("\tShared with you\t"));
     }

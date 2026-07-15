@@ -1061,6 +1061,7 @@ struct DirDetailArcs {
     shared: ipc::SharedSet,
     fileids: ipc::FileIdMap,
     details: ipc::FileDetailMap,
+    children: ipc::ChildrenMap,
     dirty: ipc::DirtySet,
 }
 
@@ -1083,7 +1084,18 @@ fn apply_dir_detail_maps(path: &Path, entries: &[RemoteEntry], arcs: &DirDetailA
     }
     { let mut sh = arcs.shared.safe_write(); for p in shared_paths { sh.insert(p); } }
     { let mut fi = arcs.fileids.safe_write(); for (p, fid) in fileid_paths { fi.insert(p, fid); } }
-    { let mut dt = arcs.details.safe_write(); for (p, d) in detail_entries { dt.insert(p, d); } }
+    {
+        let mut dt = arcs.details.safe_write();
+        let mut cm = arcs.children.safe_write();
+        for (p, d) in detail_entries {
+            if let Some(parent) = p.parent() {
+                cm.entry(parent.to_path_buf())
+                    .or_insert_with(std::collections::HashSet::new)
+                    .insert(p.clone());
+            }
+            dt.insert(p, d);
+        }
+    }
     arcs.dirty.safe_lock().insert(path.to_path_buf());
 }
 
@@ -1679,6 +1691,7 @@ pub struct NextCloudFs {
     shared: ipc::SharedSet,
     fileids: ipc::FileIdMap,
     details: ipc::FileDetailMap,
+    children_map: ipc::ChildrenMap,
     conn: Arc<ConnInfo>,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     next_fh: Arc<Mutex<u64>>,
@@ -1776,6 +1789,7 @@ impl NextCloudFs {
         let shared: ipc::SharedSet = Arc::new(RwLock::new(std::collections::HashSet::new()));
         let fileids: ipc::FileIdMap = Arc::new(RwLock::new(HashMap::new()));
         let details: ipc::FileDetailMap = Arc::new(RwLock::new(HashMap::new()));
+        let children_map: ipc::ChildrenMap = Arc::new(RwLock::new(HashMap::new()));
 
         let base_url = notifications::base_url(&options.url);
         let use_http3 = options.http3 && !options.offline;
@@ -1861,6 +1875,7 @@ impl NextCloudFs {
             shared,
             fileids,
             details,
+            children_map,
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
@@ -1895,6 +1910,10 @@ impl NextCloudFs {
 
     pub fn detail_map(&self) -> ipc::FileDetailMap {
         self.details.clone()
+    }
+
+    pub fn children_map(&self) -> ipc::ChildrenMap {
+        self.children_map.clone()
     }
 
     pub fn dirty_set(&self) -> ipc::DirtySet {
@@ -2090,6 +2109,12 @@ impl Filesystem for NextCloudFs {
                 size: entry.size,
                 is_dir: entry.is_dir,
             });
+            if let Some(parent) = target_path.parent() {
+                self.children_map.safe_write()
+                    .entry(parent.to_path_buf())
+                    .or_insert_with(std::collections::HashSet::new)
+                    .insert(target_path.clone());
+            }
             if !entry.is_dir {
                 self.status.safe_write().entry(target_path).or_insert(FileStatus::Remote);
             }
@@ -2738,6 +2763,7 @@ impl Filesystem for NextCloudFs {
         let shared = self.shared.clone();
         let fileids = self.fileids.clone();
         let details = self.details.clone();
+        let children_map = self.children_map.clone();
         let dirty = self.dirty.clone();
         let conn = self.conn.clone();
         let aggressive_prefetch = self.aggressive_prefetch;
@@ -2789,6 +2815,7 @@ impl Filesystem for NextCloudFs {
                 shared: shared.clone(),
                 fileids: fileids.clone(),
                 details: details.clone(),
+                children: children_map.clone(),
                 dirty: dirty.clone(),
             })) {
                 Ok((entries, self_entry)) => {
@@ -2941,9 +2968,9 @@ impl Filesystem for NextCloudFs {
 
                     // Pre-populate detail/shared/fileid maps before reply.ok() so that
                     // Nautilus extension DETAIL queries arriving immediately after the
-                    // kernel receives the listing find fresh data. No retain() here to
-                    // avoid adding O(total_cached) latency to the readdir response; the
-                    // post-reply block below still runs retain() to evict stale entries.
+                    // kernel receives the listing find fresh data. No eviction here;
+                    // the post-reply block uses the ChildrenMap index for O(old_dir_size)
+                    // targeted removal of stale entries.
                     {
                         let mut sh = shared.safe_write();
                         for p in &shared_paths { sh.insert(p.clone()); }
@@ -2962,25 +2989,46 @@ impl Filesystem for NextCloudFs {
                     schedule_save_dir_cache(&cache);
 
                     // ── Map updates (after reply.ok()) ────────────────────────────────
-                    // Evict stale entries for this directory, then insert fresh ones.
-                    // Runs after reply.ok() so O(total_cached) retain() scans don't
-                    // add latency before the kernel gets the directory listing back.
+                    // Evict stale entries using the ChildrenMap index: O(old_dir_size)
+                    // targeted removal instead of O(N_total) retain scans.
                     {
-                        let is_child_of_dir = |p: &PathBuf| p == &path || p.parent() == Some(&path);
+                        // Snapshot old direct children before any mutation.
+                        let old_child_set: std::collections::HashSet<PathBuf> = {
+                            let cm = children_map.safe_read();
+                            cm.get(&path).cloned().unwrap_or_default()
+                        };
+
+                        // shared/fileids: evict dir + old children, re-insert fresh
                         {
                             let mut sh = shared.safe_write();
-                            sh.retain(|p| !is_child_of_dir(p));
+                            sh.remove(&path);
+                            for p in &old_child_set { sh.remove(p); }
                             for p in shared_paths { sh.insert(p); }
                         }
                         {
                             let mut fi = fileids.safe_write();
-                            fi.retain(|p, _| !is_child_of_dir(p));
+                            fi.remove(&path);
+                            for p in &old_child_set { fi.remove(p); }
                             for (p, fid) in fileid_paths { fi.insert(p, fid); }
                         }
+                        // details: evict dir + old children, re-insert fresh
                         {
                             let mut dt = details.safe_write();
-                            dt.retain(|p, _| !is_child_of_dir(p));
-                            for (p, d) in detail_entries { dt.insert(p, d); }
+                            dt.remove(&path);
+                            for p in &old_child_set { dt.remove(p); }
+                            for (p, d) in &detail_entries { dt.insert(p.clone(), d.clone()); }
+                        }
+                        // Rebuild ChildrenMap[path] with the fresh child set.
+                        {
+                            let mut cm = children_map.safe_write();
+                            let entry = cm.entry(path.clone())
+                                .or_insert_with(std::collections::HashSet::new);
+                            entry.clear();
+                            for (p, _) in &detail_entries {
+                                if p.parent() == Some(path.as_path()) {
+                                    entry.insert(p.clone());
+                                }
+                            }
                         }
                         // Collect paths with in-flight or just-completed upload status before
                         // we clear smap.  These must (a) survive the PROPFIND status reset so
@@ -3000,9 +3048,10 @@ impl Filesystem for NextCloudFs {
                                 })
                                 .collect()
                         };
+                        // status: evict old children (O(old_dir_size)), re-insert fresh
                         {
                             let mut st = status.safe_write();
-                            st.retain(|p, _| !is_child_of_dir(p));
+                            for p in &old_child_set { st.remove(p); }
                             let upload_set: std::collections::HashSet<&PathBuf> =
                                 upload_paths.iter().collect();
                             for (p, s) in &status_entries {
@@ -4097,7 +4146,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let ipc_creds = options.credentials()?;
     let file_change_queue: ipc::FileChangeQueue = Arc::new(Mutex::new(Vec::new()));
     let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone());
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.children_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone());
 
     let offline_flag = filesystem.is_offline_flag();
     let backend = filesystem.conn.backend.clone();
