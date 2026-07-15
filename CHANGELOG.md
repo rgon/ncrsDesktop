@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.28](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.27...ncrs-v0.1.28) (2026-07-15)
+
+
+### Bug Fixes
+
+* **ci:** add actions:read permission for artifact downloads ([45cdb14](https://github.com/rgon/ncrsDesktop/commit/45cdb14e1976f0f019cdfba2eb6d804523ad0432))
+* **ci:** downgrade download-artifact to v7 to match upload-artifact v7 ([84cddc8](https://github.com/rgon/ncrsDesktop/commit/84cddc8fd0a2d6c7712abb79ff2aad610c9a7642))
+* **ci:** fix sccache GHA backend and add Cargo registry cache ([6e8385a](https://github.com/rgon/ncrsDesktop/commit/6e8385a8ff792da6b3570bb5fcc2c61dcacb8a00))
+
 ## [0.1.27](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.26...ncrs-v0.1.27) (2026-07-15)
 
 
