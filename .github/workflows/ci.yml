@@ -16,7 +16,7 @@ permissions:
   pull-requests: write
 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -33,77 +33,6 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             python3-nautilus \
-            dpkg-dev \
-            desktop-file-utils \
-            lintian \
-            mold
-
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run tests
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: sccache
-        run: cargo test -p ncrs_core
-
-  e2e:
-    name: e2e (data-loss)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      # Runs the ncrs CLI daemon against a real (non-Nextcloud) WebDAV server
-      # over FUSE and asserts no data loss across CRUD / move / delete.
-      # ubuntu-latest ships docker + compose and exposes /dev/fuse.
-      - name: Run e2e suite
-        run: scripts/e2e.sh
-
-  release-please:
-    # Manage the release PR and cut releases; pushes to master only.
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-    steps:
-      - uses: googleapis/release-please-action@v5
-        id: release
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-
-  build-release:
-    # Publish the .deb. Gated on the test + e2e jobs (which already ran once for
-    # this commit) and on release-please having cut a release — the e2e suite is
-    # a shared dependency here, never a duplicated step.
-    needs: [test, e2e, release-please]
-    if: needs.release-please.outputs.release_created
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y \
-            libfuse3-dev \
-            fuse3 \
-            pkg-config \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            python3-nautilus \
-            dpkg-dev \
-            desktop-file-utils \
-            lintian \
             mold
 
       - name: Set up sccache
@@ -122,11 +51,104 @@ jobs:
           cache: pnpm
           cache-dependency-path: ncrs-gui/pnpm-lock.yaml
 
-      - name: Build .deb
+      - name: Build GUI frontend
+        run: |
+          cd ncrs-gui
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Build release binaries
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: sccache
-        run: bash scripts/build-deb.sh
+        run: cargo build --release -p ncrs_core -p ncrs-gui --features ncrs-gui/custom-protocol
+
+      - name: Run unit tests
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+        run: cargo test -p ncrs_core
+
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncrs-release-binaries
+          path: |
+            target/release/ncrs
+            target/release/ncrs-open
+            target/release/ncrs-gui
+          retention-days: 1
+
+  e2e:
+    name: e2e (data-loss)
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ncrs-release-binaries
+          path: .
+
+      - name: Stage binary for Docker build context
+        run: |
+          chmod +x target/release/ncrs
+          cp target/release/ncrs docker/e2e/ncrs/ncrs
+
+      - name: Run e2e suite
+        env:
+          PREBUILT_BINARY: "1"
+        run: scripts/e2e.sh
+
+  release-please:
+    # Manage the release PR and cut releases; pushes to master only.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build-release:
+    # Assemble and publish the .deb using the binaries already built and tested
+    # by the build + e2e jobs. Gated on release-please having cut a release.
+    needs: [build, e2e, release-please]
+    if: needs.release-please.outputs.release_created
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            fuse3 \
+            libssl-dev \
+            dpkg-dev \
+            desktop-file-utils \
+            lintian
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ncrs-release-binaries
+          path: .
+
+      - name: Fix binary permissions
+        run: chmod +x target/release/ncrs target/release/ncrs-open target/release/ncrs-gui
+
+      - name: Build .deb
+        run: bash scripts/build-deb.sh --skip-build
 
       - name: Test .deb
         run: bash scripts/test-deb.sh --container

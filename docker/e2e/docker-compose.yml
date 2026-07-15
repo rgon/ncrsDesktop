@@ -24,6 +24,8 @@ services:
     build:
       context: ../..
       dockerfile: docker/e2e/ncrs/Dockerfile
+      args:
+        PREBUILT_BINARY: ${PREBUILT_BINARY:-0}
     depends_on:
       - webdav
     environment:
