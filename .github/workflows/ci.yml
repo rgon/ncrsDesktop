@@ -18,6 +18,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Must be job-level so the sccache daemon starts with the GHA backend
+      # enabled. Step-level env is too late — the daemon is already running.
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v7
 
@@ -30,6 +34,17 @@ jobs:
         with:
           path: cached-binaries/
           key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
+
+      - name: Cache Cargo registry and git sources
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-
 
       - name: Install system dependencies
         if: steps.binary-cache.outputs.cache-hit != 'true'
@@ -76,14 +91,12 @@ jobs:
       - name: Build release binaries
         if: steps.binary-cache.outputs.cache-hit != 'true'
         env:
-          SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: sccache
         run: cargo build --release -p ncrs_core -p ncrs-gui --features ncrs-gui/custom-protocol
 
       - name: Run unit tests
         if: steps.binary-cache.outputs.cache-hit != 'true'
         env:
-          SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: sccache
         run: cargo test -p ncrs_core
 
