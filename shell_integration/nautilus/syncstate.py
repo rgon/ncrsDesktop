@@ -222,9 +222,12 @@ _dir_cache: dict = {}  # dir path → {basename: (sync, sharing, perms, owner, s
 _dir_cache_ts: dict = {}  # dir path → monotonic timestamp of last fetch
 _dir_inflight: set = set()  # dirs with a fetch in progress
 # Basenames that Nautilus requested while a directory's fetch was still cold (so
-# they were painted empty). Only these need repainting once the fetch lands —
-# bounded by Nautilus's visible window, not the whole directory. Without this a
-# huge directory would invalidate every child on the main thread.
+# they were painted empty). Only these need repainting once the fetch lands.
+# Nautilus calls update_file_info_full eagerly for every file in the directory,
+# not just the visible window. Cap per-directory entries so _invalidate_children
+# never issues more than _DIR_PENDING_MAX GObject calls on the GTK main thread.
+# Files beyond the cap still get metadata on cache-hit on the next call (instant).
+_DIR_PENDING_MAX = 200
 _dir_pending: dict = {}  # dir path → set(basename)
 _cache_lock = threading.Lock()
 
@@ -591,7 +594,9 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 # A (re)fetch runs whenever the cache is not fresh. Record this
                 # file so it — and only it — gets repainted when the fetch lands.
                 if not fresh:
-                    _dir_pending.setdefault(parent, set()).add(name)
+                    pending = _dir_pending.setdefault(parent, set())
+                    if len(pending) < _DIR_PENDING_MAX:
+                        pending.add(name)
 
             if ent is not None:
                 self._apply_detail(file_info, ent)

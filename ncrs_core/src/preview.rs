@@ -38,6 +38,10 @@ const THUMB_BATCH_GAP_MS: u64 = 100;
 // (ImageMagick decoding). Process one at a time and pause between requests so the
 // server keeps PHP workers free for FUSE HTTP operations.
 const RAW_THUMB_INTERVAL_SECS: u64 = 2;
+// On-demand non-RAW previews (PDF via libpoppler, video via ffmpeg) are much cheaper
+// server-side than RAW. A tighter interval keeps prefetch manageable for large PDF dirs
+// (1500 files × 300 ms ≈ 7.5 min vs 50 min at the RAW rate).
+const ON_DEMAND_PREVIEWABLE_INTERVAL_MS: u64 = 300;
 
 const PREVIEWABLE: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic",
@@ -344,12 +348,20 @@ pub fn prefetch_directory_thumbnails(
         });
     }
 
-    // ── Slow path: on-demand RAW + other previewable (sequential, generous gap) ─
-    // One request at a time so the server always has workers left for FUSE ops.
-    let on_demand: Vec<_> = on_demand_raw.iter().chain(on_demand_previewable.iter()).collect();
-    for (i, (path, mtime, _, fileid)) in on_demand.iter().enumerate() {
+    // ── Slow path RAW: expensive ImageMagick decoding, one at a time ────────────
+    for (i, (path, mtime, _, fileid)) in on_demand_raw.iter().enumerate() {
         if i > 0 {
             std::thread::sleep(Duration::from_secs(RAW_THUMB_INTERVAL_SECS));
+        }
+        while active_streams.load(Ordering::Relaxed) > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        prefetch_thumbnail(client, base, creds, mount_point, path, *mtime, *fileid);
+    }
+    // ── Slow path other (PDF, video, audio): cheaper server-side, tighter gap ──
+    for (i, (path, mtime, _, fileid)) in on_demand_previewable.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(ON_DEMAND_PREVIEWABLE_INTERVAL_MS));
         }
         while active_streams.load(Ordering::Relaxed) > 0 {
             std::thread::sleep(Duration::from_millis(500));
