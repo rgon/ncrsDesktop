@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.26](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.25...ncrs-v0.1.26) (2026-07-15)
+
+
+### Bug Fixes
+
+* **ci:** single build job; reuse binary in e2e and release ([2d7e7bb](https://github.com/rgon/ncrsDesktop/commit/2d7e7bb722d9f08efdfbb43f031f638bd3ddaf08))
+
 ## [0.1.25](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.24...ncrs-v0.1.25) (2026-07-14)
 
 
