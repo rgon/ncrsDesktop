@@ -3011,17 +3011,12 @@ impl Filesystem for NextCloudFs {
                             for p in &old_child_set { fi.remove(p); }
                             for (p, fid) in fileid_paths { fi.insert(p, fid); }
                         }
-                        // details: evict dir + old children, re-insert fresh
-                        {
-                            let mut dt = details.safe_write();
-                            dt.remove(&path);
-                            for p in &old_child_set { dt.remove(p); }
-                            for (p, d) in &detail_entries { dt.insert(p.clone(), d.clone()); }
-                        }
-                        // Rebuild ChildrenMap[path] with the fresh child set.
-                        // Use retain+extend instead of clear+rebuild so that concurrent
-                        // lookup() insertions that arrived between the old_child_set
-                        // snapshot and this write-lock acquire are not silently dropped.
+                        // details + children_map: update in one scope so DETAILDIR never
+                        // observes fresh detail_map paired with stale children_map — a gap
+                        // between two separate write scopes would let new files appear in
+                        // detail_map but be missing from children_map, silently omitting them
+                        // from the DETAILDIR reply.  Lock order matches apply_dir_detail_maps
+                        // (dt before cm) to prevent deadlock.
                         {
                             let new_set: std::collections::HashSet<PathBuf> = detail_entries
                                 .iter()
@@ -3029,12 +3024,16 @@ impl Filesystem for NextCloudFs {
                                     if p.parent() == Some(path.as_path()) { Some(p.clone()) } else { None }
                                 })
                                 .collect();
+                            let mut dt = details.safe_write();
                             let mut cm = children_map.safe_write();
+                            dt.remove(&path);
+                            for p in &old_child_set { dt.remove(p); }
+                            for (p, d) in &detail_entries { dt.insert(p.clone(), d.clone()); }
                             let entry = cm.entry(path.clone())
                                 .or_insert_with(std::collections::HashSet::new);
-                            // Keep entries NOT in old_child_set (concurrent insertions)
+                            // Keep entries NOT in old_child_set (concurrent lookup() insertions)
                             // and entries present in both old and new sets (surviving files).
-                            // Remove entries in old_child_set that the fresh PROPFIND no longer lists.
+                            // Remove entries in old_child_set absent from the fresh PROPFIND.
                             entry.retain(|p| !old_child_set.contains(p) || new_set.contains(p));
                             entry.extend(new_set);
                         }
