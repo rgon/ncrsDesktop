@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.31](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.30...ncrs-v0.1.31) (2026-07-15)
+
+
+### Bug Fixes
+
+* **ipc:** code-review fixes — children_map consistency, TOCTOU, stale-entry eviction, fallback scans ([2ae1bb8](https://github.com/rgon/ncrsDesktop/commit/2ae1bb897403eb3e3f41c11aecbe6c2caf2b260e))
+* **ipc:** evict directory's own status entry on readdir refresh ([401c743](https://github.com/rgon/ncrsDesktop/commit/401c74358bebea8fd5787d0e71c0c6e74df19826))
+* **ipc:** preserve concurrent lookup insertions in children_map readdir rebuild ([5c19fc5](https://github.com/rgon/ncrsDesktop/commit/5c19fc525bc8602c0ee0aa2df7414ddd37ee80b4))
+* **ipc:** update detail_map and children_map atomically in readdir rebuild ([e58365e](https://github.com/rgon/ncrsDesktop/commit/e58365e3f032c7135aa3c8b10d06c38f7057a767))
+* **nautilus:** read config as utf-8 and quit nautilus in postinst ([a05fcf7](https://github.com/rgon/ncrsDesktop/commit/a05fcf705984cbe537de0dbde95e2564b820ab51))
+
+
+### Performance Improvements
+
+* **ci:** unit test against release build to avoid re-building both versions in CI ([ab82031](https://github.com/rgon/ncrsDesktop/commit/ab82031bda898e0c2da3af83397d97cd83af1496))
+* **ipc:** add ChildrenMap index for O(dir_size) detail/status lookups ([2241bf5](https://github.com/rgon/ncrsDesktop/commit/2241bf5488b6ea84b1bbab27de8ad55440518592))
+* **ipc:** convert StatusMap/FileDetailMap/SharedSet/FileIdMap to RwLock to fix DETAILDIR starvation ([da95012](https://github.com/rgon/ncrsDesktop/commit/da950122f6cded587c9809882a9beda0ba424535))
+* **nautilus:** cap pending invalidations and split pdf thumbnail throttle ([64f2e98](https://github.com/rgon/ncrsDesktop/commit/64f2e98bd7d87670c018a4f11171c2becc7c787f))
+
 ## [0.1.30](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.29...ncrs-v0.1.30) (2026-07-15)
 
 
