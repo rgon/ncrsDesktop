@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.29](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.28...ncrs-v0.1.29) (2026-07-15)
+
+
+### Bug Fixes
+
+* **ci:** replace upload/download-artifact with actions/cache for cross-job binary sharing ([8f6a812](https://github.com/rgon/ncrsDesktop/commit/8f6a81257c73794068811e3906bc3470d8b9c385))
+
 ## [0.1.28](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.27...ncrs-v0.1.28) (2026-07-15)
 
 
