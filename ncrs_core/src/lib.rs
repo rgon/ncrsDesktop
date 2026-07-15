@@ -49,7 +49,7 @@ impl<T> MutexExt<T> for Mutex<T> {
     }
 }
 
-trait RwLockExt<T> {
+pub(crate) trait RwLockExt<T> {
     fn safe_read(&self) -> RwLockReadGuard<'_, T>;
     fn safe_write(&self) -> RwLockWriteGuard<'_, T>;
 }
