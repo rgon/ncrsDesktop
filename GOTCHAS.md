@@ -78,9 +78,23 @@ access time. Without a guard, the copy would receive magic bytes instead of
 real content and write a tiny corrupted file to the destination. The
 distinguishing signal is the **read size**: GLib always requests exactly 16384
 bytes (`MAGIC_BYTES_BUFFER_SIZE` in `gcontenttype.c`), while copy tools use
-much larger buffers (`cp` uses 131072 bytes, GIO uses 65536 bytes). `read()`
-only intercepts when `sz <= 16384 && off == 0`; larger reads fall through to
-the real download path.
+much larger buffers (`cp` uses 131072 bytes, GIO uses 65536 bytes).
+
+⚠️ **Kernel read-ahead inflates the magic read — do NOT guard on `sz <= 16384`.**
+GLib asks userspace-side for 16384 bytes, but the kernel enlarges the *initial*
+FUSE `read` to fill its read-ahead window: measured at exactly **32768 bytes**
+(one 8-page window) for the first read of any file, even a multi-GB one, because
+a magic-detection open reads once and closes so the sequential read-ahead ramp
+never grows. A file larger than 16 KiB therefore arrives with `sz` in
+`(16384, 32768]`. Guarding on `sz <= 16384` silently rejected every such file
+and downloaded it in full (~300 ms each; ~19 s for a 114-entry folder) — a
+regression seen after the guard was first added. `read()` now intercepts when
+`off == 0 && sz <= MIME_DETECT_MAX_READ` (**32768**), which covers the
+read-ahead-inflated read while staying below the smallest copy buffer (65536),
+so copies still fall through. Verify with `scripts/perf_test_listing.py`.
+(In practice copy tools do not even set `O_NOATIME` on the source — confirmed
+via FUSE flag logging that `cp`/`gio copy` open with `0x8000`, no `O_NOATIME` —
+so the size guard is defence in depth.)
 
 **Result:** a directory with 266 files (37 with unusual extensions) that
 previously took 10–12 seconds to list in Nautilus now lists in under 100 ms.

@@ -1275,3 +1275,46 @@ password: "pass"
         assert!(!is_gio_temp_file(".goutputstream"));
         assert!(!is_gio_temp_file("goutputstream-abc"));
     }
+
+    // Regression guard for the MIME-detection intercept threshold.
+    //
+    // GLib 2.80 sniffs unknown-extension files by opening them with O_NOATIME
+    // and reading 16 KiB. The kernel inflates that into a read-ahead read of up
+    // to one 8-page window (32768 bytes) for the *initial* read of any file —
+    // measured stable even on multi-GB files. `read()` must intercept up to that
+    // bound, otherwise every file larger than 16 KiB is fully downloaded just to
+    // answer a MIME query (the regression fixed here: ~300 ms/file, ~19 s for a
+    // 114-entry directory). The bound must also stay below the smallest copy
+    // buffer (GIO's g_file_copy uses 65536) so real copies fall through to the
+    // network-fetch path and receive true content.
+    #[test]
+    fn mime_detect_threshold_covers_readahead_but_not_copies() {
+        // Kernel read-ahead ceiling observed for a single magic-detection read.
+        const READAHEAD_CEILING: usize = 32768;
+        // Smallest copy-tool buffer (GIO g_file_copy); cp uses 131072.
+        const SMALLEST_COPY_BUFFER: usize = 65536;
+
+        assert!(MIME_DETECT_MAX_READ >= READAHEAD_CEILING,
+            "intercept must cover read-ahead-inflated magic reads ({} < {})",
+            MIME_DETECT_MAX_READ, READAHEAD_CEILING);
+        assert!(MIME_DETECT_MAX_READ < SMALLEST_COPY_BUFFER,
+            "intercept must not swallow copy reads ({} >= {})",
+            MIME_DETECT_MAX_READ, SMALLEST_COPY_BUFFER);
+    }
+
+    #[test]
+    fn mime_magic_bytes_are_detectable_and_never_empty() {
+        // A representative mapped type resolves to its real signature...
+        assert_eq!(mime_magic_bytes("image/png"), b"\x89PNG\r\n\x1a\n");
+        assert_eq!(mime_magic_bytes("application/pdf"), b"%PDF-");
+        // ...content-type parameters are ignored...
+        assert_eq!(mime_magic_bytes("text/plain; charset=utf-8"), b"# text\n");
+        // ...and every unmapped type still yields non-empty, text-classifiable
+        // bytes so the file gets a usable type instead of a download.
+        for ct in ["application/vnd.oasis.opendocument.spreadsheet",
+                   "application/octet-stream",
+                   "application/x-freecad-document"] {
+            assert!(!mime_magic_bytes(ct).is_empty(),
+                "unmapped content-type {ct} must still return synthetic bytes");
+        }
+    }

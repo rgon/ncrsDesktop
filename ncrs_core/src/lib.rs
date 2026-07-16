@@ -368,9 +368,24 @@ fn is_timeout_err(e: &str) -> bool {
 /// The distinguishing signal is the **read size**: GLib always requests
 /// exactly 16384 bytes (`MAGIC_BYTES_BUFFER_SIZE` in `gcontenttype.c`)
 /// regardless of the file's actual size.  Copy tools use much larger buffers
-/// (`cp` uses 131072 bytes; GIO's `g_file_copy` uses 65536 bytes).  `read()`
-/// therefore only intercepts when `sz <= 16384 && off == 0`; larger reads fall
-/// through to the normal network-fetch path and serve real content.
+/// (`cp` uses 131072 bytes; GIO's `g_file_copy` uses 65536 bytes).
+///
+/// The catch is **kernel read-ahead**: GLib's single 16384-byte `read()` at
+/// offset 0 is inflated by the kernel into a larger FUSE `read` request to
+/// pre-fill the read-ahead window.  Measured on Linux 6.x this caps at exactly
+/// 32768 bytes (one 8-page window) for the initial read of *any* file — even a
+/// multi-GB one — because a magic-detection open reads once and closes, so the
+/// sequential read-ahead ramp never grows past the first window.  A file larger
+/// than 16 KiB therefore arrives here with `sz` in `(16384, 32768]`, so the old
+/// `sz <= 16384` guard rejected it and every such file was fully downloaded
+/// (~300 ms each) just to answer a MIME query — the regression this fixes.
+///
+/// `read()` intercepts when `off == 0 && sz <= MIME_DETECT_MAX_READ` (32768).
+/// That covers the read-ahead-inflated magic read while staying safely below
+/// the smallest copy buffer (GIO's 65536), so copies still fall through to the
+/// real network-fetch path.  (In practice copy tools do not even set
+/// `O_NOATIME` on the source, so `mime_detect_ct` is never set for them — the
+/// size guard is defence in depth.)
 ///
 /// # Forward-compatibility
 ///
@@ -380,6 +395,12 @@ fn is_timeout_err(e: &str) -> bool {
 /// extension-based detection (which runs before magic-byte detection) already
 /// handles the vast majority of common file types, so this function is only
 /// reached for genuinely obscure extensions.
+/// Upper bound on the FUSE `read` size that still counts as a GLib magic-byte
+/// MIME-detection probe (see [`mime_magic_bytes`]).  GLib asks for 16384 bytes,
+/// but kernel read-ahead inflates the initial read up to one 8-page window
+/// (32768 bytes) regardless of file size; copy tools use ≥65536-byte buffers.
+const MIME_DETECT_MAX_READ: usize = 32768;
+
 fn mime_magic_bytes(content_type: &str) -> &'static [u8] {
     let ct = content_type.split(';').next().unwrap_or(content_type).trim();
     match ct {
@@ -2363,17 +2384,19 @@ impl Filesystem for NextCloudFs {
                 // downloading the file. The content-type was captured at open() from the
                 // PROPFIND dir cache. Zero network I/O; see mime_magic_bytes() for details.
                 //
-                // Guard: GLib always requests exactly 16384 bytes for magic detection.
-                // Copy tools (cp, Nautilus/GIO g_file_copy) use 65536+ byte buffers.
-                // Only intercepting small reads keeps copies correct.
+                // Guard: GLib's 16384-byte magic-detection read is inflated by
+                // kernel read-ahead up to MIME_DETECT_MAX_READ (32768) for the
+                // initial read of a file, while copy tools use ≥65536-byte
+                // buffers. Intercepting reads up to that bound keeps copies
+                // correct. See mime_magic_bytes() for the full rationale.
                 if let Some(ref ct) = of.mime_detect_ct {
-                    if off == 0 && sz <= 16384 {
+                    if off == 0 && sz <= MIME_DETECT_MAX_READ {
                         let magic = mime_magic_bytes(ct);
                         let end = magic.len().min(sz);
                         reply.data(&magic[..end]);
                         return;
                     }
-                    // Copy-sized read (sz > 16384) on a handle that was opened while the
+                    // Copy-sized read (sz > MIME_DETECT_MAX_READ) on a handle that was opened while the
                     // file was NOT in the local cache (mime_detect_ct being set proves this).
                     // If we are offline, we have no real content to serve — fail now rather
                     // than letting the file_cache return a stale/poisoned entry or letting
