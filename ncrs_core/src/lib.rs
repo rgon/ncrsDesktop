@@ -26,8 +26,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    INodeNo, InitFlags, KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
 pub use config::{configuration_parser, MountOptions};
@@ -1604,6 +1605,18 @@ pub(crate) fn perms_to_mode(permissions: Option<&str>, is_dir: bool) -> u16 {
     }
 }
 
+// The mounting process's uid/gid never change, so resolve them once instead of
+// calling getuid/getgid on every attribute built (readdirplus builds one per
+// directory entry).
+fn proc_uid() -> u32 {
+    static UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UID.get_or_init(|| unsafe { libc::getuid() })
+}
+fn proc_gid() -> u32 {
+    static GID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *GID.get_or_init(|| unsafe { libc::getgid() })
+}
+
 pub(crate) fn make_file_attr(inode: u64, entry: &RemoteEntry) -> FileAttr {
     let modified = entry.modified.unwrap_or(UNIX_EPOCH);
     FileAttr {
@@ -1617,8 +1630,8 @@ pub(crate) fn make_file_attr(inode: u64, entry: &RemoteEntry) -> FileAttr {
         kind: if entry.is_dir { FileType::Directory } else { FileType::RegularFile },
         perm: perms_to_mode(entry.ext.str("permissions"), entry.is_dir),
         nlink: if entry.is_dir { 2 } else { 1 },
-        uid: unsafe { libc::getuid() },
-        gid: unsafe { libc::getgid() },
+        uid: proc_uid(),
+        gid: proc_gid(),
         rdev: 0,
         flags: 0,
         blksize: 512,
@@ -1637,8 +1650,8 @@ fn make_dir_attr(inode: u64) -> FileAttr {
         kind: FileType::Directory,
         perm: 0o755,
         nlink: 2,
-        uid: unsafe { libc::getuid() },
-        gid: unsafe { libc::getgid() },
+        uid: proc_uid(),
+        gid: proc_gid(),
         rdev: 0,
         flags: 0,
         blksize: 512,
@@ -1657,8 +1670,8 @@ fn root_attr() -> FileAttr {
         kind: FileType::Directory,
         perm: 0o755,
         nlink: 2,
-        uid: unsafe { libc::getuid() },
-        gid: unsafe { libc::getgid() },
+        uid: proc_uid(),
+        gid: proc_gid(),
         rdev: 0,
         flags: 0,
         blksize: 512,
@@ -2061,6 +2074,429 @@ impl NextCloudFs {
             let uri = crate::preview::file_uri(&conn.mount_point, &remote_path);
             crate::preview::xdg_thumbnail_path(&uri).exists()
         })
+    }
+}
+
+/// Unifies the plain and "plus" directory replies so `readdir` and
+/// `readdirplus` share one implementation. `readdirplus` bundles each entry's
+/// attributes into the directory read, sparing the kernel a `lookup`+`getattr`
+/// round-trip per file; the plain reply simply ignores the supplied attribute.
+enum DirReply {
+    Plain(ReplyDirectory),
+    Plus(ReplyDirectoryPlus),
+}
+
+impl DirReply {
+    fn add(&mut self, ino: INodeNo, offset: u64, kind: FileType, name: &str, attr: &FileAttr) -> bool {
+        match self {
+            DirReply::Plain(r) => r.add(ino, offset, kind, name),
+            DirReply::Plus(r) => r.add(ino, offset, name, &TTL, attr, Generation(0)),
+        }
+    }
+    fn ok(self) {
+        match self {
+            DirReply::Plain(r) => r.ok(),
+            DirReply::Plus(r) => r.ok(),
+        }
+    }
+    fn error(self, err: Errno) {
+        match self {
+            DirReply::Plain(r) => r.error(err),
+            DirReply::Plus(r) => r.error(err),
+        }
+    }
+}
+
+impl NextCloudFs {
+    fn readdir_common(&self, ino: INodeNo, offset: u64, mut reply: DirReply) {
+        let (path, parent_ino) = {
+            let c = self.cache.safe_lock();
+            let path = match c.get_path(ino.0) {
+                Some(p) => p,
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            };
+            let parent_ino = if ino.0 == 1 {
+                1
+            } else {
+                let parent = path.parent().unwrap_or(Path::new("/"));
+                c.get_inode(parent).unwrap_or(1)
+            };
+            (path, parent_ino)
+        };
+
+        log::info!("[{}] READDIR {}", self.log_user, path.display());
+
+        let cache = self.cache.clone();
+        let status = self.status.clone();
+        let shared = self.shared.clone();
+        let fileids = self.fileids.clone();
+        let details = self.details.clone();
+        let children_map = self.children_map.clone();
+        let dirty = self.dirty.clone();
+        let conn = self.conn.clone();
+        let aggressive_prefetch = self.aggressive_prefetch;
+        let exclude_folders = self.exclude_folders.clone();
+        let thumb_inflight = self.thumb_inflight.clone();
+        let cleanup_stale_gio_temps = self.cleanup_stale_gio_temps;
+        let elog = self.error_log.clone();
+
+        thread::spawn(move || {
+            if offset == 0 {
+                let dot_attr = make_dir_attr(ino.0);
+                if reply.add(ino, 1, FileType::Directory, ".", &dot_attr) {
+                    reply.ok();
+                    return;
+                }
+                let dotdot_attr = make_dir_attr(parent_ino);
+                if reply.add(INodeNo(parent_ino), 2, FileType::Directory, "..", &dotdot_attr) {
+                    reply.ok();
+                    return;
+                }
+            }
+
+            // Continuation pages (offset > 0): serve directly from cache, skip all heavy work.
+            if offset > 0 {
+                let skip = (offset - 2) as usize;
+                // Collect under a short lock, then reply outside it so concurrent
+                // getattr/lookup calls aren't blocked while the kernel drains pages.
+                let rows: Vec<(INodeNo, u64, FileType, String, FileAttr)> = {
+                    let c = cache.safe_lock();
+                    match c.get_cached_dir_readonly(&path) {
+                        Some(entries) => entries.iter().enumerate().skip(skip).filter_map(|(i, entry)| {
+                            let name = entry.path.file_name().and_then(|n| n.to_str())?.to_string();
+                            let entry_path = path.join(&name);
+                            if entry.is_dir && exclude_folders.contains(&entry_path) { return None; }
+                            let ino = c.get_inode(&entry_path).unwrap_or(1);
+                            let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
+                            let attr = make_file_attr(ino, entry);
+                            Some((INodeNo(ino), (i + 3) as u64, kind, name, attr))
+                        }).collect(),
+                        None => vec![],
+                    }
+                };
+                for (ino, off, kind, name, attr) in rows {
+                    if reply.add(ino, off, kind, &name, &attr) { break; }
+                }
+                reply.ok();
+                return;
+            }
+
+            let t_readdir = Instant::now();
+            match get_or_list_dir(&conn, &cache, path.clone(), Some(DirDetailArcs {
+                shared: shared.clone(),
+                fileids: fileids.clone(),
+                details: details.clone(),
+                children: children_map.clone(),
+                dirty: dirty.clone(),
+            })) {
+                Ok((entries, self_entry)) => {
+                    log::info!("READDIR {} get_or_list_dir returned {} entries in {:?}", path.display(), entries.len(), t_readdir.elapsed());
+
+                    // GIO writes files atomically via a .goutputstream-* / .xdp-* temp
+                    // that is renamed to the final name within seconds. Any such file
+                    // visible in a PROPFIND is either an orphan (app crashed) or is about
+                    // to be renamed imminently. Delete them from the server immediately
+                    // (when the flag is on) and never include them in the listing.
+                    let gio_temps: Vec<PathBuf> = entries.iter()
+                        .filter(|e| {
+                            let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            is_gio_temp_file(name)
+                        })
+                        .map(|e| e.path.clone())
+                        .collect();
+                    if !gio_temps.is_empty() {
+                        if cleanup_stale_gio_temps {
+                            log::info!("purging {} GIO temp(s) in {}", gio_temps.len(), path.display());
+                            let conn2 = conn.clone();
+                            thread::spawn(move || {
+                                for p in gio_temps {
+                                    if let Err(e) = conn2.backend.delete(&p) {
+                                        log::debug!("GIO temp delete {}: {}", p.display(), e);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    let entries: Vec<RemoteEntry> = entries.iter()
+                        .filter(|e| {
+                            let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            !is_gio_temp_file(name)
+                        })
+                        .cloned()
+                        .collect();
+
+                    // Kick off background PROPFINDs for child dirs (opt-in via
+                    // aggressive_prefetch; off by default until the serialisation
+                    // issues in proactive_refresh / poll loop are fixed).
+                    if aggressive_prefetch && offset == 0 {
+                        for entry in entries.iter().filter(|e| e.is_dir) {
+                            if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
+                                start_background_propfind(&conn, &cache, path.join(name), PREFETCH_CHAIN_DEPTH);
+                            }
+                        }
+                    }
+
+                    let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
+
+                    // Build per-entry metadata vectors and allocate inodes.
+                    // Map updates (retain+insert on shared/fileids/details/status) are
+                    // deferred to after reply.ok() so the kernel gets the directory listing
+                    // back without waiting for O(total_cached) retain() scans.
+                    let (shared_paths, fileid_paths, detail_entries, status_entries, cache_entries) = {
+                        let (kept_dir, auto_cache_dir) = {
+                            let mut c = cache.safe_lock();
+                            for entry in entries.iter() {
+                                if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
+                                    c.allocate_inode(path.join(name));
+                                }
+                            }
+                            (c.kept_dir.clone(), c.auto_cache_dir.clone())
+                        };
+
+                        let mut shared_paths = Vec::new();
+                        let mut fileid_paths = Vec::new();
+                        let mut detail_entries = Vec::new();
+                        let mut status_entries = Vec::new();
+                        let mut cache_entries = Vec::new();
+
+                        if let Some(ref se) = self_entry {
+                            if se.ext.flag("is_shared") { shared_paths.push(path.clone()); }
+                            if let Some(fid) = se.ext.int("fileid") { fileid_paths.push((path.clone(), fid)); }
+                            detail_entries.push((path.clone(), ipc::FileDetail {
+                                permissions: se.ext.str("permissions").map(str::to_string),
+                                owner_id: se.ext.str("owner_id").map(str::to_string),
+                                owner_display_name: se.ext.str("owner_display_name").map(str::to_string),
+                                size: se.size,
+                                is_dir: se.is_dir,
+                            }));
+                        }
+
+                        for entry in entries.iter() {
+                            let name = match entry.path.file_name().and_then(|n| n.to_str()) {
+                                Some(n) => n,
+                                None => continue,
+                            };
+                            let entry_path = path.join(name);
+                            if entry.ext.flag("is_shared") { shared_paths.push(entry_path.clone()); }
+                            if let Some(fid) = entry.ext.int("fileid") { fileid_paths.push((entry_path.clone(), fid)); }
+                            detail_entries.push((entry_path.clone(), ipc::FileDetail {
+                                permissions: entry.ext.str("permissions").map(str::to_string),
+                                owner_id: entry.ext.str("owner_id").map(str::to_string),
+                                owner_display_name: entry.ext.str("owner_display_name").map(str::to_string),
+                                size: entry.size,
+                                is_dir: entry.is_dir,
+                            }));
+                            if !entry.is_dir {
+                                let rel = entry_path.strip_prefix("/").unwrap_or(&entry_path);
+                                let kept_path = kept_dir.join(rel);
+                                let cached_path = auto_cache_dir.join(rel);
+                                // Lazy: only stat cached_path if kept_path misses — most
+                                // files are Remote so this saves one stat(2) per entry.
+                                if let Some(km) = kept_path.metadata().ok().filter(|m| m.len() > 0) {
+                                    status_entries.push((entry_path.clone(), FileStatus::Kept));
+                                    cache_entries.push((entry_path.clone(), FileCacheEntry {
+                                        local_path: kept_path,
+                                        remote_modified: entry.modified,
+                                        etag: entry.change_token.clone(),
+                                        kept: true,
+                                        size: km.len(),
+                                    }));
+                                } else if let Some(cm) = cached_path.metadata().ok().filter(|m| m.len() > 0) {
+                                    status_entries.push((entry_path.clone(), FileStatus::Cached));
+                                    cache_entries.push((entry_path.clone(), FileCacheEntry {
+                                        local_path: cached_path,
+                                        remote_modified: entry.modified,
+                                        etag: entry.change_token.clone(),
+                                        kept: false,
+                                        size: cm.len(),
+                                    }));
+                                } else {
+                                    status_entries.push((entry_path.clone(), FileStatus::Remote));
+                                }
+                                thumb_candidates.push((entry_path, entry.modified, entry.ext.flag("has_preview"), entry.ext.int("fileid")));
+                            }
+                        }
+
+                        (shared_paths, fileid_paths, detail_entries, status_entries, cache_entries)
+                    };
+
+                    // Collect inode/kind/name under a short lock, then call reply.add()
+                    // outside it so concurrent getattr/lookup aren't blocked for all N entries.
+                    let reply_rows: Vec<(INodeNo, u64, FileType, String, FileAttr)> = {
+                        let c = cache.safe_lock();
+                        entries.iter().enumerate().filter_map(|(i, entry)| {
+                            let name = entry.path.file_name().and_then(|n| n.to_str())?.to_string();
+                            let entry_path = path.join(&name);
+                            if entry.is_dir && exclude_folders.contains(&entry_path) { return None; }
+                            let ino = c.get_inode(&entry_path).unwrap_or(1);
+                            let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
+                            let attr = make_file_attr(ino, entry);
+                            Some((INodeNo(ino), (i + 3) as u64, kind, name, attr))
+                        }).collect()
+                    };
+                    for (ino, off, kind, name, attr) in reply_rows {
+                        if reply.add(ino, off, kind, &name, &attr) { break; }
+                    }
+
+                    // Pre-populate detail/shared/fileid maps before reply.ok() so that
+                    // Nautilus extension DETAIL queries arriving immediately after the
+                    // kernel receives the listing find fresh data. No eviction here;
+                    // the post-reply block uses the ChildrenMap index for O(old_dir_size)
+                    // targeted removal of stale entries.
+                    {
+                        let mut sh = shared.safe_write();
+                        for p in &shared_paths { sh.insert(p.clone()); }
+                    }
+                    {
+                        let mut fi = fileids.safe_write();
+                        for (p, fid) in &fileid_paths { fi.insert(p.clone(), *fid); }
+                    }
+                    {
+                        let mut dt = details.safe_write();
+                        for (p, d) in &detail_entries { dt.insert(p.clone(), d.clone()); }
+                    }
+
+                    log::info!("READDIR {} reply.ok() at {:?}", path.display(), t_readdir.elapsed());
+                    reply.ok();
+                    schedule_save_dir_cache(&cache);
+
+                    // ── Map updates (after reply.ok()) ────────────────────────────────
+                    // The pre-reply block already inserted all fresh entries into shared,
+                    // fileids, and details. Here we only need to evict entries that are in
+                    // the OLD child set but absent from the fresh PROPFIND (truly deleted
+                    // files), and rebuild children_map[path] atomically with details.
+                    {
+                        // V7: take the old child set without cloning — swaps in an empty
+                        // HashSet, transfers ownership of the old set, no heap allocation.
+                        let old_child_set: HashSet<PathBuf> = {
+                            let mut cm = children_map.safe_write();
+                            cm.get_mut(&path).map(std::mem::take).unwrap_or_default()
+                        };
+
+                        // Build fresh direct-child set from PROPFIND result.
+                        let new_set: HashSet<PathBuf> = detail_entries
+                            .iter()
+                            .filter_map(|(p, _)| {
+                                if p.parent() == Some(path.as_path()) { Some(p.clone()) } else { None }
+                            })
+                            .collect();
+
+                        // V6: evict only truly stale children (deleted/moved away).
+                        // Fresh entries are already in the maps from the pre-reply block.
+                        {
+                            let mut sh = shared.safe_write();
+                            for p in &old_child_set { if !new_set.contains(p) { sh.remove(p); } }
+                        }
+                        {
+                            let mut fi = fileids.safe_write();
+                            for p in &old_child_set { if !new_set.contains(p) { fi.remove(p); } }
+                        }
+                        // details + children_map: evict stale, rebuild children_map atomically.
+                        // Combined scope prevents DETAILDIR from observing fresh detail_map
+                        // paired with stale children_map. Lock order (dt before cm) matches
+                        // apply_dir_detail_maps to prevent deadlock.
+                        {
+                            let mut dt = details.safe_write();
+                            let mut cm = children_map.safe_write();
+                            for p in &old_child_set { if !new_set.contains(p) { dt.remove(p); } }
+                            let entry = cm.entry(path.clone())
+                                .or_insert_with(std::collections::HashSet::new);
+                            // Keep concurrent lookup() insertions (not in old_child_set)
+                            // and surviving files (in both old and new). Add fresh entries.
+                            entry.retain(|p| !old_child_set.contains(p) || new_set.contains(p));
+                            entry.extend(new_set);
+                        }
+                        // Collect paths with in-flight or just-completed upload status before
+                        // we clear smap.  These must (a) survive the PROPFIND status reset so
+                        // the upload emblem persists, and (b) be dirtied individually so
+                        // Nautilus re-queries their NC properties from the fresh detail_map.
+                        let upload_paths: Vec<PathBuf> = {
+                            let st = status.safe_read();
+                            status_entries.iter()
+                                .filter_map(|(p, _)| {
+                                    if matches!(st.get(p),
+                                        Some(FileStatus::Uploading) | Some(FileStatus::Synced))
+                                    {
+                                        Some(p.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        };
+                        // status: evict dir + old children (O(old_dir_size)), re-insert fresh
+                        {
+                            let mut st = status.safe_write();
+                            st.remove(&path);
+                            for p in &old_child_set { st.remove(p); }
+                            let upload_set: std::collections::HashSet<&PathBuf> =
+                                upload_paths.iter().collect();
+                            for (p, s) in &status_entries {
+                                // Don't overwrite Uploading/Synced with Remote: those entries
+                                // track in-flight and just-completed uploads.
+                                if !upload_set.contains(p) {
+                                    st.insert(p.clone(), *s);
+                                }
+                            }
+                        }
+                        {
+                            let mut c = cache.safe_lock();
+                            for (p, fc) in cache_entries { c.file_cache.entry(p).or_insert(fc); }
+                        }
+                        {
+                            // Insert only the directory itself; children get their own
+                            // dirty notifications via notify_push when they change.
+                            // Inserting all N children here floods the CHANGES queue and
+                            // triggers a cascade of GIO attribute invalidations in Nautilus.
+                            let mut d = dirty.safe_lock();
+                            d.insert(path.clone());
+                            // Additionally dirty recently uploaded files so Nautilus re-queries
+                            // them and picks up NC properties from the freshly populated detail_map.
+                            for p in upload_paths {
+                                d.insert(p);
+                            }
+                        }
+                    }
+
+                    if offset == 0 && !thumb_candidates.is_empty() {
+                        let already = {
+                            let mut inf = thumb_inflight.safe_lock();
+                            !inf.insert(path.clone())
+                        };
+                        if !already {
+                            let conn2 = conn.clone();
+                            thread::spawn(move || {
+                                thread::sleep(Duration::from_millis(200));
+                                preview::prefetch_directory_thumbnails(
+                                    &conn2.http,
+                                    &conn2.base_url,
+                                    &conn2.creds,
+                                    &conn2.mount_point,
+                                    &thumb_candidates,
+                                    &conn2.active_streams,
+                                );
+                                thumb_inflight.safe_lock().remove(&path);
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("readdir {}: {}", path.display(), e);
+                    let kind = if e.contains("401") || e.contains("403")
+                        || e.contains("Unauthorized") || e.contains("Forbidden")
+                    {
+                        SyncErrorKind::PermissionDenied
+                    } else {
+                        SyncErrorKind::NetworkError
+                    };
+                    push_error(&elog, path.clone(), kind, e.clone());
+                    reply.error(error_to_errno(&e));
+                }
+            }
+        });
     }
 }
 
@@ -2753,398 +3189,23 @@ impl Filesystem for NextCloudFs {
         reply.ok();
     }
 
-    fn readdir(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
-        let (path, parent_ino) = {
-            let c = self.cache.safe_lock();
-            let path = match c.get_path(ino.0) {
-                Some(p) => p,
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            };
-            let parent_ino = if ino.0 == 1 {
-                1
-            } else {
-                let parent = path.parent().unwrap_or(Path::new("/"));
-                c.get_inode(parent).unwrap_or(1)
-            };
-            (path, parent_ino)
-        };
+    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, reply: ReplyDirectory) {
+        self.readdir_common(ino, offset, DirReply::Plain(reply));
+    }
 
-        log::info!("[{}] READDIR {}", self.log_user, path.display());
+    fn readdirplus(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, reply: ReplyDirectoryPlus) {
+        self.readdir_common(ino, offset, DirReply::Plus(reply));
+    }
 
-        let cache = self.cache.clone();
-        let status = self.status.clone();
-        let shared = self.shared.clone();
-        let fileids = self.fileids.clone();
-        let details = self.details.clone();
-        let children_map = self.children_map.clone();
-        let dirty = self.dirty.clone();
-        let conn = self.conn.clone();
-        let aggressive_prefetch = self.aggressive_prefetch;
-        let exclude_folders = self.exclude_folders.clone();
-        let thumb_inflight = self.thumb_inflight.clone();
-        let cleanup_stale_gio_temps = self.cleanup_stale_gio_temps;
-        let elog = self.error_log.clone();
-
-        thread::spawn(move || {
-            if offset == 0 {
-                if reply.add(ino, 1, FileType::Directory, ".") {
-                    reply.ok();
-                    return;
-                }
-                if reply.add(INodeNo(parent_ino), 2, FileType::Directory, "..") {
-                    reply.ok();
-                    return;
-                }
-            }
-
-            // Continuation pages (offset > 0): serve directly from cache, skip all heavy work.
-            if offset > 0 {
-                let skip = (offset - 2) as usize;
-                // Collect under a short lock, then reply outside it so concurrent
-                // getattr/lookup calls aren't blocked while the kernel drains pages.
-                let rows: Vec<(INodeNo, u64, FileType, String)> = {
-                    let c = cache.safe_lock();
-                    match c.get_cached_dir_readonly(&path) {
-                        Some(entries) => entries.iter().enumerate().skip(skip).filter_map(|(i, entry)| {
-                            let name = entry.path.file_name().and_then(|n| n.to_str())?.to_string();
-                            let entry_path = path.join(&name);
-                            if entry.is_dir && exclude_folders.contains(&entry_path) { return None; }
-                            let ino = c.get_inode(&entry_path).unwrap_or(1);
-                            let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                            Some((INodeNo(ino), (i + 3) as u64, kind, name))
-                        }).collect(),
-                        None => vec![],
-                    }
-                };
-                for (ino, off, kind, name) in rows {
-                    if reply.add(ino, off, kind, &name) { break; }
-                }
-                reply.ok();
-                return;
-            }
-
-            let t_readdir = Instant::now();
-            match get_or_list_dir(&conn, &cache, path.clone(), Some(DirDetailArcs {
-                shared: shared.clone(),
-                fileids: fileids.clone(),
-                details: details.clone(),
-                children: children_map.clone(),
-                dirty: dirty.clone(),
-            })) {
-                Ok((entries, self_entry)) => {
-                    log::info!("READDIR {} get_or_list_dir returned {} entries in {:?}", path.display(), entries.len(), t_readdir.elapsed());
-
-                    // GIO writes files atomically via a .goutputstream-* / .xdp-* temp
-                    // that is renamed to the final name within seconds. Any such file
-                    // visible in a PROPFIND is either an orphan (app crashed) or is about
-                    // to be renamed imminently. Delete them from the server immediately
-                    // (when the flag is on) and never include them in the listing.
-                    let gio_temps: Vec<PathBuf> = entries.iter()
-                        .filter(|e| {
-                            let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                            is_gio_temp_file(name)
-                        })
-                        .map(|e| e.path.clone())
-                        .collect();
-                    if !gio_temps.is_empty() {
-                        if cleanup_stale_gio_temps {
-                            log::info!("purging {} GIO temp(s) in {}", gio_temps.len(), path.display());
-                            let conn2 = conn.clone();
-                            thread::spawn(move || {
-                                for p in gio_temps {
-                                    if let Err(e) = conn2.backend.delete(&p) {
-                                        log::debug!("GIO temp delete {}: {}", p.display(), e);
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    let entries: Vec<RemoteEntry> = entries.iter()
-                        .filter(|e| {
-                            let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                            !is_gio_temp_file(name)
-                        })
-                        .cloned()
-                        .collect();
-
-                    // Kick off background PROPFINDs for child dirs (opt-in via
-                    // aggressive_prefetch; off by default until the serialisation
-                    // issues in proactive_refresh / poll loop are fixed).
-                    if aggressive_prefetch && offset == 0 {
-                        for entry in entries.iter().filter(|e| e.is_dir) {
-                            if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
-                                start_background_propfind(&conn, &cache, path.join(name), PREFETCH_CHAIN_DEPTH);
-                            }
-                        }
-                    }
-
-                    let mut thumb_candidates: Vec<(PathBuf, Option<SystemTime>, bool, Option<u64>)> = Vec::new();
-
-                    // Build per-entry metadata vectors and allocate inodes.
-                    // Map updates (retain+insert on shared/fileids/details/status) are
-                    // deferred to after reply.ok() so the kernel gets the directory listing
-                    // back without waiting for O(total_cached) retain() scans.
-                    let (shared_paths, fileid_paths, detail_entries, status_entries, cache_entries) = {
-                        let (kept_dir, auto_cache_dir) = {
-                            let mut c = cache.safe_lock();
-                            for entry in entries.iter() {
-                                if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
-                                    c.allocate_inode(path.join(name));
-                                }
-                            }
-                            (c.kept_dir.clone(), c.auto_cache_dir.clone())
-                        };
-
-                        let mut shared_paths = Vec::new();
-                        let mut fileid_paths = Vec::new();
-                        let mut detail_entries = Vec::new();
-                        let mut status_entries = Vec::new();
-                        let mut cache_entries = Vec::new();
-
-                        if let Some(ref se) = self_entry {
-                            if se.ext.flag("is_shared") { shared_paths.push(path.clone()); }
-                            if let Some(fid) = se.ext.int("fileid") { fileid_paths.push((path.clone(), fid)); }
-                            detail_entries.push((path.clone(), ipc::FileDetail {
-                                permissions: se.ext.str("permissions").map(str::to_string),
-                                owner_id: se.ext.str("owner_id").map(str::to_string),
-                                owner_display_name: se.ext.str("owner_display_name").map(str::to_string),
-                                size: se.size,
-                                is_dir: se.is_dir,
-                            }));
-                        }
-
-                        for entry in entries.iter() {
-                            let name = match entry.path.file_name().and_then(|n| n.to_str()) {
-                                Some(n) => n,
-                                None => continue,
-                            };
-                            let entry_path = path.join(name);
-                            if entry.ext.flag("is_shared") { shared_paths.push(entry_path.clone()); }
-                            if let Some(fid) = entry.ext.int("fileid") { fileid_paths.push((entry_path.clone(), fid)); }
-                            detail_entries.push((entry_path.clone(), ipc::FileDetail {
-                                permissions: entry.ext.str("permissions").map(str::to_string),
-                                owner_id: entry.ext.str("owner_id").map(str::to_string),
-                                owner_display_name: entry.ext.str("owner_display_name").map(str::to_string),
-                                size: entry.size,
-                                is_dir: entry.is_dir,
-                            }));
-                            if !entry.is_dir {
-                                let rel = entry_path.strip_prefix("/").unwrap_or(&entry_path);
-                                let kept_path = kept_dir.join(rel);
-                                let cached_path = auto_cache_dir.join(rel);
-                                // Lazy: only stat cached_path if kept_path misses — most
-                                // files are Remote so this saves one stat(2) per entry.
-                                if let Some(km) = kept_path.metadata().ok().filter(|m| m.len() > 0) {
-                                    status_entries.push((entry_path.clone(), FileStatus::Kept));
-                                    cache_entries.push((entry_path.clone(), FileCacheEntry {
-                                        local_path: kept_path,
-                                        remote_modified: entry.modified,
-                                        etag: entry.change_token.clone(),
-                                        kept: true,
-                                        size: km.len(),
-                                    }));
-                                } else if let Some(cm) = cached_path.metadata().ok().filter(|m| m.len() > 0) {
-                                    status_entries.push((entry_path.clone(), FileStatus::Cached));
-                                    cache_entries.push((entry_path.clone(), FileCacheEntry {
-                                        local_path: cached_path,
-                                        remote_modified: entry.modified,
-                                        etag: entry.change_token.clone(),
-                                        kept: false,
-                                        size: cm.len(),
-                                    }));
-                                } else {
-                                    status_entries.push((entry_path.clone(), FileStatus::Remote));
-                                }
-                                thumb_candidates.push((entry_path, entry.modified, entry.ext.flag("has_preview"), entry.ext.int("fileid")));
-                            }
-                        }
-
-                        (shared_paths, fileid_paths, detail_entries, status_entries, cache_entries)
-                    };
-
-                    // Collect inode/kind/name under a short lock, then call reply.add()
-                    // outside it so concurrent getattr/lookup aren't blocked for all N entries.
-                    let reply_rows: Vec<(INodeNo, u64, FileType, String)> = {
-                        let c = cache.safe_lock();
-                        entries.iter().enumerate().filter_map(|(i, entry)| {
-                            let name = entry.path.file_name().and_then(|n| n.to_str())?.to_string();
-                            let entry_path = path.join(&name);
-                            if entry.is_dir && exclude_folders.contains(&entry_path) { return None; }
-                            let ino = c.get_inode(&entry_path).unwrap_or(1);
-                            let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                            Some((INodeNo(ino), (i + 3) as u64, kind, name))
-                        }).collect()
-                    };
-                    for (ino, off, kind, name) in reply_rows {
-                        if reply.add(ino, off, kind, &name) { break; }
-                    }
-
-                    // Pre-populate detail/shared/fileid maps before reply.ok() so that
-                    // Nautilus extension DETAIL queries arriving immediately after the
-                    // kernel receives the listing find fresh data. No eviction here;
-                    // the post-reply block uses the ChildrenMap index for O(old_dir_size)
-                    // targeted removal of stale entries.
-                    {
-                        let mut sh = shared.safe_write();
-                        for p in &shared_paths { sh.insert(p.clone()); }
-                    }
-                    {
-                        let mut fi = fileids.safe_write();
-                        for (p, fid) in &fileid_paths { fi.insert(p.clone(), *fid); }
-                    }
-                    {
-                        let mut dt = details.safe_write();
-                        for (p, d) in &detail_entries { dt.insert(p.clone(), d.clone()); }
-                    }
-
-                    log::info!("READDIR {} reply.ok() at {:?}", path.display(), t_readdir.elapsed());
-                    reply.ok();
-                    schedule_save_dir_cache(&cache);
-
-                    // ── Map updates (after reply.ok()) ────────────────────────────────
-                    // The pre-reply block already inserted all fresh entries into shared,
-                    // fileids, and details. Here we only need to evict entries that are in
-                    // the OLD child set but absent from the fresh PROPFIND (truly deleted
-                    // files), and rebuild children_map[path] atomically with details.
-                    {
-                        // V7: take the old child set without cloning — swaps in an empty
-                        // HashSet, transfers ownership of the old set, no heap allocation.
-                        let old_child_set: HashSet<PathBuf> = {
-                            let mut cm = children_map.safe_write();
-                            cm.get_mut(&path).map(std::mem::take).unwrap_or_default()
-                        };
-
-                        // Build fresh direct-child set from PROPFIND result.
-                        let new_set: HashSet<PathBuf> = detail_entries
-                            .iter()
-                            .filter_map(|(p, _)| {
-                                if p.parent() == Some(path.as_path()) { Some(p.clone()) } else { None }
-                            })
-                            .collect();
-
-                        // V6: evict only truly stale children (deleted/moved away).
-                        // Fresh entries are already in the maps from the pre-reply block.
-                        {
-                            let mut sh = shared.safe_write();
-                            for p in &old_child_set { if !new_set.contains(p) { sh.remove(p); } }
-                        }
-                        {
-                            let mut fi = fileids.safe_write();
-                            for p in &old_child_set { if !new_set.contains(p) { fi.remove(p); } }
-                        }
-                        // details + children_map: evict stale, rebuild children_map atomically.
-                        // Combined scope prevents DETAILDIR from observing fresh detail_map
-                        // paired with stale children_map. Lock order (dt before cm) matches
-                        // apply_dir_detail_maps to prevent deadlock.
-                        {
-                            let mut dt = details.safe_write();
-                            let mut cm = children_map.safe_write();
-                            for p in &old_child_set { if !new_set.contains(p) { dt.remove(p); } }
-                            let entry = cm.entry(path.clone())
-                                .or_insert_with(std::collections::HashSet::new);
-                            // Keep concurrent lookup() insertions (not in old_child_set)
-                            // and surviving files (in both old and new). Add fresh entries.
-                            entry.retain(|p| !old_child_set.contains(p) || new_set.contains(p));
-                            entry.extend(new_set);
-                        }
-                        // Collect paths with in-flight or just-completed upload status before
-                        // we clear smap.  These must (a) survive the PROPFIND status reset so
-                        // the upload emblem persists, and (b) be dirtied individually so
-                        // Nautilus re-queries their NC properties from the fresh detail_map.
-                        let upload_paths: Vec<PathBuf> = {
-                            let st = status.safe_read();
-                            status_entries.iter()
-                                .filter_map(|(p, _)| {
-                                    if matches!(st.get(p),
-                                        Some(FileStatus::Uploading) | Some(FileStatus::Synced))
-                                    {
-                                        Some(p.clone())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        };
-                        // status: evict dir + old children (O(old_dir_size)), re-insert fresh
-                        {
-                            let mut st = status.safe_write();
-                            st.remove(&path);
-                            for p in &old_child_set { st.remove(p); }
-                            let upload_set: std::collections::HashSet<&PathBuf> =
-                                upload_paths.iter().collect();
-                            for (p, s) in &status_entries {
-                                // Don't overwrite Uploading/Synced with Remote: those entries
-                                // track in-flight and just-completed uploads.
-                                if !upload_set.contains(p) {
-                                    st.insert(p.clone(), *s);
-                                }
-                            }
-                        }
-                        {
-                            let mut c = cache.safe_lock();
-                            for (p, fc) in cache_entries { c.file_cache.entry(p).or_insert(fc); }
-                        }
-                        {
-                            // Insert only the directory itself; children get their own
-                            // dirty notifications via notify_push when they change.
-                            // Inserting all N children here floods the CHANGES queue and
-                            // triggers a cascade of GIO attribute invalidations in Nautilus.
-                            let mut d = dirty.safe_lock();
-                            d.insert(path.clone());
-                            // Additionally dirty recently uploaded files so Nautilus re-queries
-                            // them and picks up NC properties from the freshly populated detail_map.
-                            for p in upload_paths {
-                                d.insert(p);
-                            }
-                        }
-                    }
-
-                    if offset == 0 && !thumb_candidates.is_empty() {
-                        let already = {
-                            let mut inf = thumb_inflight.safe_lock();
-                            !inf.insert(path.clone())
-                        };
-                        if !already {
-                            let conn2 = conn.clone();
-                            thread::spawn(move || {
-                                thread::sleep(Duration::from_millis(200));
-                                preview::prefetch_directory_thumbnails(
-                                    &conn2.http,
-                                    &conn2.base_url,
-                                    &conn2.creds,
-                                    &conn2.mount_point,
-                                    &thumb_candidates,
-                                    &conn2.active_streams,
-                                );
-                                thumb_inflight.safe_lock().remove(&path);
-                            });
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("readdir {}: {}", path.display(), e);
-                    let kind = if e.contains("401") || e.contains("403")
-                        || e.contains("Unauthorized") || e.contains("Forbidden")
-                    {
-                        SyncErrorKind::PermissionDenied
-                    } else {
-                        SyncErrorKind::NetworkError
-                    };
-                    push_error(&elog, path.clone(), kind, e.clone());
-                    reply.error(error_to_errno(&e));
-                }
-            }
-        });
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // readdirplus bundles each entry's attributes into the directory read
+        // (readdir + lookup in one), and READDIRPLUS_AUTO lets the kernel fall
+        // back to plain readdir when a listing does not stat its entries. A file
+        // manager stats every file, so this removes a lookup+getattr round-trip
+        // per entry on large directories; `ls` keeps using plain readdir. Best
+        // effort — silently ignored if the running kernel lacks support.
+        let _ = config.add_capabilities(InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO);
+        Ok(())
     }
 
     fn setattr(
