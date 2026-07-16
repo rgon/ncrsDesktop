@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
-"""ncrs document thumbnailer.
+"""ncrs thumbnailer.
 
-Registered via /usr/share/thumbnailers/ncrs.thumbnailer for PDF and related
-document formats.  Intercepts requests for remote files and uses the Nextcloud
-preview API (a small pre-generated thumbnail) instead of downloading the full
-document.
+Registered via ~/.local/share/thumbnailers/ncrs.thumbnailer (see install.sh) for
+the image and document formats the Nextcloud preview API can render. For a file
+on the ncrs mount that is not yet downloaded, it uses the server-side preview (a
+small, pre-rendered image) instead of downloading the whole file — this is what
+keeps thumbnailing a large *remote* folder cheap (one small preview per file
+rather than a full download per file).
 
-Priority order:
+Because XDG thumbnailers are registered per MIME type system-wide, this script is
+also invoked for ordinary files that are NOT on the ncrs mount. Those — and any
+file that already has a local copy — are rendered locally exactly as the stock
+thumbnailer would, so claiming these MIME types never slows down or breaks
+thumbnails of non-ncrs files.
 
-  1. XDG cache hit — daemon pre-fetched it; just write to %o.
-  2a. STATUS says file is remote → THUMBNAIL IPC: daemon fetches NC preview.
-  2b. STATUS says file is local  → delegate to evince-thumbnailer.
+Routing:
+  1. XDG cache hit — the daemon already pre-fetched it; just write to %o.
+  2. On the ncrs mount and remote → THUMBNAIL IPC: the daemon fetches the
+     Nextcloud preview into the XDG cache, then we emit it.
+  3. Otherwise (not on the mount, or a local copy exists) → render locally:
+     PDFs via evince-thumbnailer, images in-process via GdkPixbuf.
 """
 import hashlib
 import os
@@ -22,6 +31,8 @@ from urllib.parse import unquote
 import gi
 gi.require_version('GdkPixbuf', '2.0')
 from gi.repository import GdkPixbuf
+
+_PDF_EXTS = {'pdf'}
 
 
 def ipc(cmd, timeout=10):
@@ -39,6 +50,61 @@ def ipc(cmd, timeout=10):
         return None
 
 
+def _mount_point():
+    """The ncrs mount point from ~/.config/ncrs/config.yaml, or None. Used to
+    decide whether a file is even eligible for the server-preview path, so
+    non-ncrs files never pay a socket round-trip."""
+    cfg = os.path.join(
+        os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'),
+        'ncrs', 'config.yaml',
+    )
+    try:
+        with open(cfg, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('mount_point:'):
+                    val = line.split(':', 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        return val.rstrip('/')
+    except OSError:
+        pass
+    return None
+
+
+def _write_thumbnail(pixbuf, dst, src_uri, src_path, size):
+    w, h = pixbuf.get_width(), pixbuf.get_height()
+    longest = max(w, h)
+    if longest > size:
+        if w >= h:
+            pixbuf = pixbuf.scale_simple(size, max(1, size * h // w), GdkPixbuf.InterpType.BILINEAR)
+        else:
+            pixbuf = pixbuf.scale_simple(max(1, size * w // h), size, GdkPixbuf.InterpType.BILINEAR)
+    mtime = str(int(os.stat(src_path).st_mtime))
+    pixbuf.savev(dst, 'png',
+                 ['tEXt::Thumb::URI', 'tEXt::Thumb::MTime'],
+                 [src_uri, mtime])
+
+
+def _render_local(src_uri, src_path, dst, size):
+    """Render a locally-readable file to *dst*. PDFs go through
+    evince-thumbnailer; everything else is decoded in-process by GdkPixbuf
+    (which covers jpeg/png/gif/webp/bmp/svg/…). Returns a process exit code."""
+    ext = os.path.splitext(src_path)[1].lower().lstrip('.')
+    if ext in _PDF_EXTS:
+        try:
+            return subprocess.run(
+                ['evince-thumbnailer', '-s', str(size), src_uri, dst],
+                timeout=60,
+            ).returncode
+        except (subprocess.TimeoutExpired, OSError):
+            return 1
+    try:
+        _write_thumbnail(GdkPixbuf.Pixbuf.new_from_file(src_path), dst, src_uri, src_path, size)
+        return 0
+    except Exception:
+        return 1
+
+
 def main():
     size    = int(sys.argv[1])
     src_uri = sys.argv[2]   # file:// URI, percent-encoded
@@ -50,51 +116,31 @@ def main():
     xdg_dir  = os.path.join(CACHE_HOME, 'thumbnails', 'normal')
     xdg_path = os.path.join(xdg_dir, hashlib.md5(src_uri.encode()).hexdigest() + '.png')
 
-    def write_thumbnail(pixbuf):
-        w, h = pixbuf.get_width(), pixbuf.get_height()
-        long = max(w, h)
-        if long > size:
-            if w >= h:
-                pixbuf = pixbuf.scale_simple(size, max(1, size * h // w), GdkPixbuf.InterpType.BILINEAR)
-            else:
-                pixbuf = pixbuf.scale_simple(max(1, size * w // h), size, GdkPixbuf.InterpType.BILINEAR)
-        mtime = str(int(os.stat(src_path).st_mtime))
-        pixbuf.savev(dst, 'png',
-                     ['tEXt::Thumb::URI', 'tEXt::Thumb::MTime'],
-                     [src_uri, mtime])
-
     # ── 1. XDG cache hit (daemon pre-fetched) ────────────────────────────────────
     if os.path.exists(xdg_path):
         try:
-            write_thumbnail(GdkPixbuf.Pixbuf.new_from_file(xdg_path))
+            _write_thumbnail(GdkPixbuf.Pixbuf.new_from_file(xdg_path), dst, src_uri, src_path, size)
             sys.exit(0)
         except Exception:
             pass  # corrupted cache entry — fall through
 
-    # ── 2. Route based on whether the file is locally available ──────────────────
-    status = ipc(f'STATUS {src_path}', timeout=3)
-    is_remote = status in ('remote', 'downloading')
+    # ── 2. On the ncrs mount and remote → server-side preview via the daemon ─────
+    mount = _mount_point()
+    on_mount = mount is not None and (src_path == mount or src_path.startswith(mount + '/'))
+    if on_mount:
+        status = ipc(f'STATUS {src_path}', timeout=3)
+        if status in ('remote', 'downloading'):
+            reply = ipc(f'THUMBNAIL {src_path}', timeout=15)
+            if reply == 'ok' and os.path.exists(xdg_path):
+                try:
+                    _write_thumbnail(GdkPixbuf.Pixbuf.new_from_file(xdg_path), dst, src_uri, src_path, size)
+                    sys.exit(0)
+                except Exception:
+                    pass
+            sys.exit(1)
 
-    if is_remote:
-        # ── 2a. Remote file: ask daemon to fetch preview from Nextcloud ──────────
-        reply = ipc(f'THUMBNAIL {src_path}', timeout=15)
-        if reply == 'ok' and os.path.exists(xdg_path):
-            try:
-                write_thumbnail(GdkPixbuf.Pixbuf.new_from_file(xdg_path))
-                sys.exit(0)
-            except Exception:
-                pass
-        sys.exit(1)
-
-    # ── 2b. Local file: delegate to evince-thumbnailer ───────────────────────────
-    try:
-        result = subprocess.run(
-            ['evince-thumbnailer', '-s', str(size), src_uri, dst],
-            timeout=60,
-        )
-        sys.exit(result.returncode)
-    except (subprocess.TimeoutExpired, OSError):
-        sys.exit(1)
+    # ── 3. Not on the mount, or a local copy exists → render locally ─────────────
+    sys.exit(_render_local(src_uri, src_path, dst, size))
 
 
 if __name__ == '__main__':

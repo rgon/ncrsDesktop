@@ -102,8 +102,13 @@ class TestNcrsThumbnailer(unittest.TestCase):
             hashlib.md5(self.src_uri.encode()).hexdigest() + '.png',
         )
         os.makedirs(self.xdg_dir, exist_ok=True)
+        # Treat the temp dir as the ncrs mount so the IPC (server-preview) path
+        # is exercised for these files; individual tests override as needed.
+        self._orig_mount = _mod._mount_point
+        _mod._mount_point = lambda: self.tmpdir
 
     def tearDown(self):
+        _mod._mount_point = self._orig_mount
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -223,6 +228,48 @@ class TestNcrsThumbnailer(unittest.TestCase):
         with patch('subprocess.run', return_value=result):
             code = _run_main(self._argv(), self._env())
         self.assertEqual(code, 0)
+
+    # ── Mount scoping: non-ncrs files must not touch the daemon ────────────────
+
+    def test_off_mount_file_renders_locally_without_ipc(self):
+        # A file outside the ncrs mount must never issue a STATUS/THUMBNAIL IPC
+        # (so registering these MIME types system-wide can't slow down or hang
+        # thumbnails of ordinary files when the daemon is busy or absent).
+        _mod._mount_point = lambda: '/some/other/ncrs/mount'
+        received = []
+        _ipc_server(self.sock, {}, extra_action=received.append)
+        result = subprocess.CompletedProcess([], 0)
+        with patch('subprocess.run', return_value=result):
+            self.assertEqual(_run_main(self._argv(), self._env()), 0)
+        self.assertEqual(received, [], "off-mount file must not hit the daemon socket")
+
+    def test_no_mount_configured_renders_locally_without_ipc(self):
+        _mod._mount_point = lambda: None
+        received = []
+        _ipc_server(self.sock, {}, extra_action=received.append)
+        result = subprocess.CompletedProcess([], 0)
+        with patch('subprocess.run', return_value=result):
+            self.assertEqual(_run_main(self._argv(), self._env()), 0)
+        self.assertEqual(received, [])
+
+    # ── Local image rendering (in-process, no external thumbnailer) ────────────
+
+    def test_local_image_rendered_in_process(self):
+        # A local (kept) image on the mount is decoded by GdkPixbuf directly —
+        # no evince, no external process.
+        img = os.path.join(self.tmpdir, 'photo.png')
+        _make_png(img, width=300, height=200)
+        img_uri = 'file://' + img
+        dst = os.path.join(self.tmpdir, 'photo_thumb.png')
+        _ipc_server(self.sock, {f'STATUS {img}': 'kept'})
+        ran_external = []
+        with patch('subprocess.run', side_effect=lambda *a, **k: ran_external.append(a)):
+            code = _run_main(['ncrs-thumbnailer', '128', img_uri, dst], self._env())
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(dst))
+        self.assertEqual(ran_external, [], "images must render in-process, not via a subprocess")
+        pb = GdkPixbuf.Pixbuf.new_from_file(dst)
+        self.assertLessEqual(max(pb.get_width(), pb.get_height()), 128)
 
     # ── URI decoding ──────────────────────────────────────────────────────────
 
