@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.33](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.32...ncrs-v0.1.33) (2026-07-16)
+
+
+### Bug Fixes
+
+* **fuse:** use TTL=0 for readdirplus entry attrs to prevent stale-size data loss ([2585b34](https://github.com/rgon/ncrsDesktop/commit/2585b34aa0bf7df4e5b426dbf8f97ccd6a0e8806))
+
 ## [0.1.32](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.31...ncrs-v0.1.32) (2026-07-16)
 
 
