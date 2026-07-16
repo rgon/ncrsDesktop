@@ -458,7 +458,6 @@ class TestInfoProviderSyncCache(unittest.TestCase):
             syncstate._dir_cache.clear()
             syncstate._dir_cache_ts.clear()
             syncstate._dir_inflight.clear()
-            syncstate._dir_pending.clear()
 
     def tearDown(self):
         syncstate._POOL.submit = self._orig_submit
@@ -488,13 +487,14 @@ class TestInfoProviderSyncCache(unittest.TestCase):
         syncstate._send_command = fake_send
         prov = self._make_provider()
 
-        # First request for a.txt: cache miss → COMPLETE + one DETAILDIR fetch.
+        # First request for a.txt: cold dir → one synchronous DETAILDIR, and
+        # a.txt is served on this first pass (no paint-empty-then-repaint).
         fi_a = _FakeFileInfo("/mnt/ncrs/dir/a.txt")
         res = prov.update_file_info_full(None, None, None, fi_a)
         self.assertEqual(res, syncstate.Nautilus.OperationResult.COMPLETE)
-
-        # Exactly one DETAILDIR was issued for the parent directory.
         self.assertEqual(calls, ["DETAILDIR /mnt/ncrs/dir"])
+        self.assertEqual(fi_a.attrs.get("ncrs_sync"), "Kept locally",
+                         "cold file served synchronously from the sync fetch")
 
         # A second file in the same dir must NOT trigger another socket call.
         fi_b = _FakeFileInfo("/mnt/ncrs/dir/b.txt")
@@ -536,12 +536,12 @@ class TestInfoProviderSyncCache(unittest.TestCase):
         self.assertEqual(res, syncstate.Nautilus.OperationResult.COMPLETE)
         self.assertEqual(calls, [])
 
-    def test_invalidation_scoped_to_requested_children(self):
-        # A huge directory must repaint only the files Nautilus actually asked
-        # about, never every child. Defer the fetch so several requests pile up
-        # into the pending set before it lands.
-        submitted = []
-        syncstate._POOL.submit = lambda fn, *a: submitted.append((fn, a))
+    def test_cold_open_is_synchronous_without_repaint_storm(self):
+        # A large cold directory must be warmed by ONE synchronous DETAILDIR and
+        # every child served on its first update_file_info call — never painted
+        # empty and then repainted via a per-child invalidate_extension_info
+        # storm (which is what made large folders slow).
+        calls = []
         looked_up = []
         orig_lookup = syncstate.Nautilus.FileInfo.lookup
         orig_newpath = syncstate.Gio.File.new_for_path
@@ -549,18 +549,64 @@ class TestInfoProviderSyncCache(unittest.TestCase):
         syncstate.Gio.File.new_for_path = lambda p: p
         try:
             children = [f"f{i}" for i in range(1000)]
-            syncstate._send_command = lambda cmd: "\x1e".join(
-                f"{n}\tremote\t\t\t\t0" for n in children
-            )
+
+            def fake_send(cmd):
+                calls.append(cmd)
+                if cmd.startswith("DETAILDIR "):
+                    return "\x1e".join(f"{n}\tremote\t\t\t\t0" for n in children)
+                return "error"
+
+            syncstate._send_command = fake_send
             prov = self._make_provider()
-            # Only two of the 1000 children are requested (as if visible).
-            prov.update_file_info_full(None, None, None, _FakeFileInfo("/mnt/ncrs/dir/f1"))
-            prov.update_file_info_full(None, None, None, _FakeFileInfo("/mnt/ncrs/dir/f2"))
-            self.assertEqual(len(submitted), 1, "one DETAILDIR fetch for the directory")
-            fn, args = submitted[0]
-            fn(*args)  # run the deferred fetch; idle_add runs inline
-            # Exactly the two requested children were invalidated, not all 1000.
-            self.assertEqual(set(looked_up), {"/mnt/ncrs/dir/f1", "/mnt/ncrs/dir/f2"})
+
+            # First child of the cold dir: exactly one synchronous DETAILDIR,
+            # and it is served immediately.
+            fi0 = _FakeFileInfo("/mnt/ncrs/dir/f0")
+            prov.update_file_info_full(None, None, None, fi0)
+            self.assertEqual(calls, ["DETAILDIR /mnt/ncrs/dir"])
+            self.assertEqual(fi0.attrs.get("ncrs_sync"), "Remote")
+
+            # Every other child is a warm cache hit: no extra DETAILDIR, and no
+            # per-child invalidation for any of the 1000.
+            for i in range(1, 1000):
+                prov.update_file_info_full(
+                    None, None, None, _FakeFileInfo(f"/mnt/ncrs/dir/f{i}")
+                )
+            self.assertEqual(calls, ["DETAILDIR /mnt/ncrs/dir"],
+                             "one fetch warms the whole directory")
+            self.assertEqual(looked_up, [],
+                             "cold open must not invalidate any child (no repaint storm)")
+        finally:
+            syncstate.Nautilus.FileInfo.lookup = orig_lookup
+            syncstate.Gio.File.new_for_path = orig_newpath
+
+    def test_stale_refresh_repaints_only_changed_children(self):
+        # A background refresh of a stale directory must repaint only the
+        # children whose record changed, never the whole directory.
+        looked_up = []
+        orig_lookup = syncstate.Nautilus.FileInfo.lookup
+        orig_newpath = syncstate.Gio.File.new_for_path
+        syncstate.Nautilus.FileInfo.lookup = lambda gfile: looked_up.append(gfile) or None
+        syncstate.Gio.File.new_for_path = lambda p: p
+        try:
+            prov = self._make_provider()
+            # Warm the directory synchronously with two remote files.
+            syncstate._send_command = (
+                lambda cmd: "a\tremote\t\t\t\t0\x1eb\tremote\t\t\t\t0"
+            )
+            prov.update_file_info_full(None, None, None, _FakeFileInfo("/mnt/ncrs/dir/a"))
+            # Force staleness; on the next request 'b' has changed, 'a' has not.
+            with syncstate._cache_lock:
+                syncstate._dir_cache_ts["/mnt/ncrs/dir"] = 0.0
+            syncstate._send_command = (
+                lambda cmd: "a\tremote\t\t\t\t0\x1eb\tkept\t\t\t\t0"
+            )
+            looked_up.clear()
+            # A stale cache hit serves immediately and triggers the background
+            # refresh (submit + idle_add run inline in this test).
+            prov.update_file_info_full(None, None, None, _FakeFileInfo("/mnt/ncrs/dir/a"))
+            self.assertEqual(looked_up, ["/mnt/ncrs/dir/b"],
+                             "only the changed child is repainted on refresh")
         finally:
             syncstate.Nautilus.FileInfo.lookup = orig_lookup
             syncstate.Gio.File.new_for_path = orig_newpath
@@ -645,7 +691,6 @@ class TestTargetedChangeRefresh(unittest.TestCase):
             syncstate._dir_cache.clear()
             syncstate._dir_cache_ts.clear()
             syncstate._dir_inflight.clear()
-            syncstate._dir_pending.clear()
 
     def tearDown(self):
         syncstate._send_command = self._orig_send

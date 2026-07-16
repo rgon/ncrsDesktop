@@ -207,11 +207,17 @@ def _human_size(n: int) -> str:
 
 
 # ── Per-directory detail cache ───────────────────────────────────────────────
-# The InfoProvider answers Nautilus synchronously from this cache so it never
-# blocks the file view on a per-file socket round-trip. A cache miss paints the
-# file immediately with no metadata and warms the *whole* directory with a
-# single DETAILDIR query in the background, then invalidates the children so
-# Nautilus repaints them from the now-populated cache.
+# The InfoProvider answers Nautilus synchronously from this cache. Nautilus calls
+# update_file_info_full on the GTK main thread and eagerly for *every* child of a
+# directory (not just the visible window). The first call for a cold directory
+# therefore fetches the whole directory's metadata with a single blocking
+# DETAILDIR round-trip (~1 ms; a few ms for thousands of entries) and populates
+# the cache; every sibling call that follows is a warm cache hit served on its
+# first pass. This is what keeps a large directory fast: it avoids the O(N)
+# "repaint storm" of painting all N files empty, then issuing N
+# invalidate_extension_info calls to force Nautilus to re-query every file. A
+# stale-but-present entry is served immediately and refreshed in the background,
+# which then repaints only the children whose record actually changed.
 _DIR_CACHE_TTL = 30.0  # seconds
 # Cap the number of cached directories so a long-lived Nautilus process that
 # browses thousands of folders cannot grow this without bound. When exceeded,
@@ -220,15 +226,7 @@ _DIR_CACHE_TTL = 30.0  # seconds
 _DIR_CACHE_MAX = 512
 _dir_cache: dict = {}  # dir path → {basename: (sync, sharing, perms, owner, size)}
 _dir_cache_ts: dict = {}  # dir path → monotonic timestamp of last fetch
-_dir_inflight: set = set()  # dirs with a fetch in progress
-# Basenames that Nautilus requested while a directory's fetch was still cold (so
-# they were painted empty). Only these need repainting once the fetch lands.
-# Nautilus calls update_file_info_full eagerly for every file in the directory,
-# not just the visible window. Cap per-directory entries so _invalidate_children
-# never issues more than _DIR_PENDING_MAX GObject calls on the GTK main thread.
-# Files beyond the cap still get metadata on cache-hit on the next call (instant).
-_DIR_PENDING_MAX = 200
-_dir_pending: dict = {}  # dir path → set(basename)
+_dir_inflight: set = set()  # dirs with a fetch (sync or background) in progress
 _cache_lock = threading.Lock()
 
 
@@ -241,7 +239,6 @@ def _evict_dir_cache_locked() -> None:
     for old in sorted(_dir_cache_ts, key=_dir_cache_ts.get)[:over]:
         _dir_cache.pop(old, None)
         _dir_cache_ts.pop(old, None)
-        _dir_pending.pop(old, None)
 
 
 def _parse_detaildir(resp: str) -> dict:
@@ -254,6 +251,16 @@ def _parse_detaildir(resp: str) -> dict:
             continue
         result[parts[0]] = (parts[1], parts[2], parts[3], parts[4], parts[5])
     return result
+
+
+def _fetch_detaildir(parent: str):
+    """Blocking DETAILDIR → parsed ``{basename: record}`` dict, or ``None`` on
+    error. Blocks on the socket, so on the GTK main thread it must be called at
+    most once per directory (the cold-miss path), never once per file."""
+    resp = _send_command(f"DETAILDIR {parent}")
+    if not resp or resp.startswith("error"):
+        return None
+    return _parse_detaildir(resp)
 
 
 def _invalidate_path(path: str) -> bool:
@@ -585,27 +592,41 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             parent = os.path.dirname(path)
             name = os.path.basename(path)
             ent = None
-            fresh = False
+            claim_sync = False
             with _cache_lock:
                 entry = _dir_cache.get(parent)
                 fresh = (time.monotonic() - _dir_cache_ts.get(parent, 0.0)) < _DIR_CACHE_TTL
                 if entry is not None:
                     ent = entry.get(name)
-                # A (re)fetch runs whenever the cache is not fresh. Record this
-                # file so it — and only it — gets repainted when the fetch lands.
-                if not fresh:
-                    pending = _dir_pending.setdefault(parent, set())
-                    if len(pending) < _DIR_PENDING_MAX:
-                        pending.add(name)
+                elif parent not in _dir_inflight:
+                    # Cold directory: this call warms it synchronously. Claim the
+                    # fetch so sibling calls (all on this same main thread) don't
+                    # each block on the socket.
+                    _dir_inflight.add(parent)
+                    claim_sync = True
+
+            if claim_sync:
+                # One blocking DETAILDIR warms the whole directory so this file
+                # and every sibling are served on their first pass — no
+                # paint-empty-then-invalidate-all repaint storm across N files.
+                parsed = _fetch_detaildir(parent)
+                with _cache_lock:
+                    _dir_inflight.discard(parent)
+                    if parsed is not None:
+                        _dir_cache[parent] = parsed
+                        _dir_cache_ts[parent] = time.monotonic()
+                        _evict_dir_cache_locked()
+                        ent = parsed.get(name)
+                if parsed is None:
+                    # Daemon slow/unavailable: hand off to the background path so
+                    # we neither block again on the next sibling nor lose the retry.
+                    self._ensure_dir_fetch(parent)
+            elif entry is not None and not fresh:
+                # Present but stale: serve the cached record now, refresh async.
+                self._ensure_dir_fetch(parent)
 
             if ent is not None:
                 self._apply_detail(file_info, ent)
-
-            # Warm (or refresh) the whole directory in the background on a miss
-            # or once the cache has gone stale; the fetch repaints the requested
-            # children from the populated cache.
-            if ent is None or not fresh:
-                self._ensure_dir_fetch(parent)
 
             return Nautilus.OperationResult.COMPLETE
         except Exception:
@@ -665,27 +686,29 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
             _log_error("_ensure_dir_fetch submit")
 
     def _do_dir_fetch(self, parent):
+        # Background path: used to refresh a stale directory, or as the fallback
+        # when a cold synchronous fetch could not reach the daemon. Repaints only
+        # the children whose record actually changed since the last snapshot, so
+        # a refresh never re-invalidates a whole large directory.
         try:
-            resp = _send_command(f"DETAILDIR {parent}")
-            if not resp or resp.startswith("error"):
+            with _cache_lock:
+                old = dict(_dir_cache.get(parent) or {})
+            parsed = _fetch_detaildir(parent)
+            if parsed is None:
                 return
-            parsed = _parse_detaildir(resp)
             with _cache_lock:
                 _dir_cache[parent] = parsed
                 _dir_cache_ts[parent] = time.monotonic()
                 _evict_dir_cache_locked()
-                pending = _dir_pending.pop(parent, None)
 
-            # Repaint all fetched children so that files beyond _DIR_PENDING_MAX
-            # (which were not added to pending) still receive their emblems.
-            # The cost is one GLib idle call per child on the first directory open;
-            # each call hits the now-warm cache and completes in O(1).
-            names = list(parsed.keys())
-            if not names:
+            # Changed = every child when the directory was previously empty (a
+            # degraded cold fetch), and none when a refresh finds no changes.
+            changed = [n for n, rec in parsed.items() if old.get(n) != rec]
+            if not changed:
                 return
 
-            def _invalidate_children():
-                for child_name in names:
+            def _invalidate_changed():
+                for child_name in changed:
                     try:
                         child = os.path.join(parent, child_name)
                         fi = Nautilus.FileInfo.lookup(Gio.File.new_for_path(child))
@@ -695,14 +718,12 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                         pass
                 return GLib.SOURCE_REMOVE
 
-            GLib.idle_add(_invalidate_children)
+            GLib.idle_add(_invalidate_changed)
         except Exception:
             _log_error(f"_do_dir_fetch({parent})")
         finally:
             with _cache_lock:
                 _dir_inflight.discard(parent)
-                # Drop any names a failed fetch left behind so they can't leak.
-                _dir_pending.pop(parent, None)
 
 
 # ── Menu provider ─────────────────────────────────────────────────────────────
