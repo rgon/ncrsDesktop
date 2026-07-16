@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.32](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.31...ncrs-v0.1.32) (2026-07-16)
+
+
+### Features
+
+* **fuse:** implement readdirplus to bundle entry attributes and cut per-file getattr ([1ef19a9](https://github.com/rgon/ncrsDesktop/commit/1ef19a9b166637854471cf3140f890fc799fd464))
+* **thumbnailer:** render images via Nextcloud preview API, mount-scoped to avoid full downloads ([c85f549](https://github.com/rgon/ncrsDesktop/commit/c85f549e2e4c8bbbc892b7467c8d6e7af2f92988))
+
+
+### Bug Fixes
+
+* **fuse:** raise MIME magic intercept guard to 32K to cover kernel read-ahead ([8e104c9](https://github.com/rgon/ncrsDesktop/commit/8e104c9eec916661d7f97c8420ba7a7602688639))
+
+
+### Performance Improvements
+
+* **nautilus:** resolve path via single get_uri() and read cache lock-free in the per-file hot path ([d181217](https://github.com/rgon/ncrsDesktop/commit/d181217b5f047f7a9a0bf90ffc05e4fa7595fa1b))
+* **nautilus:** skip empty file attributes and memoize perms to cut per-file GObject calls ([f389cb4](https://github.com/rgon/ncrsDesktop/commit/f389cb41cda0b57b5521ae71b161d12c20a2fac2))
+* **nautilus:** warm dir cache synchronously on cold open to kill O(N) repaint storm ([eaf3414](https://github.com/rgon/ncrsDesktop/commit/eaf34144b43a2022d92296274e23aafdebf31473))
+
 ## [0.1.31](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.30...ncrs-v0.1.31) (2026-07-15)
 
 
