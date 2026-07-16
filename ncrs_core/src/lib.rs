@@ -2081,6 +2081,8 @@ impl NextCloudFs {
 /// `readdirplus` share one implementation. `readdirplus` bundles each entry's
 /// attributes into the directory read, sparing the kernel a `lookup`+`getattr`
 /// round-trip per file; the plain reply simply ignores the supplied attribute.
+/// Entry attrs use TTL=0 so the kernel re-stats on open — dir-cache sizes can
+/// lag a concurrent upload, and a stale size cached for 30 s would truncate reads.
 enum DirReply {
     Plain(ReplyDirectory),
     Plus(ReplyDirectoryPlus),
@@ -2090,7 +2092,10 @@ impl DirReply {
     fn add(&mut self, ino: INodeNo, offset: u64, kind: FileType, name: &str, attr: &FileAttr) -> bool {
         match self {
             DirReply::Plain(r) => r.add(ino, offset, kind, name),
-            DirReply::Plus(r) => r.add(ino, offset, name, &TTL, attr, Generation(0)),
+            // TTL=0 forces the kernel to re-stat each entry after listing;
+            // dir-cache sizes can be stale (written before a concurrent upload
+            // completes) so trusting them for 30 s would cause truncated reads.
+            DirReply::Plus(r) => r.add(ino, offset, name, &Duration::ZERO, attr, Generation(0)),
         }
     }
     fn ok(self) {
