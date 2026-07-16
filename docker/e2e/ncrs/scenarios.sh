@@ -146,6 +146,53 @@ done
 [ "$lost" = 0 ] && ok "all 20 renamed files keep their content on mount" || no "$lost/20 files lost content (data loss)"
 wait_dav_sha r1.txt "${want[1]}" 60 && ok "backend batch sample intact" || no "backend batch sample lost content (data loss)"
 
+echo "→ 11. MIME magic-byte interception (content-type sniffing must not download)"
+# GLib 2.80 sniffs the content type of a file with an unknown/ambiguous
+# extension by opening it O_NOATIME and reading the first ~16 KiB. On a remote
+# mount ncrs must answer that probe with a few synthetic magic bytes instead of
+# downloading the file (see mime_magic_bytes() / MIME_DETECT_MAX_READ in
+# ncrs_core/src/lib.rs). The read size matters: the kernel's read-ahead inflates
+# GLib's 16 KiB read up to a 32 KiB FUSE read, so the intercept must fire for
+# reads up to 32768 bytes — the guard was once sz<=16384, which downloaded every
+# file >16 KiB just to answer a MIME query (~300 ms each). This scenario probes
+# with a 24576-byte O_NOATIME read (inside that regressed band) so it fails
+# deterministically if the guard is ever tightened back below the read-ahead
+# window, independent of the host's actual read-ahead behaviour.
+od_hex() { od -An -tx1 | tr -d ' \n'; }
+# 64 KiB file, unknown extension, with a distinctive printable prefix so a
+# *downloaded* read is unmistakably different from the synthetic magic bytes.
+{ printf 'NCRS-REAL-DATA--'; head -c 65520 /dev/urandom; } > /tmp/weird.bin
+WW="$(sha < /tmp/weird.bin)"
+REAL_HEX="$(head -c16 /tmp/weird.bin | od_hex)"
+cp /tmp/weird.bin "$MOUNT/weird.ncrstest"
+# Upload must complete; the file is not kept locally, so the next read re-fetches
+# from the backend unless it is intercepted.
+if wait_dav_sha weird.ncrstest "$WW" 90; then
+    ls "$MOUNT" >/dev/null 2>&1; sleep 2   # drop any local staging copy
+
+    # O_NOATIME probe in the read-ahead-inflated band: intercepted → synthetic
+    # magic bytes (≠ real content); not intercepted → real downloaded bytes.
+    SNIFF_HEX="$(dd if="$MOUNT/weird.ncrstest" iflag=noatime bs=24576 count=1 2>/dev/null | head -c16 | od_hex)"
+    if [ -n "$SNIFF_HEX" ] && [ "$SNIFF_HEX" != "$REAL_HEX" ]; then
+        ok "O_NOATIME content-type probe intercepted (no download for MIME detection)"
+    else
+        no "O_NOATIME probe returned real content — file downloaded for MIME detection (regression)"
+    fi
+
+    # A plain (no-O_NOATIME) read is a real content request and must return true
+    # bytes — the intercept must never leak into ordinary reads.
+    PLAIN_HEX="$(dd if="$MOUNT/weird.ncrstest" bs=24576 count=1 2>/dev/null | head -c16 | od_hex)"
+    [ "$PLAIN_HEX" = "$REAL_HEX" ] && ok "plain read returns real content (intercept scoped to O_NOATIME)" \
+        || no "plain read did not return real content (got ${PLAIN_HEX:-empty})"
+
+    # Copies use large buffers and no O_NOATIME; they must receive true content.
+    cp "$MOUNT/weird.ncrstest" /tmp/weird.copy
+    [ "$(sha < /tmp/weird.copy)" = "$WW" ] && ok "copy of sniffable file is byte-identical (no corruption)" \
+        || no "copy corrupted by MIME intercept (data loss)"
+else
+    no "large unknown-ext file never reached backend (setup failed)"
+fi
+
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]

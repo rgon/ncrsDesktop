@@ -11,6 +11,14 @@ Every byte written through the mount must be retrievable, unchanged, from both
 the mount **and** the backend; renames/moves must preserve content; deletes must
 propagate. Integrity is checked with `sha256`. See `ncrs/scenarios.sh`.
 
+The final scenario also guards a **performance regression**: GLib content-type
+sniffing (an `O_NOATIME` read of the first ~16 KiB) must be answered with
+synthetic magic bytes rather than downloading the whole file, while ordinary
+reads and copies still receive true content. It probes in the read-ahead
+window (a 24 KiB `O_NOATIME` read) so it fails if the intercept guard is ever
+tightened below the kernel read-ahead size. The matching live/manual check is
+`scripts/perf_test_listing.py <mounted-dir>`.
+
 ## Run locally
 
 ```sh
