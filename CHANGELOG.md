@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.34](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.33...ncrs-v0.1.34) (2026-07-16)
+
+
+### Bug Fixes
+
+* **fuse:** evict all five maps on rmdir to match unlink cleanup ([6e8d4cb](https://github.com/rgon/ncrsDesktop/commit/6e8d4cba920a3207ef0ac3206341c698ce7b1c40))
+
 ## [0.1.33](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.32...ncrs-v0.1.33) (2026-07-16)
 
 
