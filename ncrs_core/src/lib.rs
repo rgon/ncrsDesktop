@@ -3883,6 +3883,14 @@ impl Filesystem for NextCloudFs {
             }
             c.dir_cache.remove(&remote_path);
         }
+        if let Some(set) = self.children_map.safe_write().get_mut(&parent_path) {
+            set.remove(&remote_path);
+        }
+        self.details.safe_write().remove(&remote_path);
+        self.status.safe_write().remove(&remote_path);
+        self.shared.safe_write().remove(&remote_path);
+        self.fileids.safe_write().remove(&remote_path);
+
         self.dirty.safe_lock().insert(parent_path);
         reply.ok();
 
