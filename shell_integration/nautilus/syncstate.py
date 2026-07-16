@@ -31,6 +31,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
 import gi
 
@@ -183,7 +184,11 @@ def _send_command(cmd: str) -> str:
     return conn.send(cmd)
 
 
+@lru_cache(maxsize=256)
 def _human_perms(raw: str) -> str:
+    # Memoised: a directory's files share only a handful of distinct permission
+    # strings, so this turns the per-file format into a dict lookup on the
+    # update_file_info hot path.
     if not raw:
         return ""
     seen = set()
@@ -434,6 +439,17 @@ _SYNC_LABELS = {
     "unknown": "",
 }
 
+# Sync status → emblem name. "remote"/"synced"/"unknown" intentionally absent
+# (no emblem). A dict lookup replaces a per-file if/elif chain in the hot path.
+_SYNC_EMBLEMS = {
+    "kept": _EMBLEM_KEPT,
+    "cached": _EMBLEM_CACHED,
+    "local": _EMBLEM_KEPT,
+    "downloading": _EMBLEM_REMOTE,
+    "uploading": _EMBLEM_UPLOADING,
+    "partial": _EMBLEM_PARTIAL,
+}
+
 
 class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
     def __init__(self):
@@ -639,34 +655,35 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         pass
 
     def _apply_detail(self, file_info, ent):
+        # Hot path: called once per file in a directory (2000+ times for a large
+        # folder). Every GObject call crosses into C, so we make as few as
+        # possible — an unset extension attribute renders as a blank column and
+        # Nautilus clears these before each update, so skipping empty values is
+        # equivalent to setting "" but avoids the call. Most remote files have
+        # empty sharing/perms/owner and size 0, i.e. one attribute instead of five.
         sync, sharing, perms, owner, size_str = ent
         try:
-            if sync == "kept":
-                file_info.add_emblem(_EMBLEM_KEPT)
-            elif sync == "cached":
-                file_info.add_emblem(_EMBLEM_CACHED)
-            elif sync == "local":
-                file_info.add_emblem(_EMBLEM_KEPT)
-            elif sync == "downloading":
-                file_info.add_emblem(_EMBLEM_REMOTE)
-            elif sync == "uploading":
-                file_info.add_emblem(_EMBLEM_UPLOADING)
-            elif sync == "partial":
-                file_info.add_emblem(_EMBLEM_PARTIAL)
+            emblem = _SYNC_EMBLEMS.get(sync)
+            if emblem:
+                file_info.add_emblem(emblem)
             if sharing:
                 file_info.add_emblem(_EMBLEM_SHARED)
+                file_info.add_string_attribute("ncrs_sharing", sharing)
 
-            file_info.add_string_attribute("ncrs_sync", _SYNC_LABELS.get(sync, ""))
-            file_info.add_string_attribute("ncrs_sharing", sharing)
-            file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
-            file_info.add_string_attribute("ncrs_owner", owner)
-            try:
-                size_val = int(size_str)
-                file_info.add_string_attribute(
-                    "ncrs_size", _human_size(size_val) if size_val > 0 else ""
-                )
-            except ValueError:
-                file_info.add_string_attribute("ncrs_size", "")
+            label = _SYNC_LABELS.get(sync, "")
+            if label:
+                file_info.add_string_attribute("ncrs_sync", label)
+            if perms:
+                file_info.add_string_attribute("ncrs_permissions", _human_perms(perms))
+            if owner:
+                file_info.add_string_attribute("ncrs_owner", owner)
+            if size_str and size_str != "0":
+                try:
+                    size_val = int(size_str)
+                    if size_val > 0:
+                        file_info.add_string_attribute("ncrs_size", _human_size(size_val))
+                except ValueError:
+                    pass
         except Exception:
             _log_error("_apply_detail")
 
