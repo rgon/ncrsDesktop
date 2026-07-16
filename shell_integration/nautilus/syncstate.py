@@ -32,6 +32,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+from urllib.parse import unquote
 
 import gi
 
@@ -57,6 +58,11 @@ SOCKET_TIMEOUT = 2.0  # seconds
 PROTOCOL_VERSION = 2
 
 _POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="ncrs-nautilus")
+
+# Bind the InfoProvider result enums once so the per-file hot path does not
+# re-resolve the Nautilus.OperationResult attribute chain on every call.
+_COMPLETE = Nautilus.OperationResult.COMPLETE
+_FAILED = Nautilus.OperationResult.FAILED
 
 # Nextcloud oc:permissions flag letters → human labels.
 # G = readable, W = writable, C = can create, D = can delete,
@@ -592,32 +598,43 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         # update_complete_invoke — that is only for IN_PROGRESS results and
         # calling it on a synchronous return triggers Nautilus's "Unexpected
         # plugin response: handle=(nil)" and drops the completion).
+        #
+        # Hot path: runs once per file — thousands of times for a large folder —
+        # so it minimises work. A single get_uri() replaces get_uri_scheme() +
+        # get_location() + get_path() (three GObject round-trips → one), and the
+        # common warm-cache read is done without the lock: dict.get is atomic
+        # under the GIL and we keep the returned reference, so a concurrent
+        # background refresh (which rebinds _dir_cache[parent]) cannot corrupt it.
         try:
-            if not self._mount:
-                return Nautilus.OperationResult.COMPLETE
+            mount = self._mount
+            if not mount:
+                return _COMPLETE
 
-            if file_info.get_uri_scheme() != "file":
-                return Nautilus.OperationResult.COMPLETE
+            uri = file_info.get_uri()
+            if not uri or not uri.startswith("file://"):
+                return _COMPLETE
+            path = unquote(uri[7:])  # "file://" + "/abs/path"; matches get_path()
+            if not (path == mount or path.startswith(self._mount_prefix)):
+                return _COMPLETE
 
-            path = file_info.get_location().get_path()
-            if path is None or not (
-                path == self._mount or path.startswith(self._mount_prefix)
-            ):
-                return Nautilus.OperationResult.COMPLETE
+            parent, _, name = path.rpartition("/")
 
-            parent = os.path.dirname(path)
-            name = os.path.basename(path)
-            ent = None
+            # Warm hit — serve immediately, no lock.
+            entry = _dir_cache.get(parent)
+            if entry is not None:
+                ent = entry.get(name)
+                if ent is not None:
+                    self._apply_detail(file_info, ent)
+                if (time.monotonic() - _dir_cache_ts.get(parent, 0.0)) >= _DIR_CACHE_TTL:
+                    self._ensure_dir_fetch(parent)  # stale → refresh in background
+                return _COMPLETE
+
+            # Cold directory: claim a single synchronous fetch. The claim touches
+            # _dir_inflight, which pool threads also mutate, so it is guarded.
             claim_sync = False
             with _cache_lock:
                 entry = _dir_cache.get(parent)
-                fresh = (time.monotonic() - _dir_cache_ts.get(parent, 0.0)) < _DIR_CACHE_TTL
-                if entry is not None:
-                    ent = entry.get(name)
-                elif parent not in _dir_inflight:
-                    # Cold directory: this call warms it synchronously. Claim the
-                    # fetch so sibling calls (all on this same main thread) don't
-                    # each block on the socket.
+                if entry is None and parent not in _dir_inflight:
                     _dir_inflight.add(parent)
                     claim_sync = True
 
@@ -632,22 +649,25 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                         _dir_cache[parent] = parsed
                         _dir_cache_ts[parent] = time.monotonic()
                         _evict_dir_cache_locked()
-                        ent = parsed.get(name)
-                if parsed is None:
+                if parsed is not None:
+                    ent = parsed.get(name)
+                    if ent is not None:
+                        self._apply_detail(file_info, ent)
+                else:
                     # Daemon slow/unavailable: hand off to the background path so
                     # we neither block again on the next sibling nor lose the retry.
                     self._ensure_dir_fetch(parent)
-            elif entry is not None and not fresh:
-                # Present but stale: serve the cached record now, refresh async.
-                self._ensure_dir_fetch(parent)
+            elif entry is not None:
+                # Another call filled the cache between the lock-free miss and the
+                # claim; serve from it.
+                ent = entry.get(name)
+                if ent is not None:
+                    self._apply_detail(file_info, ent)
 
-            if ent is not None:
-                self._apply_detail(file_info, ent)
-
-            return Nautilus.OperationResult.COMPLETE
+            return _COMPLETE
         except Exception:
             _log_error("update_file_info_full")
-            return Nautilus.OperationResult.FAILED
+            return _FAILED
 
     def cancel_update(self, provider, handle):
         # We answer synchronously, so there is never an outstanding async

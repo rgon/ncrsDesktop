@@ -415,6 +415,12 @@ class _FakeFileInfo:
     def get_uri_scheme(self):
         return self._scheme
 
+    def get_uri(self):
+        from urllib.parse import quote
+        if self._scheme == "file":
+            return "file://" + quote(self._path)
+        return self._scheme + "://" + self._path
+
     def get_location(self):
         return types.SimpleNamespace(get_path=lambda: self._path)
 
