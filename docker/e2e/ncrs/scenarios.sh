@@ -63,6 +63,24 @@ wait_dav_gone() {
     return 1
 }
 
+# ── Server-outage simulation ─────────────────────────────────────────────────
+# Sever / restore connectivity to the WebDAV host with iptables (needs NET_ADMIN)
+# so we can verify that edits made while the server is down are saved locally,
+# stay readable from the mount, and sync once the server returns. Blocking by IP
+# with a TCP reset makes the daemon's requests fail fast (connection refused)
+# rather than hang, mirroring an unreachable server.
+DAV_HOST="$(printf '%s' "$URL" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')"
+DAV_IP="$(getent hosts "$DAV_HOST" | awk '{print $1; exit}')"
+DAV_IP="${DAV_IP:-$DAV_HOST}"
+server_down() {
+    iptables -I OUTPUT -p tcp -d "$DAV_IP" --dport 80 -j REJECT --reject-with tcp-reset
+    echo "    (server unreachable: OUTPUT→${DAV_IP}:80 rejected)"
+}
+server_up() {
+    iptables -D OUTPUT -p tcp -d "$DAV_IP" --dport 80 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+    echo "    (server reachable again)"
+}
+
 echo "→ 1. CREATE"
 C1="ncrs-e2e create $(date +%s%N)"
 printf '%s' "$C1" > "$MOUNT/create.txt"
@@ -194,6 +212,63 @@ if wait_dav_sha weird.ncrstest "$WW" 90; then
 else
     no "large unknown-ext file never reached backend (setup failed)"
 fi
+
+echo "→ 12. SERVER DOWN — new edit persists locally and syncs on recovery"
+# The whole point of the local cache: a save must succeed and stay readable even
+# when the server is unreachable, then upload itself once the server is back.
+server_down
+OC="offline-created $(date +%s%N)"
+printf '%s' "$OC" > "$MOUNT/offline.txt"
+OW="$(printf '%s' "$OC" | sha)"
+# Readable from the mount immediately, straight from local staging, while down.
+wait_fuse_sha offline.txt "$OW" 15 \
+    && ok "offline-created file readable on mount while server down" \
+    || no "offline-created file not readable while server down (data loss)"
+# Still readable after a moment (staging is durable, not a one-shot buffer).
+sleep 3
+[ "$(fuse_sha offline.txt)" = "$OW" ] \
+    && ok "offline-created file stays readable during the outage" \
+    || no "offline-created file became unreadable during the outage (data loss)"
+server_up
+wait_dav_sha offline.txt "$OW" 120 \
+    && ok "offline edit synced to backend after recovery" \
+    || no "offline edit never synced after recovery (data loss)"
+
+echo "→ 13. SERVER DOWN — overwrite reads back new content, not stale cache"
+# Create + fully sync a baseline, read it (to populate any read-cache), then
+# overwrite it while the server is down: the mount must return the NEW bytes
+# (the pending local write wins over the cached/server copy), and sync later.
+BC="baseline $(date +%s%N)"
+printf '%s' "$BC" > "$MOUNT/over.txt"
+BW="$(printf '%s' "$BC" | sha)"
+wait_dav_sha over.txt "$BW" 60 || no "baseline for overwrite never synced (setup failed)"
+cat "$MOUNT/over.txt" >/dev/null 2>&1   # populate read path / any cache
+server_down
+NC2="overwritten-offline $(date +%s%N)"
+printf '%s' "$NC2" > "$MOUNT/over.txt"
+NW2="$(printf '%s' "$NC2" | sha)"
+wait_fuse_sha over.txt "$NW2" 15 \
+    && ok "overwrite reads back new content while server down" \
+    || no "overwrite returned stale content while server down (staleness/data loss)"
+server_up
+wait_dav_sha over.txt "$NW2" 120 \
+    && ok "offline overwrite synced to backend after recovery" \
+    || no "offline overwrite never synced (data loss)"
+
+echo "→ 14. SERVER DOWN — large offline write fully readable from local staging"
+# Guards that staging serves arbitrary offsets (multi-chunk reads), not just the
+# first bytes, while the server is unreachable — then round-trips on recovery.
+server_down
+head -c 3145728 /dev/urandom > /tmp/offbig.bin   # 3 MiB
+OBW="$(sha < /tmp/offbig.bin)"
+cp /tmp/offbig.bin "$MOUNT/offbig.bin"
+wait_fuse_sha offbig.bin "$OBW" 30 \
+    && ok "large offline file fully readable from staging while server down" \
+    || no "large offline file not fully readable while server down (data loss)"
+server_up
+wait_dav_sha offbig.bin "$OBW" 150 \
+    && ok "large offline file synced after recovery" \
+    || no "large offline file never synced (data loss)"
 
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"

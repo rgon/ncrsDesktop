@@ -36,6 +36,9 @@ services:
       - /dev/fuse
     cap_add:
       - SYS_ADMIN
+      # NET_ADMIN lets the data-loss suite sever connectivity to the WebDAV host
+      # (iptables) to simulate a server outage, then restore it.
+      - NET_ADMIN
     security_opt:
       - apparmor:unconfined
 

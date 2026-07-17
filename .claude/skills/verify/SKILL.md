@@ -7,7 +7,8 @@ description: Run the ncrs FUSE daemon end-to-end via the Docker e2e data-loss su
 
 The runtime surface is `scripts/e2e.sh`: it builds the `ncrs` CLI daemon, FUSE-mounts
 a live rclone WebDAV backend inside Docker, and runs `docker/e2e/ncrs/scenarios.sh`
-(11 data-loss scenarios). Exit 0 = all scenarios passed. Needs `docker` + `/dev/fuse`.
+(14 data-loss scenarios, incl. server-outage offline-edit persistence). Exit 0 =
+all scenarios passed. Needs `docker` + `/dev/fuse`.
 
 ## Fast path (what CI does) — PREBUILT_BINARY=1
 
