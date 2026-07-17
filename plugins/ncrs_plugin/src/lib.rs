@@ -30,11 +30,27 @@ pub trait NcrsPlugin: Send + Sync {
 
 pub fn open_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
-        let monitor = w.primary_monitor().unwrap();
+        // The overlay is a transparent full-screen window; the visible card is
+        // CSS-anchored to the right edge of the viewport. So the window must
+        // cover the target monitor exactly, or the card falls off-screen.
+        //
+        // Prefer the monitor the window is on, falling back to the primary one.
+        let monitor = w
+            .current_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| w.primary_monitor().ok().flatten());
         if let Some(m) = monitor {
-            let _ = w.set_size(*m.size());
+            // Size/position in *logical* units derived from the monitor's own
+            // scale factor. Passing the monitor's physical size to set_size
+            // lets it be re-scaled by the window's (still-default 1.0) scale
+            // factor, which overshoots the screen on fractional-scaled displays
+            // (e.g. 125%/150%) and crops the right-anchored card off-screen.
+            let scale = m.scale_factor();
+            let _ = w.set_size(m.size().to_logical::<f64>(scale));
+            let _ = w.set_position(m.position().to_logical::<f64>(scale));
         } else {
-            let _ = w.set_size(tauri::PhysicalSize::new(1860u32, 1000u32));
+            let _ = w.set_size(tauri::LogicalSize::new(1860f64, 1000f64));
         }
         let _ = w.show();
         let _ = w.set_focus();
