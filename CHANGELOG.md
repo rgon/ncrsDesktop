@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.36](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.35...ncrs-v0.1.36) (2026-07-17)
+
+
+### Bug Fixes
+
+* **gui:** size overlay in logical units so fractional-scaled displays don't crop the right-anchored card ([31121af](https://github.com/rgon/ncrsDesktop/commit/31121af28fd2b097e10d099a03fa6a90f800963d))
+
 ## [0.1.35](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.34...ncrs-v0.1.35) (2026-07-17)
 
 

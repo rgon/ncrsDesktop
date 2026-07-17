@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.35" # x-release-please-version
+version = "0.1.36" # x-release-please-version
 edition = "2021"
 authors = ["Gonzalo Ruiz <gonza@logo.cl>"]
 
