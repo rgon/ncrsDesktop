@@ -109,6 +109,9 @@ pub enum FileStatus {
     Remote,
     Downloading,
     Uploading,
+    /// Written locally but not yet on the server — the upload failed or the
+    /// network is down and it is queued in the mutation journal for retry.
+    PendingSync,
     Unknown,
 }
 
@@ -121,6 +124,7 @@ impl FileStatus {
             FileStatus::Remote => "remote",
             FileStatus::Downloading => "downloading",
             FileStatus::Uploading => "uploading",
+            FileStatus::PendingSync => "pending",
             FileStatus::Unknown => "unknown",
         }
     }

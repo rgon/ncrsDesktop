@@ -441,6 +441,7 @@ _SYNC_LABELS = {
     "remote": "Remote",
     "downloading": "Downloading",
     "uploading": "Uploading",
+    "pending": "Pending sync",
     "partial": "Partial",
     "unknown": "",
 }
@@ -453,6 +454,7 @@ _SYNC_EMBLEMS = {
     "local": _EMBLEM_KEPT,
     "downloading": _EMBLEM_REMOTE,
     "uploading": _EMBLEM_UPLOADING,
+    "pending": _EMBLEM_UPLOADING,  # saved locally, queued for upload — same sync arrows
     "partial": _EMBLEM_PARTIAL,
 }
 

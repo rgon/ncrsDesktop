@@ -3465,6 +3465,11 @@ impl Filesystem for NextCloudFs {
         if !self.conn.is_offline.load(Ordering::Relaxed) {
             self.status.safe_write().insert(remote_path.clone(), FileStatus::Uploading);
             self.dirty.safe_lock().insert(remote_path.clone());
+        } else {
+            // Offline: the edit is saved locally and journaled; show it as pending
+            // sync until connectivity returns and the queued PUT is replayed.
+            self.status.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+            self.dirty.safe_lock().insert(remote_path.clone());
         }
         reply.ok();
 
@@ -3569,18 +3574,34 @@ impl Filesystem for NextCloudFs {
                     Err(ref e) => {
                         tmap.safe_lock().remove(&remote_path);
                         cache.safe_lock().uploading.remove(&remote_path);
-                        smap.safe_write().remove(&remote_path);
-                        log::error!("PUT {} failed (journaled): {}", remote_path.display(), e);
-                        let kind = match e {
-                            backend::BackendWriteError::Conflict => SyncErrorKind::UploadFailed,
-                            backend::BackendWriteError::Locked => SyncErrorKind::Locked,
-                            backend::BackendWriteError::Network(_) => SyncErrorKind::NetworkError,
-                            backend::BackendWriteError::Forbidden => SyncErrorKind::PermissionDenied,
-                            backend::BackendWriteError::QuotaExceeded => SyncErrorKind::QuotaExceeded,
-                            backend::BackendWriteError::Server(code, _) => SyncErrorKind::ServerError(*code),
-                        };
-                        push_error(&elog, remote_path.clone(), kind, e.to_string());
-                        journal.safe_lock().mark_failed(seq, e.to_string());
+                        // Keep the local edit: the staging file and journal entry stay put,
+                        // so the content survives and the mutation is retried. Surface it as
+                        // PendingSync rather than dropping the status, so the UI shows the
+                        // file is saved locally but not yet on the server.
+                        smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+                        match e {
+                            // Transient — network down/unreachable. Retry indefinitely (no
+                            // attempt-budget cost) and do not raise a user-facing error; the
+                            // PendingSync marker already conveys the state.
+                            backend::BackendWriteError::Network(_) => {
+                                log::warn!("PUT {} deferred — network unavailable, queued for retry", remote_path.display());
+                                journal.safe_lock().mark_deferred(seq, e.to_string());
+                            }
+                            // Permanent — the server refuses this write and retrying cannot
+                            // help. Flag it so the user can act; still keep the local copy.
+                            backend::BackendWriteError::Forbidden => {
+                                log::error!("PUT {} failed (no permission): {}", remote_path.display(), e);
+                                push_error(&elog, remote_path.clone(), SyncErrorKind::PermissionDenied, e.to_string());
+                                journal.safe_lock().mark_failed(seq, e.to_string());
+                            }
+                            // Other server-side failures (5xx, locked, quota, unexpected
+                            // conflict): retry a bounded number of times, after which the
+                            // journal turns it into a permanent-failure conflict itself.
+                            _ => {
+                                log::warn!("PUT {} failed (queued for retry): {}", remote_path.display(), e);
+                                journal.safe_lock().mark_failed(seq, e.to_string());
+                            }
+                        }
                         dirty.safe_lock().insert(remote_path.clone());
                     }
                 }
@@ -4350,6 +4371,9 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let backend = filesystem.conn.backend.clone();
     let notifier_slot = filesystem.notifier_slot();
     let wipe_flag = Arc::new(AtomicBool::new(false));
+    // Serializes journal replays so the startup replay and the connectivity
+    // monitor's periodic retry never run concurrently over the same queue.
+    let replay_active = Arc::new(AtomicBool::new(false));
 
     if !options.offline {
         // Replay any journal entries from a previous session
@@ -4360,10 +4384,15 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let c = filesystem.cache_ref();
             let d = filesystem.dirty_set();
             let el = filesystem.error_log();
-            thread::spawn(move || {
-                let ctx = mutation_journal::ReplayContext { backend: b };
-                mutation_journal::replay_journal(&j, &ctx, &c, &d, &el);
-            });
+            let smap = filesystem.status_map();
+            let active = replay_active.clone();
+            if !active.swap(true, Ordering::Relaxed) {
+                thread::spawn(move || {
+                    let ctx = mutation_journal::ReplayContext { backend: b, status: smap };
+                    mutation_journal::replay_journal(&j, &ctx, &c, &d, &el);
+                    active.store(false, Ordering::Relaxed);
+                });
+            }
         }
 
         // Connectivity monitor
@@ -4374,6 +4403,8 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let cache_for_monitor = filesystem.cache_ref();
             let dirty_for_monitor = filesystem.dirty_set();
             let elog_for_monitor = filesystem.error_log();
+            let status_for_monitor = filesystem.status_map();
+            let replay_active_monitor = replay_active.clone();
             let shutdown_monitor = filesystem.shutdown_flag();
             let paused_monitor = filesystem.paused_flag();
             let wipe_flag_monitor = wipe_flag.clone();
@@ -4402,16 +4433,30 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                     match backend_monitor.check_reachability(Duration::from_secs(5)) {
                         backend::ReachabilityStatus::Reachable => {
                             let was_offline = offline.swap(false, Ordering::Relaxed);
-                            if was_offline {
-                                log::info!("CONNECTIVITY restored — replaying mutation journal");
+                            // Replay whenever there is queued work — both right after
+                            // connectivity is restored AND periodically while online, so a
+                            // PendingSync entry from a failed upload is retried on its own
+                            // without needing an offline→online transition or a restart.
+                            let has_pending = !journal_for_monitor.safe_lock().is_empty();
+                            if (was_offline || has_pending)
+                                && !replay_active_monitor.swap(true, Ordering::Relaxed)
+                            {
+                                if was_offline {
+                                    log::info!("CONNECTIVITY restored — replaying mutation journal");
+                                } else {
+                                    log::info!("CONNECTIVITY: retrying pending mutations");
+                                }
                                 let j = journal_for_monitor.clone();
                                 let b = backend_monitor.clone();
                                 let c = cache_for_monitor.clone();
                                 let d = dirty_for_monitor.clone();
                                 let el = elog_for_monitor.clone();
+                                let smap = status_for_monitor.clone();
+                                let active = replay_active_monitor.clone();
                                 thread::spawn(move || {
-                                    let ctx = mutation_journal::ReplayContext { backend: b };
+                                    let ctx = mutation_journal::ReplayContext { backend: b, status: smap };
                                     mutation_journal::replay_journal(&j, &ctx, &c, &d, &el);
+                                    active.store(false, Ordering::Relaxed);
                                 });
                             }
                         }

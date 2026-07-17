@@ -256,6 +256,17 @@ impl MutationJournal {
         self.save_journal();
     }
 
+    /// Record a transient failure (network down / unreachable) without counting
+    /// it against the attempt budget. Offline editing must be able to retry
+    /// indefinitely once connectivity returns — only genuine server rejections
+    /// should ever exhaust MAX_ATTEMPTS and become a permanent failure.
+    pub fn mark_deferred(&mut self, seq: SeqId, error: String) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.seq == seq) {
+            entry.last_error = Some(error);
+        }
+        self.save_journal();
+    }
+
     pub fn remove(&mut self, seq: SeqId) {
         self.entries.retain(|e| e.seq != seq);
         self.save_journal();
@@ -387,6 +398,9 @@ impl MutationJournal {
 
 pub struct ReplayContext {
     pub backend: std::sync::Arc<dyn crate::backend::CloudBackend>,
+    /// Path → status map, so a successful replay clears the PendingSync marker
+    /// the live upload path set when it first failed.
+    pub status: crate::ipc::StatusMap,
 }
 
 pub(crate) fn replay_journal(
@@ -447,7 +461,9 @@ pub(crate) fn replay_journal(
             }
             ReplayResult::NetworkError(msg) => {
                 log::warn!("JOURNAL: replay stopped — network error: {}", msg);
-                journal.safe_lock().mark_failed(entry.seq, msg);
+                // Transient: do not count against the attempt budget so offline
+                // edits keep retrying once connectivity returns.
+                journal.safe_lock().mark_deferred(entry.seq, msg);
                 return;
             }
             ReplayResult::ServerError(msg) => {
@@ -501,7 +517,13 @@ fn execute_op(
                         dir.files = Arc::new(files);
                     }
                     drop(c);
+                    // Clear the PendingSync marker the live upload path set on failure.
+                    {
+                        use crate::RwLockExt;
+                        ctx.status.safe_write().insert(remote_path.clone(), crate::ipc::FileStatus::Synced);
+                    }
                     dirty.safe_lock().insert(parent);
+                    dirty.safe_lock().insert(remote_path.clone());
                     ReplayResult::Ok
                 }
                 Err(BackendWriteError::Conflict) => {
@@ -742,6 +764,26 @@ mod tests {
         let front = j.peek_front().unwrap();
         assert_eq!(front.attempts, 1);
         assert_eq!(front.last_error.as_deref(), Some("timeout"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_deferred_does_not_burn_attempts() {
+        // Transient network failures must not count toward MAX_ATTEMPTS, so an
+        // offline-edited file keeps retrying indefinitely until the server is back.
+        let dir = temp_dir("mark_deferred");
+        let mut j = MutationJournal::load_or_create(&dir);
+        let seq = j.enqueue(MutationOp::MkDir { path: PathBuf::from("/offline") });
+
+        for _ in 0..(MutationJournal::max_attempts() + 5) {
+            j.mark_deferred(seq, "network unavailable".into());
+        }
+
+        let front = j.peek_front().unwrap();
+        assert_eq!(front.attempts, 0, "deferred retries must not increment attempts");
+        assert_eq!(front.last_error.as_deref(), Some("network unavailable"));
+        assert_eq!(j.len(), 1, "entry must survive for later retry");
 
         let _ = fs::remove_dir_all(&dir);
     }
