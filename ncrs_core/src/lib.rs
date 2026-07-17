@@ -3440,6 +3440,19 @@ impl Filesystem for NextCloudFs {
         };
         log::info!("[{}] FLUSH {} size={} etag={:?}", self.log_user, remote_path.display(), upload_size, original_etag);
 
+        // Durability: force the staged bytes to stable storage BEFORE the PUT is
+        // recorded in the journal. The write() handler opens the staging file per
+        // call without fsync, so without this a crash or power loss could leave a
+        // journal entry pointing at a staging file whose contents never reached
+        // disk — the local edit would be silently lost on recovery. fsync failure
+        // is non-fatal: the save still succeeds, we just log that durability could
+        // not be guaranteed.
+        if let Ok(f) = std::fs::File::open(&write_path) {
+            if let Err(e) = f.sync_all() {
+                log::warn!("flush: fsync staging {} failed: {}", write_path.display(), e);
+            }
+        }
+
         // Update dir_cache size synchronously so getattr returns the correct size
         // before the background PUT thread has a chance to run.
         {

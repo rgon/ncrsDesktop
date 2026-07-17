@@ -86,6 +86,30 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Atomically and durably replace `path` with `data`: write a temp file, fsync
+/// its contents, rename it into place, then fsync the containing directory so
+/// the rename itself survives a crash/power-loss. Without the fsyncs the journal
+/// could be lost or truncated on power-loss even though the app's save returned
+/// success — which would strand the staged bytes with no record to replay them.
+fn write_atomic_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        // Directory fsync makes the rename durable. Best-effort: not all
+        // filesystems require or support it, so a failure here is not fatal.
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 impl MutationOp {
     #[allow(dead_code)]
     pub fn path(&self) -> &Path {
@@ -373,9 +397,8 @@ impl MutationJournal {
         let list: Vec<&JournalEntry> = self.entries.iter().collect();
         match serde_json::to_vec(&list) {
             Ok(data) => {
-                let tmp = self.journal_path.with_extension("tmp");
-                if std::fs::write(&tmp, &data).is_ok() {
-                    let _ = std::fs::rename(&tmp, &self.journal_path);
+                if let Err(e) = write_atomic_durable(&self.journal_path, &data) {
+                    log::error!("JOURNAL: durable write failed: {}", e);
                 }
             }
             Err(e) => log::error!("JOURNAL: serialize failed: {}", e),
@@ -385,9 +408,8 @@ impl MutationJournal {
     fn save_conflicts(&self) {
         match serde_json::to_vec(&self.conflicts) {
             Ok(data) => {
-                let tmp = self.conflicts_path.with_extension("tmp");
-                if std::fs::write(&tmp, &data).is_ok() {
-                    let _ = std::fs::rename(&tmp, &self.conflicts_path);
+                if let Err(e) = write_atomic_durable(&self.conflicts_path, &data) {
+                    log::error!("JOURNAL: conflicts durable write failed: {}", e);
                 }
             }
             Err(e) => log::error!("JOURNAL: conflicts serialize failed: {}", e),
@@ -681,6 +703,23 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::create_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn write_atomic_durable_roundtrips_and_replaces() {
+        let dir = temp_dir("atomic_durable");
+        let target = dir.join("state.json");
+
+        write_atomic_durable(&target, b"first").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+        // No stray temp file left behind after the rename.
+        assert!(!target.with_extension("tmp").exists());
+
+        // Overwrite is atomic and durable.
+        write_atomic_durable(&target, b"second-longer").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second-longer");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
