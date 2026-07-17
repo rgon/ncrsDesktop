@@ -4102,19 +4102,27 @@ impl Filesystem for NextCloudFs {
             thread::spawn(move || {
                 // If the source was just created via create() + flush(), the PUT runs
                 // asynchronously and the file may not yet exist on the server when this
-                // MOVE fires.  Wait until the uploading guard is cleared before sending
-                // the MOVE, so the server has the file content in place first.
-                let waiting = cache.safe_lock().uploading.contains(&from);
-                if waiting {
-                    log::info!("MOVE {} → {}: waiting for in-flight PUT to complete", from.display(), to.display());
+                // MOVE fires.  Wait until BOTH the in-flight upload guard is cleared AND
+                // no Put for the source is still queued in the journal before sending the
+                // MOVE, so the server has the file content in place first.  The `uploading`
+                // guard only covers PUTs started by the online flush path; offline-created
+                // files (or ones behind a backlog) sit in the journal with no guard, so the
+                // journal check is what stops the MOVE from racing ahead of a queued PUT and
+                // getting a 404 for a source that was never uploaded yet.
+                let source_pending = || {
+                    cache.safe_lock().uploading.contains(&from)
+                        || journal.safe_lock().has_pending_put(&from)
+                };
+                if source_pending() {
+                    log::info!("MOVE {} → {}: waiting for source PUT to complete", from.display(), to.display());
                 }
                 let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 loop {
-                    if !cache.safe_lock().uploading.contains(&from) {
+                    if !source_pending() {
                         break;
                     }
                     if std::time::Instant::now() >= deadline {
-                        log::warn!("MOVE {} → {}: timed out waiting for in-flight PUT", from.display(), to.display());
+                        log::warn!("MOVE {} → {}: timed out waiting for source PUT", from.display(), to.display());
                         break;
                     }
                     thread::sleep(Duration::from_millis(50));
@@ -4125,6 +4133,18 @@ impl Filesystem for NextCloudFs {
                     Ok(()) => {
                         log::info!("MOVE {} → {}", from.display(), to.display());
                         journal.safe_lock().remove(seq);
+                    }
+                    Err(backend::BackendWriteError::Server(404, _)) => {
+                        // Source is gone on the server. Reconcile the same way the journal
+                        // replay does (MoveSourceGone) instead of surfacing a misleading
+                        // "rename failed" error and leaving the entry to retry forever.
+                        log::warn!("MOVE {} → {}: source gone on server (404) — recording move conflict", from.display(), to.display());
+                        let mut j = journal.safe_lock();
+                        j.add_conflict(mutation_journal::ConflictKind::MoveSourceGone {
+                            from: from.clone(),
+                            to: to.clone(),
+                        });
+                        j.remove(seq);
                     }
                     Err(e) => {
                         log::error!("MOVE {} → {} failed (journaled): {}", from.display(), to.display(), e);

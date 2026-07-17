@@ -222,6 +222,14 @@ impl MutationJournal {
         self.entries.front()
     }
 
+    /// True while a Put for `path` is still queued (not yet uploaded/removed).
+    /// Used to hold back a live MOVE until the source exists on the server.
+    pub fn has_pending_put(&self, path: &Path) -> bool {
+        self.entries.iter().any(|e| {
+            matches!(&e.op, MutationOp::Put { remote_path, .. } if remote_path == path)
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
