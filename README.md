@@ -17,6 +17,7 @@ Performs as good in an actual business than in a recently created personal cloud
 | Maps nextcloud permissions to filesystem permissions      | ❌                | ❌ (will error, but doesn't first display it to the user)                    | ✅   |
 | HPB Support/Speed         | ✅ NC HPB | ❌ | ✅ NC HPB |
 | QUIC/HTTP3 Support         | ❌ | ❌ | ✅ |
+| Syncing folders in different OS paths to similar folders within Nextcloud     | ✅ | ❌ | ❌ |
 
 
 ## Server tips
