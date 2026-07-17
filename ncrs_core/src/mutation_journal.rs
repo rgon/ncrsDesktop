@@ -324,6 +324,49 @@ impl MutationJournal {
         self.conflicts = conflicts;
     }
 
+    // ── Recovery ─────────────────────────────────────────────
+
+    /// Move a failed upload's staged bytes out of the volatile write-staging area
+    /// into a durable `unsynced/` recovery folder, so a permanent failure never
+    /// silently destroys the user's local edit. Returns the recovery path on
+    /// success. Named after the remote file (not the opaque `write_N` staging
+    /// name) so the user can recognise it; collisions get the staging name as a
+    /// disambiguating suffix.
+    fn recover_staging(&self, staging_path: &Path, remote_path: &Path) -> Option<PathBuf> {
+        let cache_dir = self.journal_path.parent()?;
+        let recovery_dir = cache_dir.join("unsynced");
+        if std::fs::create_dir_all(&recovery_dir).is_err() {
+            return None;
+        }
+        let base = remote_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "recovered".to_string());
+        let mut dest = recovery_dir.join(&base);
+        if dest.exists() {
+            if let Some(uniq) = staging_path.file_name().and_then(|n| n.to_str()) {
+                dest = recovery_dir.join(format!("{}.{}", base, uniq));
+            }
+        }
+        // rename is atomic on the same filesystem; fall back to copy+remove across
+        // filesystems (cache dir and staging are normally colocated, so rare).
+        if std::fs::rename(staging_path, &dest).is_ok() {
+            log::warn!("JOURNAL: preserved unsynced local copy at {}", dest.display());
+            return Some(dest);
+        }
+        match std::fs::copy(staging_path, &dest) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(staging_path);
+                log::warn!("JOURNAL: preserved unsynced local copy at {}", dest.display());
+                Some(dest)
+            }
+            Err(e) => {
+                log::error!("JOURNAL: failed to preserve staging {}: {}", staging_path.display(), e);
+                None
+            }
+        }
+    }
+
     // ── Persistence ──────────────────────────────────────────
 
     fn save_journal(&self) {
@@ -426,11 +469,19 @@ pub(crate) fn replay_journal(
 
         if entry.attempts >= MutationJournal::max_attempts() {
             log::warn!("JOURNAL: entry seq={} exceeded max attempts, marking permanent failure", entry.seq);
-            if let MutationOp::Put { staging_path, .. } = &entry.op {
-                let _ = std::fs::remove_file(staging_path);
-            }
+            // Preserve the local bytes instead of deleting them — a permanent
+            // failure must never silently destroy the user's edit.
+            let recovered = if let MutationOp::Put { staging_path, remote_path, .. } = &entry.op {
+                journal.safe_lock().recover_staging(staging_path, remote_path)
+            } else {
+                None
+            };
             let mut j = journal.safe_lock();
-            let desc = format!("{:?}: {}", entry.op, entry.last_error.as_deref().unwrap_or("unknown"));
+            let last_err = entry.last_error.as_deref().unwrap_or("unknown");
+            let desc = match recovered {
+                Some(p) => format!("{:?}: {} — local copy preserved at {}", entry.op, last_err, p.display()),
+                None => format!("{:?}: {}", entry.op, last_err),
+            };
             j.add_conflict(ConflictKind::PermanentFailure { description: desc });
             j.dequeue_front();
             continue;
@@ -445,12 +496,21 @@ pub(crate) fn replay_journal(
                 }
             }
             ReplayResult::Conflict(kind) => {
+                // Only discard the staged bytes when they are known safe on the
+                // server. An EditConflict has already uploaded a conflicted copy,
+                // so the local staging is redundant. Any other conflict (e.g. the
+                // destination/parent is gone) means the bytes exist ONLY locally —
+                // preserve them so the user can recover.
+                if let MutationOp::Put { staging_path, remote_path, .. } = &entry.op {
+                    if matches!(kind, ConflictKind::EditConflict { .. }) {
+                        let _ = std::fs::remove_file(staging_path);
+                    } else {
+                        journal.safe_lock().recover_staging(staging_path, remote_path);
+                    }
+                }
                 let mut j = journal.safe_lock();
                 j.add_conflict(kind);
                 j.dequeue_front();
-                if let MutationOp::Put { staging_path, .. } = &entry.op {
-                    let _ = std::fs::remove_file(staging_path);
-                }
             }
             ReplayResult::Idempotent => {
                 let mut j = journal.safe_lock();
@@ -459,10 +519,11 @@ pub(crate) fn replay_journal(
                     let _ = std::fs::remove_file(staging_path);
                 }
             }
-            ReplayResult::NetworkError(msg) => {
-                log::warn!("JOURNAL: replay stopped — network error: {}", msg);
-                // Transient: do not count against the attempt budget so offline
-                // edits keep retrying once connectivity returns.
+            ReplayResult::Retryable(msg) => {
+                log::warn!("JOURNAL: replay stopped — retryable failure: {}", msg);
+                // Transient (network down, server 5xx/timeout, locked): do not count
+                // against the attempt budget and stop the run — the connectivity
+                // monitor replays again later, once the server is back.
                 journal.safe_lock().mark_deferred(entry.seq, msg);
                 return;
             }
@@ -477,7 +538,9 @@ enum ReplayResult {
     Ok,
     Conflict(ConflictKind),
     Idempotent,
-    NetworkError(String),
+    /// Transient failure — retry later without counting against the attempt budget.
+    Retryable(String),
+    /// Permanent server rejection — counts toward MAX_ATTEMPTS.
     ServerError(String),
 }
 
@@ -536,7 +599,7 @@ fn execute_op(
                         conflicted_copy_path: conflict_name,
                     })
                 }
-                Err(BackendWriteError::Network(e)) => ReplayResult::NetworkError(e),
+                Err(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
                 Err(BackendWriteError::Server(404, _)) => {
                     ReplayResult::Conflict(ConflictKind::PermanentFailure {
                         description: format!("PUT {} failed: parent directory not found", remote_path.display()),
@@ -551,7 +614,7 @@ fn execute_op(
                     log::info!("JOURNAL replay: MKCOL {}", path.display());
                     ReplayResult::Ok
                 }
-                Err(BackendWriteError::Network(e)) => ReplayResult::NetworkError(e),
+                Err(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
@@ -565,7 +628,7 @@ fn execute_op(
                     log::info!("JOURNAL replay: DELETE {} — already gone (idempotent)", path.display());
                     ReplayResult::Idempotent
                 }
-                Err(BackendWriteError::Network(e)) => ReplayResult::NetworkError(e),
+                Err(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
@@ -579,7 +642,7 @@ fn execute_op(
                     log::info!("JOURNAL replay: RMDIR {} — already gone (idempotent)", path.display());
                     ReplayResult::Idempotent
                 }
-                Err(BackendWriteError::Network(e)) => ReplayResult::NetworkError(e),
+                Err(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
@@ -601,7 +664,7 @@ fn execute_op(
                         to: to.clone(),
                     })
                 }
-                Err(BackendWriteError::Network(e)) => ReplayResult::NetworkError(e),
+                Err(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }

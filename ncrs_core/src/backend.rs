@@ -52,6 +52,27 @@ pub enum BackendWriteError {
     Server(u16, String),
 }
 
+impl BackendWriteError {
+    /// True when the failure is temporary and the same request can be expected to
+    /// succeed later without user intervention — the server is down/overloaded,
+    /// timed out, throttling, or the resource is briefly locked. Such failures
+    /// must NOT count against the mutation journal's attempt budget, otherwise a
+    /// server outage would exhaust the retries and the queued local edit (its
+    /// staging file) would be discarded — data loss for a file that was fine.
+    ///
+    /// Permanent failures (Forbidden, quota, malformed request) return false so
+    /// they surface to the user and eventually give up rather than retry forever.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Network(_) | Self::Locked => true,
+            // 5xx = server-side outage/error; 408 request timeout; 429 too many
+            // requests. All resolve on their own once the server recovers.
+            Self::Server(code, _) => *code >= 500 || *code == 408 || *code == 429,
+            Self::Conflict | Self::Forbidden | Self::QuotaExceeded => false,
+        }
+    }
+}
+
 impl std::fmt::Display for BackendWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -322,5 +343,34 @@ impl From<crate::webdav_ops::WriteError> for BackendWriteError {
 impl From<crate::webdav_ops::PutResult> for PutResult {
     fn from(r: crate::webdav_ops::PutResult) -> Self {
         PutResult { new_change_token: r.new_etag }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendWriteError;
+
+    #[test]
+    fn transient_errors_do_not_burn_attempt_budget() {
+        // Server-down / overloaded / throttled / locked: retry indefinitely.
+        assert!(BackendWriteError::Network("reset".into()).is_transient());
+        assert!(BackendWriteError::Locked.is_transient());
+        assert!(BackendWriteError::Server(500, String::new()).is_transient());
+        assert!(BackendWriteError::Server(502, String::new()).is_transient());
+        assert!(BackendWriteError::Server(503, String::new()).is_transient());
+        assert!(BackendWriteError::Server(504, String::new()).is_transient());
+        assert!(BackendWriteError::Server(408, String::new()).is_transient());
+        assert!(BackendWriteError::Server(429, String::new()).is_transient());
+    }
+
+    #[test]
+    fn permanent_errors_are_not_transient() {
+        // These would keep failing forever; they must surface and eventually give up.
+        assert!(!BackendWriteError::Forbidden.is_transient());
+        assert!(!BackendWriteError::QuotaExceeded.is_transient());
+        assert!(!BackendWriteError::Conflict.is_transient());
+        assert!(!BackendWriteError::Server(400, String::new()).is_transient());
+        assert!(!BackendWriteError::Server(404, String::new()).is_transient());
+        assert!(!BackendWriteError::Server(405, String::new()).is_transient());
     }
 }

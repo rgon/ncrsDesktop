@@ -3579,28 +3579,27 @@ impl Filesystem for NextCloudFs {
                         // PendingSync rather than dropping the status, so the UI shows the
                         // file is saved locally but not yet on the server.
                         smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
-                        match e {
-                            // Transient — network down/unreachable. Retry indefinitely (no
-                            // attempt-budget cost) and do not raise a user-facing error; the
-                            // PendingSync marker already conveys the state.
-                            backend::BackendWriteError::Network(_) => {
-                                log::warn!("PUT {} deferred — network unavailable, queued for retry", remote_path.display());
-                                journal.safe_lock().mark_deferred(seq, e.to_string());
-                            }
-                            // Permanent — the server refuses this write and retrying cannot
-                            // help. Flag it so the user can act; still keep the local copy.
-                            backend::BackendWriteError::Forbidden => {
-                                log::error!("PUT {} failed (no permission): {}", remote_path.display(), e);
-                                push_error(&elog, remote_path.clone(), SyncErrorKind::PermissionDenied, e.to_string());
-                                journal.safe_lock().mark_failed(seq, e.to_string());
-                            }
-                            // Other server-side failures (5xx, locked, quota, unexpected
-                            // conflict): retry a bounded number of times, after which the
-                            // journal turns it into a permanent-failure conflict itself.
-                            _ => {
-                                log::warn!("PUT {} failed (queued for retry): {}", remote_path.display(), e);
-                                journal.safe_lock().mark_failed(seq, e.to_string());
-                            }
+                        if e.is_transient() {
+                            // Server down/overloaded/timed out or resource locked. Retry
+                            // indefinitely (no attempt-budget cost) with no user-facing
+                            // error — the PendingSync marker already conveys the state, and
+                            // the local edit stays safely staged until the server is back.
+                            log::warn!("PUT {} deferred — {} (queued for retry)", remote_path.display(), e);
+                            journal.safe_lock().mark_deferred(seq, e.to_string());
+                        } else {
+                            // Permanent — the server refuses this write (permission, quota,
+                            // malformed) and retrying cannot help. Flag it so the user can
+                            // act; still keep the local copy staged and let the journal's
+                            // attempt budget decide when to give up.
+                            let kind = match e {
+                                backend::BackendWriteError::Forbidden => SyncErrorKind::PermissionDenied,
+                                backend::BackendWriteError::QuotaExceeded => SyncErrorKind::QuotaExceeded,
+                                backend::BackendWriteError::Server(code, _) => SyncErrorKind::ServerError(*code),
+                                _ => SyncErrorKind::UploadFailed,
+                            };
+                            log::error!("PUT {} failed permanently: {}", remote_path.display(), e);
+                            push_error(&elog, remote_path.clone(), kind, e.to_string());
+                            journal.safe_lock().mark_failed(seq, e.to_string());
                         }
                         dirty.safe_lock().insert(remote_path.clone());
                     }
