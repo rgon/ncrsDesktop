@@ -2996,6 +2996,30 @@ impl Filesystem for NextCloudFs {
             }
         }
 
+        // Serve locally-written-but-not-yet-uploaded content from the pending PUT's
+        // staging file. After a save (plain create-close-reopen, or an app's atomic
+        // write-temp-then-rename dance like LibreOffice), the new bytes live only in
+        // the journal's staging file until the upload lands on the server — the staging
+        // copy is deleted the moment the PUT succeeds. Without this, an immediate read
+        // of the freshly-saved path finds nothing in file_cache and streams from a
+        // server that does not have the content yet, returning EIO until the PUT (and
+        // any queued MOVE) drains. A rename rewrites the queued Put's remote_path to the
+        // destination (see MutationJournal::enqueue), so this also covers reopens of the
+        // renamed-to path.
+        {
+            let staging = self.journal.safe_lock().pending_put_staging(&path);
+            if let Some(sp) = staging {
+                if let Ok(f) = std::fs::File::open(&sp) {
+                    let mut buf = vec![0u8; sz];
+                    if let Ok(n) = f.read_at(&mut buf, off) {
+                        buf.truncate(n);
+                        reply.data(&buf);
+                        return;
+                    }
+                }
+            }
+        }
+
         // Network fetch — only this path needs a thread.
         let open_files = self.open_files.clone();
         let conn = self.conn.clone();

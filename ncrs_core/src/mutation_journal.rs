@@ -225,8 +225,18 @@ impl MutationJournal {
     /// True while a Put for `path` is still queued (not yet uploaded/removed).
     /// Used to hold back a live MOVE until the source exists on the server.
     pub fn has_pending_put(&self, path: &Path) -> bool {
-        self.entries.iter().any(|e| {
-            matches!(&e.op, MutationOp::Put { remote_path, .. } if remote_path == path)
+        self.pending_put_staging(path).is_some()
+    }
+
+    /// Staging file backing a still-queued Put for `path`, if any. Reads of a
+    /// locally-written-but-not-yet-uploaded file can be served from here instead
+    /// of streaming from a server that does not have the content yet.
+    pub fn pending_put_staging(&self, path: &Path) -> Option<PathBuf> {
+        self.entries.iter().rev().find_map(|e| match &e.op {
+            MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
+                Some(staging_path.clone())
+            }
+            _ => None,
         })
     }
 
@@ -689,6 +699,35 @@ mod tests {
         } else {
             panic!("expected Put");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_put_staging_follows_rename() {
+        // Mirrors the LibreOffice save: write temp file (Put), then rename temp onto
+        // the final name. enqueue() rewrites the queued Put's remote_path to the
+        // destination, so a read of the destination resolves to the temp's staging.
+        let dir = temp_dir("pending_put_staging");
+        let staging = dir.join("staging_lo");
+        fs::write(&staging, b"odf-bytes").unwrap();
+
+        let mut j = MutationJournal::load_or_create(&dir);
+        j.enqueue(MutationOp::Put {
+            remote_path: PathBuf::from("/docs/lu123.tmp"),
+            staging_path: staging.clone(),
+            if_match_etag: None,
+        });
+        assert_eq!(j.pending_put_staging(&PathBuf::from("/docs/lu123.tmp")), Some(staging.clone()));
+
+        j.enqueue(MutationOp::Rename {
+            from: PathBuf::from("/docs/lu123.tmp"),
+            to: PathBuf::from("/docs/report.odt"),
+        });
+        // Old path no longer resolves; destination now serves the staging bytes.
+        assert!(j.pending_put_staging(&PathBuf::from("/docs/lu123.tmp")).is_none());
+        assert_eq!(j.pending_put_staging(&PathBuf::from("/docs/report.odt")), Some(staging));
+        assert!(j.has_pending_put(&PathBuf::from("/docs/report.odt")));
 
         let _ = fs::remove_dir_all(&dir);
     }
