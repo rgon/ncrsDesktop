@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.37](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.36...ncrs-v0.1.37) (2026-07-17)
+
+
+### Features
+
+* **sync:** keep local edits on upload failure, mark pending-sync in UI, and retry queued mutations while online ([8dcfa54](https://github.com/rgon/ncrsDesktop/commit/8dcfa549920d075ebca20071ba9a4cbca41f1637))
+
+
+### Bug Fixes
+
+* **fuse:** prioritize pending-PUT staging over cached copies so reads return the newest local write ([953ce66](https://github.com/rgon/ncrsDesktop/commit/953ce66f4892053d7b7d93e93d33347ae86c3a34))
+* **fuse:** serve reads of not-yet-uploaded files from pending PUT staging to avoid EIO on save-then-reopen ([f9edd74](https://github.com/rgon/ncrsDesktop/commit/f9edd74851e845580610cb57c53efc9c31c0cdcc))
+* **sync:** fsync staged bytes before journaling and make journal writes crash-durable ([9b6a533](https://github.com/rgon/ncrsDesktop/commit/9b6a533ef6228a0565da9ade1e0f1f76ba6cd4f8))
+* **sync:** hold live MOVE until source PUT drains and treat rename 404 as move-source-gone conflict ([caaf4ba](https://github.com/rgon/ncrsDesktop/commit/caaf4ba4ffb6ed3b7dabfd3e3f490750fe91cade))
+* **sync:** never discard local edits on server outage — treat 5xx/timeout/locked as retryable and preserve staged bytes on permanent failure ([8ee1fa1](https://github.com/rgon/ncrsDesktop/commit/8ee1fa1276b89db07b675300a3f22f364e9969f2))
+
 ## [0.1.36](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.35...ncrs-v0.1.36) (2026-07-17)
 
 
