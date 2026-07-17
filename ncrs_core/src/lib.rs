@@ -2780,6 +2780,17 @@ impl Filesystem for NextCloudFs {
             None
         };
 
+        // A MIME-detect handle answers GLib's probe with a few synthetic magic
+        // bytes — far fewer than the (read-ahead-inflated) size the kernel asked
+        // for. A buffered short read at offset 0 is recorded by the kernel as an
+        // EOF for that page, poisoning the inode's page cache: every later
+        // *buffered* read of the same file then returns only those few bytes,
+        // truncating real content (a data-loss bug, since GLib sniffs a file the
+        // user is about to open). FOPEN_DIRECT_IO keeps this handle's reads out
+        // of the page cache entirely, so the short reply cannot poison it — and
+        // as a bonus the kernel stops inflating the probe read via read-ahead, so
+        // it always arrives within the MIME_DETECT_MAX_READ guard at its true size.
+        let mime_detect = mime_detect_ct.is_some();
         self.open_files.safe_lock().insert(
             fh,
             OpenFile {
@@ -2792,7 +2803,12 @@ impl Filesystem for NextCloudFs {
                 mime_detect_ct,
             },
         );
-        reply.opened(FileHandle(fh), FopenFlags::empty());
+        let fopen_flags = if mime_detect {
+            FopenFlags::FOPEN_DIRECT_IO
+        } else {
+            FopenFlags::empty()
+        };
+        reply.opened(FileHandle(fh), fopen_flags);
     }
 
     fn read(
