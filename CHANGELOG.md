@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.35](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.34...ncrs-v0.1.35) (2026-07-17)
+
+
+### Bug Fixes
+
+* **ci:** gate release-please on e2e and run e2e on release PRs so a red suite blocks releases ([690abac](https://github.com/rgon/ncrsDesktop/commit/690abac38d4bdfd04d6dba6bcb7e606a7a4ffda1))
+* **fuse:** open MIME-detect handle O_DIRECT to stop page-cache poisoning truncating reads ([3acaf55](https://github.com/rgon/ncrsDesktop/commit/3acaf5546703d7d8fc8d03c29d945528d6e3d891))
+
 ## [0.1.34](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.33...ncrs-v0.1.34) (2026-07-16)
 
 
