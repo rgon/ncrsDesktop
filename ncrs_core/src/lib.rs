@@ -3906,6 +3906,14 @@ impl Filesystem for NextCloudFs {
                         log::debug!("DELETE {} — already gone (idempotent)", remote_path.display());
                         journal.safe_lock().remove(seq);
                     }
+                    Err(e) if e.is_transient() => {
+                        // Server briefly down/overloaded or the resource is locked (423).
+                        // Keep the Unlink journaled and let the connectivity monitor's
+                        // replay retry it — no user-facing error, since nothing is wrong
+                        // with the delete itself. Matches the PUT path and journal replay.
+                        log::warn!("DELETE {} deferred — {} (queued for retry)", remote_path.display(), e);
+                        journal.safe_lock().mark_deferred(seq, e.to_string());
+                    }
                     Err(e) => {
                         log::error!("DELETE {} failed (journaled): {}", remote_path.display(), e);
                         push_error(&elog, remote_path, SyncErrorKind::ServerError(0), format!("delete failed: {}", e));
