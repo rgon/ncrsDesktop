@@ -418,14 +418,33 @@ fn refresh_one_dir(
             let mut c = cache.safe_lock();
             let parent_ino = c.get_inode(&dir_path).unwrap_or(1);
 
-            let mut cache_moved = false;
+            let mut file_cache_changed = false;
             for (old_path, new_path, is_dir) in &diff.renames {
                 if !is_dir {
                     if let Some(entry) = c.file_cache.remove(old_path) {
                         c.file_cache.insert(new_path.clone(), entry);
-                        cache_moved = true;
+                        file_cache_changed = true;
                         log::info!("file_cache: moved {} → {}", old_path.display(), new_path.display());
                     }
+                }
+            }
+
+            // A file whose content changed on the server (new etag → flagged
+            // `modified`) makes our locally cached copy stale. Evict it — both the
+            // map entry and the on-disk file — so the next read re-downloads via
+            // ensure_file_cached instead of the read fast-path serving the old bytes
+            // at the NEW (dir-cache) size. That size/content mismatch is what makes a
+            // ZIP-based format (odt/xlsx/…) opened right after a server-side edit look
+            // corrupt. Renames are handled above; only genuine content changes land here.
+            for p in &diff.modified {
+                if let Some(entry) = c.file_cache.remove(p) {
+                    match std::fs::remove_file(&entry.local_path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => log::warn!("file_cache: failed to remove stale {}: {}", entry.local_path.display(), e),
+                    }
+                    file_cache_changed = true;
+                    log::info!("file_cache: evicted stale {} (modified on server)", p.display());
                 }
             }
 
@@ -497,7 +516,7 @@ fn refresh_one_dir(
                 }
             }
 
-            if cache_moved {
+            if file_cache_changed {
                 crate::save_file_cache(&cache);
             }
 
