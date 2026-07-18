@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.38](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.37...ncrs-v0.1.38) (2026-07-18)
+
+
+### Bug Fixes
+
+* **sync:** drain in-flight PUT before live DELETE so lock-file create-then-delete doesn't hit 423 Locked ([53f9fd1](https://github.com/rgon/ncrsDesktop/commit/53f9fd1674141942a1ff638234325e93492c7754))
+* **sync:** treat live-DELETE 423/5xx as retryable so lock-file deletes don't surface 'resource locked' ([71f365e](https://github.com/rgon/ncrsDesktop/commit/71f365e0a884a7d95f0f78479fbaac4e86f885d1))
+
 ## [0.1.37](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.36...ncrs-v0.1.37) (2026-07-17)
 
 
