@@ -763,6 +763,28 @@ impl FsCache {
         self.find_entry(path).and_then(|e| e.change_token.clone())
     }
 
+    /// True when the locally cached copy of `path` still matches the server
+    /// version recorded in the directory cache, so a read may be served from it.
+    /// Prefer the change_token (etag) — it changes on every server-side edit
+    /// (e.g. a Nextcloud Office save); fall back to the remote mtime when either
+    /// side lacks a token. When neither a token nor an mtime is available on both
+    /// sides (offline, or a server without etags) assume fresh, so this never
+    /// breaks offline reads. Serving a stale copy at the dir-cache's newer size is
+    /// what makes a just-edited odt/xlsx look corrupt, so the read fast-paths gate
+    /// on this before returning local bytes.
+    fn file_cache_matches_remote(&self, path: &Path) -> bool {
+        match self.file_cache.get(path) {
+            None => false,
+            Some(fc) => match (fc.etag.as_deref(), self.remote_etag_for(path).as_deref()) {
+                (Some(cached), Some(current)) => cached == current,
+                _ => match (fc.remote_modified, self.remote_modified_for(path)) {
+                    (Some(cached), Some(current)) => cached == current,
+                    _ => true,
+                },
+            },
+        }
+    }
+
     fn find_entry(&self, path: &Path) -> Option<&RemoteEntry> {
         let parent = path.parent().unwrap_or(Path::new("/"));
         let name = path.file_name()?.to_str()?;
@@ -2887,13 +2909,20 @@ impl Filesystem for NextCloudFs {
                         return;
                     }
                 }
+                // Only serve the cached local copy if it still matches the server
+                // version — otherwise a file edited server-side (e.g. in Nextcloud
+                // Office) would be served at the stale content but the NEW getattr
+                // size, which reads back as a corrupt archive. When stale, fall
+                // through to the network fetch below, which re-downloads.
                 if let Some(ref local) = of.local {
-                    if let Ok(f) = std::fs::File::open(local) {
-                        let mut buf = vec![0u8; sz];
-                        if let Ok(n) = f.read_at(&mut buf, off) {
-                            buf.truncate(n);
-                            reply.data(&buf);
-                            return;
+                    if self.cache.safe_lock().file_cache_matches_remote(&path) {
+                        if let Ok(f) = std::fs::File::open(local) {
+                            let mut buf = vec![0u8; sz];
+                            if let Ok(n) = f.read_at(&mut buf, off) {
+                                buf.truncate(n);
+                                reply.data(&buf);
+                                return;
+                            }
                         }
                     }
                 }
@@ -3002,11 +3031,19 @@ impl Filesystem for NextCloudFs {
             }
         }
 
-        // Check file_cache synchronously too.
+        // Check file_cache synchronously too — but only when the cached copy still
+        // matches the server version. A file edited server-side (Nextcloud Office,
+        // another client) leaves this entry stale; serving it at the refreshed
+        // getattr size makes a ZIP-based format (odt/xlsx/…) look corrupt. When
+        // stale, skip it and fall through to the re-downloading network fetch.
         {
-            let cached_local = self.cache.safe_lock().file_cache.get(&path)
-                .filter(|fc| fc.local_path.metadata().map_or(false, |m| m.len() > 0))
-                .map(|fc| fc.local_path.clone());
+            let cached_local = {
+                let c = self.cache.safe_lock();
+                c.file_cache.get(&path)
+                    .filter(|_| c.file_cache_matches_remote(&path))
+                    .filter(|fc| fc.local_path.metadata().map_or(false, |m| m.len() > 0))
+                    .map(|fc| fc.local_path.clone())
+            };
             if let Some(ref local) = cached_local {
                 if let Ok(f) = std::fs::File::open(local) {
                     let mut buf = vec![0u8; sz];
