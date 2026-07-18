@@ -270,6 +270,29 @@ wait_dav_sha offbig.bin "$OBW" 150 \
     && ok "large offline file synced after recovery" \
     || no "large offline file never synced (data loss)"
 
+echo "→ 15. LOCK-FILE create-then-delete race (LibreOffice .~lock…# pattern)"
+# LibreOffice creates a lock file when opening a document and deletes it a moment
+# later on close. The DELETE can fire while the lock file's own PUT is still in
+# flight; Nextcloud's transactional locking holds the file locked during upload,
+# so a racing DELETE comes back 423 and — before the drain fix — surfaced
+# "delete failed: resource locked" and left the lock file orphaned on the server.
+# The guarantee under test: after a rapid create+delete, the lock file leaves NO
+# trace on the backend (no orphan) and none on the mount. Repeat a few times to
+# widen the window onto the in-flight PUT.
+lock_orphans=0
+for i in $(seq 1 5); do
+    LF=".~lock.doc-$i-$(date +%s%N).odt#"
+    printf 'LOGO,1000,%s' "$i" > "$MOUNT/$LF"   # tiny, like a real LO lock file
+    rm -f "$MOUNT/$LF"                            # delete immediately, racing the PUT
+    # The delete (possibly deferred past an in-flight PUT then retried) must fully
+    # propagate: no lock file may remain on the backend.
+    wait_dav_gone "$LF" 60 || { lock_orphans=$((lock_orphans + 1)); echo "    ✗ orphan left on backend: $LF"; }
+    wait_fuse_gone "$LF" 30 || { lock_orphans=$((lock_orphans + 1)); echo "    ✗ still visible on mount: $LF"; }
+done
+[ "$lock_orphans" = 0 ] \
+    && ok "rapid lock-file create+delete leaves no orphan on backend or mount (no 423 stall)" \
+    || no "$lock_orphans lock-file create+delete races left orphans (resource-locked regression)"
+
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
