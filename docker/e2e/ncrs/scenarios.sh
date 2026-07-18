@@ -293,6 +293,46 @@ done
     && ok "rapid lock-file create+delete leaves no orphan on backend or mount (no 423 stall)" \
     || no "$lock_orphans lock-file create+delete races left orphans (resource-locked regression)"
 
+echo "→ 16. SERVER-SIDE EDIT — stale local copy must not be served at the new size"
+# Reproduces the "file is corrupt" report: create + sync a file (so ncrs keeps a
+# local copy), read it (populate the read fast-path), then overwrite it DIRECTLY
+# on the backend with different, LARGER content — exactly what Nextcloud Office
+# does when you edit the file server-side. The mount must then serve the NEW
+# bytes (matching the new size), never the stale local copy at the refreshed
+# size, which is what makes a ZIP-based odt/xlsx read back as corrupt.
+#
+# Observing a server-made change requires the mount to notice the file's new
+# change_token, which on a plain WebDAV server (rclone, no notify_push and dir
+# ETags that don't change on a child edit) is best-effort — same limitation as
+# scenario 9 — so a non-observation here is informational, NOT a suite failure.
+# On Nextcloud (changing dir ETags) this actively verifies the fix.
+SC="server-edit-baseline $(date +%s%N)"
+printf '%s' "$SC" > "$MOUNT/sedit.txt"
+SW="$(printf '%s' "$SC" | sha)"
+if wait_dav_sha sedit.txt "$SW" 60 && wait_fuse_sha sedit.txt "$SW" 45; then
+    cat "$MOUNT/sedit.txt" >/dev/null 2>&1   # populate the read fast-path / local copy
+    # Overwrite server-side with different, larger content (new size + new ETag).
+    NCS="server-edited-larger-$(date +%s%N)-$(head -c 4096 /dev/urandom | base64 | tr -d '\n')"
+    printf '%s' "$NCS" > /tmp/sedit.new
+    NSW="$(sha < /tmp/sedit.new)"
+    curl -s -u "$U:$P" -T /tmp/sedit.new "${URL}sedit.txt" -o /dev/null
+    if wait_fuse_sha sedit.txt "$NSW" 90; then
+        # Whatever we got must be the COMPLETE new version — never a stale-content /
+        # new-size mix (the corruption). wait_fuse_sha already hashed the full read.
+        ok "server-side edit served as complete new content (no stale copy at new size)"
+    else
+        GOT="$(fuse_sha sedit.txt)"
+        if [ "$GOT" = "$SW" ]; then
+            echo "  ⓘ server-side edit not observed on mount — expected on plain WebDAV"
+            echo "    (no notify_push / unchanged dir ETag); not a corruption/data-loss failure"
+        else
+            no "mount served neither old nor new full content (got ${GOT:0:12}…) — corruption"
+        fi
+    fi
+else
+    no "baseline for server-side edit never synced (setup failed)"
+fi
+
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]

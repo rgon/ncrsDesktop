@@ -1318,3 +1318,66 @@ password: "pass"
                 "unmapped content-type {ct} must still return synthetic bytes");
         }
     }
+
+    // ── file_cache_matches_remote (read fast-path freshness guard) ──────────────
+
+    #[test]
+    fn file_cache_stale_after_server_side_edit() {
+        // A file edited server-side (e.g. in Nextcloud Office) gets a new
+        // change_token in the dir cache. The locally cached copy must then be
+        // reported as no-longer-matching, so the read fast-paths skip it and
+        // re-download rather than serving old bytes at the new getattr size — the
+        // size/content mismatch that makes a just-edited odt/xlsx look corrupt.
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/doc.odt");
+
+        // Dir cache: server currently holds change_token "etag-v2".
+        let mut entry = make_dav_entry("doc.odt", None);
+        entry.change_token = Some("etag-v2".into());
+        entry.size = 200;
+        cache.put_dir_cache(PathBuf::from("/"), None, None, vec![entry]);
+
+        // No local copy → nothing to serve from.
+        assert!(!cache.file_cache_matches_remote(&path));
+
+        // Local copy downloaded at the OLD token → stale, must not match.
+        cache.file_cache.insert(path.clone(), FileCacheEntry {
+            local_path: PathBuf::from("/tmp/ncrs-test-cache/kept/doc.odt"),
+            remote_modified: None,
+            etag: Some("etag-v1".into()),
+            kept: true,
+            size: 100,
+        });
+        assert!(!cache.file_cache_matches_remote(&path), "stale etag must not match");
+
+        // Local copy re-downloaded at the CURRENT token → fresh, may be served.
+        cache.file_cache.get_mut(&path).unwrap().etag = Some("etag-v2".into());
+        assert!(cache.file_cache_matches_remote(&path), "matching etag must match");
+    }
+
+    #[test]
+    fn file_cache_matches_remote_falls_back_to_mtime_without_etag() {
+        // Without a change_token on either side (a plain WebDAV server, or offline)
+        // freshness falls back to the remote mtime.
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/doc.odt");
+        let t_old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let t_new = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2000);
+
+        let mut entry = make_dav_entry("doc.odt", None);
+        entry.change_token = None;
+        entry.modified = Some(t_new);
+        cache.put_dir_cache(PathBuf::from("/"), None, None, vec![entry]);
+
+        cache.file_cache.insert(path.clone(), FileCacheEntry {
+            local_path: PathBuf::from("/tmp/ncrs-test-cache/kept/doc.odt"),
+            remote_modified: Some(t_old),
+            etag: None,
+            kept: true,
+            size: 100,
+        });
+        assert!(!cache.file_cache_matches_remote(&path), "older mtime must not match");
+
+        cache.file_cache.get_mut(&path).unwrap().remote_modified = Some(t_new);
+        assert!(cache.file_cache_matches_remote(&path), "equal mtime must match");
+    }
