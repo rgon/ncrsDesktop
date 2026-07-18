@@ -202,6 +202,18 @@ struct OpenFile {
     write_path: Option<PathBuf>,
     dirty: bool,
     original_etag: Option<String>,
+    // Freshness of the on-disk cached copy, decided ONCE at open() and pinned for
+    // the whole handle. The read fast-paths that serve on-disk cache bytes
+    // (of.local, the sync file_cache) consult this instead of re-checking
+    // file_cache_matches_remote() on every read. Re-checking per read let a
+    // concurrent dir-cache refresh flip the verdict mid-scan, so a single
+    // sequential read would splice a stale prefix onto a freshly-fetched suffix
+    // (or vice-versa) and hash to neither the old nor the new file — the
+    // corruption scenario 16 reproduces. Pinning gives each handle one
+    // consistent source: fresh → serve the cached copy throughout; stale → never
+    // touch it, re-download via the network path (whose read-ahead buffer only
+    // ever holds current bytes, so it needs no gate).
+    cache_fresh: bool,
     // Present when this fh was opened with O_NOATIME|O_NOFOLLOW — GLib's exclusive
     // MIME magic-byte detection signature.  read() at offset 0 returns magic bytes
     // derived from this content type without touching the network.
@@ -632,6 +644,27 @@ impl FsCache {
             }
         }
         self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), refreshing: false, invalidated: false });
+    }
+
+    /// Patch a single file entry's size in its parent's dir cache, returning true
+    /// if an entry was found and its size actually changed. Used by the read path
+    /// to reconcile the getattr size with the bytes the server is actually serving
+    /// after a server-side edit the dir listing hasn't picked up (see the caller).
+    fn set_entry_size(&mut self, path: &Path, size: u64) -> bool {
+        let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        if let Some(dir) = self.dir_cache.get_mut(&parent) {
+            let mut files = (*dir.files).clone();
+            if let Some(entry) = files.iter_mut().find(|e| e.path == path) {
+                if entry.size == size {
+                    return false;
+                }
+                entry.size = size;
+                entry.modified = Some(SystemTime::now());
+                dir.files = Arc::new(files);
+                return true;
+            }
+        }
+        false
     }
 
     fn touch_dir_cache(&mut self, path: &Path) {
@@ -2866,6 +2899,11 @@ impl Filesystem for NextCloudFs {
         // as a bonus the kernel stops inflating the probe read via read-ahead, so
         // it always arrives within the MIME_DETECT_MAX_READ guard at its true size.
         let mime_detect = mime_detect_ct.is_some();
+        // Pin the cached-copy freshness for this handle's lifetime (see OpenFile).
+        // file_cache_matches_remote() returns false when the file is not cached,
+        // and true when offline (no remote etag to compare) so offline reads of a
+        // kept copy are never forced into an unsatisfiable re-download.
+        let cache_fresh = self.cache.safe_lock().file_cache_matches_remote(&path);
         self.open_files.safe_lock().insert(
             fh,
             OpenFile {
@@ -2876,6 +2914,7 @@ impl Filesystem for NextCloudFs {
                 dirty: false,
                 original_etag: etag,
                 mime_detect_ct,
+                cache_fresh,
             },
         );
         let fopen_flags = if mime_detect {
@@ -2962,13 +3001,15 @@ impl Filesystem for NextCloudFs {
                         return;
                     }
                 }
-                // Only serve the cached local copy if it still matches the server
-                // version — otherwise a file edited server-side (e.g. in Nextcloud
-                // Office) would be served at the stale content but the NEW getattr
-                // size, which reads back as a corrupt archive. When stale, fall
-                // through to the network fetch below, which re-downloads.
+                // Only serve the cached local copy if it was fresh at open() —
+                // otherwise a file edited server-side (e.g. in Nextcloud Office)
+                // would be served at the stale content but the NEW getattr size,
+                // which reads back as a corrupt archive. The verdict is pinned per
+                // handle (of.cache_fresh) so a mid-scan dir-cache refresh cannot
+                // flip it and splice stale+fresh bytes. When stale, fall through to
+                // the network fetch below, which re-downloads.
                 if let Some(ref local) = of.local {
-                    if self.cache.safe_lock().file_cache_matches_remote(&path) {
+                    if of.cache_fresh {
                         if let Ok(f) = std::fs::File::open(local) {
                             let mut buf = vec![0u8; sz];
                             if let Ok(n) = f.read_at(&mut buf, off) {
@@ -3084,18 +3125,21 @@ impl Filesystem for NextCloudFs {
             }
         }
 
-        // Check file_cache synchronously too — but only when the cached copy still
-        // matches the server version. A file edited server-side (Nextcloud Office,
-        // another client) leaves this entry stale; serving it at the refreshed
-        // getattr size makes a ZIP-based format (odt/xlsx/…) look corrupt. When
-        // stale, skip it and fall through to the re-downloading network fetch.
+        // Check file_cache synchronously too — but only when this handle's cached
+        // copy was fresh at open() (of.cache_fresh, pinned; see the of.local path
+        // above for why re-checking per read corrupts). A file edited server-side
+        // (Nextcloud Office, another client) leaves this entry stale; serving it at
+        // the refreshed getattr size makes a ZIP-based format (odt/xlsx/…) look
+        // corrupt. When stale, skip it and fall through to the network fetch.
         {
-            let cached_local = {
+            let cache_fresh = self.open_files.safe_lock().get(&fh.0).map_or(false, |of| of.cache_fresh);
+            let cached_local = if cache_fresh {
                 let c = self.cache.safe_lock();
                 c.file_cache.get(&path)
-                    .filter(|_| c.file_cache_matches_remote(&path))
                     .filter(|fc| fc.local_path.metadata().map_or(false, |m| m.len() > 0))
                     .map(|fc| fc.local_path.clone())
+            } else {
+                None
             };
             if let Some(ref local) = cached_local {
                 if let Ok(f) = std::fs::File::open(local) {
@@ -3123,6 +3167,7 @@ impl Filesystem for NextCloudFs {
         let read_ahead = self.read_ahead_bytes;
         let cache_streamed = self.cache_streamed_reads;
         let file_total_size = self.cache.safe_lock().find_entry(&path).map(|e| e.size).unwrap_or(0);
+        let ino_u64 = ino.0;
         // True when the file was not locally cached at open() time. For such handles
         // there is no guarantee the file_cache has valid content, so the ensure_file_cached
         // fallback must be skipped — a range-read failure means the copy must fail.
@@ -3148,9 +3193,56 @@ impl Filesystem for NextCloudFs {
             match do_range_read_stream(&conn, &path, off, fetch, use_throttle) {
                 Ok((mut resp, _permit)) => {
                     let t0 = Instant::now();
+                    // The authoritative current size, read from the response headers
+                    // before the body is consumed (see the reconciliation after
+                    // reply.data below).
+                    let server_total = resp.headers()
+                        .get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_content_range_total)
+                        .or_else(|| if off == 0 { resp.content_length() } else { None });
                     match read_exact_from_stream(&mut resp, sz) {
                         Ok(first) => {
                             reply.data(&first);
+                            // Reconcile the getattr size with reality. On a plain
+                            // WebDAV server (rclone) a child edit does not bump the
+                            // parent dir's ETag, so the background dir refresh takes
+                            // the ETAG_MATCH fast-path and never re-lists — the
+                            // dir-cache entry keeps the pre-edit size. But this GET
+                            // returned the CURRENT bytes, so the kernel (holding the
+                            // stale, smaller i_size from a TTL-cached getattr) clamps
+                            // a buffered read and a server-edited file reads back
+                            // truncated: new content at the old size, hashing to
+                            // neither version and looking corrupt. When the true size
+                            // differs from what we cached, patch the dir entry (so the
+                            // next getattr is correct) and flush the kernel's stale
+                            // attr+data cache for this inode. The invalidation MUST run
+                            // off this thread and after the reply: notify_inval_inode
+                            // on the very inode a read is in flight for deadlocks
+                            // against the kernel inode lock (this is why notify_push
+                            // only ever invalidates from its own background thread).
+                            // Skip while our own upload is in flight — the PUT
+                            // completion owns the size then.
+                            if let Some(total) = server_total {
+                                let stale = {
+                                    let c = cache.safe_lock();
+                                    !c.uploading.contains(&path) && file_total_size != total
+                                };
+                                if stale && cache.safe_lock().set_entry_size(&path, total) {
+                                    log::info!("read: reconciled {} size {} → {} (server-side change)", path.display(), file_total_size, total);
+                                    let ns = notifier_slot.clone();
+                                    thread::spawn(move || {
+                                        // Let the triggering read fully release the
+                                        // inode before invalidating; if this still
+                                        // blocks it harms nothing (detached, holds no
+                                        // locks) and the attr TTL is the backstop.
+                                        thread::sleep(Duration::from_millis(50));
+                                        if let Some(notifier) = ns.safe_lock().as_ref() {
+                                            let _ = notifier.notify_inval_inode(ino_u64, 0, 0);
+                                        }
+                                    });
+                                }
+                            }
                             tmap.safe_lock().insert(path.clone(), TransferProgress {
                                 path: path.clone(),
                                 direction: TransferDirection::Download,
@@ -3746,6 +3838,7 @@ impl Filesystem for NextCloudFs {
                                     local: None, buf: None, write_path: None,
                                     dirty: false, original_etag: None,
                                     mime_detect_ct: None,
+                                    cache_fresh: true,
                                 });
                                 log::info!("ghost create: {} (inotify trigger)", full_path.display());
                                 reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
@@ -3818,6 +3911,7 @@ impl Filesystem for NextCloudFs {
                 dirty: false,
                 original_etag: None,
                 mime_detect_ct: None,
+                cache_fresh: true,
             },
         );
 
@@ -4382,6 +4476,16 @@ fn do_range_read_stream<'a>(
         }
     }
     unreachable!()
+}
+
+/// Parse the total length out of a `Content-Range: bytes 0-499/1234` header.
+/// Returns None for an unknown total (`*`) or a malformed value.
+fn parse_content_range_total(v: &str) -> Option<u64> {
+    let total = v.rsplit('/').next()?.trim();
+    if total == "*" {
+        return None;
+    }
+    total.parse::<u64>().ok()
 }
 
 fn read_exact_from_stream(resp: &mut reqwest::blocking::Response, need: usize) -> Result<Vec<u8>, String> {

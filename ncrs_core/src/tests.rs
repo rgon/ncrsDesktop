@@ -1381,3 +1381,31 @@ password: "pass"
         cache.file_cache.get_mut(&path).unwrap().remote_modified = Some(t_new);
         assert!(cache.file_cache_matches_remote(&path), "equal mtime must match");
     }
+
+    #[test]
+    fn parse_content_range_total_extracts_size() {
+        assert_eq!(super::parse_content_range_total("bytes 0-499/1234"), Some(1234));
+        assert_eq!(super::parse_content_range_total("bytes 0-5471/5472"), Some(5472));
+        // Unknown total (server did not know the length) and malformed values yield None.
+        assert_eq!(super::parse_content_range_total("bytes 0-499/*"), None);
+        assert_eq!(super::parse_content_range_total("garbage"), None);
+    }
+
+    #[test]
+    fn set_entry_size_patches_dir_cache_entry() {
+        // The read path reconciles a stale getattr size with the size the server is
+        // actually serving after a server-side edit the dir listing hasn't picked up.
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/sedit.txt");
+        let mut entry = make_dav_entry("sedit.txt", None);
+        entry.size = 17;
+        cache.put_dir_cache(PathBuf::from("/"), None, None, vec![entry]);
+
+        assert!(cache.set_entry_size(&path, 5472), "size change must report a bump");
+        assert_eq!(cache.find_entry(&path).map(|e| e.size), Some(5472));
+        // Idempotent: patching to the same size is a no-op and must not report a bump
+        // (this is what stops the read path re-invalidating the inode on every read).
+        assert!(!cache.set_entry_size(&path, 5472), "no-op resize must not report a bump");
+        // An unknown path is simply ignored.
+        assert!(!cache.set_entry_size(&PathBuf::from("/nope.txt"), 10));
+    }
