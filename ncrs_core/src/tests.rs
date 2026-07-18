@@ -1417,6 +1417,10 @@ password: "pass"
         // Connect/read timeouts (what a short connect_timeout produces on a dead
         // network) and transport-level failures mean the server is unreachable.
         assert!(read_err_is_network_down("operation timed out"));
+        // reqwest's generic wrapper for a dropped/refused connect — the shape seen
+        // when the network is blackholed. Must be recognised even without the word
+        // "timeout" so the offline flip fires on the first failure.
+        assert!(read_err_is_network_down("error sending request for url (http://h/f)"));
         assert!(read_err_is_network_down("error sending request: connection timed out"));
         assert!(read_err_is_network_down("network: Connection refused"));
         assert!(read_err_is_network_down("connection reset by peer"));

@@ -335,7 +335,15 @@ fn is_timeout_err(e: &str) -> bool {
 /// periodic probe notices. The monitor re-probes every 5s while offline and
 /// clears the flag once the server is reachable again.
 fn read_err_is_network_down(e: &str) -> bool {
-    is_timeout_err(e) || is_transient_network_err(e)
+    // reqwest wraps a failed connect/send (dropped SYN, refused, reset, TLS/connect
+    // timeout) as "error sending request for url (...)" — the dominant shape when
+    // the network is gone. Match it explicitly: it is NOT in is_transient_network_err
+    // (which drives read RETRIES — we deliberately do not want to retry a dead
+    // network here, just flip offline and fail fast), so it must be recognised
+    // separately for the offline flip.
+    is_timeout_err(e)
+        || is_transient_network_err(e)
+        || e.contains("error sending request")
 }
 
 /// Return the minimal magic byte sequence that identifies a given MIME type.
@@ -1905,11 +1913,26 @@ impl NextCloudFs {
         // short connect timeout lets an interface-down failure surface in
         // seconds so the offline fallback (serve cache + journal the write)
         // engages promptly instead.
+        //
+        // The read client also disables idle connection reuse
+        // (pool_max_idle_per_host = 0). connect_timeout only bounds the CONNECT
+        // phase; a request that reuses a warm pooled connection whose network has
+        // since gone silent (packets dropped, not refused) skips connect entirely
+        // and blocks on the full DOWNLOAD_TIMEOUT — the exact "save hangs until the
+        // network is back" report, since a read()-driven save reuses the same
+        // connection opening the file just warmed. Forcing every foreground read to
+        // connect fresh makes connect_timeout effective, so a blackholed read fails
+        // in seconds and flips the daemon offline. The cost is negligible here: a
+        // read fetches a 64 MiB read-ahead window per request, so there is roughly
+        // one connect per file open, not per read(). The metadata/write client keeps
+        // its idle pool — those requests run off the FUSE read path (background PUTs,
+        // the connectivity probe's own 5s timeout), so a stale warm connection there
+        // never freezes an app.
         let mut http_builder = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(16)
             .connect_timeout(CONNECT_TIMEOUT);
         let mut read_builder = reqwest::blocking::Client::builder()
-            .pool_max_idle_per_host(8)
+            .pool_max_idle_per_host(0)
             .tcp_nodelay(true)
             .connect_timeout(CONNECT_TIMEOUT);
         if use_http3 {
