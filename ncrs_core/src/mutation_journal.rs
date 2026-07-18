@@ -786,6 +786,33 @@ mod tests {
     }
 
     #[test]
+    fn unlink_after_fresh_put_leaves_no_pending_put_to_race() {
+        // Race guard for the LibreOffice lock-file case (`.~lock.doc.odt#`):
+        // create-then-delete must NOT leave a queued Put that a live DELETE could
+        // race — otherwise the DELETE hits the server while the upload still holds
+        // Nextcloud's transactional lock and comes back 423. After coalescing, the
+        // path must have no pending Put and the fresh-create staging must be gone.
+        let dir = temp_dir("unlink_race_guard");
+        let staging = dir.join("staging_lock");
+        fs::write(&staging, b"lock-bytes").unwrap();
+        let path = PathBuf::from("/.~lock.doc.odt#");
+
+        let mut j = MutationJournal::load_or_create(&dir);
+        j.enqueue(MutationOp::Put {
+            remote_path: path.clone(),
+            staging_path: staging.clone(),
+            if_match_etag: None,
+        });
+        assert!(j.has_pending_put(&path), "fresh create should register a pending Put");
+
+        j.enqueue(MutationOp::Unlink { path: path.clone() });
+        assert!(!j.has_pending_put(&path), "coalesced Unlink must leave no Put for a DELETE to race");
+        assert!(!staging.exists(), "coalesced fresh-create staging must be cleaned up");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn coalesce_rmdir_after_mkdir() {
         let dir = temp_dir("coalesce_rmdir");
         let mut j = MutationJournal::load_or_create(&dir);
