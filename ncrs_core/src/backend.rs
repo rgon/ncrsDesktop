@@ -71,6 +71,18 @@ impl BackendWriteError {
             Self::Conflict | Self::Forbidden | Self::QuotaExceeded => false,
         }
     }
+
+    /// True only when the failure means the network/server could not be reached at
+    /// all (connect refused, DNS failure, connect/read timeout) — i.e. we are
+    /// offline. A subset of `is_transient()`: it deliberately EXCLUDES `Locked`
+    /// (423) and `Server(5xx/408/429)`, where the server answered and is plainly
+    /// reachable. Callers use this to flip the daemon into offline mode eagerly so
+    /// subsequent ops short-circuit to cache instead of each blocking on a dead
+    /// connection; flipping offline on a mere 423/5xx would wrongly suppress live
+    /// sync while the server is actually up.
+    pub fn is_network_down(&self) -> bool {
+        matches!(self, Self::Network(_))
+    }
 }
 
 impl std::fmt::Display for BackendWriteError {
@@ -372,5 +384,20 @@ mod tests {
         assert!(!BackendWriteError::Server(400, String::new()).is_transient());
         assert!(!BackendWriteError::Server(404, String::new()).is_transient());
         assert!(!BackendWriteError::Server(405, String::new()).is_transient());
+    }
+
+    #[test]
+    fn only_network_errors_flip_offline() {
+        // A true network-down failure flips the daemon offline so the rest of a
+        // save short-circuits to cache instead of blocking on a dead connection.
+        assert!(BackendWriteError::Network("connect timed out".into()).is_network_down());
+        // A reachable-but-transient failure must NOT flip offline: the server
+        // answered, so live sync should keep going rather than be suppressed.
+        assert!(!BackendWriteError::Locked.is_network_down());
+        assert!(!BackendWriteError::Server(503, String::new()).is_network_down());
+        assert!(!BackendWriteError::Server(429, String::new()).is_network_down());
+        // Permanent failures are not network-down either.
+        assert!(!BackendWriteError::Forbidden.is_network_down());
+        assert!(!BackendWriteError::Conflict.is_network_down());
     }
 }

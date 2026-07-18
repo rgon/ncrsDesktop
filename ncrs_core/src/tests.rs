@@ -1409,3 +1409,27 @@ password: "pass"
         // An unknown path is simply ignored.
         assert!(!cache.set_entry_size(&PathBuf::from("/nope.txt"), 10));
     }
+
+    // ── read_err_is_network_down ────────────────────────────────────────────────
+
+    #[test]
+    fn network_down_read_errors_flip_offline() {
+        // Connect/read timeouts (what a short connect_timeout produces on a dead
+        // network) and transport-level failures mean the server is unreachable.
+        assert!(read_err_is_network_down("operation timed out"));
+        assert!(read_err_is_network_down("error sending request: connection timed out"));
+        assert!(read_err_is_network_down("network: Connection refused"));
+        assert!(read_err_is_network_down("connection reset by peer"));
+        assert!(read_err_is_network_down("broken pipe"));
+    }
+
+    #[test]
+    fn app_level_read_errors_do_not_flip_offline() {
+        // The server answered — these are application-level, not connectivity.
+        // Flipping offline here would wrongly suppress live sync while the server
+        // is up and reachable.
+        assert!(!read_err_is_network_down("401 Unauthorized"));
+        assert!(!read_err_is_network_down("403 Forbidden"));
+        assert!(!read_err_is_network_down("404 Not Found"));
+        assert!(!read_err_is_network_down("No space left on device"));
+    }

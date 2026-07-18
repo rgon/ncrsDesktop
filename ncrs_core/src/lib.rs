@@ -81,6 +81,10 @@ fn effective_dir_ttl(optimistic_listing: bool, notify_push_connected: &AtomicBoo
     }
 }
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+// Bounds only the TCP/TLS connect phase, independent of the (longer) per-request
+// body timeouts. Keeps a legitimately slow large download alive while making a
+// dead network surface in seconds instead of after the full request timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const GHOST_TTL: Duration = Duration::from_secs(10);
 // Files at or below this size are downloaded eagerly in open() so that parallel
 // open() calls run parallel downloads.  This makes MIME magic-byte detection
@@ -321,6 +325,17 @@ fn is_transient_network_err(e: &str) -> bool {
 
 fn is_timeout_err(e: &str) -> bool {
     e.contains("timeout") || e.contains("Timeout") || e.contains("timed out")
+}
+
+/// True when a read-path error string means we could not reach the server at all
+/// (connect/read timeout or a transport-level failure) rather than an
+/// application-level rejection (401/403/404) or a server that answered. Used to
+/// flip the daemon offline eagerly so a burst of reads during a read-modify-write
+/// save doesn't each block on a dead network before the connectivity monitor's
+/// periodic probe notices. The monitor re-probes every 5s while offline and
+/// clears the flag once the server is reachable again.
+fn read_err_is_network_down(e: &str) -> bool {
+    is_timeout_err(e) || is_transient_network_err(e)
 }
 
 /// Return the minimal magic byte sequence that identifies a given MIME type.
@@ -1883,11 +1898,20 @@ impl NextCloudFs {
         let base_url = notifications::base_url(&options.url);
         let use_http3 = options.http3 && !options.offline;
 
+        // Fail fast when the network is gone. Without a connect timeout a dead
+        // route makes each request block for the full per-request timeout
+        // (WRITE_TIMEOUT 60s / DOWNLOAD_TIMEOUT 120s), which freezes a
+        // synchronous read()-driven save until the first op finally errors. A
+        // short connect timeout lets an interface-down failure surface in
+        // seconds so the offline fallback (serve cache + journal the write)
+        // engages promptly instead.
         let mut http_builder = reqwest::blocking::Client::builder()
-            .pool_max_idle_per_host(16);
+            .pool_max_idle_per_host(16)
+            .connect_timeout(CONNECT_TIMEOUT);
         let mut read_builder = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(8)
-            .tcp_nodelay(true);
+            .tcp_nodelay(true)
+            .connect_timeout(CONNECT_TIMEOUT);
         if use_http3 {
             http_builder = http_builder.http3_prior_knowledge();
             read_builder = read_builder.http3_prior_knowledge();
@@ -3345,12 +3369,23 @@ impl Filesystem for NextCloudFs {
                         }
                         Err(e) => {
                             log::warn!("stream read first bytes failed: {}", e);
+                            if read_err_is_network_down(&e) {
+                                conn.is_offline.store(true, Ordering::Relaxed);
+                            }
                             push_error(&elog, path.clone(), SyncErrorKind::NetworkError, format!("download failed: {}", e));
                             reply.error(Errno::EIO);
                         }
                     }
                 }
                 Err(e) => {
+                    // This read just proved the server is unreachable. Flip offline
+                    // now so the rest of the save's reads/writes take the instant
+                    // cache/journal path instead of each waiting out its own connect
+                    // timeout; the connectivity monitor clears the flag (and replays
+                    // the journal) within ~5s of the server coming back.
+                    if read_err_is_network_down(&e) {
+                        conn.is_offline.store(true, Ordering::Relaxed);
+                    }
                     // For handles opened while the file was not cached (mime-detect opens),
                     // skip ensure_file_cached entirely — the file_cache may hold a stale or
                     // poisoned entry and we have no valid content to offer. Propagate the
@@ -3779,6 +3814,19 @@ impl Filesystem for NextCloudFs {
                             // indefinitely (no attempt-budget cost) with no user-facing
                             // error — the PendingSync marker already conveys the state, and
                             // the local edit stays safely staged until the server is back.
+                            //
+                            // Flip offline NOW rather than waiting up to 30s for the
+                            // connectivity monitor's next poll: this upload just proved the
+                            // network is down, and a save is typically a burst of ops
+                            // (write→flush plus read-modify-write reads). Flagging offline
+                            // here makes every following op in the same save take the
+                            // instant cache/journal path instead of each blocking on its own
+                            // connect timeout. The monitor re-probes every 5s while offline
+                            // and clears the flag (and replays the journal) once the server
+                            // is back, so a brief hiccup self-heals quickly.
+                            if e.is_network_down() {
+                                conn.is_offline.store(true, Ordering::Relaxed);
+                            }
                             log::warn!("PUT {} deferred — {} (queued for retry)", remote_path.display(), e);
                             journal.safe_lock().mark_deferred(seq, e.to_string());
                         } else {
