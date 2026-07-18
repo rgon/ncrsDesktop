@@ -3895,7 +3895,26 @@ impl Filesystem for NextCloudFs {
             let conn = self.conn.clone();
             let journal = self.journal.clone();
             let elog = self.error_log.clone();
+            let cache = self.cache.clone();
             thread::spawn(move || {
+                // Hold the DELETE until the file's own upload has drained. LibreOffice
+                // (and similar apps) create a lock file, then delete it a moment later;
+                // its PUT may still be in flight, and Nextcloud's transactional locking
+                // holds the file locked during upload, so a racing DELETE comes back 423.
+                // The enqueue above already coalesced away a still-queued Put, but a Put
+                // already dispatched by flush() lives in the `uploading` guard, so wait on
+                // that too — same drain the live MOVE uses for its source.
+                let pending = || {
+                    cache.safe_lock().uploading.contains(&remote_path)
+                        || journal.safe_lock().has_pending_put(&remote_path)
+                };
+                if pending() {
+                    log::info!("DELETE {}: waiting for in-flight PUT to drain", remote_path.display());
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    while pending() && std::time::Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
                 let _permit = conn.throttle.acquire();
                 match conn.backend.delete(&remote_path) {
                     Ok(()) => {
