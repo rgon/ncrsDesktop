@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.40](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.39...ncrs-v0.1.40) (2026-07-18)
+
+
+### Bug Fixes
+
+* **fuse:** fail fast on a blackholed read by disabling read-client idle pooling and treating reqwest send errors as network-down ([0b12058](https://github.com/rgon/ncrsDesktop/commit/0b1205876f5cc3bfb1705dabeee01c7d01c0414e))
+* **fuse:** flip offline eagerly on network-down and add HTTP connect_timeout so an offline save falls back to cache instead of hanging ([8992a77](https://github.com/rgon/ncrsDesktop/commit/8992a773814c439dac62d1f23f96712288a3ce5b))
+* **fuse:** skip the ensure_file_cached fallback on read when offline so a blackholed server fails fast instead of retrying connect timeouts ([cce9add](https://github.com/rgon/ncrsDesktop/commit/cce9addf87eb2ae6e707f0d0ea73f7cd0d6f0f7e))
+
 ## [0.1.39](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.38...ncrs-v0.1.39) (2026-07-18)
 
 
