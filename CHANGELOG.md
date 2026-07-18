@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.39](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.38...ncrs-v0.1.39) (2026-07-18)
+
+
+### Features
+
+* **gui:** add purge local cache action that re-downloads fresh copies while preserving unsynced edits ([c7225d3](https://github.com/rgon/ncrsDesktop/commit/c7225d3736e70b30445dd85b717a92bb59fe38c0))
+
+
+### Bug Fixes
+
+* **fuse:** evict stale file_cache copy when a file changes on the server so reopens aren't served old bytes ([7804763](https://github.com/rgon/ncrsDesktop/commit/780476323bb7ec23d866604fb788f673140ff9a3))
+* **fuse:** gate read fast-paths on cache-vs-remote freshness so a server-edited file isn't served stale at the new size ([bcc3cc8](https://github.com/rgon/ncrsDesktop/commit/bcc3cc862d9f9bf8f9da22f0a9db328dfa1e63ff))
+* **fuse:** reconcile stale getattr size on read so a server-edited file isn't served truncated; pin cache freshness per open handle ([f2f76e1](https://github.com/rgon/ncrsDesktop/commit/f2f76e15469779f50e8efeab1eaf98ca9307436f))
+
 ## [0.1.38](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.37...ncrs-v0.1.38) (2026-07-18)
 
 
