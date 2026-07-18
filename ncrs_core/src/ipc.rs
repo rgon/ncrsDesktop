@@ -47,6 +47,10 @@ pub type PrefetchCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 /// Synchronously fetch the Nextcloud preview for a remote path and write it to
 /// the XDG thumbnail cache. Returns `true` if the thumbnail is now available.
 pub type ThumbnailCallback = Arc<dyn Fn(PathBuf) -> bool + Send + Sync>;
+/// Drop every locally cached file copy so it re-downloads fresh, EXCEPT files
+/// with a pending upload (unsynced local edits — purging those is data loss).
+/// Returns the number of cached files removed, or an error string.
+pub type PurgeCallback = Arc<dyn Fn() -> Result<usize, String> + Send + Sync>;
 pub type SharedSet = Arc<RwLock<std::collections::HashSet<PathBuf>>>;
 pub type FileIdMap = Arc<RwLock<std::collections::HashMap<PathBuf, u64>>>;
 
@@ -314,7 +318,7 @@ fn detaildir_records(
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, children_map: ChildrenMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, children_map: ChildrenMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, purge_cb: Option<PurgeCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -356,6 +360,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let ev = evict_cb.clone();
             let pf = prefetch_cb.clone();
             let th = thumbnail_cb.clone();
+            let pu = purge_cb.clone();
             let elog = error_log.clone();
             let tmap = transfer_map.clone();
             let jrnl = journal.clone();
@@ -365,7 +370,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let active = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, elog, tmap, jrnl, fcq, sstats, pause_flag);
+                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, pu, elog, tmap, jrnl, fcq, sstats, pause_flag);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -399,6 +404,7 @@ fn handle_client(
     evict_cb: Option<EvictCallback>,
     prefetch_cb: Option<PrefetchCallback>,
     thumbnail_cb: Option<ThumbnailCallback>,
+    purge_cb: Option<PurgeCallback>,
     error_log: crate::ErrorLog,
     transfer_map: crate::TransferMap,
     journal: crate::mutation_journal::SharedJournal,
@@ -681,6 +687,20 @@ fn handle_client(
             paused.store(false, Ordering::Relaxed);
             log::info!("sync resumed via IPC");
             "ok".to_string()
+        } else if trimmed == "PURGE_CACHE" {
+            match &purge_cb {
+                Some(cb) => match cb() {
+                    Ok(n) => {
+                        log::info!("cache purged via IPC — {} file(s) cleared", n);
+                        format!("ok:{}", n)
+                    }
+                    Err(e) => {
+                        log::error!("PURGE_CACHE failed: {}", e);
+                        format!("error: {}", e)
+                    }
+                },
+                None => "error: not supported".to_string(),
+            }
         } else if let Some(ver_str) = trimmed.strip_prefix("VERSION ") {
             // The extension announces its protocol version on connect. Print it
             // and warn if it does not match the daemon so a half-updated install

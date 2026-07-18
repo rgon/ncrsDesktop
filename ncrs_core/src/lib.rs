@@ -2061,6 +2061,59 @@ impl NextCloudFs {
         })
     }
 
+    /// Drop every locally cached file copy so subsequent reads re-download fresh
+    /// content — the recovery for a cache tainted by a past bug. A file with a
+    /// pending upload is skipped: its staged bytes are the only copy of an
+    /// unsynced edit, so purging it would be data loss. Directory listings are
+    /// invalidated too, so stale sizes/etags are re-fetched. The mutation journal
+    /// and write-staging files are never touched.
+    pub fn purge_callback(&self) -> ipc::PurgeCallback {
+        let cache = self.cache.clone();
+        let status = self.status.clone();
+        let dirty = self.dirty.clone();
+        let journal = self.journal.clone();
+        let notifier_slot = self.notifier_slot.clone();
+        Arc::new(move || {
+            // Paths with a queued Put must be preserved — their local bytes are
+            // unsynced. Collect them under the journal lock alone to avoid nesting.
+            let protected: std::collections::HashSet<PathBuf> = {
+                let j = journal.safe_lock();
+                j.entries().iter().filter_map(|e| match &e.op {
+                    mutation_journal::MutationOp::Put { remote_path, .. } => Some(remote_path.clone()),
+                    _ => None,
+                }).collect()
+            };
+            let to_remove: Vec<(PathBuf, PathBuf)> = {
+                let c = cache.safe_lock();
+                c.file_cache.iter()
+                    .filter(|(p, _)| !protected.contains(*p))
+                    .map(|(p, e)| (p.clone(), e.local_path.clone()))
+                    .collect()
+            };
+            let mut purged = 0usize;
+            for (remote, local) in &to_remove {
+                match std::fs::remove_file(local) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        log::warn!("purge: failed to remove cached file {}: {}", local.display(), e);
+                        continue;
+                    }
+                }
+                cache.safe_lock().file_cache.remove(remote);
+                status.safe_write().insert(remote.clone(), FileStatus::Remote);
+                dirty.safe_lock().insert(remote.clone());
+                purged += 1;
+            }
+            save_file_cache(&cache);
+            // Drop in-memory directory listings so the next access re-PROPFINDs
+            // fresh metadata rather than trusting possibly-stale cached sizes/etags.
+            notify_push::invalidate_all_dirs(&cache, &dirty, &notifier_slot);
+            log::info!("purge: cleared {} cached file(s) ({} protected by pending upload)", purged, protected.len());
+            Ok(purged)
+        })
+    }
+
     pub fn prefetch_callback(&self) -> ipc::PrefetchCallback {
         let conn = self.conn.clone();
         let cache = self.cache.clone();
@@ -4437,11 +4490,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let evict_cb = filesystem.evict_callback();
     let prefetch_cb = filesystem.prefetch_callback();
     let thumbnail_cb = filesystem.thumbnail_callback();
+    let purge_cb = filesystem.purge_callback();
     let base_url = notifications::base_url(&options.url);
     let ipc_creds = options.credentials()?;
     let file_change_queue: ipc::FileChangeQueue = Arc::new(Mutex::new(Vec::new()));
     let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.children_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone());
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.children_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), Some(purge_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone());
 
     let offline_flag = filesystem.is_offline_flag();
     let backend = filesystem.conn.backend.clone();

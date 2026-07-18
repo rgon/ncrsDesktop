@@ -26,6 +26,8 @@
     let status = $state<"idle" | "saving" | "saved" | "error">("idle");
     let errorMsg = $state("");
     let remounting = $state(false);
+    let purging = $state(false);
+    let purgeMsg = $state("");
 
     // Displayed as MB / GB; stored as bytes
     let readAheadMb = $state(64);
@@ -71,6 +73,19 @@
             errorMsg = String(e);
         } finally {
             remounting = false;
+        }
+    }
+
+    async function purgeCache() {
+        purging = true;
+        purgeMsg = "";
+        try {
+            const cleared = await invoke<number>("purge_cache");
+            purgeMsg = `Cleared ${cleared} cached file${cleared === 1 ? "" : "s"}.`;
+        } catch (e: unknown) {
+            purgeMsg = `Failed: ${String(e)}`;
+        } finally {
+            purging = false;
         }
     }
 </script>
@@ -148,6 +163,20 @@
                 <div class="sv-toggle">
                     <label class="sv-toggle-label" for="keep-cached">Keep all cached files</label>
                     <input id="keep-cached" type="checkbox" class="sv-check" bind:checked={settings.auto_keep_cached_files} />
+                </div>
+
+                <div class="sv-field">
+                    <button class="nc-btn-ghost sv-purge-btn" onclick={purgeCache} disabled={purging}>
+                        {purging ? "Purging…" : "Purge local cache"}
+                    </button>
+                    <p class="sv-hint">
+                        Delete all locally cached copies so files re-download fresh from the
+                        server. Files with unsynced local edits are kept. Use this if a cached
+                        file looks stale or corrupt.
+                    </p>
+                    {#if purgeMsg}
+                        <p class="sv-purge-msg">{purgeMsg}</p>
+                    {/if}
                 </div>
             </section>
 
@@ -373,6 +402,17 @@
 
 .sv-remount-btn {
     flex-shrink: 0;
+}
+
+.sv-purge-btn {
+    align-self: flex-start;
+    margin-top: 2px;
+}
+
+.sv-purge-msg {
+    font-size: 11px;
+    color: var(--nc-text-2);
+    margin-top: 4px;
 }
 
 .sv-error {

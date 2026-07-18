@@ -309,6 +309,27 @@ fn clear_conflicts(state: State<Arc<AppState>>) {
     state.journal.lock().unwrap().resolve_all_conflicts();
 }
 
+/// Drop every locally cached file copy (except files with a pending upload) so
+/// reads re-download fresh content. Returns the number of files cleared.
+#[tauri::command]
+async fn purge_cache() -> Result<u64, String> {
+    tokio::task::spawn_blocking(|| match ipc_request(&["PURGE_CACHE"]) {
+        Some(replies) => {
+            let r = replies.first().map(String::as_str).unwrap_or("");
+            if let Some(n) = r.strip_prefix("ok:") {
+                n.parse::<u64>().map_err(|_| format!("unexpected reply: {}", r))
+            } else if let Some(e) = r.strip_prefix("error:") {
+                Err(e.trim().to_string())
+            } else {
+                Err(format!("unexpected reply: {}", r))
+            }
+        }
+        None => Err("daemon not reachable".to_string()),
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn get_storage_stats() -> Result<StorageStats, String> {
     tokio::task::spawn_blocking(|| {
@@ -750,6 +771,7 @@ pub fn run() {
             get_conflicts,
             resolve_conflict,
             clear_conflicts,
+            purge_cache,
             fetch_search_providers,
             search_nextcloud,
             get_storage_stats,
