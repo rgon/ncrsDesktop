@@ -80,6 +80,18 @@ server_up() {
     iptables -D OUTPUT -p tcp -d "$DAV_IP" --dport 80 -j REJECT --reject-with tcp-reset 2>/dev/null || true
     echo "    (server reachable again)"
 }
+# Unlike server_down (a fast RST), a real "network off" BLACKHOLES packets: they
+# are silently DROPped, so the daemon's connect() gets no answer and blocks until
+# its connect timeout fires. This is the condition that used to hang a save; use
+# it to prove the mount now fails fast and stays responsive.
+server_blackhole() {
+    iptables -I OUTPUT -p tcp -d "$DAV_IP" --dport 80 -j DROP
+    echo "    (server blackholed: OUTPUT→${DAV_IP}:80 dropped, connects hang)"
+}
+server_unblackhole() {
+    iptables -D OUTPUT -p tcp -d "$DAV_IP" --dport 80 -j DROP 2>/dev/null || true
+    echo "    (server reachable again)"
+}
 
 echo "→ 1. CREATE"
 C1="ncrs-e2e create $(date +%s%N)"
@@ -332,6 +344,51 @@ if wait_dav_sha sedit.txt "$SW" 60 && wait_fuse_sha sedit.txt "$SW" 45; then
 else
     no "baseline for server-side edit never synced (setup failed)"
 fi
+
+echo "→ 17. NETWORK BLACKHOLED (packets dropped) — mount fails fast, never hangs the save"
+# Reproduces the original report: open a document, drop the network, save. With a
+# blackholed server, connect() hangs until it times out. Before the fix, a save
+# that does a read-modify-write (LibreOffice re-reads the .ods during save) blocked
+# on the full 120s download timeout — one or more times — so the app froze "until
+# the network came back". The daemon only noticed it was offline on its next 30s
+# poll. The guarantees under test:
+#   (a) a cold read of a non-cached file RETURNS within a bounded time (the connect
+#       timeout + a few retries), instead of hanging out the download timeout; and
+#   (b) that first failure flips the daemon offline eagerly, so the *next* read
+#       short-circuits almost instantly rather than each paying the connect wait.
+# Two files that live ONLY on the backend (never read through the mount → never
+# cached), so reading them genuinely requires the network.
+for n in 1 2; do
+    printf 'blackhole-src-%s' "$n" > "/tmp/bh$n.txt"
+    curl -s -u "$U:$P" -T "/tmp/bh$n.txt" "${URL}bh$n.txt" -o /dev/null
+done
+ls "$MOUNT" >/dev/null 2>&1   # let the mount see them (metadata only, no content)
+
+server_blackhole
+# (a) First cold read must return fast (fast-fail), not hang the full 120s timeout.
+t0=$(date +%s)
+timeout 50 cat "$MOUNT/bh1.txt" >/dev/null 2>&1
+e1=$(( $(date +%s) - t0 ))
+if [ "$e1" -lt 50 ]; then
+    ok "cold read of non-cached file returns fast while blackholed (${e1}s, not a 120s hang)"
+else
+    no "cold read hung past the bound while blackholed (${e1}s) — offline fast-fail regression"
+fi
+# (b) With the offline flag now engaged, the next cold read must be near-instant —
+# the signature of the eager offline flip (no per-op connect wait, no download retries).
+t0=$(date +%s)
+timeout 25 cat "$MOUNT/bh2.txt" >/dev/null 2>&1
+e2=$(( $(date +%s) - t0 ))
+if [ "$e2" -lt 10 ]; then
+    ok "second read short-circuits once offline engaged (${e2}s) — flag flipped eagerly"
+else
+    no "second read still blocked (${e2}s) — offline flag did not engage on the first failure"
+fi
+server_unblackhole
+# Mount recovers: the file is readable again, byte-identical, once the server is back.
+wait_fuse_sha bh1.txt "$(printf 'blackhole-src-1' | sha)" 60 \
+    && ok "blackholed file readable again after connectivity restored" \
+    || no "file not readable after connectivity restored (recovery regression)"
 
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
