@@ -3386,6 +3386,18 @@ impl Filesystem for NextCloudFs {
                     if read_err_is_network_down(&e) {
                         conn.is_offline.store(true, Ordering::Relaxed);
                     }
+                    // If we are offline (either the flip above or the connectivity
+                    // monitor set it), the ensure_file_cached fallback below can only
+                    // fail after burning its own connect-timeout retries — there is no
+                    // reachable server to download from. Fail fast instead so an app
+                    // doing a read-modify-write save is not stalled once per read; the
+                    // pending edit is still safe in staging + the journal.
+                    if conn.is_offline.load(Ordering::Relaxed) {
+                        log::warn!("read {} failed while offline: {}", path.display(), e);
+                        push_error(&elog, path.clone(), SyncErrorKind::NetworkError, format!("offline: {}", e));
+                        reply.error(error_to_errno(&e));
+                        return;
+                    }
                     // For handles opened while the file was not cached (mime-detect opens),
                     // skip ensure_file_cached entirely — the file_cache may hold a stale or
                     // poisoned entry and we have no valid content to offer. Propagate the
