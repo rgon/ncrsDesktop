@@ -16,6 +16,11 @@
 ///   FILE_CHANGES\n                    → tab-separated A:/path or D:/path entries
 ///   STORAGE\n                         → JSON {kept_bytes, cached_bytes, remote_used, remote_total}
 ///   STATE\n                           → paused|syncing|idle (daemon-wide sync state)
+///   SUBSCRIBE\n                        → SUBSCRIBED, then a `SNAP\t<state>\x1e<errors>
+///                                       \x1e<transfers>\x1e<journal>\x1e<conflicts>`
+///                                       line on every change, plus `PING` keepalives.
+///                                       Lets the GUI react to state pushes instead of
+///                                       polling. Additive — old clients never send it.
 ///   PAUSE\n / RESUME\n                → ok (suspend/resume background sync)
 ///   THUMBNAIL <abs-path>\n           → ok | error: <msg>  (fetch NC preview → XDG thumb cache)
 ///   VERSION <n>\n                     → <daemon-protocol>\t<pkg-version>  (n = extension protocol)
@@ -23,7 +28,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use crate::{MutexExt, RwLockExt};
@@ -315,6 +320,124 @@ fn detaildir_records(
     records
 }
 
+/// Coalescing push channel for daemon→subscriber state updates.
+///
+/// A single monitor thread rebuilds the combined state snapshot on a short
+/// cadence and calls [`StatePush::publish`]; each `SUBSCRIBE` client blocks in
+/// [`StatePush::wait`] and is woken only when the snapshot actually changes. So
+/// an idle daemon publishes an unchanged snapshot (a no-op that wakes nobody)
+/// and idle subscribers stay parked on a socket read, burning no CPU — the work
+/// the GUI used to spend re-polling every 2s disappears.
+#[derive(Default)]
+struct PushInner {
+    generation: u64,
+    snapshot: String,
+}
+
+pub struct StatePush {
+    inner: Mutex<PushInner>,
+    cv: Condvar,
+}
+
+impl StatePush {
+    fn new() -> Self {
+        StatePush {
+            inner: Mutex::new(PushInner::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Publish a fresh snapshot. Bumps the generation and wakes waiters only
+    /// when it differs from the current one, so unchanged state is free.
+    fn publish(&self, snapshot: String) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.snapshot != snapshot {
+            g.generation += 1;
+            g.snapshot = snapshot;
+            drop(g);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Current generation (the snapshot itself is rebuilt fresh by the caller).
+    fn current_generation(&self) -> u64 {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).generation
+    }
+
+    /// Block until the generation moves past `last`, or `timeout` elapses.
+    /// Returns the new `(generation, snapshot)`; `generation == last` on timeout.
+    fn wait(&self, last: u64, timeout: Duration) -> (u64, String) {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, timeout, |s| s.generation == last)
+            .unwrap_or_else(|e| e.into_inner());
+        (g.generation, g.snapshot.clone())
+    }
+}
+
+/// Build the combined `SUBSCRIBE` snapshot payload: the STATE word followed by
+/// the errors/transfers/journal/conflicts JSON arrays, joined by 0x1e. Serde
+/// escapes control chars, so 0x1e never appears inside the JSON and stays an
+/// unambiguous field delimiter while the whole payload remains one line.
+fn build_state_snapshot(
+    paused: &AtomicBool,
+    transfer_map: &crate::TransferMap,
+    error_log: &crate::ErrorLog,
+    journal: &crate::mutation_journal::SharedJournal,
+) -> String {
+    let transfers: Vec<crate::TransferProgress> =
+        transfer_map.safe_lock().values().cloned().collect();
+    // Same derivation the STATE verb uses: pause wins, then transfer activity.
+    let state = if paused.load(Ordering::Relaxed) {
+        "paused"
+    } else if !transfers.is_empty() {
+        "syncing"
+    } else {
+        "idle"
+    };
+    let errors: Vec<crate::SyncError> = error_log.safe_lock().iter().cloned().collect();
+    let (journal_json, conflicts_json) = {
+        let j = journal.safe_lock();
+        let entries: Vec<&crate::mutation_journal::JournalEntry> = j.entries().iter().collect();
+        let conflicts = j.unresolved_conflicts();
+        (
+            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string()),
+            serde_json::to_string(&conflicts).unwrap_or_else(|_| "[]".to_string()),
+        )
+    };
+    format!(
+        "{}\x1e{}\x1e{}\x1e{}\x1e{}",
+        state,
+        serde_json::to_string(&errors).unwrap_or_else(|_| "[]".to_string()),
+        serde_json::to_string(&transfers).unwrap_or_else(|_| "[]".to_string()),
+        journal_json,
+        conflicts_json,
+    )
+}
+
+/// Rebuild the state snapshot on a short cadence and publish it. Fast only while
+/// transfers are live; when idle it re-publishes an unchanged snapshot every 2s
+/// (a no-op) so no subscriber is ever woken without a real change.
+fn spawn_state_monitor(
+    push: Arc<StatePush>,
+    paused: Arc<AtomicBool>,
+    transfer_map: crate::TransferMap,
+    error_log: crate::ErrorLog,
+    journal: crate::mutation_journal::SharedJournal,
+) {
+    std::thread::spawn(move || loop {
+        let snapshot = build_state_snapshot(&paused, &transfer_map, &error_log, &journal);
+        push.publish(snapshot);
+        let active = !transfer_map.safe_lock().is_empty();
+        std::thread::sleep(if active {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(2)
+        });
+    });
+}
+
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
@@ -330,6 +453,17 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
         }
     };
     log::info!("IPC socket listening at {}", sock.display());
+
+    // Drive daemon→GUI state pushes: the monitor rebuilds the snapshot and
+    // subscribers block until it changes.
+    let state_push = Arc::new(StatePush::new());
+    spawn_state_monitor(
+        state_push.clone(),
+        paused.clone(),
+        transfer_map.clone(),
+        error_log.clone(),
+        journal.clone(),
+    );
 
     let active = Arc::new(AtomicUsize::new(0));
 
@@ -367,10 +501,11 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let fcq = file_change_queue.clone();
             let sstats = storage_stats.clone();
             let pause_flag = paused.clone();
+            let sp = state_push.clone();
             let active = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, pu, elog, tmap, jrnl, fcq, sstats, pause_flag);
+                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, pu, elog, tmap, jrnl, fcq, sstats, pause_flag, sp);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -411,6 +546,7 @@ fn handle_client(
     file_change_queue: FileChangeQueue,
     storage_stats: SharedStorageStats,
     paused: Arc<AtomicBool>,
+    state_push: Arc<StatePush>,
 ) {
     let mut write_half = match stream.try_clone() {
         Ok(s) => s,
@@ -424,6 +560,33 @@ fn handle_client(
             Err(_) => break,
         };
         let trimmed = line.trim();
+
+        // SUBSCRIBE hands this connection to the push loop: acknowledge, send the
+        // current snapshot, then a SNAP line whenever state changes (with a PING
+        // keepalive so a dead peer is noticed). It never returns to reading verbs.
+        if trimmed == "SUBSCRIBE" {
+            if writeln!(write_half, "SUBSCRIBED").is_err() {
+                return;
+            }
+            let mut last_gen = state_push.current_generation();
+            let initial = build_state_snapshot(&paused, &transfer_map, &error_log, &journal);
+            if writeln!(write_half, "SNAP\t{}", initial).is_err() {
+                return;
+            }
+            loop {
+                let (gen, snap) = state_push.wait(last_gen, Duration::from_secs(20));
+                if gen == last_gen {
+                    if writeln!(write_half, "PING").is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                last_gen = gen;
+                if writeln!(write_half, "SNAP\t{}", snap).is_err() {
+                    return;
+                }
+            }
+        }
 
         let reply = if let Some(path_str) = trimmed.strip_prefix("STATUS ") {
             match strip_mount(Path::new(path_str), &mount_point) {
