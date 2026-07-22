@@ -1273,9 +1273,13 @@ fn run_subscription(app: AppHandle, state: Arc<AppState>) -> SubscribeOutcome {
     }
     log::info!("attached to external daemon via push subscription");
 
-    // Track the error count so only newly-appeared errors raise a desktop
-    // notification (each snapshot carries the full current error list).
-    let mut prev_error_count = state.error_log.lock().unwrap().len();
+    // Baseline so only newly-appeared errors raise a desktop notification, and
+    // each field's last raw JSON so an unchanged field is neither re-parsed nor
+    // re-emitted (a snapshot arrives whenever *any* field changes).
+    let mut cache = SnapshotCache {
+        error_count: state.error_log.lock().unwrap().len(),
+        ..SnapshotCache::default()
+    };
 
     loop {
         let mut line = String::new();
@@ -1289,107 +1293,132 @@ fn run_subscription(app: AppHandle, state: Arc<AppState>) -> SubscribeOutcome {
             continue;
         }
         if let Some(payload) = line.strip_prefix("SNAP\t") {
-            apply_snapshot(&app, &state, payload, &mut prev_error_count);
+            apply_snapshot(&app, &state, payload, &mut cache);
         }
+    }
+}
+
+/// Last-seen per-field snapshot state, so [`apply_snapshot`] only re-parses and
+/// re-emits a field whose raw JSON actually changed.
+#[derive(Default)]
+struct SnapshotCache {
+    error_count: usize,
+    errors_json: String,
+    transfers_json: String,
+    journal_json: String,
+    conflicts_json: String,
+}
+
+/// Map a daemon STATE word to a [`SyncState`] and store it, preserving a
+/// GUI-detected auth error against a daemon "idle" (the daemon can serve from
+/// cache and look healthy while creds are invalid). Returns the mapped state
+/// when the stored state actually changed, so the caller emits sync-state-changed.
+/// Shared by the push path ([`apply_snapshot`]) and the legacy [`attached_poll_loop`].
+fn apply_state_word(state: &Arc<AppState>, word: &str) -> Option<SyncState> {
+    let new_state = match word {
+        "paused" => SyncState::Paused,
+        "syncing" => SyncState::Syncing,
+        "unmounted" => SyncState::Unmounted,
+        "wiped" => SyncState::Wiped,
+        s if s.starts_with("error:") => SyncState::Error(s["error:".len()..].to_string()),
+        s if s.starts_with("degraded:") => SyncState::Degraded(s["degraded:".len()..].to_string()),
+        _ => SyncState::Idle,
+    };
+    let mut ss = state.sync_state.lock().unwrap();
+    let auth_err_active =
+        matches!(*ss, SyncState::Error(_)) && state.auth_error.lock().unwrap().is_some();
+    let effective = if auth_err_active && matches!(new_state, SyncState::Idle) {
+        ss.clone()
+    } else {
+        new_state.clone()
+    };
+    if *ss != effective {
+        *ss = effective;
+        Some(new_state)
+    } else {
+        None
     }
 }
 
 /// Apply one pushed snapshot — `<state>\x1e<errors>\x1e<transfers>\x1e<journal>\x1e<conflicts>` —
 /// to shared state and emit the frontend events. Push-driven equivalent of the
 /// old attach poll plus the error/transfer/journal pollers, minus the timers.
-fn apply_snapshot(
-    app: &AppHandle,
-    state: &Arc<AppState>,
-    payload: &str,
-    prev_error_count: &mut usize,
-) {
+fn apply_snapshot(app: &AppHandle, state: &Arc<AppState>, payload: &str, cache: &mut SnapshotCache) {
     let parts: Vec<&str> = payload.split('\x1e').collect();
 
-    // 0: daemon sync state
+    // 0: daemon sync state (change-gated inside apply_state_word).
     if let Some(s) = parts.first() {
-        let new_state = match *s {
-            "paused" => SyncState::Paused,
-            "syncing" => SyncState::Syncing,
-            "unmounted" => SyncState::Unmounted,
-            "wiped" => SyncState::Wiped,
-            s if s.starts_with("error:") => SyncState::Error(s["error:".len()..].to_string()),
-            s if s.starts_with("degraded:") => SyncState::Degraded(s["degraded:".len()..].to_string()),
-            _ => SyncState::Idle,
-        };
-        let changed = {
-            let mut ss = state.sync_state.lock().unwrap();
-            // Don't let a daemon "idle" clobber a GUI-detected auth error — the
-            // daemon may serve from cache and look healthy while creds are bad.
-            let auth_err_active = matches!(*ss, SyncState::Error(_))
-                && state.auth_error.lock().unwrap().is_some();
-            let effective = if auth_err_active && matches!(new_state, SyncState::Idle) {
-                ss.clone()
-            } else {
-                new_state.clone()
-            };
-            if *ss != effective {
-                *ss = effective;
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
+        if let Some(new_state) = apply_state_word(state, s) {
             app.emit("sync-state-changed", new_state.to_string()).ok();
         }
     }
 
-    // 1: errors — desktop-notify newly-added ones, mirror the full list, emit.
+    // 1: errors — only when the list changed. Desktop-notify newly-added ones.
     if let Some(json) = parts.get(1) {
-        if let Ok(errors) = serde_json::from_str::<Vec<SyncError>>(json) {
-            let count = errors.len();
-            if count > *prev_error_count {
-                for err in errors.iter().skip(*prev_error_count) {
-                    app.notification()
-                        .builder()
-                        .title("ncRS: Sync Error")
-                        .body(format!("{}: {}", err.path.display(), err.message))
-                        .show()
-                        .ok();
+        if *json != cache.errors_json {
+            if let Ok(errors) = serde_json::from_str::<Vec<SyncError>>(json) {
+                let count = errors.len();
+                if count > cache.error_count {
+                    for err in errors.iter().skip(cache.error_count) {
+                        app.notification()
+                            .builder()
+                            .title("ncRS: Sync Error")
+                            .body(format!("{}: {}", err.path.display(), err.message))
+                            .show()
+                            .ok();
+                    }
                 }
+                {
+                    let mut log = state.error_log.lock().unwrap();
+                    log.clear();
+                    log.extend(errors.iter().cloned());
+                }
+                app.emit("sync-errors-updated", &errors).ok();
+                cache.error_count = count;
+                cache.errors_json = json.to_string();
             }
-            {
-                let mut log = state.error_log.lock().unwrap();
-                log.clear();
-                log.extend(errors.iter().cloned());
-            }
-            app.emit("sync-errors-updated", &errors).ok();
-            *prev_error_count = count;
         }
     }
 
-    // 2: transfers
+    // 2: transfers — only when changed.
     if let Some(json) = parts.get(2) {
-        if let Ok(transfers) = serde_json::from_str::<Vec<TransferProgress>>(json) {
-            {
-                let mut map = state.transfer_map.lock().unwrap();
-                map.clear();
-                map.extend(transfers.iter().cloned().map(|t| (t.path.clone(), t)));
+        if *json != cache.transfers_json {
+            if let Ok(transfers) = serde_json::from_str::<Vec<TransferProgress>>(json) {
+                {
+                    let mut map = state.transfer_map.lock().unwrap();
+                    map.clear();
+                    map.extend(transfers.iter().cloned().map(|t| (t.path.clone(), t)));
+                }
+                app.emit("transfers-updated", &transfers).ok();
+                cache.transfers_json = json.to_string();
             }
-            app.emit("transfers-updated", &transfers).ok();
         }
     }
 
-    // 3 + 4: journal and conflicts
-    if let Some(jjson) = parts.get(3) {
-        if let Ok(entries) = serde_json::from_str::<Vec<JournalEntry>>(jjson) {
-            let conflicts: Vec<ConflictRecord> = parts
-                .get(4)
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
+    // 3 + 4: journal and conflicts. replace_from_remote needs both, so re-parse
+    // when either changed, then emit only the event whose field actually moved.
+    let journal_raw = parts.get(3).copied().unwrap_or("[]");
+    let conflicts_raw = parts.get(4).copied().unwrap_or("[]");
+    let jchanged = journal_raw != cache.journal_json;
+    let cchanged = conflicts_raw != cache.conflicts_json;
+    if jchanged || cchanged {
+        if let Ok(entries) = serde_json::from_str::<Vec<JournalEntry>>(journal_raw) {
+            let conflicts: Vec<ConflictRecord> =
+                serde_json::from_str(conflicts_raw).unwrap_or_default();
             let pending = entries.len();
             state
                 .journal
                 .lock()
                 .unwrap()
                 .replace_from_remote(entries, conflicts.clone());
-            app.emit("journal-updated", pending).ok();
-            app.emit("conflicts-updated", &conflicts).ok();
+            if jchanged {
+                app.emit("journal-updated", pending).ok();
+                cache.journal_json = journal_raw.to_string();
+            }
+            if cchanged {
+                app.emit("conflicts-updated", &conflicts).ok();
+                cache.conflicts_json = conflicts_raw.to_string();
+            }
         }
     }
 }
@@ -1474,34 +1503,8 @@ async fn attached_poll_loop(
         };
         failures = 0;
 
-        let new_state = match replies.first().map(String::as_str) {
-            Some("paused") => SyncState::Paused,
-            Some("syncing") => SyncState::Syncing,
-            Some("unmounted") => SyncState::Unmounted,
-            Some("wiped") => SyncState::Wiped,
-            Some(s) if s.starts_with("error:") => SyncState::Error(s["error:".len()..].to_string()),
-            Some(s) if s.starts_with("degraded:") => SyncState::Degraded(s["degraded:".len()..].to_string()),
-            _ => SyncState::Idle,
-        };
-        let changed = {
-            let mut ss = state.sync_state.lock().unwrap();
-            // Don't overwrite a GUI-detected auth error with Idle from the daemon —
-            // the daemon may be serving from cache and appear healthy while creds are invalid.
-            let auth_err_active = matches!(*ss, SyncState::Error(_))
-                && state.auth_error.lock().unwrap().is_some();
-            let effective = if auth_err_active && matches!(new_state, SyncState::Idle) {
-                ss.clone()
-            } else {
-                new_state.clone()
-            };
-            if *ss != effective {
-                *ss = effective.clone();
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
+        let word = replies.first().map(String::as_str).unwrap_or("");
+        if let Some(new_state) = apply_state_word(&state, word) {
             app.emit("sync-state-changed", new_state.to_string()).ok();
         }
 
