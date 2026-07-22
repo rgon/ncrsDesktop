@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,6 +76,12 @@ pub struct MutationJournal {
     next_conflict_id: u64,
     journal_path: PathBuf,
     conflicts_path: PathBuf,
+    /// Monotonic counter bumped on every mutation. Lets a reader — e.g. the IPC
+    /// state monitor — skip re-serializing the (potentially large) journal when
+    /// nothing changed. Invariant: every mutator must either go through a
+    /// `save_*` funnel (which bumps this) or bump it directly, as the
+    /// non-persisting `replace_from_remote` does — otherwise a reader goes stale.
+    dirty_version: AtomicU64,
 }
 
 pub type SharedJournal = Arc<Mutex<MutationJournal>>;
@@ -195,6 +202,7 @@ impl MutationJournal {
             next_seq,
             conflicts,
             next_conflict_id,
+            dirty_version: AtomicU64::new(0),
             journal_path,
             conflicts_path,
         };
@@ -346,6 +354,13 @@ impl MutationJournal {
     pub fn replace_from_remote(&mut self, entries: Vec<JournalEntry>, conflicts: Vec<ConflictRecord>) {
         self.entries = entries.into();
         self.conflicts = conflicts;
+        self.dirty_version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Monotonic version bumped on every mutation. A reader can cache derived
+    /// data (e.g. a serialized snapshot) and rebuild it only when this changes.
+    pub fn version(&self) -> u64 {
+        self.dirty_version.load(Ordering::Relaxed)
     }
 
     // ── Recovery ─────────────────────────────────────────────
@@ -394,6 +409,7 @@ impl MutationJournal {
     // ── Persistence ──────────────────────────────────────────
 
     fn save_journal(&self) {
+        self.dirty_version.fetch_add(1, Ordering::Relaxed);
         let list: Vec<&JournalEntry> = self.entries.iter().collect();
         match serde_json::to_vec(&list) {
             Ok(data) => {
@@ -406,6 +422,7 @@ impl MutationJournal {
     }
 
     fn save_conflicts(&self) {
+        self.dirty_version.fetch_add(1, Ordering::Relaxed);
         match serde_json::to_vec(&self.conflicts) {
             Ok(data) => {
                 if let Err(e) = write_atomic_durable(&self.conflicts_path, &data) {

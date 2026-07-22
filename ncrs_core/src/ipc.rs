@@ -27,7 +27,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -35,6 +35,25 @@ use crate::{MutexExt, RwLockExt};
 
 const MAX_IPC_CLIENTS: usize = 64;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Counts how often directory-status aggregation takes the O(N_total)
+/// whole-status-map fallback because the `ChildrenMap` had no entry for the
+/// directory. Believed rare (a cold cache before the first readdir), so it is
+/// logged sparsely — the first hit, then every 1000th — to reveal a real hot
+/// spot without noise, instead of silently paying a full-map scan per query.
+static DIR_STATUS_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+fn note_dir_status_fallback(context: &str, dir: &Path) {
+    let n = DIR_STATUS_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 1000 == 0 {
+        log::info!(
+            "dir-status children-map miss #{} ({}): {} — O(N) status-map scan",
+            n,
+            context,
+            dir.display()
+        );
+    }
+}
 
 /// IPC protocol version. Bump whenever the daemon⇄extension contract changes
 /// (a new command, a changed reply format). The Nautilus extension announces
@@ -172,6 +191,7 @@ fn dir_status_from_children(
         // ChildrenMap not yet populated for this directory (e.g. readdir in progress
         // or dir accessed only via individual file opens before the first FUSE readdir).
         // Fall back to scanning status_map directly — O(N_total) but only on a cold cache.
+        note_dir_status_fallback("dir_status_from_children", dir);
         for (p, s) in sm.iter() {
             if p.parent() == Some(dir) {
                 total += 1;
@@ -228,6 +248,7 @@ fn detaildir_records(
         dir_children_owned = c.iter().cloned().collect();
         &dir_children_owned
     } else {
+        note_dir_status_fallback("detaildir_records", remote_dir);
         dir_children_owned = details.keys()
             .filter(|p| p.parent() == Some(remote_dir))
             .cloned()
@@ -376,49 +397,92 @@ impl StatePush {
     }
 }
 
-/// Build the combined `SUBSCRIBE` snapshot payload: the STATE word followed by
-/// the errors/transfers/journal/conflicts JSON arrays, joined by 0x1e. Serde
-/// escapes control chars, so 0x1e never appears inside the JSON and stays an
-/// unambiguous field delimiter while the whole payload remains one line.
+/// Serialize the journal's pending entries to a JSON array (or `"[]"`). Shared
+/// by the `JOURNAL` command handler and the snapshot builders.
+fn journal_entries_json(j: &crate::mutation_journal::MutationJournal) -> String {
+    let entries: Vec<&crate::mutation_journal::JournalEntry> = j.entries().iter().collect();
+    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Serialize the journal's unresolved conflicts to a JSON array (or `"[]"`).
+/// Shared by the `CONFLICTS` command handler and the snapshot builders.
+fn conflicts_json(j: &crate::mutation_journal::MutationJournal) -> String {
+    serde_json::to_string(&j.unresolved_conflicts()).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Serialize the journal entries and unresolved conflicts together (one lock).
+/// This is the expensive part of a snapshot when a big offline backlog has
+/// accumulated, so callers cache the result keyed by [`MutationJournal::version`].
+fn serialize_journal(journal: &crate::mutation_journal::SharedJournal) -> (String, String) {
+    let j = journal.safe_lock();
+    (journal_entries_json(&j), conflicts_json(&j))
+}
+
+/// The cheap (non-journal) snapshot fields: the STATE word, the errors and
+/// transfers JSON, and whether any transfer is active. Locks `transfer_map` and
+/// `error_log` once each. Cheap to recompute every monitor tick, unlike the
+/// journal, so it needs no version cache.
+fn collect_cheap_fields(
+    paused: &AtomicBool,
+    transfer_map: &crate::TransferMap,
+    error_log: &crate::ErrorLog,
+) -> (&'static str, String, String, bool) {
+    let transfers: Vec<crate::TransferProgress> =
+        transfer_map.safe_lock().values().cloned().collect();
+    let active = !transfers.is_empty();
+    // Same derivation the STATE verb uses: pause wins, then transfer activity.
+    let state = if paused.load(Ordering::Relaxed) {
+        "paused"
+    } else if active {
+        "syncing"
+    } else {
+        "idle"
+    };
+    let errors: Vec<crate::SyncError> = error_log.safe_lock().iter().cloned().collect();
+    (
+        state,
+        serde_json::to_string(&errors).unwrap_or_else(|_| "[]".to_string()),
+        serde_json::to_string(&transfers).unwrap_or_else(|_| "[]".to_string()),
+        active,
+    )
+}
+
+/// Join the five snapshot fields into the one-line `SUBSCRIBE` payload. Fields
+/// are delimited by 0x1e; serde escapes control chars, so 0x1e never appears
+/// inside the JSON and the payload stays on a single line.
+fn format_snapshot(
+    state: &str,
+    errors_json: &str,
+    transfers_json: &str,
+    journal_json: &str,
+    conflicts_json: &str,
+) -> String {
+    format!(
+        "{}\x1e{}\x1e{}\x1e{}\x1e{}",
+        state, errors_json, transfers_json, journal_json, conflicts_json
+    )
+}
+
+/// Build a complete snapshot, serializing the journal fresh. Used for the
+/// one-shot initial send to a new subscriber; the monitor loop caches instead.
 fn build_state_snapshot(
     paused: &AtomicBool,
     transfer_map: &crate::TransferMap,
     error_log: &crate::ErrorLog,
     journal: &crate::mutation_journal::SharedJournal,
 ) -> String {
-    let transfers: Vec<crate::TransferProgress> =
-        transfer_map.safe_lock().values().cloned().collect();
-    // Same derivation the STATE verb uses: pause wins, then transfer activity.
-    let state = if paused.load(Ordering::Relaxed) {
-        "paused"
-    } else if !transfers.is_empty() {
-        "syncing"
-    } else {
-        "idle"
-    };
-    let errors: Vec<crate::SyncError> = error_log.safe_lock().iter().cloned().collect();
-    let (journal_json, conflicts_json) = {
-        let j = journal.safe_lock();
-        let entries: Vec<&crate::mutation_journal::JournalEntry> = j.entries().iter().collect();
-        let conflicts = j.unresolved_conflicts();
-        (
-            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string()),
-            serde_json::to_string(&conflicts).unwrap_or_else(|_| "[]".to_string()),
-        )
-    };
-    format!(
-        "{}\x1e{}\x1e{}\x1e{}\x1e{}",
-        state,
-        serde_json::to_string(&errors).unwrap_or_else(|_| "[]".to_string()),
-        serde_json::to_string(&transfers).unwrap_or_else(|_| "[]".to_string()),
-        journal_json,
-        conflicts_json,
-    )
+    let (journal_json, conflicts_json) = serialize_journal(journal);
+    let (state, errors_json, transfers_json, _active) =
+        collect_cheap_fields(paused, transfer_map, error_log);
+    format_snapshot(state, &errors_json, &transfers_json, &journal_json, &conflicts_json)
 }
 
 /// Rebuild the state snapshot on a short cadence and publish it. Fast only while
-/// transfers are live; when idle it re-publishes an unchanged snapshot every 2s
-/// (a no-op) so no subscriber is ever woken without a real change.
+/// transfers are live. Two costs are avoided when nothing changed: the journal
+/// (costly to serialize with a large offline backlog) is re-serialized only when
+/// its version moves, and the full payload is assembled/published only when a
+/// field actually changed — so an idle tick neither copies the cached journal
+/// JSON nor wakes any subscriber.
 fn spawn_state_monitor(
     push: Arc<StatePush>,
     paused: Arc<AtomicBool>,
@@ -426,15 +490,46 @@ fn spawn_state_monitor(
     error_log: crate::ErrorLog,
     journal: crate::mutation_journal::SharedJournal,
 ) {
-    std::thread::spawn(move || loop {
-        let snapshot = build_state_snapshot(&paused, &transfer_map, &error_log, &journal);
-        push.publish(snapshot);
-        let active = !transfer_map.safe_lock().is_empty();
-        std::thread::sleep(if active {
-            Duration::from_millis(500)
-        } else {
-            Duration::from_secs(2)
-        });
+    std::thread::spawn(move || {
+        let mut cached_version = u64::MAX; // forces a build+publish on the first tick
+        let mut journal_json = String::from("[]");
+        let mut conflicts_json = String::from("[]");
+        let mut last_state = "";
+        let mut last_errors_json = String::new();
+        let mut last_transfers_json = String::new();
+        loop {
+            let version = journal.safe_lock().version();
+            let journal_changed = version != cached_version;
+            if journal_changed {
+                let (j, c) = serialize_journal(&journal);
+                journal_json = j;
+                conflicts_json = c;
+                cached_version = version;
+            }
+            let (state, errors_json, transfers_json, active) =
+                collect_cheap_fields(&paused, &transfer_map, &error_log);
+            if journal_changed
+                || state != last_state
+                || errors_json != last_errors_json
+                || transfers_json != last_transfers_json
+            {
+                push.publish(format_snapshot(
+                    state,
+                    &errors_json,
+                    &transfers_json,
+                    &journal_json,
+                    &conflicts_json,
+                ));
+                last_state = state;
+                last_errors_json = errors_json;
+                last_transfers_json = transfers_json;
+            }
+            std::thread::sleep(if active {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(2)
+            });
+        }
     });
 }
 
@@ -823,13 +918,9 @@ fn handle_client(
             let transfers: Vec<crate::TransferProgress> = transfer_map.safe_lock().values().cloned().collect();
             serde_json::to_string(&transfers).unwrap_or_else(|_| "[]".to_string())
         } else if trimmed == "JOURNAL" {
-            let j = journal.safe_lock();
-            let entries: Vec<&crate::mutation_journal::JournalEntry> = j.entries().iter().collect();
-            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+            journal_entries_json(&journal.safe_lock())
         } else if trimmed == "CONFLICTS" {
-            let j = journal.safe_lock();
-            let conflicts = j.unresolved_conflicts();
-            serde_json::to_string(&conflicts).unwrap_or_else(|_| "[]".to_string())
+            conflicts_json(&journal.safe_lock())
         } else if trimmed == "STORAGE" {
             let stats = storage_stats.safe_lock().clone();
             serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())
