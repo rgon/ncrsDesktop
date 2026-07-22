@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tauri::menu::MenuItem;
-use tauri::{AppHandle, EventLoopMessage, Manager};
+use tauri::{AppHandle, EventLoopMessage, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_runtime_wry::Wry;
 
 type WryRuntime = Wry<EventLoopMessage>;
@@ -29,7 +29,33 @@ pub trait NcrsPlugin: Send + Sync {
 }
 
 pub fn open_main_window(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
+    // The window is destroyed (not hidden) when closed to the tray, so the
+    // WebKitGTK webview stops eating idle CPU. Rebuild it from the same config
+    // the manifest declares before showing. Keep these attributes in sync with
+    // the `main` window entry in tauri.conf.json.
+    let w = match app.get_webview_window("main") {
+        Some(w) => w,
+        None => match WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+            .title("ncrs-gui")
+            .inner_size(1860.0, 1000.0)
+            .resizable(false)
+            .minimizable(false)
+            .maximizable(false)
+            .closable(true)
+            .fullscreen(false)
+            .decorations(false)
+            .transparent(true)
+            .visible(false)
+            .build()
+        {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("failed to rebuild main window: {e}");
+                return;
+            }
+        },
+    };
+    {
         // The overlay is a transparent full-screen window; the visible card is
         // CSS-anchored to the right edge of the viewport. So the window must
         // cover the target monitor exactly, or the card falls off-screen.

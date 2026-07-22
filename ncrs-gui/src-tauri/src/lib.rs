@@ -5,7 +5,7 @@ use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent, TrayIconId},
-    AppHandle, Emitter, EventLoopMessage, Listener, Manager, State, WindowEvent,
+    AppHandle, Emitter, EventLoopMessage, Listener, Manager, State,
 };
 use tauri_plugin_opener::OpenerExt;
 use tauri::async_runtime::spawn;
@@ -87,7 +87,10 @@ fn ipc_request(verbs: &[&str]) -> Option<Vec<String>> {
 #[tauri::command]
 fn close_window(app: AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
-        w.hide().unwrap();
+        // Destroy (not hide) so the WebKitGTK webview process is torn down and
+        // stops burning idle CPU/memory while we sit in the tray. open_main_window
+        // rebuilds it on demand; ExitRequested keeps the process alive meanwhile.
+        let _ = w.destroy();
     }
 }
 
@@ -843,13 +846,11 @@ pub fn run() {
 
             Ok(())
         })
-        .on_window_event(|app, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                if let Some(w) = app.get_webview_window("main") {
-                    w.hide().unwrap();
-                }
-                api.prevent_close();
-            }
+        .on_window_event(|_app, _event| {
+            // Let the window close normally when dismissed: closing destroys the
+            // WebKitGTK webview and frees its idle CPU/memory. The ExitRequested
+            // handler in `run` keeps the tray-only process alive with no windows,
+            // and open_main_window rebuilds the webview when reopened.
         })
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "about" => open_main_window(app),
@@ -954,8 +955,20 @@ pub fn run() {
             }
             other => { plugins::handle_plugin_tray_event(app, other); }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application")
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // Closing the window to the tray destroys the last webview, which
+            // would otherwise exit the app and kill the tray icon. Keep the
+            // process alive on a window-driven exit (code == None); a real quit
+            // comes from the tray "Exit" item via app.exit() (code == Some) and
+            // is allowed through.
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
 
 async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), ()> {
@@ -998,7 +1011,7 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
         // mounting a second time.
         log::info!("existing ncrs daemon detected — attaching via IPC");
         state.attached.store(true, std::sync::atomic::Ordering::Relaxed);
-        spawn(attached_poll_loop(app.clone(), state.clone(), shutdown_tx));
+        spawn(attached_subscribe_loop(app.clone(), state.clone(), shutdown_tx));
     } else {
         // FUSE mount thread — share error_log and transfer_map with the core
         let fuse_opts = opts.clone();
@@ -1134,6 +1147,10 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
         }
     }
 
+    // Embedded mode only: poll the locally-owned state maps every 2s and emit.
+    // In attach mode the daemon pushes these via the SUBSCRIBE snapshot, so
+    // running these timers too would double-emit and re-notify errors.
+    if !external_daemon {
     // Error log polling — check every 2s, emit event + desktop notification on new errors
     let err_state = state.clone();
     let err_app = app.clone();
@@ -1209,8 +1226,219 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
             }
         }
     });
+    } // end embedded-only pollers
 
     Ok(())
+}
+
+/// Outcome of a single [`run_subscription`] attempt.
+enum SubscribeOutcome {
+    /// The daemon does not understand SUBSCRIBE (older build) — poll instead.
+    Unsupported,
+    /// The subscription ended. `was_connected` is true if the handshake ever
+    /// completed (a live daemon that then went away — likely a restart); false
+    /// if we could not even connect (daemon absent).
+    Disconnected { was_connected: bool },
+}
+
+/// Open one long-lived push subscription to the daemon and apply every pushed
+/// snapshot until the connection drops. Blocking: runs on a spawn_blocking
+/// thread that parks on the socket read while idle, so an idle attached GUI
+/// burns no CPU (this is what replaces the old 2s poll cadence).
+fn run_subscription(app: AppHandle, state: Arc<AppState>) -> SubscribeOutcome {
+    use std::io::{BufRead, BufReader, Write};
+    let sock = ncrs_core::ipc::socket_path();
+    let stream = match std::os::unix::net::UnixStream::connect(&sock) {
+        Ok(s) => s,
+        Err(_) => return SubscribeOutcome::Disconnected { was_connected: false },
+    };
+    // Just past twice the daemon's 20s keepalive, so a silent socket (dead
+    // daemon) is detected without tripping on a normal idle gap.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(45)));
+    let mut write_half = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return SubscribeOutcome::Disconnected { was_connected: false },
+    };
+    if writeln!(write_half, "SUBSCRIBE").is_err() {
+        return SubscribeOutcome::Disconnected { was_connected: false };
+    }
+    let mut reader = BufReader::new(stream);
+    let mut handshake = String::new();
+    if reader.read_line(&mut handshake).unwrap_or(0) == 0 {
+        return SubscribeOutcome::Disconnected { was_connected: false };
+    }
+    if handshake.trim() != "SUBSCRIBED" {
+        // Old daemon replied "unknown" (or something else) — fall back to polling.
+        return SubscribeOutcome::Unsupported;
+    }
+    log::info!("attached to external daemon via push subscription");
+
+    // Track the error count so only newly-appeared errors raise a desktop
+    // notification (each snapshot carries the full current error list).
+    let mut prev_error_count = state.error_log.lock().unwrap().len();
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return SubscribeOutcome::Disconnected { was_connected: true }, // EOF
+            Ok(_) => {}
+            Err(_) => return SubscribeOutcome::Disconnected { was_connected: true }, // timeout/error
+        }
+        let line = line.trim_end();
+        if line == "PING" || line.is_empty() {
+            continue;
+        }
+        if let Some(payload) = line.strip_prefix("SNAP\t") {
+            apply_snapshot(&app, &state, payload, &mut prev_error_count);
+        }
+    }
+}
+
+/// Apply one pushed snapshot — `<state>\x1e<errors>\x1e<transfers>\x1e<journal>\x1e<conflicts>` —
+/// to shared state and emit the frontend events. Push-driven equivalent of the
+/// old attach poll plus the error/transfer/journal pollers, minus the timers.
+fn apply_snapshot(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    payload: &str,
+    prev_error_count: &mut usize,
+) {
+    let parts: Vec<&str> = payload.split('\x1e').collect();
+
+    // 0: daemon sync state
+    if let Some(s) = parts.first() {
+        let new_state = match *s {
+            "paused" => SyncState::Paused,
+            "syncing" => SyncState::Syncing,
+            "unmounted" => SyncState::Unmounted,
+            "wiped" => SyncState::Wiped,
+            s if s.starts_with("error:") => SyncState::Error(s["error:".len()..].to_string()),
+            s if s.starts_with("degraded:") => SyncState::Degraded(s["degraded:".len()..].to_string()),
+            _ => SyncState::Idle,
+        };
+        let changed = {
+            let mut ss = state.sync_state.lock().unwrap();
+            // Don't let a daemon "idle" clobber a GUI-detected auth error — the
+            // daemon may serve from cache and look healthy while creds are bad.
+            let auth_err_active = matches!(*ss, SyncState::Error(_))
+                && state.auth_error.lock().unwrap().is_some();
+            let effective = if auth_err_active && matches!(new_state, SyncState::Idle) {
+                ss.clone()
+            } else {
+                new_state.clone()
+            };
+            if *ss != effective {
+                *ss = effective;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            app.emit("sync-state-changed", new_state.to_string()).ok();
+        }
+    }
+
+    // 1: errors — desktop-notify newly-added ones, mirror the full list, emit.
+    if let Some(json) = parts.get(1) {
+        if let Ok(errors) = serde_json::from_str::<Vec<SyncError>>(json) {
+            let count = errors.len();
+            if count > *prev_error_count {
+                for err in errors.iter().skip(*prev_error_count) {
+                    app.notification()
+                        .builder()
+                        .title("ncRS: Sync Error")
+                        .body(format!("{}: {}", err.path.display(), err.message))
+                        .show()
+                        .ok();
+                }
+            }
+            {
+                let mut log = state.error_log.lock().unwrap();
+                log.clear();
+                log.extend(errors.iter().cloned());
+            }
+            app.emit("sync-errors-updated", &errors).ok();
+            *prev_error_count = count;
+        }
+    }
+
+    // 2: transfers
+    if let Some(json) = parts.get(2) {
+        if let Ok(transfers) = serde_json::from_str::<Vec<TransferProgress>>(json) {
+            {
+                let mut map = state.transfer_map.lock().unwrap();
+                map.clear();
+                map.extend(transfers.iter().cloned().map(|t| (t.path.clone(), t)));
+            }
+            app.emit("transfers-updated", &transfers).ok();
+        }
+    }
+
+    // 3 + 4: journal and conflicts
+    if let Some(jjson) = parts.get(3) {
+        if let Ok(entries) = serde_json::from_str::<Vec<JournalEntry>>(jjson) {
+            let conflicts: Vec<ConflictRecord> = parts
+                .get(4)
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let pending = entries.len();
+            state
+                .journal
+                .lock()
+                .unwrap()
+                .replace_from_remote(entries, conflicts.clone());
+            app.emit("journal-updated", pending).ok();
+            app.emit("conflicts-updated", &conflicts).ok();
+        }
+    }
+}
+
+/// Attach-mode driver: keep a push subscription open, reconnecting across daemon
+/// restarts, and detach (Unmounted) once the daemon is gone for good. Falls back
+/// to [`attached_poll_loop`] for a daemon too old to support SUBSCRIBE.
+async fn attached_subscribe_loop(
+    app: AppHandle,
+    state: Arc<AppState>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let mut failures = 0u32;
+    loop {
+        let outcome = tokio::task::spawn_blocking({
+            let app = app.clone();
+            let state = state.clone();
+            move || run_subscription(app, state)
+        })
+        .await
+        .unwrap_or(SubscribeOutcome::Disconnected { was_connected: false });
+
+        match outcome {
+            SubscribeOutcome::Unsupported => {
+                log::info!("daemon lacks SUBSCRIBE — using legacy poll loop");
+                attached_poll_loop(app, state, shutdown_tx).await;
+                return;
+            }
+            SubscribeOutcome::Disconnected { was_connected } => {
+                // A subscription that actually ran means the daemon was alive;
+                // treat the drop as a transient restart and reset the strike count.
+                if was_connected {
+                    failures = 0;
+                }
+                failures += 1;
+                // ~6s of failed reconnects: the daemon is gone. Show Unmounted;
+                // the Remount menu re-probes and re-attaches or mounts embedded.
+                if failures >= 3 {
+                    log::warn!("external ncrs daemon stopped responding — detaching");
+                    state.attached.store(false, std::sync::atomic::Ordering::Relaxed);
+                    *state.sync_state.lock().unwrap() = SyncState::Unmounted;
+                    app.emit("sync-state-changed", "unmounted").ok();
+                    let _ = shutdown_tx.send(true);
+                    return;
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
 }
 
 // Attach mode: mirror the external daemon's state over IPC into the same
