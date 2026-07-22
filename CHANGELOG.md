@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.41](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.40...ncrs-v0.1.41) (2026-07-22)
+
+
+### Features
+
+* **ipc:** push daemon state to subscribers via a SUBSCRIBE verb so the GUI stops polling ([28efecd](https://github.com/rgon/ncrsDesktop/commit/28efecdc911ecb58ab5c72f06d01364a196a355f))
+
+
+### Performance Improvements
+
+* **gui:** apply pushed snapshots per-field so only changed fields re-parse and re-emit ([3ad2cef](https://github.com/rgon/ncrsDesktop/commit/3ad2cef17fcda06af861a60cc55dc8cf15468760))
+* **gui:** end idle tray CPU by subscribing to daemon pushes and freeing the webview on close ([4fe90ab](https://github.com/rgon/ncrsDesktop/commit/4fe90abcc4e64f6cff1c171c235f647e9ae843f8))
+* **ipc:** cache the daemon state snapshot's journal JSON by version and skip rebuilding unchanged ticks ([e2c994e](https://github.com/rgon/ncrsDesktop/commit/e2c994ed044d1d383bb71ed83c52487c79ca58a9))
+
 ## [0.1.40](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.39...ncrs-v0.1.40) (2026-07-18)
 
 
