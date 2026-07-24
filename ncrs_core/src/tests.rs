@@ -1312,13 +1312,32 @@ password: "pass"
         assert_eq!(mime_magic_bytes("image/x-dcraw"), b"MM\x00*");
         // ...content-type parameters are ignored...
         assert_eq!(mime_magic_bytes("text/plain; charset=utf-8"), b"# text\n");
-        // ...and every unmapped type still yields non-empty, text-classifiable
-        // bytes so the file gets a usable type instead of a download.
+
+        // ISO-BMFF arms carry a brand at offset 8 (a bare "ftyp" box degrades to
+        // application/octet-stream), and the biggest real-world gaps get an exact
+        // arm rather than only a category match.
+        assert_eq!(mime_magic_bytes("video/mp4"),       b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00");
+        assert_eq!(mime_magic_bytes("audio/mp4"),       b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00");
+        assert_eq!(mime_magic_bytes("video/quicktime"), b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00");
+        assert_eq!(mime_magic_bytes("image/heic"),      mime_magic_bytes("image/heif"));
+
+        // Text-based application/* subtypes stay text-classifiable.
+        assert_eq!(mime_magic_bytes("application/json"), b"# text\n");
+
+        // Category-aware fallback: an unmapped binary type must NEVER resolve to
+        // the text sentinel — that was the root cause of files showing as text.
+        // Each category resolves to bytes an image/video/audio type sniffs from.
+        assert_eq!(mime_magic_bytes("image/x-unknown-format"), b"II*\x00");
+        assert_eq!(mime_magic_bytes("video/x-unknown"),        b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00");
+        assert_eq!(mime_magic_bytes("audio/x-unknown"),        b"\xFF\xFB");
         for ct in ["application/vnd.oasis.opendocument.spreadsheet",
                    "application/octet-stream",
                    "application/x-freecad-document"] {
-            assert!(!mime_magic_bytes(ct).is_empty(),
+            let bytes = mime_magic_bytes(ct);
+            assert!(!bytes.is_empty(),
                 "unmapped content-type {ct} must still return synthetic bytes");
+            assert_ne!(bytes, b"# text\n",
+                "unmapped binary content-type {ct} must not be classified as text");
         }
     }
 

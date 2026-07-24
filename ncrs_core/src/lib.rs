@@ -472,15 +472,50 @@ fn mime_magic_bytes(content_type: &str) -> &'static [u8] {
         "application/ogg"
         | "audio/ogg"
         | "video/ogg"                      => b"OggS",
-        "video/mp4"                        => b"\x00\x00\x00\x18ftyp",
+        // ISO-BMFF: the major brand at offset 8 is what disambiguates the subtype,
+        // so a bare "ftyp" box resolves to application/octet-stream — every arm
+        // below must carry a real brand (verified against Gio.content_type_guess).
+        "video/mp4"                        => b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00",
+        "audio/mp4"                        => b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00",
+        "video/quicktime"                  => b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00",
+        "image/heic"
+        | "image/heif"                     => b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00",
         "audio/mpeg"                       => b"\xFF\xFB",
         "audio/flac"                       => b"fLaC",
         "audio/wav"                        => b"RIFF",
+        "image/svg+xml"                    => b"<svg xmlns=\"http://www.w3.org/2000/svg\">",
+        "image/x-icon"
+        | "image/vnd.microsoft.icon"       => b"\x00\x00\x01\x00\x01\x00",
+        "application/postscript"           => b"%!PS-Adobe-3.0",
+        "application/x-deb"
+        | "application/vnd.debian.binary-package" => b"!<arch>\ndebian-binary",
         "application/vnd.ms-excel"
         | "application/msword"
         | "application/vnd.ms-powerpoint" => b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1",
-        // text/* and everything else → printable ASCII, detected as text/plain
-        _ => b"# text\n",
+        // Text-based application/* subtypes: keep them classifiable as text so an
+        // extension-unknown .json/.xml/… is editable text, not opaque binary.
+        "application/json"
+        | "application/xml"
+        | "application/javascript"
+        | "application/yaml"
+        | "application/toml"
+        | "application/x-tex"              => b"# text\n",
+        // Category-aware fallback. The old code returned `# text\n` for EVERY
+        // unmapped type, so any content-type absent from this table — and whose
+        // extension the freedesktop MIME db doesn't know, forcing GLib to sniff —
+        // was shown as editable text/plain (e.g. .srw before image/x-dcraw was
+        // added). Dispatch on the top-level type instead so an unknown binary
+        // never masquerades as text: images stay images (thumbnailable), media
+        // stays media, and everything else becomes generic application/octet-stream
+        // rather than text. Each branch's bytes are verified to resolve to the
+        // intended category via Gio.content_type_guess.
+        _ => match ct.split('/').next().unwrap_or("") {
+            "image" => b"II*\x00",                          // → image/tiff
+            "video" => b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00", // → video/mp4
+            "audio" => b"\xFF\xFB",                          // → audio/mpeg
+            "text"  => b"# text\n",                          // → text/plain
+            _       => b"\x00\x00\x00\x00",                  // → application/octet-stream
+        },
     }
 }
 
