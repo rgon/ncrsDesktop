@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.42](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.41...ncrs-v0.1.42) (2026-07-24)
+
+
+### Bug Fixes
+
+* **fuse:** make MIME-detect fallback category-aware so unknown binaries stop showing as text ([2fb74b5](https://github.com/rgon/ncrsDesktop/commit/2fb74b5de37593a986cb0a82836759c8fa9e5e4e))
+* **fuse:** map image/x-dcraw to TIFF magic so camera RAW files show as images not text ([f57a0ce](https://github.com/rgon/ncrsDesktop/commit/f57a0ce98baf3259a2d4df127272eb94a6eecb0f))
+
 ## [0.1.41](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.40...ncrs-v0.1.41) (2026-07-22)
 
 
