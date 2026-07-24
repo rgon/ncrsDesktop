@@ -447,6 +447,16 @@ fn mime_magic_bytes(content_type: &str) -> &'static [u8] {
         "image/webp"                        => b"RIFF",
         "image/bmp"                         => b"BM",
         "image/tiff"                        => b"II*\x00",
+        // TIFF-based camera RAW. Nextcloud reports image/x-dcraw for raw formats
+        // (.srw/.cr2/.nef/.arw/.dng/…), and the freedesktop MIME db often has no
+        // glob for the extension (e.g. .srw), so without this arm GLib sniffs the
+        // synthetic bytes, falls through to `# text\n`, and shows the file as
+        // text/plain. Real raw files are TIFF containers, so returning TIFF magic
+        // makes GLib classify them as image/tiff — an image type — which is enough
+        // for Nautilus to show an image icon and pick up the server-side preview
+        // the daemon prefetches into the XDG thumbnail cache. Big-endian magic
+        // (MM) mirrors the actual on-disk header of these files.
+        "image/x-dcraw"                     => b"MM\x00*",
         "application/zip"
         | "application/x-zip-compressed"
         | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"

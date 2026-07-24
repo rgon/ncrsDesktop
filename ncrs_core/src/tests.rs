@@ -1307,6 +1307,9 @@ password: "pass"
         // A representative mapped type resolves to its real signature...
         assert_eq!(mime_magic_bytes("image/png"), b"\x89PNG\r\n\x1a\n");
         assert_eq!(mime_magic_bytes("application/pdf"), b"%PDF-");
+        // TIFF-based camera RAW (Nextcloud's image/x-dcraw) must resolve to TIFF
+        // magic so GLib classifies it as an image instead of text/plain.
+        assert_eq!(mime_magic_bytes("image/x-dcraw"), b"MM\x00*");
         // ...content-type parameters are ignored...
         assert_eq!(mime_magic_bytes("text/plain; charset=utf-8"), b"# text\n");
         // ...and every unmapped type still yields non-empty, text-classifiable
