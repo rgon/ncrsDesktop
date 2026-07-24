@@ -40,6 +40,13 @@ struct Cli {
     /// Print the default config template to stdout and exit
     #[arg(long)]
     print_default_config: bool,
+
+    /// Diagnostic: read content-types from stdin (one per line) and print
+    /// "<content-type>\t<hex>" of the synthetic MIME-detect bytes for each,
+    /// then exit. Needs no config, network or keyring. Used by
+    /// scripts/mime_audit.py to verify the intercept against real GLib.
+    #[arg(long, hide = true)]
+    dump_mime_magic: bool,
 }
 
 fn main() {
@@ -48,6 +55,23 @@ fn main() {
 
     if cli.print_default_config {
         print!("{}", ncrs_core::config::DEFAULT_CONFIG);
+        return;
+    }
+
+    if cli.dump_mime_magic {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            let ct = line.trim();
+            if ct.is_empty() {
+                continue;
+            }
+            let hex: String = ncrs_core::mime_magic_bytes(ct)
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            println!("{}\t{}", ct, hex);
+        }
         return;
     }
 

@@ -437,15 +437,18 @@ fn read_err_is_network_down(e: &str) -> bool {
 /// (32768 bytes) regardless of file size; copy tools use ≥65536-byte buffers.
 const MIME_DETECT_MAX_READ: usize = 32768;
 
-fn mime_magic_bytes(content_type: &str) -> &'static [u8] {
+pub fn mime_magic_bytes(content_type: &str) -> &'static [u8] {
     let ct = content_type.split(';').next().unwrap_or(content_type).trim();
     match ct {
         "application/pdf"                   => b"%PDF-",
         "image/jpeg"                        => b"\xFF\xD8\xFF\xE0",
         "image/png"                         => b"\x89PNG\r\n\x1a\n",
         "image/gif"                         => b"GIF89a",
-        "image/webp"                        => b"RIFF",
-        "image/bmp"                         => b"BM",
+        // RIFF-container formats need the form-type at offset 8; bare "RIFF"
+        // resolves to application/x-riff (and bare "BM" is short printable ASCII
+        // that GLib reads as text) — both verified against Gio.content_type_guess.
+        "image/webp"                        => b"RIFF\x00\x00\x00\x00WEBP",
+        "image/bmp"                         => b"BM\x00\x00\x00\x00\x00\x00\x00\x00",
         "image/tiff"                        => b"II*\x00",
         // TIFF-based camera RAW. Nextcloud reports image/x-dcraw for raw formats
         // (.srw/.cr2/.nef/.arw/.dng/…), and the freedesktop MIME db often has no
@@ -482,7 +485,7 @@ fn mime_magic_bytes(content_type: &str) -> &'static [u8] {
         | "image/heif"                     => b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00",
         "audio/mpeg"                       => b"\xFF\xFB",
         "audio/flac"                       => b"fLaC",
-        "audio/wav"                        => b"RIFF",
+        "audio/wav"                        => b"RIFF\x00\x00\x00\x00WAVE",
         "image/svg+xml"                    => b"<svg xmlns=\"http://www.w3.org/2000/svg\">",
         "image/x-icon"
         | "image/vnd.microsoft.icon"       => b"\x00\x00\x01\x00\x01\x00",

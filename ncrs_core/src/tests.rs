@@ -1320,6 +1320,11 @@ password: "pass"
         assert_eq!(mime_magic_bytes("audio/mp4"),       b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00");
         assert_eq!(mime_magic_bytes("video/quicktime"), b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00");
         assert_eq!(mime_magic_bytes("image/heic"),      mime_magic_bytes("image/heif"));
+        // RIFF/BMP arms carry the form-type/enough bytes: bare "RIFF"/"BM" degrade
+        // to application/x-riff / text/plain (caught by scripts/mime_audit.py).
+        assert_eq!(mime_magic_bytes("image/webp"), b"RIFF\x00\x00\x00\x00WEBP");
+        assert_eq!(mime_magic_bytes("audio/wav"),  b"RIFF\x00\x00\x00\x00WAVE");
+        assert_eq!(mime_magic_bytes("image/bmp"),  b"BM\x00\x00\x00\x00\x00\x00\x00\x00");
 
         // Text-based application/* subtypes stay text-classifiable.
         assert_eq!(mime_magic_bytes("application/json"), b"# text\n");
