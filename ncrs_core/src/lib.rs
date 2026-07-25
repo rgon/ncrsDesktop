@@ -1860,6 +1860,10 @@ pub struct NextCloudFs {
     journal: mutation_journal::SharedJournal,
     notifier_slot: fuse_notify::NotifierSlot,
     ghost_entries: GhostMap,
+    // Shared between notify-push refreshes and read-triggered revalidation so
+    // the two paths never double-probe the same directory within a cooldown.
+    refresh_debounce: notify_push::DebounceMap,
+    file_change_queue: ipc::FileChangeQueue,
     log_user: String,
     aggressive_prefetch: bool,
     auto_keep_locally_modified_files: bool,
@@ -2068,6 +2072,8 @@ impl NextCloudFs {
             journal: journal_arc,
             notifier_slot: Arc::new(Mutex::new(None)),
             ghost_entries: Arc::new(Mutex::new(HashMap::new())),
+            refresh_debounce: Arc::new(Mutex::new(HashMap::new())),
+            file_change_queue: Arc::new(Mutex::new(Vec::new())),
             log_user: options.log_user,
             aggressive_prefetch: options.aggressive_prefetch,
             auto_keep_locally_modified_files: options.auto_keep_locally_modified_files,
@@ -2158,6 +2164,14 @@ impl NextCloudFs {
 
     pub(crate) fn ghost_entries(&self) -> GhostMap {
         self.ghost_entries.clone()
+    }
+
+    pub(crate) fn refresh_debounce(&self) -> notify_push::DebounceMap {
+        self.refresh_debounce.clone()
+    }
+
+    pub fn file_change_queue(&self) -> ipc::FileChangeQueue {
+        self.file_change_queue.clone()
     }
 
     pub fn keep_callback(&self) -> ipc::KeepCallback {
@@ -2350,6 +2364,10 @@ impl NextCloudFs {
         let thumb_inflight = self.thumb_inflight.clone();
         let cleanup_stale_gio_temps = self.cleanup_stale_gio_temps;
         let elog = self.error_log.clone();
+        let notifier_slot = self.notifier_slot.clone();
+        let ghost_entries = self.ghost_entries.clone();
+        let refresh_debounce = self.refresh_debounce.clone();
+        let file_change_queue = self.file_change_queue.clone();
 
         thread::spawn(move || {
             if offset == 0 {
@@ -2402,6 +2420,19 @@ impl NextCloudFs {
             })) {
                 Ok((entries, self_entry)) => {
                     log::info!("READDIR {} get_or_list_dir returned {} entries in {:?}", path.display(), entries.len(), t_readdir.elapsed());
+
+                    // Cached listings are served for speed, not trusted for
+                    // correctness: every read also probes the server etag in the
+                    // background and, on mismatch, refreshes + notifies. Catches
+                    // changes made while this client was offline, for which no
+                    // notify-push event will ever arrive.
+                    if !conn.is_offline.load(Ordering::Relaxed) && !conn.paused.load(Ordering::Relaxed) {
+                        notify_push::revalidate_dir_on_read(
+                            &path, &conn.backend, &cache, &dirty, &conn.active_streams,
+                            &conn.throttle, &notifier_slot, &refresh_debounce,
+                            &ghost_entries, &file_change_queue,
+                        );
+                    }
 
                     // GIO writes files atomically via a .goutputstream-* / .xdp-* temp
                     // that is renamed to the final name within seconds. Any such file
@@ -4728,7 +4759,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let purge_cb = filesystem.purge_callback();
     let base_url = notifications::base_url(&options.url);
     let ipc_creds = options.credentials()?;
-    let file_change_queue: ipc::FileChangeQueue = Arc::new(Mutex::new(Vec::new()));
+    let file_change_queue = filesystem.file_change_queue();
     let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
     ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.children_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), Some(purge_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone());
 
@@ -4875,7 +4906,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let watcher_fcq = file_change_queue.clone();
             let watcher_paused = filesystem.paused_flag();
             let watcher_offline = offline_flag.clone();
-            let debounce: notify_push::DebounceMap = Arc::new(Mutex::new(HashMap::new()));
+            let debounce = filesystem.refresh_debounce();
 
             let watcher = backend.start_change_watcher(Box::new(move |event| {
                 if watcher_paused.load(Ordering::Relaxed) { return; }

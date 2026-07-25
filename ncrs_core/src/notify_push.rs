@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -161,6 +161,23 @@ pub(crate) struct OldDirSnapshot {
     pub is_dir: HashMap<PathBuf, bool>,
 }
 
+impl OldDirSnapshot {
+    pub(crate) fn of(files: &[crate::backend::RemoteEntry]) -> Self {
+        OldDirSnapshot {
+            names: files.iter().map(|f| f.path.clone()).collect(),
+            etags: files.iter()
+                .map(|f| (f.path.clone(), f.change_token.clone()))
+                .collect(),
+            fileids: files.iter()
+                .filter_map(|f| f.ext.int("fileid").map(|fid| (f.path.clone(), fid)))
+                .collect(),
+            is_dir: files.iter()
+                .map(|f| (f.path.clone(), f.is_dir))
+                .collect(),
+        }
+    }
+}
+
 pub(crate) struct DirDiff {
     pub removed: Vec<PathBuf>,
     pub added: Vec<PathBuf>,
@@ -296,16 +313,7 @@ fn invalidate_dirs_by_path(
             continue;
         }
 
-        let names: Vec<PathBuf> = entry.files.iter().map(|f| f.path.clone()).collect();
-        let etags: HashMap<PathBuf, Option<String>> = entry.files.iter()
-            .map(|f| (f.path.clone(), f.change_token.clone()))
-            .collect();
-        let fileids: HashMap<PathBuf, u64> = entry.files.iter()
-            .filter_map(|f| f.ext.int("fileid").map(|fid| (f.path.clone(), fid)))
-            .collect();
-        let is_dir: HashMap<PathBuf, bool> = entry.files.iter()
-            .map(|f| (f.path.clone(), f.is_dir))
-            .collect();
+        let snapshot = OldDirSnapshot::of(&entry.files);
 
         let just_fetched = entry.at.elapsed() < Duration::from_secs(1);
         if just_fetched {
@@ -315,7 +323,7 @@ fn invalidate_dirs_by_path(
             entry.invalidated = true;
             entry.refreshing = false;
         }
-        invalidated.push((dir_path.clone(), OldDirSnapshot { names, etags, fileids, is_dir }));
+        invalidated.push((dir_path.clone(), snapshot));
     }
 
     let invalidated_inodes: Vec<u64> = invalidated.iter()
@@ -345,6 +353,77 @@ fn invalidate_dirs_by_path(
     }
 
     invalidated
+}
+
+// -- Read-triggered revalidation ------------------------------------------------
+
+/// Kicks off a background etag revalidation of `dir_path` after its cached
+/// listing was served to a reader. This makes the dir cache a latency
+/// optimization rather than a source of truth: readers get the cached answer
+/// immediately, and if the cheap Depth-0 etag probe shows the directory
+/// changed on the server, the full refresh pipeline (diff, ghost entries,
+/// kernel invalidation, IPC change queue) brings the listing up to date.
+///
+/// Covers changes for which no notify-push event was ever received — events
+/// emitted while this client was offline are not replayed by the server.
+///
+/// Rate limiting relies on the shared debounce map (3s after a refresh that
+/// found changes, 30s after one that found none), so at most one probe per
+/// directory per cooldown window regardless of readdir frequency.
+pub(crate) fn revalidate_dir_on_read(
+    dir_path: &Path,
+    backend: &Arc<dyn CloudBackend>,
+    cache: &Arc<Mutex<crate::FsCache>>,
+    dirty: &DirtySet,
+    active_streams: &AtomicUsize,
+    throttle: &Arc<Throttle>,
+    notifier_slot: &fuse_notify::NotifierSlot,
+    debounce: &DebounceMap,
+    ghost_entries: &GhostMap,
+    file_change_queue: &FileChangeQueue,
+) {
+    // Same guard as handle_change_event: don't perturb active streaming reads.
+    // The next readdir after the stream ends revalidates.
+    if active_streams.load(Ordering::Relaxed) > 0 {
+        return;
+    }
+
+    {
+        let db = debounce.safe_lock();
+        if let Some(state) = db.get(dir_path) {
+            if state.last_refresh.elapsed() < debounce_cooldown(state.had_changes) {
+                return;
+            }
+        }
+    }
+
+    let old_snap = {
+        let c = cache.safe_lock();
+        let entry = match c.dir_cache.get(dir_path) {
+            Some(e) => e,
+            None => return,
+        };
+        // A listing that was just PROPFINDed (cache miss, TTL refresh, or a
+        // notify-push refresh) is already fresh — probing again is pure churn.
+        if entry.refreshing || entry.at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        OldDirSnapshot::of(&entry.files)
+    };
+
+    let dir_path = dir_path.to_path_buf();
+    let backend = Arc::clone(backend);
+    let cache = Arc::clone(cache);
+    let dirty = Arc::clone(dirty);
+    let throttle = Arc::clone(throttle);
+    let notifier_slot = Arc::clone(notifier_slot);
+    let debounce = Arc::clone(debounce);
+    let ghosts = Arc::clone(ghost_entries);
+    let fcq = Arc::clone(file_change_queue);
+    std::thread::spawn(move || {
+        refresh_one_dir(dir_path, old_snap, backend, cache, dirty, throttle,
+                        notifier_slot, debounce, ghosts, fcq);
+    });
 }
 
 // -- Proactive refresh --------------------------------------------------------
