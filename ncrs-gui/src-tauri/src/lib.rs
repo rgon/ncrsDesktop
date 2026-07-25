@@ -753,6 +753,18 @@ pub fn run() {
         )
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        // The overlay is sized before it is shown, but on Wayland the monitor
+        // (and its scale) is only knowable once the surface maps — re-fit when
+        // the compositor reports the real scale factor.
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::ScaleFactorChanged { .. })
+                && window.label() == "main"
+            {
+                if let Some(w) = window.app_handle().get_webview_window("main") {
+                    ncrs_plugin::fit_overlay_to_monitor(&w);
+                }
+            }
+        })
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             close_window,

@@ -55,31 +55,45 @@ pub fn open_main_window(app: &AppHandle) {
             }
         },
     };
-    {
-        // The overlay is a transparent full-screen window; the visible card is
-        // CSS-anchored to the right edge of the viewport. So the window must
-        // cover the target monitor exactly, or the card falls off-screen.
-        //
-        // Prefer the monitor the window is on, falling back to the primary one.
-        let monitor = w
-            .current_monitor()
-            .ok()
-            .flatten()
-            .or_else(|| w.primary_monitor().ok().flatten());
-        if let Some(m) = monitor {
-            // Size/position in *logical* units derived from the monitor's own
-            // scale factor. Passing the monitor's physical size to set_size
-            // lets it be re-scaled by the window's (still-default 1.0) scale
-            // factor, which overshoots the screen on fractional-scaled displays
-            // (e.g. 125%/150%) and crops the right-anchored card off-screen.
-            let scale = m.scale_factor();
-            let _ = w.set_size(m.size().to_logical::<f64>(scale));
-            let _ = w.set_position(m.position().to_logical::<f64>(scale));
-        } else {
-            let _ = w.set_size(tauri::LogicalSize::new(1860f64, 1000f64));
-        }
-        let _ = w.show();
-        let _ = w.set_focus();
+    fit_overlay_to_monitor(&w);
+    let _ = w.show();
+    let _ = w.set_focus();
+}
+
+/// Size and position the transparent overlay so it exactly covers its monitor.
+///
+/// The overlay is a transparent full-screen window; the visible card is
+/// CSS-anchored to the right edge of the viewport. So the window must cover
+/// the target monitor exactly, or the card falls off-screen.
+///
+/// On Wayland an unmapped window has no current monitor (the GdkWindow does
+/// not exist until realize) and GDK reports no primary monitor at all, so
+/// before the first show both lookups fail and we must fall back to the
+/// monitor list. The pre-show guess can still be wrong (multi-monitor, or a
+/// scale the compositor only reveals on map), so this is also re-run from the
+/// ScaleFactorChanged window event once the surface is actually mapped.
+pub fn fit_overlay_to_monitor(w: &tauri::WebviewWindow) {
+    let monitor = w
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| w.primary_monitor().ok().flatten())
+        .or_else(|| {
+            w.available_monitors()
+                .ok()
+                .and_then(|ms| ms.into_iter().next())
+        });
+    if let Some(m) = monitor {
+        // Size/position in *logical* units derived from the monitor's own
+        // scale factor. Passing the monitor's physical size to set_size
+        // lets it be re-scaled by the window's (still-default 1.0) scale
+        // factor, which overshoots the screen on fractional-scaled displays
+        // (e.g. 125%/150%) and crops the right-anchored card off-screen.
+        let scale = m.scale_factor();
+        let _ = w.set_size(m.size().to_logical::<f64>(scale));
+        let _ = w.set_position(m.position().to_logical::<f64>(scale));
+    } else {
+        let _ = w.set_size(tauri::LogicalSize::new(1860f64, 1000f64));
     }
 }
 
