@@ -403,6 +403,51 @@ else
     no "blackhole test files never synced to backend (setup failed)"
 fi
 
+echo "→ 18. REMOTE ADD in a cached subdir — read-triggered revalidation surfaces it"
+# The missed-notify-push case: a file lands on the server in a directory whose
+# listing this client already cached, and no push event ever arrives (client was
+# offline when it happened / plain WebDAV has no notify_push). Every readdir now
+# probes the directory's own ETag in the background and re-lists on mismatch, so
+# simply looking at the directory must surface the file — well before the dir
+# TTL (10s in this suite) would have, and without a cache purge.
+#
+# The mechanism under test needs the server to change the dir ETag when a direct
+# child is added (rclone derives ETags from mtime, and a child create touches the
+# dir mtime). Verify that precondition first; if this server doesn't provide it,
+# report informationally like scenarios 9/16 instead of failing the suite.
+mkdir "$MOUNT/revdir"
+# MKCOL propagates asynchronously — wait for the collection on the backend
+# before caching its listing and PUTting into it.
+for _ in $(seq 1 30); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}revdir/")" = "207" ] && break
+    sleep 1
+done
+ls "$MOUNT/revdir" >/dev/null 2>&1          # cache the (empty) listing
+T_CACHE=$(date +%s)
+ETAG_BEFORE="$(curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}revdir/" | grep -o '<[^>]*getetag>[^<]*' | head -1)"
+RVC="revalidate-me $(date +%s%N)"
+printf '%s' "$RVC" > /tmp/rev.txt
+RVW="$(printf '%s' "$RVC" | sha)"
+curl -s -u "$U:$P" -T /tmp/rev.txt "${URL}revdir/rev.txt" -o /dev/null
+ETAG_AFTER="$(curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}revdir/" | grep -o '<[^>]*getetag>[^<]*' | head -1)"
+sleep 3                                      # get past the just-fetched suppression
+seen=""
+for _ in $(seq 1 12); do
+    ls "$MOUNT/revdir" >/dev/null 2>&1       # each read schedules a background probe
+    if [ "$(fuse_sha revdir/rev.txt)" = "$RVW" ]; then seen=$(( $(date +%s) - T_CACHE )); break; fi
+    sleep 1
+done
+if [ -n "$seen" ] && [ "$seen" -lt 10 ]; then
+    ok "server-added file visible ${seen}s after caching (inside TTL → revalidation, not expiry)"
+elif [ -n "$seen" ]; then
+    no "server-added file only appeared after ${seen}s — TTL expiry, read-triggered revalidation not working"
+elif [ "$ETAG_BEFORE" = "$ETAG_AFTER" ]; then
+    echo "  ⓘ server did not change the dir ETag on child add (before==after) — the"
+    echo "    revalidation probe has nothing to observe on this server; not a failure"
+else
+    no "dir ETag changed (${ETAG_BEFORE} → ${ETAG_AFTER}) but mount never surfaced the file (stale cache)"
+fi
+
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
