@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.43](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.42...ncrs-v0.1.43) (2026-07-25)
+
+
+### Bug Fixes
+
+* **fuse:** revalidate dir etag in background on every readdir so changes missed by notify-push surface without a cache purge ([757d97f](https://github.com/rgon/ncrsDesktop/commit/757d97f1fd507d8497460d69c3931a61a86367c1))
+
 ## [0.1.42](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.41...ncrs-v0.1.42) (2026-07-24)
 
 
