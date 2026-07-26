@@ -10,22 +10,71 @@ permissions:
   contents: write
   pull-requests: write
 
-# Cancel the in-progress run for this branch/PR when a new commit arrives
-# (e.g. the Cargo.lock update pushed by update-release-lockfile.yml).
-# Only cancel for pull_request events; master pushes always run to completion.
+# Cancel the in-progress run when a new commit arrives on the same PR.
+# This is critical for release-please PRs: when update-lockfile pushes the
+# corrected Cargo.lock, the current run (which hasn't started building yet)
+# is cancelled and a fresh run starts with the correct lockfile already in place.
+# Master pushes are never cancelled — they always run to completion.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # ── Lockfile hygiene (release-please PRs only) ──────────────────────────────
+  # release-please bumps versions in Cargo.toml but never runs cargo, so
+  # Cargo.lock is stale on PR open. This job refreshes it (workspace entries
+  # only — external pins are untouched) and commits it back to the PR branch
+  # before any build job starts. The push triggers a fresh CI run; the
+  # concurrency group above cancels this run before build ever starts, so
+  # the build always sees a coherent Cargo.toml + Cargo.lock pair.
+  update-lockfile:
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      # Set only when a commit was pushed; used by build to check out the
+      # updated tree so hashFiles() in the cache key reflects the new lockfile.
+      head-sha: ${{ steps.push.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Refresh Cargo.lock for bumped workspace versions
+        run: cargo update --workspace
+
+      - name: Commit and push if lockfile changed
+        id: push
+        run: |
+          git diff --quiet Cargo.lock && exit 0
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock
+          git commit -m 'chore: update Cargo.lock for release'
+          git push
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # ── Build ────────────────────────────────────────────────────────────────────
   build:
+    needs: [update-lockfile]
+    # Run when update-lockfile succeeded (release-please PR) or was skipped
+    # (every other PR / master push). Never run on a cancelled workflow.
+    if: "!cancelled() && (needs.update-lockfile.result == 'success' || needs.update-lockfile.result == 'skipped')"
     runs-on: ubuntu-22.04
     env:
       # Must be job-level so the sccache daemon starts with the GHA backend
       # enabled. Step-level env is too late — the daemon is already running.
       SCCACHE_GHA_ENABLED: "true"
     steps:
+      # If update-lockfile pushed a new commit, check that out so hashFiles()
+      # in the cache key matches what will be on master after merge.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.update-lockfile.outputs.head-sha || github.sha }}
 
       # Keyed by everything that affects compilation output. Also serves as the
       # cross-job transport for e2e and build-release (replaces upload-artifact,
