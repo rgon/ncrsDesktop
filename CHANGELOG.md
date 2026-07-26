@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.46](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.45...ncrs-v0.1.46) (2026-07-26)
+
+
+### Features
+
+* **packaging:** add AppStream metainfo with OARS rating and hardware hints ([880918b](https://github.com/rgon/ncrsDesktop/commit/880918bb77e1e5c5ba7975b106275525f6c4c2aa))
+
+
+### Bug Fixes
+
+* **ci:** move update-lockfile guard to step level to prevent skip propagation ([d9316d2](https://github.com/rgon/ncrsDesktop/commit/d9316d22974378f29fda5966eb580a49c93f85f1))
+* **overlay:** use maximize() so overlay respects taskbar/dock work area ([6d391d9](https://github.com/rgon/ncrsDesktop/commit/6d391d9bd580f6a52d4f7875feae22772e08937e))
+
 ## [0.1.45](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.44...ncrs-v0.1.45) (2026-07-26)
 
 
