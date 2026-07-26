@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>es.rgon.ncrs</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>ncRS</name>
+  <summary>Mount and sync your Nextcloud as a local filesystem</summary>
+  <description>
+    <p>
+      ncRS mounts your Nextcloud as a local FUSE filesystem with offline
+      caching, real-time sync, conflict detection, and GNOME/Nautilus
+      integration including a GNOME Shell search provider.
+    </p>
+  </description>
+
+  <url type="homepage">https://github.com/rgon/ncrsDesktop</url>
+  <developer id="es.rgon">
+    <name>Gonzalo Ruiz</name>
+  </developer>
+
+  <launchable type="desktop-id">ncrs-gui.desktop</launchable>
+
+  <!-- Sends file metadata and credentials to the configured Nextcloud server -->
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-info">mild</content_attribute>
+  </content_rating>
+
+  <!-- Desktop-only application; not designed for touch or small screens -->
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+</component>

@@ -90,6 +90,7 @@ install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.SearchProvider.ini \
                                                                          "$PKG_DIR/usr/share/gnome-shell/search-providers/es.rgon.ncrs.SearchProvider.ini"
 install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.desktop       "$PKG_DIR/usr/share/applications/es.rgon.ncrs.desktop"
 install -Dm644 packaging/es.rgon.ncrs.SearchProvider.service              "$PKG_DIR/usr/share/dbus-1/services/es.rgon.ncrs.SearchProvider.service"
+install -Dm644 packaging/es.rgon.ncrs.metainfo.xml                        "$PKG_DIR/usr/share/metainfo/es.rgon.ncrs.metainfo.xml"
 install -Dm755 shell_integration/thumbnailer/cr3-thumbnailer               "$PKG_DIR/usr/bin/cr3-thumbnailer"
 install -Dm644 shell_integration/thumbnailer/cr3.thumbnailer               "$PKG_DIR/usr/share/thumbnailers/cr3.thumbnailer"
 
