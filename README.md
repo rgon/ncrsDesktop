@@ -3,24 +3,25 @@ Performs as good in an actual business than in a recently created personal cloud
 
 | | |
 |---|---|
-| ![Sync status and plugins](docs/screenshot1.jpg) | ![Notifications](docs/screenshot3.jpg) |
-| ![Settings](docs/screenshot4.jpg) | ![Account overview](docs/screenshot2.jpg) |
+| ![Sync status and plugins](docs/screenshot1.jpg) | ![Settings](docs/screenshot2.jpg) |
+| ![NC Metadata in Nautilus](docs/screenshot3.jpg) | ![Nextcloud-generated thumbnails even for RAW files](docs/screenshot4.jpg) |
 
-## Feature Goals:
+## Feature comparison:
 | Feature                   | Nextcloud Desktop | GNOME Integration/GVfs | ncRS |
 | :------------------------ | :---------------- | :--------------------- | :--- |
 | Real Virtual Filesystem             | ❌ (Experimental, bad approach which doesn't work with shell/file pickers etc)                | ✅ (remote only)                     | ✅   |
 | Streaming Download Support (play large 4K videos at network-rate)         | ❌ | ❌ (yes, but throughput is lower) | ✅ |
 | Nextcloud Notifications         | ✅ | ❌ | ✅ |
-| Nautilus integration    | ✅                | N/A since it's only online                    | ✅   |
+| Nautilus integration: syncing/downloaded/shared    | ✅ (partial)                | N/A since it's only online                    | ✅   |
 | Instant local access      | ✅                | ❌                     | ✅   |
+| Nextcloud-generated thumbnails         | ❌ | ❌ | ✅ (even for RAW images!) |
 | Local cached file pruning      | ❌                | ❌                     | ✅ intelligently keeps local copies of often-used files  |
 | Dynamically cache files/keep part locally | ❌                | ❌ (No internet = no files) | ✅   |
 | No path conflicts | ❌ (may emit sync errors)               | ✅ | ✅ No dumb 'Some files could not be synced' |
 | Maps nextcloud permissions to filesystem permissions      | ❌                | ❌ (will error, but doesn't first display it to the user)                    | ✅   |
-| HPB Support/Speed         | ✅ NC HPB | ❌ | ✅ NC HPB |
+| HPB Support/Sync speed         | ✅ NC HPB | ❌ | ✅ NC HPB |
 | QUIC/HTTP3 Support         | ❌ | ❌ | ✅ |
-| Syncing folders in different OS paths to similar folders within Nextcloud     | ✅ | ❌ | ❌ |
+| Syncing multiple OS paths -> different folders within Nextcloud     | ✅ | ❌ | ❌ (everything mounted under the Nextcloud path) |
 
 
 ## Server tips
