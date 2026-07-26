@@ -249,10 +249,18 @@
             loadInfo();
         });
 
+        // If the window was opened before start_ncfs_daemon set mount_options
+        // (e.g. user clicked the tray icon within the first second of launch),
+        // get_user_info and get_nc_theme return null. Retry loadInfo() once the
+        // daemon signals it is ready.
+        const unlistenMountReady = listen("mount-ready", () => {
+            if (userInfo === null && !needsLogin) loadInfo();
+        });
+
         Promise.all([
             unlistenSync, unlistenNotifs, unlistenErrors, unlistenTransfers,
             unlistenJournal, unlistenConflicts, unlistenPluginNav,
-            unlistenLoginComplete, unlistenAuthCleared,
+            unlistenLoginComplete, unlistenAuthCleared, unlistenMountReady,
         ]).then(() => loadInfo());
 
         const storageInterval = setInterval(() => {
@@ -280,6 +288,7 @@
             unlistenPluginNav.then(f => f());
             unlistenLoginComplete.then(f => f());
             unlistenAuthCleared.then(f => f());
+            unlistenMountReady.then(f => f());
             clearInterval(storageInterval);
             document.removeEventListener("pointerdown", clickOutListener);
             document.removeEventListener("keydown", escKeyListener);

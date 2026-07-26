@@ -1001,6 +1001,7 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     };
 
     *state.mount_options.lock().unwrap() = Some(opts.clone());
+    app.emit("mount-ready", ()).ok();
 
     let base_url = ncrs_core::notifications::base_url(&opts.url);
     let user = opts.username.clone().unwrap_or_default();
