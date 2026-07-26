@@ -3,8 +3,8 @@ Performs as good in an actual business than in a recently created personal cloud
 
 | | |
 |---|---|
-| ![Sync status and plugins](docs/screenshot1.png) | ![Notifications](docs/screenshot3.png) |
-| ![Settings](docs/screenshot4.png) | ![Account overview](docs/screenshot2.png) |
+| ![Sync status and plugins](docs/screenshot1.jpg) | ![Notifications](docs/screenshot3.jpg) |
+| ![Settings](docs/screenshot4.jpg) | ![Account overview](docs/screenshot2.jpg) |
 
 ## Feature Goals:
 | Feature                   | Nextcloud Desktop | GNOME Integration/GVfs | ncRS |

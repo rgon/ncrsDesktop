@@ -21,19 +21,19 @@
 
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot1.png</image>
+      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot1.jpg</image>
       <caption>Sync status dashboard with plugin integrations</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot2.png</image>
+      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot2.jpg</image>
       <caption>Account overview and available storage</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot3.png</image>
+      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot3.jpg</image>
       <caption>Nextcloud notifications forwarded to the desktop</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot4.png</image>
+      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot4.jpg</image>
       <caption>Mount directory and local cache configuration</caption>
     </screenshot>
   </screenshots>
