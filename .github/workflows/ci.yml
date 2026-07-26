@@ -252,9 +252,16 @@ jobs:
       - name: Test .deb
         run: bash scripts/test-deb.sh --container
 
-      - name: Upload .deb to GitHub release
+      - name: Upload .deb and publish release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ needs.release-please.outputs.tag_name }}"
           gh release upload "$tag" dist/*.deb
+          gh release edit "$tag" --draft=false
+
+      - name: Delete draft release on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete "${{ needs.release-please.outputs.tag_name }}" --yes || true
