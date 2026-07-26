@@ -219,9 +219,12 @@ jobs:
     if: needs.release-please.outputs.release_created
     runs-on: ubuntu-latest
     steps:
+      # Do NOT check out the release tag — the tag always points to github.sha
+      # (release-please tags the triggering commit), so this checkout is
+      # identical. Checking out the tag recomputes hashFiles from a ref rather
+      # than the SHA, which can diverge when master moved since the PR was opened
+      # and cause the binary-cache key to miss the artifacts built above.
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
 
       - name: Install packaging dependencies
         run: |
