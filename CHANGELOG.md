@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.47](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.46...ncrs-v0.1.47) (2026-07-26)
+
+
+### Bug Fixes
+
+* **ci:** check out github.sha in build-release to guarantee binary cache hit ([8aa42a7](https://github.com/rgon/ncrsDesktop/commit/8aa42a7891f78c7c9517ebc2a17de68ef9b3d405))
+* **ci:** create draft releases and publish only after successful .deb upload ([a20d247](https://github.com/rgon/ncrsDesktop/commit/a20d247ab6ef7824f6bdaf757c651b1f2da5fdc2))
+
 ## [0.1.46](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.45...ncrs-v0.1.46) (2026-07-26)
 
 
