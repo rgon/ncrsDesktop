@@ -20,15 +20,18 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # ── Lockfile hygiene (release-please PRs only) ──────────────────────────────
+  # ── Lockfile hygiene ─────────────────────────────────────────────────────────
   # release-please bumps versions in Cargo.toml but never runs cargo, so
   # Cargo.lock is stale on PR open. This job refreshes it (workspace entries
   # only — external pins are untouched) and commits it back to the PR branch
   # before any build job starts. The push triggers a fresh CI run; the
   # concurrency group above cancels this run before build ever starts, so
   # the build always sees a coherent Cargo.toml + Cargo.lock pair.
+  #
+  # NO job-level `if` here — the job must always succeed (instantly, as a
+  # no-op) on non-release-please runs. A skipped job propagates through the
+  # entire needs chain and silently skips e2e and release-please too.
   update-lockfile:
-    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -38,17 +41,21 @@ jobs:
       head-sha: ${{ steps.push.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
         with:
           ref: ${{ github.head_ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
 
       - name: Refresh Cargo.lock for bumped workspace versions
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
         run: cargo update --workspace
 
       - name: Commit and push if lockfile changed
         id: push
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
         run: |
           git diff --quiet Cargo.lock && exit 0
           git config user.name  'github-actions[bot]'
@@ -61,9 +68,6 @@ jobs:
   # ── Build ────────────────────────────────────────────────────────────────────
   build:
     needs: [update-lockfile]
-    # Run when update-lockfile succeeded (release-please PR) or was skipped
-    # (every other PR / master push). Never run on a cancelled workflow.
-    if: "!cancelled() && (needs.update-lockfile.result == 'success' || needs.update-lockfile.result == 'skipped')"
     runs-on: ubuntu-22.04
     env:
       # Must be job-level so the sccache daemon starts with the GHA backend
