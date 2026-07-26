@@ -19,6 +19,25 @@
 
   <launchable type="desktop-id">ncrs-gui.desktop</launchable>
 
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot1.png</image>
+      <caption>Sync status dashboard with plugin integrations</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot2.png</image>
+      <caption>Account overview and available storage</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot3.png</image>
+      <caption>Nextcloud notifications forwarded to the desktop</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rgon/ncrsDesktop/master/docs/screenshot4.png</image>
+      <caption>Mount directory and local cache configuration</caption>
+    </screenshot>
+  </screenshots>
+
   <!-- Sends file metadata and credentials to the configured Nextcloud server -->
   <content_rating type="oars-1.1">
     <content_attribute id="social-info">mild</content_attribute>

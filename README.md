@@ -1,7 +1,10 @@
 # ncRS Desktop client
 Performs as good in an actual business than in a recently created personal cloud
 
-![Main dialog](docs/screenshot.png)
+| | |
+|---|---|
+| ![Sync status and plugins](docs/screenshot1.png) | ![Notifications](docs/screenshot3.png) |
+| ![Settings](docs/screenshot4.png) | ![Account overview](docs/screenshot2.png) |
 
 ## Feature Goals:
 | Feature                   | Nextcloud Desktop | GNOME Integration/GVfs | ncRS |
