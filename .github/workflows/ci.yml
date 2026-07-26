@@ -10,6 +10,13 @@ permissions:
   contents: write
   pull-requests: write
 
+# Cancel the in-progress run for this branch/PR when a new commit arrives
+# (e.g. the Cargo.lock update pushed by update-release-lockfile.yml).
+# Only cancel for pull_request events; master pushes always run to completion.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     runs-on: ubuntu-22.04

@@ -1,0 +1,51 @@
+name: Update Cargo.lock for release
+
+# When release-please opens a version-bump PR it touches Cargo.toml but not
+# Cargo.lock (it doesn't run cargo). This workflow commits the updated lockfile
+# to the PR branch so that:
+#   1. The PR contains a coherent Cargo.toml + Cargo.lock pair.
+#   2. The binary-cache key on master after merge matches the one computed
+#      during the PR build → cache hit → no second full compilation.
+#
+# Runs cargo update --workspace (no compilation; only workspace-package entries
+# in the lockfile are refreshed) then pushes if anything changed. The push
+# triggers a fresh ci.yml run whose cache key reflects the new lockfile.
+# ci.yml's concurrency group cancels the in-progress run on the stale lockfile.
+
+on:
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: update-lockfile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  update-lockfile:
+    if: startsWith(github.head_ref, 'release-please--')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo update --workspace
+
+      - id: diff
+        run: |
+          git diff --quiet Cargo.lock \
+            && echo "changed=false" >> "$GITHUB_OUTPUT" \
+            || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock
+          git commit -m 'chore: update Cargo.lock for release'
+          git push
