@@ -84,14 +84,15 @@ pub fn fit_overlay_to_monitor(w: &tauri::WebviewWindow) {
                 .and_then(|ms| ms.into_iter().next())
         });
     if let Some(m) = monitor {
-        // Size/position in *logical* units derived from the monitor's own
-        // scale factor. Passing the monitor's physical size to set_size
-        // lets it be re-scaled by the window's (still-default 1.0) scale
-        // factor, which overshoots the screen on fractional-scaled displays
-        // (e.g. 125%/150%) and crops the right-anchored card off-screen.
+        // Size in *logical* units derived from the monitor's own scale factor.
+        // Passing the monitor's physical size to set_size lets it be re-scaled
+        // by the window's (still-default 1.0) scale factor, which overshoots
+        // the screen on fractional-scaled displays (e.g. 125%/150%) and crops
+        // the right-anchored card off-screen. Position is left to the
+        // compositor — the overlay is a full-screen transparent window and the
+        // compositor places it at the monitor origin by default.
         let scale = m.scale_factor();
         let _ = w.set_size(m.size().to_logical::<f64>(scale));
-        let _ = w.set_position(m.position().to_logical::<f64>(scale));
     } else {
         let _ = w.set_size(tauri::LogicalSize::new(1860f64, 1000f64));
     }
