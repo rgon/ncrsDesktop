@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.44](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.43...ncrs-v0.1.44) (2026-07-26)
+
+
+### Bug Fixes
+
+* **gui:** fall back to first available monitor and re-fit on scale change so the overlay covers the screen on Wayland scaled displays ([d018168](https://github.com/rgon/ncrsDesktop/commit/d018168d54cf3918bc9caefce20eb46f50cd794f))
+
 ## [0.1.43](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.42...ncrs-v0.1.43) (2026-07-25)
 
 
