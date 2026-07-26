@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.45](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.44...ncrs-v0.1.45) (2026-07-26)
+
+
+### Bug Fixes
+
+* absolute window positioning wayland bypass had wrong offset ([44de636](https://github.com/rgon/ncrsDesktop/commit/44de6369a40f7a9599f7adb4df2a36a5456ca9e7))
+* **gui:** reload user info and theme when window opens before daemon is ready ([759a334](https://github.com/rgon/ncrsDesktop/commit/759a3340a319dd0c1f57e10c0c9d7fb0da799a5e))
+
 ## [0.1.44](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.43...ncrs-v0.1.44) (2026-07-26)
 
 
