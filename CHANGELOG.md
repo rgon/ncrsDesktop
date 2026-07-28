@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.48](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.47...ncrs-v0.1.48) (2026-07-28)
+
+
+### Performance Improvements
+
+* **gui:** use jemalloc to bound RSS from read-ahead buffer churn ([89e02e6](https://github.com/rgon/ncrsDesktop/commit/89e02e6aeeac95ef4ab2411cb81216e2d1e1930c))
+
 ## [0.1.47](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.46...ncrs-v0.1.47) (2026-07-26)
 
 
