@@ -3065,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "nc_gnome_integration"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3080,7 +3080,7 @@ dependencies = [
 
 [[package]]
 name = "nc_passwords"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "log",
  "ncrs_plugin",
@@ -3093,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs-gui"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "dirs",
  "log",
@@ -3110,12 +3110,13 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tauri-runtime-wry",
+ "tikv-jemallocator",
  "tokio",
 ]
 
 [[package]]
 name = "ncrs_core"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "clap",
  "crc32fast",
@@ -3144,7 +3145,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs_plugin"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "serde",
  "serde_json",
@@ -4570,7 +4571,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5705,6 +5706,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

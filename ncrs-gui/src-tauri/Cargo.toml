@@ -39,3 +39,16 @@ dirs = "6.0.0"
 ncrs_plugin = { path = "../../plugins/ncrs_plugin" }
 nc_passwords = { path = "../../plugins/nc_passwords" }
 nc_gnome_integration = { path = "../../plugins/nc_gnome_integration" }
+
+# Replace the system (glibc) allocator on Unix. This process churns large
+# (up to 64 MB) read-ahead and thumbnail buffers across dozens of FUSE worker
+# threads; glibc retained the freed memory in per-thread arenas and RSS crept
+# to ~2 GB. jemalloc gives it back to the OS. MSVC is excluded (unsupported).
+#
+# unprefixed_malloc_on_supported_platforms: makes jemalloc export the plain
+# `malloc`/`free`/`malloc_conf` symbols instead of the default `_rjem_`-prefixed
+# ones. Required so (a) our `#[export_name = "malloc_conf"]` tuning is the symbol
+# jemalloc actually reads, and (b) C libraries linked in (webkit/glib/openssl)
+# also route through jemalloc rather than glibc.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
