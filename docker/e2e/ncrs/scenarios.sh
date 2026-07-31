@@ -448,6 +448,71 @@ else
     no "dir ETag changed (${ETAG_BEFORE} → ${ETAG_AFTER}) but mount never surfaced the file (stale cache)"
 fi
 
+echo "→ 19. ORPHANED WRITE after a busy-mount force-detach is adopted, not refused"
+# Reproduces the historical bug: something (e.g. an app with an open document)
+# keeps the mount busy, a plain "fusermount -u" therefore can't complete, and
+# the mount gets force-detached anyway (what the GUI used to do as a silent
+# fallback) — exposing the real underlying directory while still "in use". A
+# save landing on that exposed directory used to permanently block the next
+# mount ("not empty"); it must now be adopted as a pending upload instead.
+ADOPT_DIR="adopt19"
+mkdir -p "$MOUNT/$ADOPT_DIR"
+C19="ncrs-e2e orphan-setup $(date +%s%N)"
+printf '%s' "$C19" > "$MOUNT/$ADOPT_DIR/orphan.txt"
+W19="$(printf '%s' "$C19" | sha)"
+wait_fuse_sha "$ADOPT_DIR/orphan.txt" "$W19" && ok "setup file synced before the forced detach" \
+    || no "setup file never synced — scenario precondition failed"
+
+DAEMON_PID="$(pgrep -f 'ncrs --config' | head -1)"
+if [ -z "$DAEMON_PID" ]; then
+    no "could not find the running ncrs daemon — cannot run this scenario"
+else
+    # Hold the mount busy the way an app with an open document would: a
+    # process with its cwd inside the mount makes a plain unmount EBUSY.
+    ( cd "$MOUNT" && sleep 25 ) &
+    HOLDER=$!
+    sleep 1
+
+    fusermount3 -u "$MOUNT" 2>/dev/null \
+        && no "clean unmount succeeded while busy (scenario precondition failed)" \
+        || echo "    (clean unmount correctly refused: mount is busy)"
+    fusermount3 -uz "$MOUNT" 2>/dev/null || umount -l "$MOUNT" 2>/dev/null || true
+    kill "$DAEMON_PID" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        kill -0 "$DAEMON_PID" 2>/dev/null || break
+        sleep 1
+    done
+
+    # The write a belated save from that still-open document would make —
+    # straight onto the now-exposed real directory, bypassing ncrs entirely.
+    NEW19="ncrs-e2e new-during-detach $(date +%s%N)"
+    printf '%s' "$NEW19" > "$MOUNT/$ADOPT_DIR/new_during_detach.txt"
+    WN19="$(printf '%s' "$NEW19" | sha)"
+
+    kill "$HOLDER" 2>/dev/null || true
+    wait "$HOLDER" 2>/dev/null || true
+
+    RUST_LOG="${RUST_LOG:-info}" ncrs --config "$HOME/.config/ncrs/config.yaml" >/tmp/ncrs_restart19.log 2>&1 &
+    DAEMON=$!
+
+    remounted=1
+    for _ in $(seq 1 30); do
+        mountpoint -q "$MOUNT" && { remounted=0; break; }
+        kill -0 "$DAEMON" 2>/dev/null || break
+        sleep 1
+    done
+    if [ "$remounted" -eq 0 ]; then
+        ok "ncrs remounted on the previously-orphaned mount point instead of refusing"
+    else
+        no "ncrs failed to remount after the orphaned write (adoption not working)"
+        tail -60 /tmp/ncrs_restart19.log
+    fi
+
+    wait_dav_sha "$ADOPT_DIR/new_during_detach.txt" "$WN19" 60 \
+        && ok "orphaned write reached the backend (adopted, not lost)" \
+        || no "orphaned write never reached the backend (data loss)"
+fi
+
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
