@@ -1464,3 +1464,97 @@ password: "pass"
         assert!(!read_err_is_network_down("404 Not Found"));
         assert!(!read_err_is_network_down("No space left on device"));
     }
+
+    // ── prepare_mount_point (orphan-write adoption) ─────────────────────────────
+    // Regression coverage for: ncrs torn down (or force-detached) while a file
+    // is still open elsewhere → a later save lands straight on the real,
+    // now-exposed mount-point directory → next start used to always refuse.
+
+    fn test_tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ncrs_lib_test_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn prepare_mount_point_rejects_nonempty_without_marker() {
+        // First-time setup (or a freshly configured mount point ncrs has never
+        // owned) must keep refusing a non-empty directory outright.
+        let base = test_tmp("no_marker");
+        let mount_point = base.join("mount");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&mount_point).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(mount_point.join("stray.txt"), b"data").unwrap();
+
+        let err = prepare_mount_point(&mount_point, &cache_dir).unwrap_err();
+        assert!(err.contains("not empty"), "unexpected error: {}", err);
+        assert!(mount_point.join("stray.txt").exists(), "leftover must be untouched on refusal");
+    }
+
+    #[test]
+    fn prepare_mount_point_rejects_nonempty_with_mismatched_marker() {
+        // ncrs owns a *different* path per the marker — this one is still new
+        // to it, so it must refuse just like the no-marker case, not adopt.
+        let base = test_tmp("mismatched_marker");
+        let mount_point = base.join("mount");
+        let other_mount_point = base.join("other_mount");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&mount_point).unwrap();
+        std::fs::create_dir_all(&other_mount_point).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(mount_point.join("stray.txt"), b"data").unwrap();
+
+        write_mount_marker(&cache_dir, &other_mount_point);
+
+        let err = prepare_mount_point(&mount_point, &cache_dir).unwrap_err();
+        assert!(err.contains("not empty"), "unexpected error: {}", err);
+        assert!(mount_point.join("stray.txt").exists());
+    }
+
+    #[test]
+    fn prepare_mount_point_adopts_leftovers_on_known_path() {
+        // Resuming on a path ncrs already owns: leftovers (including a nested
+        // one) are adopted as pending uploads, junk is discarded, and the
+        // mount point ends up empty so the real mount can proceed.
+        let base = test_tmp("known_path");
+        let mount_point = base.join("mount");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&mount_point).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(mount_point.join("sub")).unwrap();
+        std::fs::write(mount_point.join("sub/orphan.ods"), b"orphaned edit").unwrap();
+        std::fs::write(mount_point.join(".~lock.orphan.ods#"), b"lock").unwrap();
+
+        write_mount_marker(&cache_dir, &mount_point);
+
+        let adopted = prepare_mount_point(&mount_point, &cache_dir).unwrap();
+
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0].remote_path, PathBuf::from("/sub/orphan.ods"));
+        assert_eq!(std::fs::read(&adopted[0].staging_path).unwrap(), b"orphaned edit");
+
+        let mut entries = std::fs::read_dir(&mount_point).unwrap();
+        assert!(entries.next().is_none(), "mount point must be emptied after adoption");
+    }
+
+    #[test]
+    fn prepare_mount_point_refuses_when_leftovers_look_implausible() {
+        // An entry that isn't a plain file or directory (e.g. a socket) is not
+        // a plausible stray app-write — refuse rather than guess, and leave it
+        // untouched, same as the too-many-files/too-many-bytes safety cap.
+        let base = test_tmp("too_much");
+        let mount_point = base.join("mount");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&mount_point).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        write_mount_marker(&cache_dir, &mount_point);
+
+        use std::os::unix::net::UnixListener;
+        let _listener = UnixListener::bind(mount_point.join("weird.sock")).unwrap();
+
+        let err = prepare_mount_point(&mount_point, &cache_dir).unwrap_err();
+        assert!(err.contains("not auto-adopted"), "unexpected error: {}", err);
+        assert!(mount_point.join("weird.sock").exists(), "leftover must be untouched on refusal");
+    }

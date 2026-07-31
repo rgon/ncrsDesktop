@@ -1894,10 +1894,7 @@ impl NextCloudFs {
             }
         }
 
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("ncrs")
-            .join(url_to_dir_name(&options.url));
+        let cache_dir = ncrs_cache_dir(&options.url);
         let kept_dir = cache_dir.join("kept");
         let auto_cache_dir = cache_dir.join("cache");
         std::fs::create_dir_all(&cache_dir)
@@ -4736,7 +4733,8 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     // Must run before anything that touches shared resources (the IPC socket,
     // cache dirs, journal): a refused second instance must leave the running
     // daemon's state untouched.
-    prepare_mount_point(&options.mount_point)?;
+    let cache_dir = ncrs_cache_dir(&options.url);
+    let adopted = prepare_mount_point(&options.mount_point, &cache_dir)?;
 
     let mut filesystem = NextCloudFs::new(options.clone())?;
     if let Some(el) = error_log {
@@ -4752,6 +4750,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     // the IPC PAUSE/RESUME verbs — callers without their own flag get one.
     let paused_flag = paused.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     Arc::get_mut(&mut filesystem.conn).expect("conn not yet shared").paused = paused_flag.clone();
+
+    // Files that were written straight onto the (unmounted) real mount-point
+    // directory during a previous session — see prepare_mount_point — are
+    // queued into the journal now that it (and the backend connection) exist.
+    adopt_orphaned_files(&filesystem, adopted);
+
     let keep_cb = filesystem.keep_callback();
     let evict_cb = filesystem.evict_callback();
     let prefetch_cb = filesystem.prefetch_callback();
@@ -5124,6 +5128,11 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let session = fuser::Session::new(filesystem, &options.mount_point, &fuse_config)
         .map_err(|e| format!("FUSE session init failed: {}", e))?;
 
+    // The kernel accepted the mount — record that ncrs now owns this exact
+    // path so a later restart on it (rather than a fresh setup elsewhere) is
+    // allowed to adopt any leftovers instead of refusing. See prepare_mount_point.
+    write_mount_marker(&cache_dir, &options.mount_point);
+
     if let Some(fd) = fuse_notify::find_fuse_fd() {
         use std::os::unix::io::FromRawFd;
         let duped = unsafe { libc::dup(fd) };
@@ -5172,8 +5181,10 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 //  - stat fails with ENOTCONN: stale FUSE mount left by a dead process — detach it
 //  - listed as a live fuse mount in /proc/self/mounts: another instance owns it — refuse,
 //    detaching here would steal the mount out from under that instance
-//  - otherwise: plain (or missing) directory — create it and require it empty
-fn prepare_mount_point(mount_point: &Path) -> Result<(), String> {
+//  - otherwise: plain (or missing) directory — create it and require it empty, unless
+//    ncrs previously owned this exact path (see the mount marker below), in which case
+//    leftovers are adopted as orphaned local edits instead — see adopt_orphaned_files.
+fn prepare_mount_point(mount_point: &Path, cache_dir: &Path) -> Result<Vec<AdoptedFile>, String> {
     let mp_str = mount_point.to_string_lossy().to_string();
 
     match std::fs::metadata(mount_point) {
@@ -5196,18 +5207,34 @@ fn prepare_mount_point(mount_point: &Path) -> Result<(), String> {
     if let Err(e) = std::fs::create_dir_all(mount_point) {
         return Err(format!("failed to create mount point {}: {}", mp_str, e));
     }
-    match std::fs::read_dir(mount_point) {
-        Ok(mut entries) => {
-            if entries.next().is_some() {
-                return Err(format!(
-                    "mount point {} is not empty — mounting would hide its contents; move them away first",
-                    mp_str
-                ));
-            }
-        }
+    let is_empty = match std::fs::read_dir(mount_point) {
+        Ok(mut entries) => entries.next().is_none(),
         Err(e) => return Err(format!("cannot read mount point {}: {}", mp_str, e)),
+    };
+    if is_empty {
+        return Ok(Vec::new());
     }
-    Ok(())
+
+    let canon_mp = mount_point.canonicalize().unwrap_or_else(|_| mount_point.to_path_buf());
+    let previously_owned = read_mount_marker(cache_dir).map_or(false, |m| m == canon_mp);
+    if !previously_owned {
+        return Err(format!(
+            "mount point {} is not empty — mounting would hide its contents; move them away first",
+            mp_str
+        ));
+    }
+
+    log::warn!(
+        "{} is not empty, but ncrs previously mounted here — treating leftovers as orphaned local edits",
+        mp_str
+    );
+    let leftovers = scan_leftovers(mount_point).map_err(|e| {
+        format!(
+            "mount point {} has leftover content that was not auto-adopted: {} — move it away first",
+            mp_str, e
+        )
+    })?;
+    relocate_leftovers(mount_point, cache_dir, &leftovers)
 }
 
 // True if the path appears as a mounted fuse filesystem in /proc/self/mounts.
@@ -5234,6 +5261,250 @@ fn is_live_fuse_mount(mp: &Path) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+// ── Orphan-write adoption ────────────────────────────────────────────────────
+// If ncrs is torn down (or force-detached, e.g. a lazy `fusermount -uz` while
+// a file is still open) while an app holds a file open under the mount, a
+// later save from that app can land directly on the real, now-exposed
+// mount-point directory instead of going through FUSE. On the next start this
+// used to be an unconditional refusal ("mount point is not empty"). When the
+// mount marker below proves ncrs previously owned this exact path, leftovers
+// are instead treated as orphaned local edits and queued for upload — see
+// prepare_mount_point and adopt_orphaned_files.
+
+const ADOPT_MAX_FILES: usize = 200;
+const ADOPT_MAX_BYTES: u64 = 500 * 1024 * 1024;
+
+fn ncrs_cache_dir(url: &str) -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("ncrs")
+        .join(url_to_dir_name(url))
+}
+
+fn mount_marker_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("last_mount_point")
+}
+
+// The mount point ncrs most recently mounted successfully, if any. Compared
+// against the target mount point to distinguish "first-time setup / a
+// different configured path" (must still reject a non-empty directory) from
+// "restarting on a path we already own" (safe to adopt leftovers on).
+fn read_mount_marker(cache_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(mount_marker_path(cache_dir))
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+}
+
+fn write_mount_marker(cache_dir: &Path, mount_point: &Path) {
+    let canon = mount_point.canonicalize().unwrap_or_else(|_| mount_point.to_path_buf());
+    let _ = std::fs::create_dir_all(cache_dir);
+    if let Err(e) = std::fs::write(mount_marker_path(cache_dir), canon.to_string_lossy().as_bytes()) {
+        log::warn!("failed to record mount marker for {}: {}", canon.display(), e);
+    }
+}
+
+// Junk apps leave next to an open document — safe to discard rather than upload.
+fn is_lock_junk(name: &str) -> bool {
+    (name.starts_with(".~lock.") && name.ends_with('#')) || name.starts_with(".goutputstream-")
+}
+
+#[derive(Debug)]
+pub(crate) struct AdoptedFile {
+    pub remote_path: PathBuf,
+    pub staging_path: PathBuf,
+}
+
+enum LeftoverEntry {
+    Dir(PathBuf),
+    File(PathBuf),
+    Junk(PathBuf),
+}
+
+// Read-only walk of `root`: collects every leftover entry (paths relative to
+// `root`), or fails — without touching anything — if the content doesn't look
+// like a plausible stray app-write (too much of it, or an entry type we don't
+// recognize, e.g. a symlink or socket).
+fn scan_leftovers(root: &Path) -> Result<Vec<LeftoverEntry>, String> {
+    let mut out = Vec::new();
+    let mut total_bytes = 0u64;
+    scan_leftovers_rec(root, &PathBuf::new(), &mut out, &mut total_bytes)?;
+    Ok(out)
+}
+
+fn scan_leftovers_rec(
+    abs_dir: &Path,
+    rel_dir: &Path,
+    out: &mut Vec<LeftoverEntry>,
+    total_bytes: &mut u64,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(abs_dir)
+        .map_err(|e| format!("cannot read {}: {}", abs_dir.display(), e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read {}: {}", abs_dir.display(), e))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().to_string();
+        let rel_path = if rel_dir.as_os_str().is_empty() {
+            PathBuf::from(&name)
+        } else {
+            rel_dir.join(&name)
+        };
+        let abs_path = entry.path();
+        let file_type = entry.file_type()
+            .map_err(|e| format!("cannot stat {}: {}", abs_path.display(), e))?;
+
+        if is_lock_junk(&name_str) {
+            out.push(LeftoverEntry::Junk(rel_path));
+        } else if file_type.is_dir() {
+            out.push(LeftoverEntry::Dir(rel_path.clone()));
+            scan_leftovers_rec(&abs_path, &rel_path, out, total_bytes)?;
+        } else if file_type.is_file() {
+            *total_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(LeftoverEntry::File(rel_path));
+        } else {
+            return Err(format!("unexpected entry {}", abs_path.display()));
+        }
+
+        if out.len() > ADOPT_MAX_FILES || *total_bytes > ADOPT_MAX_BYTES {
+            return Err(format!(
+                "too much leftover content ({} entries, {} bytes so far)",
+                out.len(), *total_bytes
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Moves every leftover file into cache_dir (same-filesystem rename, so this
+// is cheap) and removes the now-empty leftover directories/junk so the mount
+// point ends up empty. Processing in reverse of the scan order handles each
+// directory's descendants before the directory itself, since scan_leftovers
+// always pushes a Dir entry immediately before the entries found within it.
+fn relocate_leftovers(
+    mount_point: &Path,
+    cache_dir: &Path,
+    entries: &[LeftoverEntry],
+) -> Result<Vec<AdoptedFile>, String> {
+    let _ = std::fs::create_dir_all(cache_dir);
+    let mut adopted = Vec::new();
+    let mut next_id: u64 = 0;
+    let pid = std::process::id();
+    for entry in entries.iter().rev() {
+        match entry {
+            LeftoverEntry::Junk(rel) => {
+                let _ = std::fs::remove_file(mount_point.join(rel));
+            }
+            LeftoverEntry::File(rel) => {
+                let abs = mount_point.join(rel);
+                next_id += 1;
+                let staging_path = cache_dir.join(format!("adopted_{}_{}", pid, next_id));
+                std::fs::rename(&abs, &staging_path)
+                    .map_err(|e| format!("failed to adopt {}: {}", abs.display(), e))?;
+                adopted.push(AdoptedFile {
+                    remote_path: PathBuf::from("/").join(rel),
+                    staging_path,
+                });
+            }
+            LeftoverEntry::Dir(rel) => {
+                let abs = mount_point.join(rel);
+                std::fs::remove_dir(&abs)
+                    .map_err(|e| format!("failed to clear leftover directory {}: {}", abs.display(), e))?;
+            }
+        }
+    }
+    Ok(adopted)
+}
+
+// Queues every adopted file as a normal pending upload. Ancestor directories
+// are created remotely first (root-to-leaf) if they don't already exist —
+// mirroring what a normal mkdir()-then-write() through FUSE would have
+// established for a file created the ordinary way. If the remote file/dir
+// already exists, the current etag is used as the Put's if_match_etag so a
+// concurrent remote change is caught by the existing conflict machinery
+// (ConflictKind::EditConflict) on replay, instead of being silently clobbered.
+fn adopt_orphaned_files(fs: &NextCloudFs, adopted: Vec<AdoptedFile>) {
+    if adopted.is_empty() {
+        return;
+    }
+    log::warn!(
+        "adopting {} locally-modified file(s) found in the mount point after an interrupted session: {}",
+        adopted.len(),
+        adopted.iter().map(|a| a.remote_path.display().to_string()).collect::<Vec<_>>().join(", "),
+    );
+
+    let mut ensured_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut newly_created_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut dir_listing_cache: HashMap<PathBuf, Vec<RemoteEntry>> = HashMap::new();
+
+    let list_cached = |dir: PathBuf, cache: &mut HashMap<PathBuf, Vec<RemoteEntry>>| -> Vec<RemoteEntry> {
+        if let Some(e) = cache.get(&dir) {
+            return e.clone();
+        }
+        match list_dir_propfind(&fs.conn, dir.clone()) {
+            Ok((_, _, entries)) => {
+                cache.insert(dir, entries.clone());
+                entries
+            }
+            Err(e) => {
+                log::warn!("adopt: could not list {}: {}", dir.display(), e);
+                Vec::new()
+            }
+        }
+    };
+
+    for AdoptedFile { remote_path, staging_path } in adopted {
+        let mut ancestors: Vec<PathBuf> = Vec::new();
+        let mut cur = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        while cur != Path::new("/") {
+            ancestors.push(cur.clone());
+            cur = cur.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("/"));
+        }
+        ancestors.reverse();
+
+        for dir in &ancestors {
+            if ensured_dirs.contains(dir) {
+                continue;
+            }
+            let parent = dir.parent().unwrap_or(Path::new("/")).to_path_buf();
+            let exists = !newly_created_dirs.contains(&parent)
+                && list_cached(parent, &mut dir_listing_cache).iter().any(|e| e.is_dir && e.path == *dir);
+            if !exists {
+                let seq = fs.journal.safe_lock().enqueue(
+                    mutation_journal::MutationOp::MkDir { path: dir.clone() },
+                );
+                log::info!("adopt: queued MKCOL {} (seq {})", dir.display(), seq);
+                newly_created_dirs.insert(dir.clone());
+            }
+            ensured_dirs.insert(dir.clone());
+        }
+
+        let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let if_match_etag = if newly_created_dirs.contains(&parent) {
+            None
+        } else {
+            list_cached(parent, &mut dir_listing_cache)
+                .iter()
+                .find(|e| !e.is_dir && e.path == remote_path)
+                .and_then(|e| e.change_token.clone())
+        };
+
+        let seq = fs.journal.safe_lock().enqueue(mutation_journal::MutationOp::Put {
+            remote_path: remote_path.clone(),
+            staging_path,
+            if_match_etag: if_match_etag.clone(),
+        });
+        if !fs.conn.is_offline.load(Ordering::Relaxed) {
+            fs.status.safe_write().insert(remote_path.clone(), FileStatus::Uploading);
+        } else {
+            fs.status.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+        }
+        fs.dirty.safe_lock().insert(remote_path.clone());
+        log::info!(
+            "adopt: queued PUT {} (seq {}, if_match_etag={:?})",
+            remote_path.display(), seq, if_match_etag,
+        );
+    }
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
