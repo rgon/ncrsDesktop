@@ -107,6 +107,39 @@ fn get_sync_state(state: State<Arc<AppState>>) -> String {
     }
 }
 
+// A plain `fusermount -u` fails with EBUSY while some process still has a
+// file open under the mount (e.g. LibreOffice keeping a document open). This
+// retries a few times — most such busy states (a lock file mid-release, a
+// save that just finished) clear within a second or two — but deliberately
+// never falls back to a lazy `-uz` detach: a lazy unmount frees the path
+// immediately even though it's still in use, so a *new* path-based write from
+// whatever still has it open (e.g. a save-as-temp-then-rename) lands straight
+// on the real underlying directory instead of erroring, bypassing ncrs
+// entirely. Returns true once a clean unmount succeeds, false if it's still
+// busy after retrying — callers must not force it silently.
+fn try_clean_unmount(mp: &str) -> bool {
+    const ATTEMPTS: u32 = 5;
+    for attempt in 0..ATTEMPTS {
+        let clean = std::process::Command::new("fusermount")
+            .args(["-u", mp])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if clean {
+            return true;
+        }
+        if attempt + 1 < ATTEMPTS {
+            log::info!("unmount {} busy, retrying ({}/{})", mp, attempt + 1, ATTEMPTS);
+            thread::sleep(Duration::from_millis(400));
+        }
+    }
+    log::warn!(
+        "unmount {} still busy after {} attempts — leaving it mounted rather than force-detaching",
+        mp, ATTEMPTS
+    );
+    false
+}
+
 #[tauri::command]
 async fn remount(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     // If a FUSE mount is active, unmount it before restarting so a changed
@@ -128,24 +161,17 @@ async fn remount(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), 
         if let Some(mp) = mp {
             log::info!("remount: unmounting {} before restart", mp);
             let mp2 = mp.clone();
-            let clean = tokio::task::spawn_blocking(move || {
-                std::process::Command::new("fusermount")
-                    .args(["-u", &mp2])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-            })
-            .await
-            .unwrap_or(false);
-            if !clean {
-                let mp2 = mp.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = std::process::Command::new("fusermount")
-                        .args(["-uz", &mp2])
-                        .status();
-                })
+            let clean = tokio::task::spawn_blocking(move || try_clean_unmount(&mp2))
                 .await
-                .ok();
+                .unwrap_or(false);
+            if !clean {
+                let msg = format!(
+                    "{} is still in use by another program — close whatever has a file open there and try again",
+                    mp
+                );
+                *state.sync_state.lock().unwrap() = SyncState::Error(msg.clone());
+                app.emit("sync-state-changed", format!("error:{}", msg)).ok();
+                return Err(msg);
             }
             // Wait for the FUSE thread to register the unmount (up to 5 s).
             for _ in 0..50 {
@@ -948,20 +974,18 @@ pub fn run() {
                 }
                 if let Some(mp) = mount_point {
                     log::info!("quit: unmounting {}", mp);
-                    // Clean unmount first so the dir can be removed below;
-                    // fall back to a lazy detach if the mount is busy.
-                    let clean = std::process::Command::new("fusermount")
-                        .args(["-u", &mp])
-                        .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false);
-                    if !clean {
-                        let _ = std::process::Command::new("fusermount")
-                            .args(["-uz", &mp])
-                            .output();
+                    // Never fall back to a lazy detach: the process is about
+                    // to exit either way, and a still-busy mount left in
+                    // place just dies with the process into a dead (ENOTCONN)
+                    // mount — prepare_mount_point already detaches that
+                    // safely on the next start. A lazy unmount instead frees
+                    // the path immediately while still in use, so a stray
+                    // path-based write from whatever's still open lands
+                    // straight on the real underlying directory.
+                    if try_clean_unmount(&mp) {
+                        // Best-effort: refuses non-empty or still-mounted dirs.
+                        let _ = std::fs::remove_dir(&mp);
                     }
-                    // Best-effort: refuses non-empty or still-mounted dirs.
-                    let _ = std::fs::remove_dir(&mp);
                 }
                 app.exit(0);
             }
