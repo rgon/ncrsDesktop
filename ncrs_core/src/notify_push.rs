@@ -4,10 +4,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use std::ffi::OsStr;
+
 use crate::backend::{ChangeEvent, CloudBackend};
 use crate::fuse_notify;
 use crate::ipc::{DirtySet, FileChange, FileChangeKind, FileChangeQueue};
 use crate::{GhostEntry, GhostKind, GhostMap, MutexExt, Throttle};
+use fuser::INodeNo;
 
 const CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(10);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -145,9 +148,7 @@ pub(crate) fn invalidate_all_dirs(
 
     if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
         for ino in inodes {
-            if let Err(e) = notifier.notify_inval_inode(ino, 0, 0) {
-                log::debug!("notify_inval_inode({}) failed: {}", ino, e);
-            }
+            let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
         }
     }
 }
@@ -341,9 +342,7 @@ fn invalidate_dirs_by_path(
 
     if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
         for ino in &invalidated_inodes {
-            if let Err(e) = notifier.notify_inval_inode(*ino, 0, 0) {
-                log::debug!("notify_inval_inode({}) failed: {}", ino, e);
-            }
+            let _ = notifier.inval_inode(INodeNo(*ino), 0, 0);
         }
     }
 
@@ -626,19 +625,13 @@ fn refresh_one_dir(
 
             if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
                 if listing_changed {
-                    if let Err(e) = notifier.notify_inval_inode(parent_ino, 0, 0) {
-                        log::warn!("notify_inval_inode(parent={}) failed: {}", parent_ino, e);
-                    }
+                    let _ = notifier.inval_inode(INodeNo(parent_ino), 0, 0);
                 }
                 for (child_ino, name) in &delete_targets {
-                    if let Err(e) = notifier.notify_delete(parent_ino, *child_ino, name.as_bytes()) {
-                        log::debug!("notify_delete({}/{}) failed (dentry likely expired): {}", parent_ino, name, e);
-                    }
+                    let _ = notifier.delete(INodeNo(parent_ino), INodeNo(*child_ino), OsStr::new(name));
                 }
                 for ino in &modified_inodes {
-                    if let Err(e) = notifier.notify_inval_inode(*ino, 0, 0) {
-                        log::debug!("notify_inval_inode({}) for modified file failed: {}", ino, e);
-                    }
+                    let _ = notifier.inval_inode(INodeNo(*ino), 0, 0);
                 }
             }
 
