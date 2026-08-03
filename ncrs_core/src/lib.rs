@@ -638,6 +638,10 @@ pub(crate) struct FsCache {
     // these entries so a concurrent PROPFIND refresh doesn't evict them
     // before the upload completes, which would cause ENOENT on stat().
     pub(crate) uploading: HashSet<PathBuf>,
+    // Full paths of files whose DELETE is in flight. put_dir_cache filters
+    // these out so a racing PROPFIND refresh can't re-add them before the
+    // server DELETE completes.
+    pub(crate) deleting: HashSet<PathBuf>,
 }
 
 impl FsCache {
@@ -714,6 +718,9 @@ impl FsCache {
                 }
             }
         }
+        // Filter out files whose DELETE is still in flight: a racing PROPFIND
+        // that completes before the server DELETE must not re-surface them.
+        files.retain(|f| !self.deleting.contains(&f.path));
         self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), refreshing: false, invalidated: false });
     }
 
@@ -2051,6 +2058,7 @@ impl NextCloudFs {
                     auto_cache_dir,
                     pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
                     uploading: HashSet::new(),
+                    deleting: HashSet::new(),
                 }));
                 load_dir_cache(&c);
                 c
@@ -3361,7 +3369,7 @@ impl Filesystem for NextCloudFs {
                                         // locks) and the attr TTL is the backstop.
                                         thread::sleep(Duration::from_millis(50));
                                         if let Some(notifier) = ns.safe_lock().as_ref() {
-                                            let _ = notifier.notify_inval_inode(ino_u64, 0, 0);
+                                            let _ = notifier.inval_inode(INodeNo(ino_u64), 0, 0);
                                         }
                                     });
                                 }
@@ -4215,6 +4223,11 @@ impl Filesystem for NextCloudFs {
                 let files: Vec<RemoteEntry> = dir.files.iter().filter(|e| e.path != remote_path).cloned().collect();
                 dir.files = Arc::new(files);
             }
+            // Guard against racing PROPFIND refreshes re-surfacing this file
+            // before the server DELETE completes (mirrors the `uploading` guard).
+            c.deleting.insert(remote_path.clone());
+            // Evict cached bytes immediately so a re-inserted dir entry can't serve stale content.
+            c.file_cache.remove(&remote_path);
         }
 
         // Keep in-memory maps consistent with the delete so DETAILDIR/STATUS no longer
@@ -4229,6 +4242,17 @@ impl Filesystem for NextCloudFs {
 
         self.dirty.safe_lock().insert(parent_path);
         reply.ok();
+
+        // Tell the kernel about the deletion so that other processes (e.g. Nautilus)
+        // invalidate their dentry cache immediately, without waiting for the background
+        // PROPFIND to complete.  Matches what proactive_refresh does for remote changes.
+        if let Some(notifier) = self.notifier_slot.safe_lock().as_ref() {
+            let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
+            let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
+            if child_ino != 0 {
+                let _ = notifier.delete(INodeNo(parent.0), INodeNo(child_ino), OsStr::new(&file_name));
+            }
+        }
 
         let seq = self.journal.safe_lock().enqueue(
             mutation_journal::MutationOp::Unlink { path: remote_path.clone() },
@@ -4263,26 +4287,36 @@ impl Filesystem for NextCloudFs {
                     Ok(()) => {
                         log::info!("DELETE {}", remote_path.display());
                         journal.safe_lock().remove(seq);
+                        cache.safe_lock().deleting.remove(&remote_path);
                     }
                     Err(backend::BackendWriteError::Server(404, _)) => {
                         log::debug!("DELETE {} — already gone (idempotent)", remote_path.display());
                         journal.safe_lock().remove(seq);
+                        cache.safe_lock().deleting.remove(&remote_path);
                     }
                     Err(e) if e.is_transient() => {
                         // Server briefly down/overloaded or the resource is locked (423).
                         // Keep the Unlink journaled and let the connectivity monitor's
                         // replay retry it — no user-facing error, since nothing is wrong
                         // with the delete itself. Matches the PUT path and journal replay.
+                        // Leave the path in `deleting` — the journal will replay the DELETE
+                        // and clear it on success.
                         log::warn!("DELETE {} deferred — {} (queued for retry)", remote_path.display(), e);
                         journal.safe_lock().mark_deferred(seq, e.to_string());
                     }
                     Err(e) => {
                         log::error!("DELETE {} failed (journaled): {}", remote_path.display(), e);
-                        push_error(&elog, remote_path, SyncErrorKind::ServerError(0), format!("delete failed: {}", e));
+                        push_error(&elog, remote_path.clone(), SyncErrorKind::ServerError(0), format!("delete failed: {}", e));
                         journal.safe_lock().mark_failed(seq, e.to_string());
+                        cache.safe_lock().deleting.remove(&remote_path);
                     }
                 }
             });
+        } else {
+            // Offline: the DELETE is journaled for later replay. Clear the guard now
+            // so it doesn't persist across a reconnect unnecessarily — the journal
+            // replay will re-issue the DELETE against the live server.
+            self.cache.safe_lock().deleting.remove(&remote_path);
         }
     }
 
@@ -4325,6 +4359,10 @@ impl Filesystem for NextCloudFs {
                 dir.files = Arc::new(files);
             }
             c.dir_cache.remove(&remote_path);
+            // Guard against racing PROPFIND refreshes re-surfacing this directory
+            // before the server DELETE completes (mirrors the `uploading` guard in
+            // unlink and the `deleting` guard added for files).
+            c.deleting.insert(remote_path.clone());
         }
         if let Some(set) = self.children_map.safe_write().get_mut(&parent_path) {
             set.remove(&remote_path);
@@ -4337,6 +4375,14 @@ impl Filesystem for NextCloudFs {
         self.dirty.safe_lock().insert(parent_path);
         reply.ok();
 
+        if let Some(notifier) = self.notifier_slot.safe_lock().as_ref() {
+            let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
+            let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
+            if child_ino != 0 {
+                let _ = notifier.delete(INodeNo(parent.0), INodeNo(child_ino), OsStr::new(&dir_name));
+            }
+        }
+
         let seq = self.journal.safe_lock().enqueue(
             mutation_journal::MutationOp::RmDir { path: remote_path.clone() },
         );
@@ -4344,6 +4390,7 @@ impl Filesystem for NextCloudFs {
         if !self.conn.is_offline.load(Ordering::Relaxed) {
             let conn = self.conn.clone();
             let journal = self.journal.clone();
+            let cache = self.cache.clone();
             let elog = self.error_log.clone();
             thread::spawn(move || {
                 let _permit = conn.throttle.acquire();
@@ -4351,18 +4398,27 @@ impl Filesystem for NextCloudFs {
                     Ok(()) => {
                         log::info!("RMDIR {}", remote_path.display());
                         journal.safe_lock().remove(seq);
+                        cache.safe_lock().deleting.remove(&remote_path);
                     }
                     Err(backend::BackendWriteError::Server(404, _)) => {
                         log::debug!("RMDIR {} — already gone (idempotent)", remote_path.display());
                         journal.safe_lock().remove(seq);
+                        cache.safe_lock().deleting.remove(&remote_path);
+                    }
+                    Err(e) if e.is_transient() => {
+                        log::warn!("RMDIR {} deferred — {} (queued for retry)", remote_path.display(), e);
+                        journal.safe_lock().mark_deferred(seq, e.to_string());
                     }
                     Err(e) => {
                         log::error!("RMDIR {} failed (journaled): {}", remote_path.display(), e);
-                        push_error(&elog, remote_path, SyncErrorKind::ServerError(0), format!("rmdir failed: {}", e));
+                        push_error(&elog, remote_path.clone(), SyncErrorKind::ServerError(0), format!("rmdir failed: {}", e));
                         journal.safe_lock().mark_failed(seq, e.to_string());
+                        cache.safe_lock().deleting.remove(&remote_path);
                     }
                 }
             });
+        } else {
+            self.cache.safe_lock().deleting.remove(&remote_path);
         }
     }
 
@@ -5133,20 +5189,8 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     // allowed to adopt any leftovers instead of refusing. See prepare_mount_point.
     write_mount_marker(&cache_dir, &options.mount_point);
 
-    if let Some(fd) = fuse_notify::find_fuse_fd() {
-        use std::os::unix::io::FromRawFd;
-        let duped = unsafe { libc::dup(fd) };
-        if duped >= 0 {
-            let fuse_file = unsafe { std::fs::File::from_raw_fd(duped) };
-            let notifier = Arc::new(fuse_notify::FuseNotifier::new(fuse_file));
-            *notifier_slot.safe_lock() = Some(notifier);
-            log::info!("FUSE notifier ready on fd {} (duped to {})", fd, duped);
-        } else {
-            log::warn!("Failed to dup FUSE fd {}: {}", fd, std::io::Error::last_os_error());
-        }
-    } else {
-        log::warn!("Could not find /dev/fuse fd — kernel notifications disabled");
-    }
+    *notifier_slot.safe_lock() = Some(session.notifier());
+    log::info!("FUSE notifier ready");
 
     let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;
     let result = bg.guard.join().map_err(|panic_payload| {

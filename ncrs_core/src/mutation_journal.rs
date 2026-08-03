@@ -533,6 +533,9 @@ pub(crate) fn replay_journal(
                 if let MutationOp::Put { staging_path, .. } = &entry.op {
                     let _ = std::fs::remove_file(staging_path);
                 }
+                if let MutationOp::Unlink { path } | MutationOp::RmDir { path } = &entry.op {
+                    cache.safe_lock().deleting.remove(path);
+                }
             }
             ReplayResult::Conflict(kind) => {
                 // Only discard the staged bytes when they are known safe on the
@@ -556,6 +559,9 @@ pub(crate) fn replay_journal(
                 j.dequeue_front();
                 if let MutationOp::Put { staging_path, .. } = &entry.op {
                     let _ = std::fs::remove_file(staging_path);
+                }
+                if let MutationOp::Unlink { path } | MutationOp::RmDir { path } = &entry.op {
+                    cache.safe_lock().deleting.remove(path);
                 }
             }
             ReplayResult::Retryable(msg) => {
