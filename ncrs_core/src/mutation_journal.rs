@@ -523,6 +523,9 @@ pub(crate) fn replay_journal(
             };
             j.add_conflict(ConflictKind::PermanentFailure { description: desc });
             j.dequeue_front();
+            if let MutationOp::Unlink { path } | MutationOp::RmDir { path } = &entry.op {
+                cache.safe_lock().deleting.remove(path);
+            }
             continue;
         }
 
@@ -574,6 +577,9 @@ pub(crate) fn replay_journal(
             }
             ReplayResult::ServerError(msg) => {
                 journal.safe_lock().mark_failed(entry.seq, msg);
+                if let MutationOp::Unlink { path } | MutationOp::RmDir { path } = &entry.op {
+                    cache.safe_lock().deleting.remove(path);
+                }
             }
         }
     }
