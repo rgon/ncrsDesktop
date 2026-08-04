@@ -321,6 +321,17 @@ fn is_transient_network_err(e: &str) -> bool {
         || e.contains("Connection refused")
         || e.contains("broken pipe")
         || e.contains("Broken pipe")
+        // reqwest wraps all transport-layer send failures (dropped SYN, TLS failure,
+        // connection dropped mid-request) as "error sending request" — these are always
+        // transient and should return EAGAIN from FUSE (not EIO, which makes Nautilus
+        // permanently mark the mount as inaccessible).
+        || e.contains("error sending request")
+        // Routing and reachability failures (EHOSTUNREACH / ENETUNREACH)
+        || e.contains("No route to host")
+        || e.contains("Network is unreachable")
+        // HTTP/2 stream resets (server-side RST_STREAM during keepalive)
+        || e.contains("stream error")
+        || e.contains("connection closed before message completed")
 }
 
 fn is_timeout_err(e: &str) -> bool {
@@ -335,15 +346,7 @@ fn is_timeout_err(e: &str) -> bool {
 /// periodic probe notices. The monitor re-probes every 5s while offline and
 /// clears the flag once the server is reachable again.
 fn read_err_is_network_down(e: &str) -> bool {
-    // reqwest wraps a failed connect/send (dropped SYN, refused, reset, TLS/connect
-    // timeout) as "error sending request for url (...)" — the dominant shape when
-    // the network is gone. Match it explicitly: it is NOT in is_transient_network_err
-    // (which drives read RETRIES — we deliberately do not want to retry a dead
-    // network here, just flip offline and fail fast), so it must be recognised
-    // separately for the offline flip.
-    is_timeout_err(e)
-        || is_transient_network_err(e)
-        || e.contains("error sending request")
+    is_timeout_err(e) || is_transient_network_err(e)
 }
 
 /// Return the minimal magic byte sequence that identifies a given MIME type.
