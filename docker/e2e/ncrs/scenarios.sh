@@ -485,6 +485,10 @@ else
 
     # The write a belated save from that still-open document would make —
     # straight onto the now-exposed real directory, bypassing ncrs entirely.
+    # The FUSE-created subdirectory only existed on the server, so recreate
+    # it on the real filesystem before writing (mirrors a real app whose OS
+    # directory cache still resolves the path after a lazy unmount).
+    mkdir -p "$MOUNT/$ADOPT_DIR"
     NEW19="ncrs-e2e new-during-detach $(date +%s%N)"
     printf '%s' "$NEW19" > "$MOUNT/$ADOPT_DIR/new_during_detach.txt"
     WN19="$(printf '%s' "$NEW19" | sha)"
