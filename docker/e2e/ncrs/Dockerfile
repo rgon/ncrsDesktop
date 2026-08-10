@@ -29,7 +29,7 @@ FROM build-${PREBUILT_BINARY} AS binary
 # ---- runtime: FUSE + the daemon + the test harness --------------------------
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        fuse3 libfuse3-3 libssl3 ca-certificates curl coreutils iptables \
+        fuse3 libfuse3-3 libssl3 ca-certificates curl coreutils iptables procps \
     && rm -rf /var/lib/apt/lists/* \
     && echo user_allow_other >> /etc/fuse.conf
 
