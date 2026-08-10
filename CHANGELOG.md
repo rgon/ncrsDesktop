@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.50](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.49...ncrs-v0.1.50) (2026-08-10)
+
+
+### Bug Fixes
+
+* **core:** adopt orphaned mount-point writes instead of refusing to remount ([fdc45cd](https://github.com/rgon/ncrsDesktop/commit/fdc45cd186afa0a8fd8c2ac215528f196a5c7dfc))
+* **core:** broaden is_transient_network_err to prevent FUSE EIO on transient network failures ([6f9ff75](https://github.com/rgon/ncrsDesktop/commit/6f9ff75a5cd15b69b95ef5435399852059d93cac))
+* **core:** clear deleting guard on journal replay ServerError and MAX_ATTEMPTS paths ([f5e02a4](https://github.com/rgon/ncrsDesktop/commit/f5e02a4c1838ad4ae3eba041c8f19fc32912f623))
+* **core:** prevent racing PROPFIND from re-surfacing in-flight deleted files and dirs ([a441d36](https://github.com/rgon/ncrsDesktop/commit/a441d361ec96db11b45cef0e1d8f00b931b59972))
+* **e2e:** install procps in e2e container for pgrep in scenario 19 ([c41482b](https://github.com/rgon/ncrsDesktop/commit/c41482b8d7edbcc5ecfa98b069f44216566d23dd))
+* **e2e:** mkdir adopt dir on real fs after lazy unmount so orphaned write lands ([788dd0f](https://github.com/rgon/ncrsDesktop/commit/788dd0f1b661d80d31db74f7899fc6d09b9bb979))
+* **gui:** stop lazy-detaching busy mounts to avoid orphaned writes ([7c283d1](https://github.com/rgon/ncrsDesktop/commit/7c283d1d337910baf311fac26cb2edc312d27238))
+
 ## [0.1.49](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.48...ncrs-v0.1.49) (2026-07-28)
 
 
