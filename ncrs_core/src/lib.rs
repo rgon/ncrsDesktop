@@ -77,6 +77,10 @@ const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 // changes landing through an external storage mount or `occ` may never produce
 // one, and no amount of client-side detection sees those. Hence a long backstop.
 const CONNECTED_MAX_STALE_FLOOR: Duration = Duration::from_secs(86400);
+// How long a directory whose forced re-list failed is served from cache before the
+// next attempt, so an unreachable server costs one timeout per minute per directory
+// instead of one per readdir.
+const EXPIRY_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
 fn effective_max_stale(configured: Option<Duration>, notify_push_connected: &AtomicBool) -> Option<Duration> {
     let base = configured?;
@@ -195,6 +199,11 @@ struct DirCacheEntry {
     // readdir pages are answered straight from this (still stale) entry and would
     // splice a fresh prefix onto a stale suffix.
     hard_expired: bool,
+    // When the forced re-list last failed. While a server is unreachable but the
+    // daemon has not yet flipped offline, re-expiring on every readdir would stall
+    // each one for the full PROPFIND timeout; this holds the check off briefly so
+    // the cost is one attempt per cooldown rather than per listing.
+    expiry_retry_after: Option<Instant>,
 }
 
 struct PendingDir {
@@ -708,8 +717,18 @@ impl FsCache {
         if entry.invalidated || entry.hard_expired {
             return None;
         }
+        if let Some(t) = entry.expiry_retry_after {
+            if t > Instant::now() {
+                return Some((Arc::clone(&entry.files), false));
+            }
+            entry.expiry_retry_after = None;
+        }
         if let Some(max) = max_stale {
-            let age = entry.fetched_at.elapsed().unwrap_or_default();
+            // elapsed() errors when fetched_at is in the future, which happens when
+            // the clock is stepped backwards after the cache was written (NTP fixing
+            // a bad RTC, a restored image). Treat that as maximally old: the listing's
+            // real age is unknown, and trusting it is the failure this guards against.
+            let age = entry.fetched_at.elapsed().unwrap_or(Duration::MAX);
             if age >= max {
                 entry.hard_expired = true;
                 log::info!("DIR_HARD_EXPIRED {} — cached listing is {}s old (max {}s), re-listing before serving",
@@ -760,7 +779,7 @@ impl FsCache {
         // Filter out files whose DELETE is still in flight: a racing PROPFIND
         // that completes before the server DELETE must not re-surface them.
         files.retain(|f| !self.deleting.contains(&f.path));
-        self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), fetched_at: SystemTime::now(), refreshing: false, invalidated: false, hard_expired: false });
+        self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), fetched_at: SystemTime::now(), refreshing: false, invalidated: false, hard_expired: false, expiry_retry_after: None });
     }
 
     /// Patch a single file entry's size in its parent's dir cache, returning true
@@ -901,6 +920,7 @@ impl FsCache {
             return None;
         }
         entry.hard_expired = false;
+        entry.expiry_retry_after = Some(Instant::now() + EXPIRY_RETRY_COOLDOWN);
         Some((Arc::clone(&entry.files), entry.self_entry.clone()))
     }
 
@@ -915,7 +935,10 @@ impl FsCache {
             Some(entry) if !entry.invalidated => {
                 entry.at = Instant::now();
                 entry.fetched_at = SystemTime::now();
-                entry.refreshing = false;
+                entry.expiry_retry_after = None;
+                // `refreshing` is deliberately left alone: it is a single-flight guard
+                // owned by whichever thread set it, and validation confirms directories
+                // it never started a refresh for.
                 entry.hard_expired = false;
                 true
             }
@@ -923,21 +946,20 @@ impl FsCache {
         }
     }
 
-    /// Root's etag was just confirmed unchanged which — Nextcloud propagates
-    /// collection etags up the tree — proves no cached directory beneath it changed
-    /// either. Restart the max-stale window for all of them, leaving the soft TTL
-    /// and any invalidation alone so the normal refresh cadence is untouched.
-    fn confirm_all_dirs_current(&mut self) -> usize {
-        let mut confirmed = 0usize;
-        for entry in self.dir_cache.values_mut() {
-            if entry.invalidated {
-                continue;
-            }
-            entry.fetched_at = SystemTime::now();
-            entry.hard_expired = false;
-            confirmed += 1;
+    /// Mark a directory whose etag no longer matches as untrusted, so it is re-listed
+    /// before being served even if the re-list that was supposed to follow fails.
+    fn invalidate_dir(&mut self, path: &Path) {
+        if let Some(entry) = self.dir_cache.get_mut(path) {
+            entry.invalidated = true;
         }
-        confirmed
+    }
+
+    /// A partial stream snapshot may only be served while the cached listing behind
+    /// it is still trusted: readdir's continuation pages read that listing directly
+    /// (see `readdir_common`), so a fresh prefix would be spliced onto a stale
+    /// suffix at shifted offsets.
+    fn may_serve_pending_snapshot(&self, path: &Path) -> bool {
+        self.dir_cache.get(path).map_or(true, |e| !e.invalidated && !e.hard_expired)
     }
 
     fn clear_refreshing(&mut self, path: &Path) {
@@ -1112,6 +1134,7 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
             refreshing: false,
             invalidated: false,
             hard_expired: false,
+            expiry_retry_after: None,
         });
         count += 1;
     }
@@ -1365,13 +1388,25 @@ fn get_or_list_dir(
     match list_dir_cached_or_fresh(conn, cache, path.clone(), dir_maps) {
         Ok(v) => Ok(v),
         Err(e) => {
-            if let Some((files, self_entry)) = cache.safe_lock().take_hard_expired_fallback(&path) {
-                log::warn!("HARD_EXPIRED_FALLBACK {}: {} — serving the stale listing", path.display(), e);
-                return Ok((files, self_entry));
+            // Only a server we could not reach justifies falling back to a listing we
+            // already decided is too old to trust. A 404/401 is an answer: surfacing
+            // it beats rendering a directory that no longer exists.
+            if is_unreachable_listing_error(&e) {
+                if let Some((files, self_entry)) = cache.safe_lock().take_hard_expired_fallback(&path) {
+                    log::warn!("HARD_EXPIRED_FALLBACK {}: {} — serving the stale listing", path.display(), e);
+                    return Ok((files, self_entry));
+                }
             }
             Err(e)
         }
     }
+}
+
+/// True when a failed listing means the server could not be reached (transport
+/// failure or timeout, including our own "PROPFIND timeout" give-up) rather than a
+/// server that answered with a rejection.
+fn is_unreachable_listing_error(e: &str) -> bool {
+    is_transient_network_err(e) || is_timeout_err(e)
 }
 
 fn list_dir_cached_or_fresh(
@@ -1462,14 +1497,15 @@ fn list_dir_cached_or_fresh(
         let mut c = cache.safe_lock();
         match probe {
             Ok(Some(ref new_etag)) if *new_etag == old_etag => {
-                if c.confirm_dir_fresh(&path) {
+                let confirmed = c.confirm_dir_fresh(&path);
+                c.clear_refreshing(&path);
+                if confirmed {
                     if let Some(entry) = c.dir_cache.get(&path) {
                         log::info!("LIST_ETAG_CONFIRMED {} ({} entries) in {:?}", path.display(), entry.files.len(), t0.elapsed());
                         return Ok((Arc::clone(&entry.files), entry.self_entry.clone()));
                     }
                 }
                 // Invalidated while the probe was in flight — re-list after all.
-                c.clear_refreshing(&path);
             }
             Ok(_) => {
                 log::info!("LIST_ETAG_CHANGED {} — re-listing before serving", path.display());
@@ -1487,11 +1523,14 @@ fn list_dir_cached_or_fresh(
         let mut c = cache.safe_lock();
         match c.get_pending_snapshot(&path) {
             Err(e) => return Err(e),
-            Ok(Some(snapshot)) => {
+            // The freshness check comes after the call, not before: a completed fetch
+            // is promoted by get_pending_snapshot itself, and that promotion clears
+            // the flags — so what matters is whether the listing is trusted *now*.
+            Ok(Some(snapshot)) if c.may_serve_pending_snapshot(&path) => {
                 let self_entry = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
                 return Ok((Arc::new(snapshot), self_entry));
             }
-            Ok(None) => {}
+            Ok(_) => {}
         }
     }
 
@@ -2006,6 +2045,14 @@ struct ConnInfo {
     deferred_invalidation: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+}
+
+/// Clears an in-progress flag on drop, so a panicking worker cannot latch it.
+struct ReleaseOnDrop(Arc<AtomicBool>);
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 struct StreamActiveGuard {
@@ -4915,10 +4962,13 @@ const RECONNECT_VALIDATE_DEPTH: u32 = 3;
 /// descended into (while `depth` allows) or handed to a background re-fetch — the
 /// alternative, dropping the cache wholesale, would make the next readdir of every
 /// directory pay a full listing.
-fn validate_subtree(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, path: PathBuf, depth: u32) {
+fn validate_subtree(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, path: PathBuf, depth: u32) -> bool {
+    if conn.shutdown.load(Ordering::Relaxed) || conn.is_offline.load(Ordering::Relaxed) {
+        return false;
+    }
     let has_cache = cache.safe_lock().dir_cache.contains_key(&path);
     if !has_cache {
-        return;
+        return false;
     }
     match list_dir_propfind(conn, path.clone()) {
         Ok((etag, self_entry, fresh_files)) => {
@@ -4952,11 +5002,16 @@ fn validate_subtree(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, path: Pat
                 }
                 // Entries handed to start_background_propfind must leave dir_cache
                 // first — it early-returns for a path that is still cached. Entries
-                // we recurse into keep their listing, so a concurrent readdir has
-                // something to serve while the descent runs.
+                // we recurse into keep their listing but are marked untrusted, so a
+                // descent that fails (or never finishes) cannot leave a directory we
+                // know has changed being served from cache.
                 if depth <= 1 {
                     for p in &changed_paths {
                         c.dir_cache.remove(p);
+                    }
+                } else {
+                    for p in &changed_paths {
+                        c.invalidate_dir(p);
                     }
                 }
                 c.put_dir_cache(path.clone(), etag, self_entry, fresh_files);
@@ -4966,14 +5021,27 @@ fn validate_subtree(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, path: Pat
             schedule_save_dir_cache(cache);
             for p in changed_paths {
                 if depth > 1 {
-                    validate_subtree(conn, cache, p, depth - 1);
+                    if !validate_subtree(conn, cache, p.clone(), depth - 1) {
+                        // The descent could not confirm this branch. It stays
+                        // invalidated either way — nothing stale is served — and when
+                        // we are still running a background re-list refills it without
+                        // waiting for a readdir. During shutdown or offline, leaving it
+                        // invalidated is enough: the next readdir re-lists.
+                        if conn.shutdown.load(Ordering::Relaxed) || conn.is_offline.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        cache.safe_lock().dir_cache.remove(&p);
+                        start_background_propfind(conn, cache, p, 0);
+                    }
                 } else {
                     start_background_propfind(conn, cache, p, 0);
                 }
             }
+            true
         }
         Err(e) => {
             log::warn!("VALIDATE {} failed: {} — cache served as-is", path.display(), e);
+            false
         }
     }
 }
@@ -4984,34 +5052,17 @@ fn boot_validate_root(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>) {
 
 /// Close the gap a dropped push connection leaves behind: notify-push has no
 /// replay, so anything that happened while the socket was down is simply gone.
-/// Probe the root etag first — since etags propagate upwards, a match proves the
-/// entire cached tree is still current, making the common reconnect cost exactly
-/// one small request. Only a mismatch descends, and only into branches that differ.
+///
+/// This deliberately does not take the tempting shortcut of probing root's etag and
+/// declaring the whole tree current on a match. Root's *cached* etag is refreshed
+/// whenever root is listed, which can happen long after a child was last listed —
+/// so a matching root etag says nothing about whether that child's cached listing
+/// is still good. The per-child comparison in `validate_subtree` is sound precisely
+/// because each child's etag was recorded together with its listing, and it costs
+/// the same single request (Depth-1 instead of Depth-0) for the whole level.
 fn revalidate_after_reconnect(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>) {
-    let root = PathBuf::from("/");
-    let cached_root_etag = {
-        let c = cache.safe_lock();
-        if !c.dir_cache.contains_key(&root) {
-            return;
-        }
-        c.cached_dir_etag(&root)
-    };
-    if let Some(old_etag) = cached_root_etag {
-        let probe = {
-            let _permit = conn.throttle.acquire();
-            conn.backend.dir_change_token(&root, PROPFIND_TIMEOUT)
-        };
-        match probe {
-            Ok(Some(ref new_etag)) if *new_etag == old_etag => {
-                let confirmed = cache.safe_lock().confirm_all_dirs_current();
-                log::info!("RECONNECT_VALIDATE: root etag unchanged — {} cached dirs still current", confirmed);
-                return;
-            }
-            Ok(_) => log::info!("RECONNECT_VALIDATE: root etag changed — validating changed branches"),
-            Err(e) => log::warn!("RECONNECT_VALIDATE root probe: {} — validating changed branches", e),
-        }
-    }
-    validate_subtree(conn, cache, root, RECONNECT_VALIDATE_DEPTH);
+    log::info!("RECONNECT_VALIDATE: revalidating cached listings by etag");
+    validate_subtree(conn, cache, PathBuf::from("/"), RECONNECT_VALIDATE_DEPTH);
 }
 
 fn build_fuse_options() -> Vec<MountOption> {
@@ -5233,9 +5284,11 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let revalidating = Arc::new(AtomicBool::new(false));
             thread::spawn(move || {
                 let mut was_connected = false;
-                // Only a *re*connect leaves a gap: the first connect happens right
-                // after mount, where boot validation already covers the same ground.
-                let mut saw_disconnect = false;
+                // Reconnects are detected by generation, not by observing the flag go
+                // false: a drop and re-auth can complete inside one poll interval and
+                // would otherwise be invisible. Generation 1 is the initial connect,
+                // already covered by boot validation; anything beyond it left a gap.
+                let mut last_generation = 0u64;
                 while !watcher_shutdown.load(Ordering::Relaxed) {
                     let connected = watcher.is_connected();
                     np_connected.store(connected, Ordering::Relaxed);
@@ -5245,23 +5298,29 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                     if connected != was_connected {
                         if connected {
                             log::info!("notify_push: high-performance backend connected");
-                            // Events that fired while the socket was down are lost for
-                            // good, so revalidate the cache by etag before trusting it
-                            // again. Off the poll thread: the descent can take a while.
-                            if saw_disconnect && !revalidating.swap(true, Ordering::Relaxed) {
-                                let rc = revalidate_conn.clone();
-                                let rcache = revalidate_cache.clone();
-                                let guard = revalidating.clone();
-                                thread::spawn(move || {
-                                    revalidate_after_reconnect(&rc, &rcache);
-                                    guard.store(false, Ordering::Relaxed);
-                                });
-                            }
                         } else {
-                            log::warn!("notify_push: high-performance backend disconnected — falling back to 5-minute poll interval");
-                            saw_disconnect = true;
+                            log::warn!("notify_push: high-performance backend disconnected — directory listings revalidate on read");
                         }
                         was_connected = connected;
+                    }
+                    let generation = watcher.connect_generation();
+                    if generation != last_generation {
+                        // Events that fired while the socket was down are gone for good,
+                        // so revalidate by etag before trusting the cache again. Runs off
+                        // the poll thread: the descent can take a while.
+                        if generation > 1 && !revalidating.swap(true, Ordering::Relaxed) {
+                            let rc = revalidate_conn.clone();
+                            let rcache = revalidate_cache.clone();
+                            let guard = ReleaseOnDrop(revalidating.clone());
+                            thread::spawn(move || {
+                                // Held to the end of the closure, and released even if
+                                // the revalidation panics — a latched guard would
+                                // silently disable every later reconnect.
+                                let _release = guard;
+                                revalidate_after_reconnect(&rc, &rcache);
+                            });
+                        }
+                        last_generation = generation;
                     }
                     watcher.set_paused(
                         sync_offline.load(Ordering::Relaxed)

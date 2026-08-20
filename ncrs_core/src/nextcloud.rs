@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -389,9 +389,11 @@ impl CloudBackend for NextcloudBackend {
         let connected = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
         let connected_ret = connected.clone();
         let shutdown_ret = shutdown.clone();
         let paused_ret = paused.clone();
+        let generation_ret = generation.clone();
 
         std::thread::spawn(move || {
             watcher_loop(
@@ -400,6 +402,7 @@ impl CloudBackend for NextcloudBackend {
                 &webdav_url,
                 &creds,
                 &connected,
+                &generation,
                 &shutdown,
                 &paused,
                 &callback,
@@ -408,6 +411,7 @@ impl CloudBackend for NextcloudBackend {
 
         Box::new(NcChangeWatcher {
             connected: connected_ret,
+            generation: generation_ret,
             shutdown: shutdown_ret,
             paused: paused_ret,
         })
@@ -481,6 +485,7 @@ impl CloudBackend for NextcloudBackend {
 
 struct NcChangeWatcher {
     connected: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
 }
@@ -488,6 +493,9 @@ struct NcChangeWatcher {
 impl ChangeWatcherHandle for NcChangeWatcher {
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+    fn connect_generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
     fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
@@ -506,6 +514,7 @@ fn watcher_loop(
     webdav_url: &str,
     creds: &Credentials,
     connected: &Arc<AtomicBool>,
+    generation: &Arc<AtomicU64>,
     shutdown: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
     callback: &ChangeCallback,
@@ -539,7 +548,7 @@ fn watcher_loop(
         };
 
         match watcher_connect_and_listen(
-            &info, http, webdav_url, creds, connected, shutdown, paused, callback,
+            &info, http, webdav_url, creds, connected, generation, shutdown, paused, callback,
         ) {
             Ok(()) => {
                 log::info!("change_watcher: connection closed cleanly");
@@ -565,6 +574,7 @@ fn watcher_connect_and_listen(
     webdav_url: &str,
     creds: &Credentials,
     connected: &Arc<AtomicBool>,
+    generation: &Arc<AtomicU64>,
     shutdown: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
     callback: &ChangeCallback,
@@ -615,6 +625,9 @@ fn watcher_connect_and_listen(
     match &auth_msg {
         Message::Text(t) if *t == "authenticated" => {
             log::info!("change_watcher: authenticated");
+            // Bump before publishing `connected`: a poller that sees the connection
+            // must never see a generation that lags behind it.
+            generation.fetch_add(1, Ordering::Relaxed);
             connected.store(true, Ordering::Relaxed);
         }
         Message::Text(t) if t.starts_with("err:") => {
