@@ -359,6 +359,28 @@
     }
 
     #[test]
+    fn confirm_dir_fresh_restarts_window_but_respects_invalidation() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/Photos");
+        let max_stale = Some(Duration::from_secs(2 * 3600));
+        cache.put_dir_cache(path.clone(), Some("etag1".into()), None, vec![make_dav_entry("g.txt", None)]);
+        cache.dir_cache.get_mut(&path).unwrap().fetched_at =
+            SystemTime::now() - Duration::from_secs(3 * 3600);
+
+        // Boot validation matched the child etag: the cached listing is current.
+        cache.confirm_dir_fresh(&path);
+        assert!(
+            cache.get_cached_dir(&path, DIR_CACHE_TTL, max_stale).is_some(),
+            "an etag-confirmed listing must not be forced through a blocking re-list"
+        );
+
+        // An invalidation that landed meanwhile still wins over the confirmation.
+        cache.dir_cache.get_mut(&path).unwrap().invalidated = true;
+        cache.confirm_dir_fresh(&path);
+        assert!(cache.get_cached_dir(&path, DIR_CACHE_TTL, max_stale).is_none());
+    }
+
+    #[test]
     fn hard_expired_fallback_returns_stale_listing_once() {
         let mut cache = make_test_cache();
         let path = PathBuf::from("/");

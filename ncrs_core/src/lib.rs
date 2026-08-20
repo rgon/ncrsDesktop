@@ -173,8 +173,10 @@ struct DirCacheEntry {
     refreshing: bool,
     invalidated: bool,
     // Set when the entry exceeded dir_cache_max_stale_mins. Behaves like a cache
-    // miss until a fresh PROPFIND replaces it, but unlike `invalidated` it still
-    // lets the incremental stream be served while that PROPFIND runs.
+    // miss until a fresh PROPFIND replaces it: like `invalidated`, the partial
+    // incremental stream is NOT served for it, because the kernel's continuation
+    // readdir pages are answered straight from this (still stale) entry and would
+    // splice a fresh prefix onto a stale suffix.
     hard_expired: bool,
 }
 
@@ -885,6 +887,20 @@ impl FsCache {
         Some((Arc::clone(&entry.files), entry.self_entry.clone()))
     }
 
+    /// Restart the max-stale window for a listing whose etag was just confirmed
+    /// unchanged: the cached data is provably current, so it must not be forced
+    /// through a synchronous re-list. Leaves the soft TTL and the invalidation
+    /// state alone — an invalidation that landed while the etag was being probed
+    /// still wins.
+    fn confirm_dir_fresh(&mut self, path: &Path) {
+        if let Some(entry) = self.dir_cache.get_mut(path) {
+            if !entry.invalidated {
+                entry.fetched_at = SystemTime::now();
+                entry.hard_expired = false;
+            }
+        }
+    }
+
     fn clear_refreshing(&mut self, path: &Path) {
         if let Some(entry) = self.dir_cache.get_mut(path) {
             entry.refreshing = false;
@@ -1046,7 +1062,7 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
         // fetch time: treat them as ancient so the first listing re-lists rather
         // than trusting a listing of unknown age.
         let fetched_at = v.fetched_at
-            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
+            .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
             .unwrap_or(UNIX_EPOCH);
         c.dir_cache.insert(dir_path, DirCacheEntry {
             files: Arc::new(v.files),
@@ -1394,7 +1410,10 @@ fn list_dir_cached_or_fresh(
     // Start incremental streaming fetch — unless another thread already started one
     let (already_pending, was_invalidated) = {
         let mut c = cache.safe_lock();
-        let was_inv = c.dir_cache.get(&path).map_or(false, |e| e.invalidated);
+        // Both invalidated and hard-expired dirs still hold a stale listing that
+        // readdir's continuation pages read directly, so a partial stream snapshot
+        // must not be served for them: wait for the full listing to be promoted.
+        let was_inv = c.dir_cache.get(&path).map_or(false, |e| e.invalidated || e.hard_expired);
         if c.dir_cache.contains_key(&path) {
             if let Some((files, _)) = c.get_cached_dir(&path, ttl, max_stale) {
                 let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
@@ -2106,7 +2125,7 @@ impl NextCloudFs {
             is_offline,
             optimistic_listing: options.optimistic_listing,
             dir_cache_max_stale: (options.dir_cache_max_stale_mins > 0)
-                .then(|| Duration::from_secs(options.dir_cache_max_stale_mins * 60)),
+                .then(|| Duration::from_secs(options.dir_cache_max_stale_mins.saturating_mul(60))),
             notify_push_connected: Arc::new(AtomicBool::new(false)),
             active_streams: Arc::new(AtomicUsize::new(0)),
             deferred_invalidation: Arc::new(AtomicBool::new(false)),
@@ -4814,10 +4833,15 @@ fn boot_validate_root(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>) {
                     }
                     let child_path = entry.path.clone();
                     let fresh_etag = entry.change_token.as_deref();
-                    let cached_etag = c.dir_cache.get(&child_path).and_then(|e| e.etag.as_deref());
-                    match (fresh_etag, cached_etag) {
+                    let cached_etag = c.dir_cache.get(&child_path).and_then(|e| e.etag.clone());
+                    match (fresh_etag, cached_etag.as_deref()) {
                         (Some(f), Some(c_etag)) if f == c_etag => {
                             matched += 1;
+                            // Etag unchanged: the cached listing is current. Restart the
+                            // max-stale window so the first readdir after a restart is
+                            // served from cache instead of blocking on a re-list of a
+                            // directory boot validation just proved up to date.
+                            c.confirm_dir_fresh(&child_path);
                         }
                         _ => {
                             if c.dir_cache.contains_key(&child_path) {
