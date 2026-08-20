@@ -311,4 +311,5 @@ Config options (in `~/.config/ncrs/config.yaml`):
 - `cache_streamed_reads: true` -- promote fully-streamed files to disk cache
 - `read_ahead_bytes: 67108864` -- read-ahead window for streaming reads (default 64 MB)
 - `cache_cleanup_interval_secs: 3600` -- how often to run cache pruning (default 3600 = 1 hour)
+- `dir_cache_max_stale_mins: 15` -- before showing a directory whose cached listing is older than this, ask the server whether it changed, so the first listing is already current (default 15, 0 = disabled). An unchanged directory costs one small etag request. Only applies while push notifications are down; while they work, a 24-hour backstop applies.
 - `keep_paths: ["/Documents", "/Photos"]` -- remote paths to auto-keep locally on startup (default empty)
