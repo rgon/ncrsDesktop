@@ -53,6 +53,9 @@
             ...settings,
             read_ahead_bytes: readAheadMb * 1024 * 1024,
             cache_max_size_bytes: cacheMaxGb * 1024 * 1024 * 1024,
+            // Clearing a number input binds null, which the u64 field cannot
+            // deserialize — the whole save would fail with an opaque error.
+            dir_cache_max_stale_mins: Math.max(0, Math.round(settings.dir_cache_max_stale_mins || 0)),
         };
         try {
             await invoke("save_config_values", { values: payload });
