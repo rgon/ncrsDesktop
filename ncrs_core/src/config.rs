@@ -207,6 +207,12 @@ mount_point: ""
 
 # Label used in log lines (usually your local username).
 user: ""
+
+# Before showing a directory whose cached listing is older than this many minutes,
+# ask the server whether it changed, so the first listing is already current. An
+# unchanged directory costs one small request. Only applies while push
+# notifications are down; while they work, a 24-hour backstop applies. 0 disables.
+# dir_cache_max_stale_mins: 15
 "#;
 
 pub fn config_path() -> PathBuf {
@@ -484,13 +490,11 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# Keeps the file manager responsive; disable if you need listings to always\n");
     content.push_str("# reflect the current server state before rendering.\n");
     content.push_str(&format!("optimistic_listing: {}\n", settings.optimistic_listing));
-    content.push_str("# Maximum age (minutes) of a cached listing that may still be served\n");
-    content.push_str("# optimistically. For a directory not listed for longer than this, the server\n");
-    content.push_str("# is asked whether it changed before the listing is shown, so the first listing\n");
-    content.push_str("# is already current instead of updating only on a second look. Unchanged\n");
-    content.push_str("# directories cost a single small etag request. While the push connection is\n");
-    content.push_str("# live, changes arrive as events instead and only a 24-hour backstop applies.\n");
-    content.push_str("# 0 disables the check.\n");
+    content.push_str("# Before showing a directory whose cached listing is older than this many\n");
+    content.push_str("# minutes, ask the server whether it changed, so the first listing is already\n");
+    content.push_str("# current. An unchanged directory costs one small request. Only applies while\n");
+    content.push_str("# push notifications are down; while they work, a 24-hour backstop applies.\n");
+    content.push_str("# 0 disables.\n");
     content.push_str(&format!("dir_cache_max_stale_mins: {}\n", settings.dir_cache_max_stale_mins));
     content.push_str(&format!("auto_keep_locally_modified_files: {}\n", settings.auto_keep_locally_modified_files));
     content.push_str(&format!("auto_keep_cached_files: {}\n", settings.auto_keep_cached_files));
