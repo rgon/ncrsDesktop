@@ -32,6 +32,11 @@ struct Cli {
     #[arg(long)]
     no_optimistic_listing: bool,
 
+    /// Re-list a directory from the server before showing it when its cached
+    /// listing is older than this many minutes (0 disables; default 120)
+    #[arg(long, value_name = "MINS")]
+    dir_cache_max_stale_mins: Option<u64>,
+
     /// Keep a local cache copy of every file after it is written and uploaded.
     /// When set, the post-upload emblem is a green checkmark; otherwise no emblem is shown.
     #[arg(long)]
@@ -118,6 +123,9 @@ fn main() {
     }
     if cli.no_optimistic_listing {
         opts.optimistic_listing = false;
+    }
+    if let Some(mins) = cli.dir_cache_max_stale_mins {
+        opts.dir_cache_max_stale_mins = mins;
     }
     if cli.auto_keep_locally_modified_files {
         opts.auto_keep_locally_modified_files = true;

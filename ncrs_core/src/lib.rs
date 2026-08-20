@@ -166,8 +166,16 @@ struct DirCacheEntry {
     self_entry: Option<RemoteEntry>,
     etag: Option<String>,
     at: Instant,
+    // Wall-clock fetch time, used only for the dir_cache_max_stale_mins check.
+    // `at` is monotonic: it neither survives a restart nor advances across
+    // suspend, so it cannot answer "how old is this listing really?".
+    fetched_at: SystemTime,
     refreshing: bool,
     invalidated: bool,
+    // Set when the entry exceeded dir_cache_max_stale_mins. Behaves like a cache
+    // miss until a fresh PROPFIND replaces it, but unlike `invalidated` it still
+    // lets the incremental stream be served while that PROPFIND runs.
+    hard_expired: bool,
 }
 
 struct PendingDir {
@@ -676,10 +684,19 @@ impl FsCache {
         ino
     }
 
-    fn get_cached_dir(&mut self, path: &Path, ttl: Duration) -> Option<(Arc<Vec<RemoteEntry>>, bool)> {
+    fn get_cached_dir(&mut self, path: &Path, ttl: Duration, max_stale: Option<Duration>) -> Option<(Arc<Vec<RemoteEntry>>, bool)> {
         let entry = self.dir_cache.get_mut(path)?;
-        if entry.invalidated {
+        if entry.invalidated || entry.hard_expired {
             return None;
+        }
+        if let Some(max) = max_stale {
+            let age = entry.fetched_at.elapsed().unwrap_or_default();
+            if age >= max {
+                entry.hard_expired = true;
+                log::info!("DIR_HARD_EXPIRED {} — cached listing is {}s old (max {}s), re-listing before serving",
+                    path.display(), age.as_secs(), max.as_secs());
+                return None;
+            }
         }
         let stale = entry.at.elapsed() >= ttl;
         let needs_refresh = stale && !entry.refreshing;
@@ -724,7 +741,7 @@ impl FsCache {
         // Filter out files whose DELETE is still in flight: a racing PROPFIND
         // that completes before the server DELETE must not re-surface them.
         files.retain(|f| !self.deleting.contains(&f.path));
-        self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), refreshing: false, invalidated: false });
+        self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), fetched_at: SystemTime::now(), refreshing: false, invalidated: false, hard_expired: false });
     }
 
     /// Patch a single file entry's size in its parent's dir cache, returning true
@@ -751,8 +768,10 @@ impl FsCache {
     fn touch_dir_cache(&mut self, path: &Path) {
         if let Some(entry) = self.dir_cache.get_mut(path) {
             entry.at = Instant::now();
+            entry.fetched_at = SystemTime::now();
             entry.refreshing = false;
             entry.invalidated = false;
+            entry.hard_expired = false;
         }
     }
 
@@ -854,6 +873,18 @@ impl FsCache {
         }
     }
 
+    /// After a failed re-list of a hard-expired directory, drop the hard-expiry
+    /// flag and hand back the stale listing: a network blip must not turn a cached
+    /// directory into an EIO. The soft TTL still drives a background refresh.
+    fn take_hard_expired_fallback(&mut self, path: &Path) -> Option<(Arc<Vec<RemoteEntry>>, Option<RemoteEntry>)> {
+        let entry = self.dir_cache.get_mut(path)?;
+        if !entry.hard_expired || entry.invalidated {
+            return None;
+        }
+        entry.hard_expired = false;
+        Some((Arc::clone(&entry.files), entry.self_entry.clone()))
+    }
+
     fn clear_refreshing(&mut self, path: &Path) {
         if let Some(entry) = self.dir_cache.get_mut(path) {
             entry.refreshing = false;
@@ -926,6 +957,10 @@ struct PersistedDirEntry {
     etag: Option<String>,
     self_entry: Option<RemoteEntry>,
     files: Vec<RemoteEntry>,
+    /// Unix seconds when this listing was fetched, so its real age survives a
+    /// restart and the max-stale check isn't fooled into treating it as fresh.
+    #[serde(default)]
+    fetched_at: Option<u64>,
 }
 
 use std::sync::atomic::AtomicU64;
@@ -962,6 +997,7 @@ fn save_dir_cache_now(cache: &Mutex<FsCache>) {
                 etag: v.etag.clone(),
                 self_entry: v.self_entry.clone(),
                 files: v.files.as_ref().clone(),
+                fetched_at: v.fetched_at.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()),
             })
         })
         .collect();
@@ -1006,13 +1042,21 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
                 c.allocate_inode(dir_path.join(name));
             }
         }
+        // Cache files written before dir_cache_max_stale_mins existed carry no
+        // fetch time: treat them as ancient so the first listing re-lists rather
+        // than trusting a listing of unknown age.
+        let fetched_at = v.fetched_at
+            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap_or(UNIX_EPOCH);
         c.dir_cache.insert(dir_path, DirCacheEntry {
             files: Arc::new(v.files),
             self_entry: v.self_entry,
             etag: v.etag,
             at: Instant::now(),
+            fetched_at,
             refreshing: false,
             invalidated: false,
+            hard_expired: false,
         });
         count += 1;
     }
@@ -1263,6 +1307,24 @@ fn get_or_list_dir(
     path: PathBuf,
     dir_maps: Option<DirDetailArcs>,
 ) -> Result<(Arc<Vec<RemoteEntry>>, Option<RemoteEntry>), String> {
+    match list_dir_cached_or_fresh(conn, cache, path.clone(), dir_maps) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if let Some((files, self_entry)) = cache.safe_lock().take_hard_expired_fallback(&path) {
+                log::warn!("HARD_EXPIRED_FALLBACK {}: {} — serving the stale listing", path.display(), e);
+                return Ok((files, self_entry));
+            }
+            Err(e)
+        }
+    }
+}
+
+fn list_dir_cached_or_fresh(
+    conn: &Arc<ConnInfo>,
+    cache: &Arc<Mutex<FsCache>>,
+    path: PathBuf,
+    dir_maps: Option<DirDetailArcs>,
+) -> Result<(Arc<Vec<RemoteEntry>>, Option<RemoteEntry>), String> {
     if conn.is_offline.load(Ordering::Relaxed) {
         let c = cache.safe_lock();
         if let Some(entry) = c.dir_cache.get(&path) {
@@ -1272,9 +1334,10 @@ fn get_or_list_dir(
     }
     let t0 = Instant::now();
     let ttl = effective_dir_ttl(conn.optimistic_listing, &conn.notify_push_connected);
+    let max_stale = conn.dir_cache_max_stale;
     {
         let mut c = cache.safe_lock();
-        if let Some((files, needs_refresh)) = c.get_cached_dir(&path, ttl) {
+        if let Some((files, needs_refresh)) = c.get_cached_dir(&path, ttl, max_stale) {
             let self_entry = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
             log::info!("LIST_CACHED {} ({} entries, refresh={}) in {:?}", path.display(), files.len(), needs_refresh, t0.elapsed());
             if needs_refresh {
@@ -1333,7 +1396,7 @@ fn get_or_list_dir(
         let mut c = cache.safe_lock();
         let was_inv = c.dir_cache.get(&path).map_or(false, |e| e.invalidated);
         if c.dir_cache.contains_key(&path) {
-            if let Some((files, _)) = c.get_cached_dir(&path, ttl) {
+            if let Some((files, _)) = c.get_cached_dir(&path, ttl, max_stale) {
                 let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
                 return Ok((files, se));
             }
@@ -1389,11 +1452,11 @@ fn get_or_list_dir(
                 }
                 Ok(_) => {}
             }
-            if c.dir_cache.get(&path).map_or(false, |e| !e.invalidated) {
+            if c.dir_cache.get(&path).map_or(false, |e| !e.invalidated && !e.hard_expired) {
                 let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
                 if poll_iters > 2 { log::debug!("LIST_PROMOTED_WAIT {} iters for {}", poll_iters, path.display()); }
                 log::info!("LIST_PROMOTED {} in {:?}", path.display(), t0.elapsed());
-                return c.get_cached_dir(&path, ttl)
+                return c.get_cached_dir(&path, ttl, max_stale)
                     .map(|(f, _)| (f, se))
                     .ok_or_else(|| format!("PROPFIND returned empty for {}", path.display()));
             }
@@ -1425,7 +1488,7 @@ fn get_or_list_dir(
     };
     if should_promote {
         let se = c.promote_pending(&path)?;
-        if let Some((files, _)) = c.get_cached_dir(&path, ttl) {
+        if let Some((files, _)) = c.get_cached_dir(&path, ttl, max_stale) {
             return Ok((files, se));
         }
     } else {
@@ -1824,6 +1887,8 @@ struct ConnInfo {
     mount_point: PathBuf,
     http: reqwest::blocking::Client,
     optimistic_listing: bool,
+    // None when dir_cache_max_stale_mins is 0 (check disabled).
+    dir_cache_max_stale: Option<Duration>,
     notify_push_connected: Arc<AtomicBool>,
     http_read: reqwest::blocking::Client,
     throttle: Arc<Throttle>,
@@ -2040,6 +2105,8 @@ impl NextCloudFs {
             prefetch_throttle: Arc::new(Throttle::new(5)),
             is_offline,
             optimistic_listing: options.optimistic_listing,
+            dir_cache_max_stale: (options.dir_cache_max_stale_mins > 0)
+                .then(|| Duration::from_secs(options.dir_cache_max_stale_mins * 60)),
             notify_push_connected: Arc::new(AtomicBool::new(false)),
             active_streams: Arc::new(AtomicUsize::new(0)),
             deferred_invalidation: Arc::new(AtomicBool::new(false)),

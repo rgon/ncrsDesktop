@@ -8,6 +8,7 @@
         http3: boolean;
         max_concurrent_requests: number;
         optimistic_listing: boolean;
+        dir_cache_max_stale_mins: number;
         auto_keep_locally_modified_files: boolean;
         auto_keep_cached_files: boolean;
         read_ahead_bytes: number;
@@ -222,6 +223,19 @@
                         <p class="sv-hint">Return directory listings immediately from the local cache while a background refresh fetches the latest contents. Keeps the file manager responsive; disable if listings must always reflect live server state.</p>
                     </div>
                     <input id="optimistic" type="checkbox" class="sv-check" bind:checked={settings.optimistic_listing} />
+                </div>
+
+                <div class="sv-field">
+                    <label class="sv-label" for="max-stale">Force refresh listings older than (minutes)</label>
+                    <input
+                        id="max-stale"
+                        class="nc-input sv-num"
+                        type="number"
+                        min="0"
+                        max="10080"
+                        bind:value={settings.dir_cache_max_stale_mins}
+                    />
+                    <p class="sv-hint">A directory you have not opened for longer than this is fetched from the server before it is shown, so the first listing is already up to date instead of correcting itself on a second look. 0 always serves the cached listing first.</p>
                 </div>
 
                 <div class="sv-toggle">
