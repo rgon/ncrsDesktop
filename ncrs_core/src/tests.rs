@@ -359,6 +359,32 @@
     }
 
     #[test]
+    fn effective_max_stale_relaxes_while_notify_push_is_connected() {
+        let base = Duration::from_secs(15 * 60);
+        let connected = AtomicBool::new(true);
+        assert_eq!(
+            effective_max_stale(Some(base), &connected),
+            Some(base * CONNECTED_MAX_STALE_FACTOR),
+            "while events are arriving the window must not bite at the configured value"
+        );
+
+        connected.store(false, Ordering::Relaxed);
+        assert_eq!(
+            effective_max_stale(Some(base), &connected),
+            Some(base),
+            "with no push connection there is nothing to invalidate the cache but this check"
+        );
+
+        assert_eq!(effective_max_stale(None, &connected), None, "0 disables the check outright");
+        connected.store(true, Ordering::Relaxed);
+        assert_eq!(effective_max_stale(None, &connected), None);
+
+        // An absurd configured value must not panic on the multiply.
+        let huge = Duration::from_secs(u64::MAX);
+        assert_eq!(effective_max_stale(Some(huge), &connected), Some(huge));
+    }
+
+    #[test]
     fn confirm_dir_fresh_restarts_window_but_respects_invalidation() {
         let mut cache = make_test_cache();
         let path = PathBuf::from("/Photos");
@@ -368,7 +394,7 @@
             SystemTime::now() - Duration::from_secs(3 * 3600);
 
         // Boot validation matched the child etag: the cached listing is current.
-        cache.confirm_dir_fresh(&path);
+        assert!(cache.confirm_dir_fresh(&path));
         assert!(
             cache.get_cached_dir(&path, DIR_CACHE_TTL, max_stale).is_some(),
             "an etag-confirmed listing must not be forced through a blocking re-list"
@@ -376,7 +402,7 @@
 
         // An invalidation that landed meanwhile still wins over the confirmation.
         cache.dir_cache.get_mut(&path).unwrap().invalidated = true;
-        cache.confirm_dir_fresh(&path);
+        assert!(!cache.confirm_dir_fresh(&path), "must report that the caller has to re-list");
         assert!(cache.get_cached_dir(&path, DIR_CACHE_TTL, max_stale).is_none());
     }
 

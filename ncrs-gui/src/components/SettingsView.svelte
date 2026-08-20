@@ -238,7 +238,7 @@
                         max="10080"
                         bind:value={settings.dir_cache_max_stale_mins}
                     />
-                    <p class="sv-hint">A directory you have not opened for longer than this is fetched from the server before it is shown, so the first listing is already up to date instead of correcting itself on a second look. 0 always serves the cached listing first.</p>
+                    <p class="sv-hint">For a directory you have not opened for longer than this, the server is asked whether it changed before the listing is shown, so the first listing is already up to date instead of correcting itself on a second look. Unchanged directories cost one small request. The window is relaxed automatically while the push connection is up, since changes arrive as events then. 0 always serves the cached listing first.</p>
                 </div>
 
                 <div class="sv-toggle">
