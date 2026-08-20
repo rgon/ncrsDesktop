@@ -27,8 +27,11 @@ pub struct MountOptions {
     #[serde(default = "default_true")]
     pub optimistic_listing: bool,
     /// Maximum age of a cached directory listing that may still be served
-    /// optimistically. Past it, the listing is re-fetched from the server before
-    /// being returned instead of being served stale with a background refresh.
+    /// optimistically. Past it, the directory etag is checked before the listing is
+    /// returned, and the listing is re-fetched if it changed, instead of serving
+    /// stale entries with a background refresh.
+    /// Relaxed automatically while the notify-push connection is up, since
+    /// invalidations arrive as events then.
     /// 0 disables the check (always serve from cache when present).
     #[serde(default = "default_dir_cache_max_stale_mins")]
     pub dir_cache_max_stale_mins: u64,
@@ -134,7 +137,7 @@ fn default_cache_cleanup_interval() -> u64 { 3600 }
 
 fn default_stale_gio_temp_mins() -> u64 { 10 }
 
-fn default_dir_cache_max_stale_mins() -> u64 { 120 }
+fn default_dir_cache_max_stale_mins() -> u64 { 15 }
 
 // ── YAML parser ───────────────────────────────────────────────────────────────
 
@@ -482,9 +485,12 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# reflect the current server state before rendering.\n");
     content.push_str(&format!("optimistic_listing: {}\n", settings.optimistic_listing));
     content.push_str("# Maximum age (minutes) of a cached listing that may still be served\n");
-    content.push_str("# optimistically. A directory not listed for longer than this is re-fetched\n");
-    content.push_str("# from the server before it is shown, so the first listing is already current\n");
-    content.push_str("# instead of updating only on a second look. 0 disables the check.\n");
+    content.push_str("# optimistically. For a directory not listed for longer than this, the server\n");
+    content.push_str("# is asked whether it changed before the listing is shown, so the first listing\n");
+    content.push_str("# is already current instead of updating only on a second look. Unchanged\n");
+    content.push_str("# directories cost a single small etag request. The window is relaxed while\n");
+    content.push_str("# the push connection is up, since changes arrive as events then.\n");
+    content.push_str("# 0 disables the check.\n");
     content.push_str(&format!("dir_cache_max_stale_mins: {}\n", settings.dir_cache_max_stale_mins));
     content.push_str(&format!("auto_keep_locally_modified_files: {}\n", settings.auto_keep_locally_modified_files));
     content.push_str(&format!("auto_keep_cached_files: {}\n", settings.auto_keep_cached_files));

@@ -32,8 +32,9 @@ struct Cli {
     #[arg(long)]
     no_optimistic_listing: bool,
 
-    /// Re-list a directory from the server before showing it when its cached
-    /// listing is older than this many minutes (0 disables; default 120)
+    /// Check the server for changes before showing a directory whose cached
+    /// listing is older than this many minutes. Relaxed 8x while notify-push is
+    /// connected (0 disables; default 15)
     #[arg(long, value_name = "MINS")]
     dir_cache_max_stale_mins: Option<u64>,
 

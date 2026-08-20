@@ -70,6 +70,23 @@ const OPTIMISTIC_TTL_CONNECTED: Duration = Duration::from_secs(86400);
 const OPTIMISTIC_TTL_FALLBACK: Duration = Duration::from_secs(300);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 
+// notify-push delivers invalidations while it is connected, but it has no replay:
+// events that happen while the socket is down are lost for good, and nothing
+// re-validates the tree on reconnect. So dir_cache_max_stale_mins is not switched
+// off while connected — only relaxed by this factor, leaving the etag probe as the
+// one thing that can still close a gap left by a drop, a suspend, or a server
+// restart. At the default 15 minutes that is a 2-hour window while connected.
+const CONNECTED_MAX_STALE_FACTOR: u32 = 8;
+
+fn effective_max_stale(configured: Option<Duration>, notify_push_connected: &AtomicBool) -> Option<Duration> {
+    let base = configured?;
+    if notify_push_connected.load(Ordering::Relaxed) {
+        Some(base.checked_mul(CONNECTED_MAX_STALE_FACTOR).unwrap_or(base))
+    } else {
+        Some(base)
+    }
+}
+
 fn effective_dir_ttl(optimistic_listing: bool, notify_push_connected: &AtomicBool) -> Duration {
     if !optimistic_listing {
         return DIR_CACHE_TTL;
@@ -887,17 +904,22 @@ impl FsCache {
         Some((Arc::clone(&entry.files), entry.self_entry.clone()))
     }
 
-    /// Restart the max-stale window for a listing whose etag was just confirmed
-    /// unchanged: the cached data is provably current, so it must not be forced
-    /// through a synchronous re-list. Leaves the soft TTL and the invalidation
+    /// Mark a listing whose etag was just confirmed unchanged as current: the
+    /// cached data is provably up to date, so it must be served rather than forced
+    /// through a re-list. Unlike `touch_dir_cache` this leaves the invalidation
     /// state alone — an invalidation that landed while the etag was being probed
-    /// still wins.
-    fn confirm_dir_fresh(&mut self, path: &Path) {
-        if let Some(entry) = self.dir_cache.get_mut(path) {
-            if !entry.invalidated {
+    /// still wins. Returns false when that happened, i.e. the caller must re-list
+    /// anyway.
+    fn confirm_dir_fresh(&mut self, path: &Path) -> bool {
+        match self.dir_cache.get_mut(path) {
+            Some(entry) if !entry.invalidated => {
+                entry.at = Instant::now();
                 entry.fetched_at = SystemTime::now();
+                entry.refreshing = false;
                 entry.hard_expired = false;
+                true
             }
+            _ => false,
         }
     }
 
@@ -1350,7 +1372,7 @@ fn list_dir_cached_or_fresh(
     }
     let t0 = Instant::now();
     let ttl = effective_dir_ttl(conn.optimistic_listing, &conn.notify_push_connected);
-    let max_stale = conn.dir_cache_max_stale;
+    let max_stale = effective_max_stale(conn.dir_cache_max_stale, &conn.notify_push_connected);
     {
         let mut c = cache.safe_lock();
         if let Some((files, needs_refresh)) = c.get_cached_dir(&path, ttl, max_stale) {
@@ -1394,6 +1416,55 @@ fn list_dir_cached_or_fresh(
             return Ok((files, self_entry));
         }
     }
+    // The listing is past dir_cache_max_stale_mins, so it may not be served before
+    // we know whether it is still current. Ask for the directory etag first: that is
+    // a Depth-0 PROPFIND whose cost is independent of how many entries the directory
+    // holds, so the common "nothing changed" case costs one small round trip instead
+    // of a full re-list. Only a mismatch (or a failed probe) falls through to one.
+    let expired_etag = {
+        let mut c = cache.safe_lock();
+        match c.dir_cache.get_mut(&path) {
+            // `refreshing` doubles as the single-prober guard: a second reader racing
+            // on the same directory goes straight to the full listing and joins the
+            // in-flight PROPFIND there rather than issuing a duplicate probe.
+            Some(e) if e.hard_expired && !e.invalidated && !e.refreshing => {
+                let etag = e.etag.clone();
+                if etag.is_some() {
+                    e.refreshing = true;
+                }
+                etag
+            }
+            _ => None,
+        }
+    };
+    if let Some(old_etag) = expired_etag {
+        let probe = {
+            let _permit = conn.throttle.acquire();
+            conn.backend.dir_change_token(&path, PROPFIND_TIMEOUT)
+        };
+        let mut c = cache.safe_lock();
+        match probe {
+            Ok(Some(ref new_etag)) if *new_etag == old_etag => {
+                if c.confirm_dir_fresh(&path) {
+                    if let Some(entry) = c.dir_cache.get(&path) {
+                        log::info!("LIST_ETAG_CONFIRMED {} ({} entries) in {:?}", path.display(), entry.files.len(), t0.elapsed());
+                        return Ok((Arc::clone(&entry.files), entry.self_entry.clone()));
+                    }
+                }
+                // Invalidated while the probe was in flight — re-list after all.
+                c.clear_refreshing(&path);
+            }
+            Ok(_) => {
+                log::info!("LIST_ETAG_CHANGED {} — re-listing before serving", path.display());
+                c.clear_refreshing(&path);
+            }
+            Err(e) => {
+                log::debug!("expiry etag check {}: {}", path.display(), e);
+                c.clear_refreshing(&path);
+            }
+        }
+    }
+
     // Check if there's already an in-progress incremental fetch
     {
         let mut c = cache.safe_lock();
