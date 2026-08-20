@@ -138,6 +138,11 @@ pub struct ChangeEvent {
 
 pub trait ChangeWatcherHandle: Send + Sync + 'static {
     fn is_connected(&self) -> bool;
+    /// Count of successful connections so far. Polling `is_connected` cannot see a
+    /// drop-and-reconnect that completes between two samples, but this counter
+    /// still advances, so a caller that must react to every reconnect (to close the
+    /// event gap it leaves) watches this instead of edge-detecting the bool.
+    fn connect_generation(&self) -> u64 { 0 }
     fn set_paused(&self, _paused: bool) {}
 }
 

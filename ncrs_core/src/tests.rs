@@ -385,28 +385,82 @@
     }
 
     #[test]
-    fn confirm_all_dirs_current_restarts_windows_but_skips_invalidated() {
+    fn pending_snapshot_is_withheld_while_the_cached_listing_is_untrusted() {
         let mut cache = make_test_cache();
-        let fresh = PathBuf::from("/Photos");
-        let invalidated = PathBuf::from("/Docs");
-        for p in [&fresh, &invalidated] {
-            cache.put_dir_cache(p.clone(), Some("etag1".into()), None, vec![make_dav_entry("x.txt", None)]);
-            let e = cache.dir_cache.get_mut(p).unwrap();
-            e.fetched_at = SystemTime::now() - Duration::from_secs(3 * 3600);
-            e.at = Instant::now() - Duration::from_secs(3 * 3600);
-        }
-        cache.dir_cache.get_mut(&invalidated).unwrap().invalidated = true;
+        let path = PathBuf::from("/");
+        cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("a.txt", None)]);
+        assert!(cache.may_serve_pending_snapshot(&path), "a trusted listing may be streamed over");
+        assert!(
+            cache.may_serve_pending_snapshot(Path::new("/never-listed")),
+            "with no cached listing there is no stale suffix to splice onto"
+        );
 
-        // Root's etag was unchanged after a reconnect, so every cached dir below it
-        // is provably current — except one a push event already invalidated.
-        assert_eq!(cache.confirm_all_dirs_current(), 1);
+        // Hard-expired: readdir's continuation pages would still read the old listing,
+        // so a partial stream must not be served as page 0.
+        cache.dir_cache.get_mut(&path).unwrap().fetched_at =
+            SystemTime::now() - Duration::from_secs(3 * 3600);
+        assert!(cache
+            .get_cached_dir(&path, DIR_CACHE_TTL, Some(Duration::from_secs(2 * 3600)))
+            .is_none());
+        assert!(!cache.may_serve_pending_snapshot(&path), "hard-expired must withhold the snapshot");
 
-        let max_stale = Some(Duration::from_secs(2 * 3600));
-        let (_files, needs_refresh) = cache
-            .get_cached_dir(&fresh, DIR_CACHE_TTL, max_stale)
-            .expect("confirmed dir must be served from cache");
-        assert!(needs_refresh, "the soft TTL must be left alone, so a background refresh still runs");
-        assert!(cache.get_cached_dir(&invalidated, DIR_CACHE_TTL, max_stale).is_none());
+        cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("a.txt", None)]);
+        cache.dir_cache.get_mut(&path).unwrap().invalidated = true;
+        assert!(!cache.may_serve_pending_snapshot(&path), "invalidated must withhold the snapshot");
+    }
+
+    #[test]
+    fn a_clock_stepped_backwards_expires_rather_than_trusts_the_listing() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/");
+        cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("a.txt", None)]);
+        // Persisted at a wall-clock time that is now in the future: age is unknowable.
+        cache.dir_cache.get_mut(&path).unwrap().fetched_at =
+            SystemTime::now() + Duration::from_secs(86400);
+
+        assert!(
+            cache.get_cached_dir(&path, DIR_CACHE_TTL, Some(Duration::from_secs(15 * 60))).is_none(),
+            "a listing of unknowable age must be re-listed, not treated as brand new"
+        );
+        assert!(cache.dir_cache.get(&path).unwrap().hard_expired);
+    }
+
+    #[test]
+    fn confirm_dir_fresh_leaves_the_refresh_guard_alone() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/Photos");
+        cache.put_dir_cache(path.clone(), Some("etag1".into()), None, vec![make_dav_entry("g.txt", None)]);
+        // Another thread owns the single-flight refresh guard for this dir.
+        cache.dir_cache.get_mut(&path).unwrap().refreshing = true;
+
+        assert!(cache.confirm_dir_fresh(&path));
+        assert!(
+            cache.dir_cache.get(&path).unwrap().refreshing,
+            "confirming freshness must not release a guard it did not take"
+        );
+    }
+
+    #[test]
+    fn invalidate_dir_keeps_a_changed_listing_out_of_readdir() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/Docs");
+        cache.put_dir_cache(path.clone(), Some("etag1".into()), None, vec![make_dav_entry("h.txt", None)]);
+        // Etag mismatch found by validation, but the re-list that should follow fails.
+        cache.invalidate_dir(&path);
+        assert!(
+            cache.get_cached_dir(&path, DIR_CACHE_TTL, None).is_none(),
+            "a directory known to have changed must never be served from cache"
+        );
+    }
+
+    #[test]
+    fn stale_fallback_covers_unreachable_servers_but_not_rejections() {
+        assert!(is_unreachable_listing_error("PROPFIND timeout for /Photos"));
+        assert!(is_unreachable_listing_error("error sending request"));
+        assert!(is_unreachable_listing_error("network: host unreachable"));
+        assert!(!is_unreachable_listing_error("404 Not Found"));
+        assert!(!is_unreachable_listing_error("401 Unauthorized"));
+        assert!(!is_unreachable_listing_error("403 Forbidden"));
     }
 
     #[test]
@@ -432,6 +486,39 @@
     }
 
     #[test]
+    fn a_failed_forced_relist_backs_off_instead_of_stalling_every_readdir() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/");
+        let max_stale = Some(Duration::from_secs(2 * 3600));
+        cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("i.txt", None)]);
+        cache.dir_cache.get_mut(&path).unwrap().fetched_at =
+            SystemTime::now() - Duration::from_secs(3 * 3600);
+
+        assert!(cache.get_cached_dir(&path, DIR_CACHE_TTL, max_stale).is_none());
+        // The forced re-list failed because the server is unreachable.
+        assert!(cache.take_hard_expired_fallback(&path).is_some());
+
+        // Within the cooldown the cached listing is served instead of stalling on
+        // another doomed PROPFIND for every single readdir.
+        assert!(
+            cache.get_cached_dir(&path, DIR_CACHE_TTL, max_stale).is_some(),
+            "inside the cooldown the stale listing is served rather than re-probed"
+        );
+
+        // Once it lapses, the directory is expired again and the next readdir retries.
+        cache.dir_cache.get_mut(&path).unwrap().expiry_retry_after =
+            Some(Instant::now() - Duration::from_secs(1));
+        assert!(
+            cache.get_cached_dir(&path, DIR_CACHE_TTL, max_stale).is_none(),
+            "after the cooldown the forced re-list must be attempted again"
+        );
+
+        // A successful listing clears the backoff outright.
+        cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("i.txt", None)]);
+        assert!(cache.dir_cache.get(&path).unwrap().expiry_retry_after.is_none());
+    }
+
+    #[test]
     fn hard_expired_fallback_returns_stale_listing_once() {
         let mut cache = make_test_cache();
         let path = PathBuf::from("/");
@@ -446,6 +533,9 @@
         let (files, _) = cache.take_hard_expired_fallback(&path).expect("stale fallback available");
         assert_eq!(files.len(), 1);
         assert!(cache.take_hard_expired_fallback(&path).is_none(), "fallback applies once per expiry");
+        // The retry itself is rate-limited — see
+        // a_failed_forced_relist_backs_off_instead_of_stalling_every_readdir.
+        cache.dir_cache.get_mut(&path).unwrap().expiry_retry_after = None;
         assert!(
             cache.get_cached_dir(&path, DIR_CACHE_TTL, max_stale).is_none(),
             "still older than max_stale — the next listing retries the fresh PROPFIND"
