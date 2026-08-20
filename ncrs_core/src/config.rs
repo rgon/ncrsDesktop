@@ -30,8 +30,8 @@ pub struct MountOptions {
     /// optimistically. Past it, the directory etag is checked before the listing is
     /// returned, and the listing is re-fetched if it changed, instead of serving
     /// stale entries with a background refresh.
-    /// Relaxed automatically while the notify-push connection is up, since
-    /// invalidations arrive as events then.
+    /// Applies while notify-push is not delivering; while it is, invalidations
+    /// arrive as events and only a 24h backstop applies.
     /// 0 disables the check (always serve from cache when present).
     #[serde(default = "default_dir_cache_max_stale_mins")]
     pub dir_cache_max_stale_mins: u64,
@@ -488,8 +488,8 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# optimistically. For a directory not listed for longer than this, the server\n");
     content.push_str("# is asked whether it changed before the listing is shown, so the first listing\n");
     content.push_str("# is already current instead of updating only on a second look. Unchanged\n");
-    content.push_str("# directories cost a single small etag request. The window is relaxed while\n");
-    content.push_str("# the push connection is up, since changes arrive as events then.\n");
+    content.push_str("# directories cost a single small etag request. While the push connection is\n");
+    content.push_str("# live, changes arrive as events instead and only a 24-hour backstop applies.\n");
     content.push_str("# 0 disables the check.\n");
     content.push_str(&format!("dir_cache_max_stale_mins: {}\n", settings.dir_cache_max_stale_mins));
     content.push_str(&format!("auto_keep_locally_modified_files: {}\n", settings.auto_keep_locally_modified_files));

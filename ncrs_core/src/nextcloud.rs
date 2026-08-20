@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use remotefs::RemoteFs;
 use remotefs_webdav::WebDAVFs;
@@ -16,6 +16,13 @@ use crate::{notifications, preview, propfind, search, webdav_ops};
 const MAX_POOL_IDLE: usize = 8;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const WS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+// The read loop swallows read timeouts, so without a keepalive a silently dead
+// socket — NAT or VPN idle timeout, suspend/resume, a middlebox dropping the flow —
+// leaves `connected` true forever while no event ever arrives. Ping once the link
+// has been quiet and treat a missing pong as a disconnect, so the reconnect path
+// (and the cache revalidation hanging off it) actually runs.
+const WS_PING_IDLE: Duration = Duration::from_secs(30);
+const WS_PONG_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PATH_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
     .add(b' ')
@@ -624,6 +631,9 @@ fn watcher_connect_and_listen(
 
     set_ws_read_timeout(&socket, Some(WS_READ_TIMEOUT));
 
+    let mut last_rx = Instant::now();
+    let mut ping_sent: Option<Instant> = None;
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             let _ = socket.close(None);
@@ -634,11 +644,34 @@ fn watcher_connect_and_listen(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
+                match ping_sent {
+                    Some(sent) if sent.elapsed() >= WS_PONG_TIMEOUT => {
+                        connected.store(false, Ordering::Relaxed);
+                        return Err(format!(
+                            "no pong within {:?} — connection is dead", WS_PONG_TIMEOUT
+                        ));
+                    }
+                    Some(_) => {}
+                    None if last_rx.elapsed() >= WS_PING_IDLE => {
+                        if let Err(e) = socket.send(Message::Ping(Vec::new().into())) {
+                            connected.store(false, Ordering::Relaxed);
+                            return Err(format!("send ping: {}", e));
+                        }
+                        ping_sent = Some(Instant::now());
+                    }
+                    None => {}
+                }
                 continue;
             }
-            Err(e) => return Err(format!("read: {}", e)),
+            Err(e) => {
+                connected.store(false, Ordering::Relaxed);
+                return Err(format!("read: {}", e));
+            }
             Ok(msg) => msg,
         };
+        // Any traffic — event, pong, even a server ping — proves the link is alive.
+        last_rx = Instant::now();
+        ping_sent = None;
         match msg {
             Message::Text(ref t) if !paused.load(Ordering::Relaxed) => {
                 watcher_handle_event(t, http, webdav_url, creds, callback);
@@ -652,6 +685,7 @@ fn watcher_connect_and_listen(
             Message::Ping(data) => {
                 let _ = socket.send(Message::Pong(data));
             }
+            Message::Pong(_) => {}
             _ => {}
         }
     }

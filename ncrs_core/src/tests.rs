@@ -364,8 +364,8 @@
         let connected = AtomicBool::new(true);
         assert_eq!(
             effective_max_stale(Some(base), &connected),
-            Some(base * CONNECTED_MAX_STALE_FACTOR),
-            "while events are arriving the window must not bite at the configured value"
+            Some(CONNECTED_MAX_STALE_FLOOR),
+            "while events are arriving, only the long backstop applies"
         );
 
         connected.store(false, Ordering::Relaxed);
@@ -379,9 +379,34 @@
         connected.store(true, Ordering::Relaxed);
         assert_eq!(effective_max_stale(None, &connected), None);
 
-        // An absurd configured value must not panic on the multiply.
-        let huge = Duration::from_secs(u64::MAX);
-        assert_eq!(effective_max_stale(Some(huge), &connected), Some(huge));
+        // A configured window longer than the backstop is honoured as-is.
+        let week = Duration::from_secs(7 * 86400);
+        assert_eq!(effective_max_stale(Some(week), &connected), Some(week));
+    }
+
+    #[test]
+    fn confirm_all_dirs_current_restarts_windows_but_skips_invalidated() {
+        let mut cache = make_test_cache();
+        let fresh = PathBuf::from("/Photos");
+        let invalidated = PathBuf::from("/Docs");
+        for p in [&fresh, &invalidated] {
+            cache.put_dir_cache(p.clone(), Some("etag1".into()), None, vec![make_dav_entry("x.txt", None)]);
+            let e = cache.dir_cache.get_mut(p).unwrap();
+            e.fetched_at = SystemTime::now() - Duration::from_secs(3 * 3600);
+            e.at = Instant::now() - Duration::from_secs(3 * 3600);
+        }
+        cache.dir_cache.get_mut(&invalidated).unwrap().invalidated = true;
+
+        // Root's etag was unchanged after a reconnect, so every cached dir below it
+        // is provably current — except one a push event already invalidated.
+        assert_eq!(cache.confirm_all_dirs_current(), 1);
+
+        let max_stale = Some(Duration::from_secs(2 * 3600));
+        let (_files, needs_refresh) = cache
+            .get_cached_dir(&fresh, DIR_CACHE_TTL, max_stale)
+            .expect("confirmed dir must be served from cache");
+        assert!(needs_refresh, "the soft TTL must be left alone, so a background refresh still runs");
+        assert!(cache.get_cached_dir(&invalidated, DIR_CACHE_TTL, max_stale).is_none());
     }
 
     #[test]

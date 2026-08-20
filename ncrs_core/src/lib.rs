@@ -70,18 +70,18 @@ const OPTIMISTIC_TTL_CONNECTED: Duration = Duration::from_secs(86400);
 const OPTIMISTIC_TTL_FALLBACK: Duration = Duration::from_secs(300);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 
-// notify-push delivers invalidations while it is connected, but it has no replay:
-// events that happen while the socket is down are lost for good, and nothing
-// re-validates the tree on reconnect. So dir_cache_max_stale_mins is not switched
-// off while connected — only relaxed by this factor, leaving the etag probe as the
-// one thing that can still close a gap left by a drop, a suspend, or a server
-// restart. At the default 15 minutes that is a 2-hour window while connected.
-const CONNECTED_MAX_STALE_FACTOR: u32 = 8;
+// While notify-push is live, invalidations arrive as events, a dead socket is
+// caught by the watcher's own keepalive, and a reconnect revalidates the tree by
+// etag — so the configured window would only buy probes nothing needs. It is not
+// switched off entirely: the *server* can fail to emit a notify_file at all, as
+// changes landing through an external storage mount or `occ` may never produce
+// one, and no amount of client-side detection sees those. Hence a long backstop.
+const CONNECTED_MAX_STALE_FLOOR: Duration = Duration::from_secs(86400);
 
 fn effective_max_stale(configured: Option<Duration>, notify_push_connected: &AtomicBool) -> Option<Duration> {
     let base = configured?;
     if notify_push_connected.load(Ordering::Relaxed) {
-        Some(base.checked_mul(CONNECTED_MAX_STALE_FACTOR).unwrap_or(base))
+        Some(base.max(CONNECTED_MAX_STALE_FLOOR))
     } else {
         Some(base)
     }
@@ -921,6 +921,23 @@ impl FsCache {
             }
             _ => false,
         }
+    }
+
+    /// Root's etag was just confirmed unchanged which — Nextcloud propagates
+    /// collection etags up the tree — proves no cached directory beneath it changed
+    /// either. Restart the max-stale window for all of them, leaving the soft TTL
+    /// and any invalidation alone so the normal refresh cadence is untouched.
+    fn confirm_all_dirs_current(&mut self) -> usize {
+        let mut confirmed = 0usize;
+        for entry in self.dir_cache.values_mut() {
+            if entry.invalidated {
+                continue;
+            }
+            entry.fetched_at = SystemTime::now();
+            entry.hard_expired = false;
+            confirmed += 1;
+        }
+        confirmed
     }
 
     fn clear_refreshing(&mut self, path: &Path) {
@@ -4886,15 +4903,26 @@ fn is_trash_dir(name: &OsStr) -> bool {
     s.starts_with(".Trash")
 }
 
-fn boot_validate_root(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>) {
-    let root = PathBuf::from("/");
-    let has_cache = cache.safe_lock().dir_cache.contains_key(&root);
+// How far a reconnect follows changed branches down before handing the rest to
+// background re-fetches. Each level costs one PROPFIND per *changed* directory, so
+// an unchanged tree costs nothing and a busy one stays bounded.
+const RECONNECT_VALIDATE_DEPTH: u32 = 3;
+
+/// Validate a cached subtree against the server by etag. One Depth-1 PROPFIND of
+/// `path` carries the etag of every child directory, so all of them are checked in
+/// a single request; a matching etag proves that child unchanged, because Nextcloud
+/// propagates collection etags up the tree. Only branches that actually differ are
+/// descended into (while `depth` allows) or handed to a background re-fetch — the
+/// alternative, dropping the cache wholesale, would make the next readdir of every
+/// directory pay a full listing.
+fn validate_subtree(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, path: PathBuf, depth: u32) {
+    let has_cache = cache.safe_lock().dir_cache.contains_key(&path);
     if !has_cache {
         return;
     }
-    match list_dir_propfind(conn, root.clone()) {
+    match list_dir_propfind(conn, path.clone()) {
         Ok((etag, self_entry, fresh_files)) => {
-            let mut invalidated_paths: Vec<PathBuf> = Vec::new();
+            let mut changed_paths: Vec<PathBuf> = Vec::new();
             let mut matched = 0usize;
             {
                 let mut c = cache.safe_lock();
@@ -4903,44 +4931,87 @@ fn boot_validate_root(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>) {
                         continue;
                     }
                     let child_path = entry.path.clone();
+                    // Nothing cached for this child, so there is nothing to validate:
+                    // its first readdir will list it anyway.
+                    if !c.dir_cache.contains_key(&child_path) {
+                        continue;
+                    }
                     let fresh_etag = entry.change_token.as_deref();
                     let cached_etag = c.dir_cache.get(&child_path).and_then(|e| e.etag.clone());
                     match (fresh_etag, cached_etag.as_deref()) {
                         (Some(f), Some(c_etag)) if f == c_etag => {
                             matched += 1;
                             // Etag unchanged: the cached listing is current. Restart the
-                            // max-stale window so the first readdir after a restart is
-                            // served from cache instead of blocking on a re-list of a
-                            // directory boot validation just proved up to date.
+                            // max-stale window so the next readdir is served from cache
+                            // instead of blocking on a re-list of a directory that was
+                            // just proved up to date.
                             c.confirm_dir_fresh(&child_path);
                         }
-                        _ => {
-                            if c.dir_cache.contains_key(&child_path) {
-                                invalidated_paths.push(child_path);
-                            }
-                        }
+                        _ => changed_paths.push(child_path),
                     }
                 }
-                // Remove stale entries so start_background_propfind won't
-                // skip them (it early-returns when the path is in dir_cache).
-                for p in &invalidated_paths {
-                    c.dir_cache.remove(p);
+                // Entries handed to start_background_propfind must leave dir_cache
+                // first — it early-returns for a path that is still cached. Entries
+                // we recurse into keep their listing, so a concurrent readdir has
+                // something to serve while the descent runs.
+                if depth <= 1 {
+                    for p in &changed_paths {
+                        c.dir_cache.remove(p);
+                    }
                 }
-                c.put_dir_cache(root, etag, self_entry, fresh_files);
+                c.put_dir_cache(path.clone(), etag, self_entry, fresh_files);
             }
-            log::info!("BOOT_VALIDATE /: {} dirs unchanged, {} invalidated", matched, invalidated_paths.len());
+            log::info!("VALIDATE {}: {} dirs unchanged, {} changed (depth {})",
+                path.display(), matched, changed_paths.len(), depth);
             schedule_save_dir_cache(cache);
-            for p in &invalidated_paths {
-                start_background_propfind(conn, cache, p.clone(), 0);
-            }
-            if !invalidated_paths.is_empty() {
-                log::info!("BOOT_VALIDATE: kicked off {} background re-fetches", invalidated_paths.len());
+            for p in changed_paths {
+                if depth > 1 {
+                    validate_subtree(conn, cache, p, depth - 1);
+                } else {
+                    start_background_propfind(conn, cache, p, 0);
+                }
             }
         }
         Err(e) => {
-            log::warn!("BOOT_VALIDATE / failed: {} — cache served as-is", e);
+            log::warn!("VALIDATE {} failed: {} — cache served as-is", path.display(), e);
         }
     }
+}
+
+fn boot_validate_root(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>) {
+    validate_subtree(conn, cache, PathBuf::from("/"), 1);
+}
+
+/// Close the gap a dropped push connection leaves behind: notify-push has no
+/// replay, so anything that happened while the socket was down is simply gone.
+/// Probe the root etag first — since etags propagate upwards, a match proves the
+/// entire cached tree is still current, making the common reconnect cost exactly
+/// one small request. Only a mismatch descends, and only into branches that differ.
+fn revalidate_after_reconnect(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>) {
+    let root = PathBuf::from("/");
+    let cached_root_etag = {
+        let c = cache.safe_lock();
+        if !c.dir_cache.contains_key(&root) {
+            return;
+        }
+        c.cached_dir_etag(&root)
+    };
+    if let Some(old_etag) = cached_root_etag {
+        let probe = {
+            let _permit = conn.throttle.acquire();
+            conn.backend.dir_change_token(&root, PROPFIND_TIMEOUT)
+        };
+        match probe {
+            Ok(Some(ref new_etag)) if *new_etag == old_etag => {
+                let confirmed = cache.safe_lock().confirm_all_dirs_current();
+                log::info!("RECONNECT_VALIDATE: root etag unchanged — {} cached dirs still current", confirmed);
+                return;
+            }
+            Ok(_) => log::info!("RECONNECT_VALIDATE: root etag changed — validating changed branches"),
+            Err(e) => log::warn!("RECONNECT_VALIDATE root probe: {} — validating changed branches", e),
+        }
+    }
+    validate_subtree(conn, cache, root, RECONNECT_VALIDATE_DEPTH);
 }
 
 fn build_fuse_options() -> Vec<MountOption> {
@@ -5157,8 +5228,14 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let sync_offline = offline_flag.clone();
             let sync_paused = filesystem.paused_flag();
             let watcher_shutdown = filesystem.shutdown_flag();
+            let revalidate_conn = filesystem.conn();
+            let revalidate_cache = filesystem.cache_ref();
+            let revalidating = Arc::new(AtomicBool::new(false));
             thread::spawn(move || {
                 let mut was_connected = false;
+                // Only a *re*connect leaves a gap: the first connect happens right
+                // after mount, where boot validation already covers the same ground.
+                let mut saw_disconnect = false;
                 while !watcher_shutdown.load(Ordering::Relaxed) {
                     let connected = watcher.is_connected();
                     np_connected.store(connected, Ordering::Relaxed);
@@ -5168,8 +5245,21 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                     if connected != was_connected {
                         if connected {
                             log::info!("notify_push: high-performance backend connected");
+                            // Events that fired while the socket was down are lost for
+                            // good, so revalidate the cache by etag before trusting it
+                            // again. Off the poll thread: the descent can take a while.
+                            if saw_disconnect && !revalidating.swap(true, Ordering::Relaxed) {
+                                let rc = revalidate_conn.clone();
+                                let rcache = revalidate_cache.clone();
+                                let guard = revalidating.clone();
+                                thread::spawn(move || {
+                                    revalidate_after_reconnect(&rc, &rcache);
+                                    guard.store(false, Ordering::Relaxed);
+                                });
+                            }
                         } else {
                             log::warn!("notify_push: high-performance backend disconnected — falling back to 5-minute poll interval");
+                            saw_disconnect = true;
                         }
                         was_connected = connected;
                     }
