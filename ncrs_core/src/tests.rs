@@ -242,7 +242,7 @@
         let path = PathBuf::from("/");
         cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("a.txt", None)]);
 
-        let result = cache.get_cached_dir(&path, DIR_CACHE_TTL);
+        let result = cache.get_cached_dir(&path, DIR_CACHE_TTL, None);
         assert!(result.is_some(), "fresh entry should return Some");
         let (files, needs_refresh) = result.unwrap();
         assert_eq!(files.len(), 1);
@@ -250,7 +250,7 @@
 
         cache.dir_cache.get_mut(&path).unwrap().invalidated = true;
 
-        let result = cache.get_cached_dir(&path, DIR_CACHE_TTL);
+        let result = cache.get_cached_dir(&path, DIR_CACHE_TTL, None);
         assert!(result.is_none(), "invalidated entry must return None to force synchronous PROPFIND");
 
         let entry = cache.dir_cache.get(&path).unwrap();
@@ -268,10 +268,10 @@
 
         cache.dir_cache.get_mut(&path).unwrap().invalidated = true;
 
-        let first = cache.get_cached_dir(&path, DIR_CACHE_TTL);
+        let first = cache.get_cached_dir(&path, DIR_CACHE_TTL, None);
         assert!(first.is_none(), "first call: invalidated entry must return None");
 
-        let second = cache.get_cached_dir(&path, DIR_CACHE_TTL);
+        let second = cache.get_cached_dir(&path, DIR_CACHE_TTL, None);
         assert!(
             second.is_none(),
             "second call: must ALSO return None — stale listing still contains deleted_on_server.txt"
@@ -286,10 +286,97 @@
 
         cache.dir_cache.get_mut(&path).unwrap().at = Instant::now() - Duration::from_secs(3600);
 
-        let result = cache.get_cached_dir(&path, DIR_CACHE_TTL);
+        let result = cache.get_cached_dir(&path, DIR_CACHE_TTL, None);
         assert!(result.is_some(), "TTL-expired (not invalidated) should return stale data for background refresh");
         let (_files, needs_refresh) = result.unwrap();
         assert!(needs_refresh, "should signal background refresh needed");
+    }
+
+    #[test]
+    fn hard_expired_entry_forces_synchronous_relist() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/");
+        cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("c.txt", None)]);
+
+        let max_stale = Duration::from_secs(2 * 3600);
+        assert!(
+            cache.get_cached_dir(&path, DIR_CACHE_TTL, Some(max_stale)).is_some(),
+            "listing younger than max_stale must still be served from cache"
+        );
+
+        cache.dir_cache.get_mut(&path).unwrap().fetched_at =
+            SystemTime::now() - Duration::from_secs(3 * 3600);
+
+        assert!(
+            cache.get_cached_dir(&path, DIR_CACHE_TTL, Some(max_stale)).is_none(),
+            "listing older than max_stale must return None so readdir blocks on a fresh PROPFIND"
+        );
+        assert!(cache.dir_cache.get(&path).unwrap().hard_expired);
+        assert!(
+            cache.get_cached_dir(&path, DIR_CACHE_TTL, Some(max_stale)).is_none(),
+            "repeated calls must keep returning None until a fresh PROPFIND replaces the entry"
+        );
+
+        // A fresh listing clears the flag and restarts the max-stale window.
+        cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("c.txt", None)]);
+        assert!(!cache.dir_cache.get(&path).unwrap().hard_expired);
+        assert!(cache.get_cached_dir(&path, DIR_CACHE_TTL, Some(max_stale)).is_some());
+    }
+
+    #[test]
+    fn hard_expiry_disabled_serves_arbitrarily_old_listing() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/");
+        cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("d.txt", None)]);
+        {
+            let entry = cache.dir_cache.get_mut(&path).unwrap();
+            entry.fetched_at = SystemTime::now() - Duration::from_secs(30 * 86400);
+            entry.at = Instant::now() - Duration::from_secs(30 * 86400);
+        }
+
+        let result = cache.get_cached_dir(&path, DIR_CACHE_TTL, None);
+        assert!(result.is_some(), "with the check disabled, age must never cause a cache miss");
+        assert!(result.unwrap().1, "stale entry still asks for a background refresh");
+        assert!(!cache.dir_cache.get(&path).unwrap().hard_expired);
+    }
+
+    #[test]
+    fn etag_match_restarts_the_max_stale_window() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/");
+        cache.put_dir_cache(path.clone(), Some("etag1".into()), None, vec![make_dav_entry("e.txt", None)]);
+        cache.dir_cache.get_mut(&path).unwrap().fetched_at =
+            SystemTime::now() - Duration::from_secs(3 * 3600);
+
+        // Background refresh found an unchanged etag: the cached data is confirmed
+        // current, so it must not be treated as stale on the next listing.
+        cache.touch_dir_cache(&path);
+
+        assert!(
+            cache.get_cached_dir(&path, DIR_CACHE_TTL, Some(Duration::from_secs(2 * 3600))).is_some(),
+            "etag-confirmed listing must be served from cache"
+        );
+    }
+
+    #[test]
+    fn hard_expired_fallback_returns_stale_listing_once() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/");
+        cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("f.txt", None)]);
+        cache.dir_cache.get_mut(&path).unwrap().fetched_at =
+            SystemTime::now() - Duration::from_secs(3 * 3600);
+        let max_stale = Some(Duration::from_secs(2 * 3600));
+        assert!(cache.get_cached_dir(&path, DIR_CACHE_TTL, max_stale).is_none());
+
+        // The forced re-list failed (offline, PROPFIND timeout): serve stale rather
+        // than fail the readdir, and clear the flag so we don't block every call.
+        let (files, _) = cache.take_hard_expired_fallback(&path).expect("stale fallback available");
+        assert_eq!(files.len(), 1);
+        assert!(cache.take_hard_expired_fallback(&path).is_none(), "fallback applies once per expiry");
+        assert!(
+            cache.get_cached_dir(&path, DIR_CACHE_TTL, max_stale).is_none(),
+            "still older than max_stale — the next listing retries the fresh PROPFIND"
+        );
     }
 
     #[test]
@@ -947,10 +1034,12 @@
         let cache = Arc::new(Mutex::new(make_test_cache()));
         let path = cache.safe_lock().cache_dir.join(DIR_CACHE_FILE);
         let mut map = HashMap::new();
+        let saved_at = SystemTime::now() - Duration::from_secs(3 * 3600);
         map.insert("/Photos".to_string(), PersistedDirEntry {
             etag: Some("abc123".into()),
             self_entry: None,
             files: vec![make_dav_entry("sunset.jpg", Some(1))],
+            fetched_at: Some(saved_at.duration_since(UNIX_EPOCH).unwrap().as_secs()),
         });
         let json = serde_json::to_vec(&map).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).ok();
@@ -960,6 +1049,31 @@
         let entry = c.dir_cache.get(&PathBuf::from("/Photos")).unwrap();
         assert!(!entry.invalidated, "boot-loaded dir should not be invalidated");
         assert_eq!(entry.etag, Some("abc123".into()));
+        assert!(
+            entry.fetched_at.elapsed().unwrap() >= Duration::from_secs(3 * 3600),
+            "the persisted fetch time must survive the restart, not reset to now"
+        );
+        drop(c);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn boot_loaded_dir_without_fetch_time_is_treated_as_ancient() {
+        let mut base = make_test_cache();
+        base.cache_dir = PathBuf::from("/tmp/ncrs-test-cache-legacy");
+        let cache = Arc::new(Mutex::new(base));
+        let path = cache.safe_lock().cache_dir.join(DIR_CACHE_FILE);
+        // A dir_cache.json written before dir_cache_max_stale_mins existed.
+        let json = br#"{"/Legacy":{"etag":"old","self_entry":null,"files":[]}}"#;
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        std::fs::write(&path, json).unwrap();
+        load_dir_cache(&cache);
+        let mut c = cache.safe_lock();
+        let legacy = PathBuf::from("/Legacy");
+        assert!(
+            c.get_cached_dir(&legacy, DIR_CACHE_TTL, Some(Duration::from_secs(2 * 3600))).is_none(),
+            "a listing of unknown age must be re-listed rather than trusted"
+        );
         drop(c);
         std::fs::remove_file(&path).ok();
     }

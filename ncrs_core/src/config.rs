@@ -26,6 +26,12 @@ pub struct MountOptions {
     pub offline: bool,
     #[serde(default = "default_true")]
     pub optimistic_listing: bool,
+    /// Maximum age of a cached directory listing that may still be served
+    /// optimistically. Past it, the listing is re-fetched from the server before
+    /// being returned instead of being served stale with a background refresh.
+    /// 0 disables the check (always serve from cache when present).
+    #[serde(default = "default_dir_cache_max_stale_mins")]
+    pub dir_cache_max_stale_mins: u64,
     #[serde(default)]
     pub auto_keep_locally_modified_files: bool,
     #[serde(default)]
@@ -128,6 +134,8 @@ fn default_cache_cleanup_interval() -> u64 { 3600 }
 
 fn default_stale_gio_temp_mins() -> u64 { 10 }
 
+fn default_dir_cache_max_stale_mins() -> u64 { 120 }
+
 // ── YAML parser ───────────────────────────────────────────────────────────────
 
 pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
@@ -156,6 +164,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let http3 = doc["http3"].as_bool().unwrap_or(true);
     let max_concurrent_requests = doc["max_concurrent_requests"].as_i64().unwrap_or(10) as usize;
     let optimistic_listing = doc["optimistic_listing"].as_bool().unwrap_or(true);
+    let dir_cache_max_stale_mins = doc["dir_cache_max_stale_mins"].as_i64().map(|v| v.max(0) as u64).unwrap_or_else(default_dir_cache_max_stale_mins);
     let auto_keep_locally_modified_files = doc["auto_keep_locally_modified_files"].as_bool().unwrap_or(false);
     let auto_keep_cached_files = doc["auto_keep_cached_files"].as_bool().unwrap_or(false);
     let read_ahead_bytes = doc["read_ahead_bytes"].as_i64().map(|v| v as usize).unwrap_or(DEFAULT_READ_AHEAD);
@@ -172,7 +181,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let cleanup_stale_gio_temps = doc["cleanup_stale_gio_temps"].as_bool().unwrap_or(true);
     let stale_gio_temp_mins = doc["stale_gio_temp_mins"].as_i64().map(|v| v as u64).unwrap_or(10);
 
-    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins })
+    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
@@ -352,6 +361,7 @@ pub struct ConfigSettings {
     pub http3: bool,
     pub max_concurrent_requests: usize,
     pub optimistic_listing: bool,
+    pub dir_cache_max_stale_mins: u64,
     pub auto_keep_locally_modified_files: bool,
     pub auto_keep_cached_files: bool,
     pub read_ahead_bytes: usize,
@@ -375,6 +385,7 @@ impl Default for ConfigSettings {
             http3: true,
             max_concurrent_requests: 10,
             optimistic_listing: true,
+            dir_cache_max_stale_mins: default_dir_cache_max_stale_mins(),
             auto_keep_locally_modified_files: false,
             auto_keep_cached_files: false,
             read_ahead_bytes: DEFAULT_READ_AHEAD,
@@ -395,6 +406,7 @@ pub fn config_settings_from_opts(opts: &MountOptions) -> ConfigSettings {
         http3: opts.http3,
         max_concurrent_requests: opts.max_concurrent_requests,
         optimistic_listing: opts.optimistic_listing,
+        dir_cache_max_stale_mins: opts.dir_cache_max_stale_mins,
         auto_keep_locally_modified_files: opts.auto_keep_locally_modified_files,
         auto_keep_cached_files: opts.auto_keep_cached_files,
         read_ahead_bytes: opts.read_ahead_bytes,
@@ -469,6 +481,11 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# Keeps the file manager responsive; disable if you need listings to always\n");
     content.push_str("# reflect the current server state before rendering.\n");
     content.push_str(&format!("optimistic_listing: {}\n", settings.optimistic_listing));
+    content.push_str("# Maximum age (minutes) of a cached listing that may still be served\n");
+    content.push_str("# optimistically. A directory not listed for longer than this is re-fetched\n");
+    content.push_str("# from the server before it is shown, so the first listing is already current\n");
+    content.push_str("# instead of updating only on a second look. 0 disables the check.\n");
+    content.push_str(&format!("dir_cache_max_stale_mins: {}\n", settings.dir_cache_max_stale_mins));
     content.push_str(&format!("auto_keep_locally_modified_files: {}\n", settings.auto_keep_locally_modified_files));
     content.push_str(&format!("auto_keep_cached_files: {}\n", settings.auto_keep_cached_files));
     content.push_str(&format!("read_ahead_bytes: {}\n", settings.read_ahead_bytes));
