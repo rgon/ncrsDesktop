@@ -448,7 +448,104 @@ else
     no "dir ETag changed (${ETAG_BEFORE} → ${ETAG_AFTER}) but mount never surfaced the file (stale cache)"
 fi
 
-echo "→ 19. ORPHANED WRITE after a busy-mount force-detach is adopted, not refused"
+echo "→ 19. MAX-STALE WINDOW — the first listing after the window is already current"
+# dir_cache_max_stale_mins (1 in this suite) promises that a directory nobody has
+# looked at for that long is checked against the server *before* its listing is
+# shown — rather than served stale and corrected on a second look, which is what
+# scenario 18 covers. Three directories are prepared and aged past the window with
+# a single wait, then each is listed exactly once:
+#   staleadd   — changed on the server behind the daemon's back
+#   stalesame  — untouched: must still be served from cache after one cheap probe
+#   staledown  — listed while the server is unreachable
+MAXSTALE_WINDOW=60                       # dir_cache_max_stale_mins: 1
+NCRS_LOG="${NCRS_LOG:-/tmp/ncrs.log}"
+STALE_DIRS="staleadd stalesame staledown"
+
+# The directory ETag the daemon's pre-serve probe compares against.
+dav_dir_etag() {
+    curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}$1/" \
+        | grep -o '<[^>]*getetag>[^<]*' | head -1
+}
+
+for d in $STALE_DIRS; do
+    mkdir -p "$MOUNT/$d"
+    # MKCOL propagates asynchronously — wait for the collection before seeding it.
+    for _ in $(seq 1 30); do
+        [ "$(curl -s -o /dev/null -w '%{http_code}' -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}$d/")" = "207" ] && break
+        sleep 1
+    done
+    printf '%s' "seed-$d" > "$MOUNT/$d/seed.txt"
+    wait_dav_sha "$d/seed.txt" "$(printf '%s' "seed-$d" | sha)" 45 >/dev/null
+done
+# Cache all three listings. This is when each max-stale window starts, so nothing
+# below may list these directories again until the wait is over.
+for d in $STALE_DIRS; do ls "$MOUNT/$d" >/dev/null 2>&1; done
+
+ETAG_BEFORE="$(dav_dir_etag staleadd)"
+SAME_ETAG="$(dav_dir_etag stalesame)"
+# The change the daemon cannot possibly know about: a direct PUT to the backend,
+# no push event, no local write.
+SA="ncrs-e2e late-arrival $(date +%s%N)"
+printf '%s' "$SA" > /tmp/staleadd.txt
+SAW="$(printf '%s' "$SA" | sha)"
+curl -s -u "$U:$P" -T /tmp/staleadd.txt "${URL}staleadd/late.txt" -o /dev/null
+ETAG_AFTER="$(dav_dir_etag staleadd)"
+
+echo "    (aging the three cached listings past ${MAXSTALE_WINDOW}s — no listing during the wait)"
+sleep $((MAXSTALE_WINDOW + 5))
+
+LOG_MARK=$(( $([ -f "$NCRS_LOG" ] && wc -l < "$NCRS_LOG" || echo 0) + 1 ))
+log_since() { tail -n +"$LOG_MARK" "$NCRS_LOG" 2>/dev/null; }
+
+# ── The guarantee: correct on the FIRST listing, not the second ──────────────
+FIRST_LS="$(ls "$MOUNT/staleadd" 2>/dev/null)"
+if printf '%s\n' "$FIRST_LS" | grep -qx 'late.txt'; then
+    ok "server-added file present in the FIRST listing after the window"
+elif [ "$ETAG_BEFORE" = "$ETAG_AFTER" ]; then
+    echo "  ⓘ server did not change the dir ETag on child add (before==after) — the"
+    echo "    pre-serve probe has nothing to observe on this server; not a failure"
+else
+    no "first listing after the window was stale (no late.txt) — window not enforced"
+fi
+# Content, not just the name: the re-list must carry real entries.
+wait_fuse_sha staleadd/late.txt "$SAW" 30 \
+    && ok "server-added file reads back byte-identical through the mount" \
+    || no "server-added file not readable through the mount (data loss)"
+# Prove the window is what corrected it, rather than a coincidental refresh.
+if log_since | grep -q "DIR_HARD_EXPIRED $MOUNT/staleadd\|DIR_HARD_EXPIRED /staleadd"; then
+    ok "aged listing was withheld pending a re-check (DIR_HARD_EXPIRED logged)"
+else
+    no "no DIR_HARD_EXPIRED for /staleadd — the aged listing was served unchecked"
+fi
+
+# ── The cost: an unchanged directory must not pay a full re-list ─────────────
+LS_SAME="$(ls "$MOUNT/stalesame" 2>/dev/null)"
+if printf '%s\n' "$LS_SAME" | grep -qx 'seed.txt'; then
+    ok "aged but unchanged listing served intact"
+else
+    no "aged unchanged listing came back wrong: [${LS_SAME}]"
+fi
+if [ -z "$SAME_ETAG" ]; then
+    echo "  ⓘ server exposes no dir ETag — the daemon cannot take the cheap-probe"
+    echo "    path here, so it re-lists instead; not a failure"
+elif log_since | grep -q "LIST_ETAG_CONFIRMED.*stalesame"; then
+    ok "unchanged dir confirmed by etag probe alone (no full re-list)"
+else
+    no "unchanged dir was fully re-listed — the etag pre-check did not run"
+fi
+
+# ── The failure mode: past the window with the server unreachable ───────────
+server_down
+LS_DOWN="$(ls "$MOUNT/staledown" 2>/dev/null)"; rc=$?
+server_up
+if [ "$rc" -eq 0 ] && printf '%s\n' "$LS_DOWN" | grep -qx 'seed.txt'; then
+    ok "aged listing still served from cache while the server was unreachable"
+else
+    no "aged listing failed with the server unreachable (rc=$rc) — a blip became an error"
+fi
+sleep 3   # let the connectivity monitor clear the offline flag before scenario 20
+
+echo "→ 20. ORPHANED WRITE after a busy-mount force-detach is adopted, not refused"
 # Reproduces the historical bug: something (e.g. an app with an open document)
 # keeps the mount busy, a plain "fusermount -u" therefore can't complete, and
 # the mount gets force-detached anyway (what the GUI used to do as a silent

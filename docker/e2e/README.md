@@ -11,6 +11,14 @@ Every byte written through the mount must be retrievable, unchanged, from both
 the mount **and** the backend; renames/moves must preserve content; deletes must
 propagate. Integrity is checked with `sha256`. See `ncrs/scenarios.sh`.
 
+One scenario covers the **directory-listing freshness window**
+(`dir_cache_max_stale_mins`, set to 1 minute in this suite): three directories are
+cached, aged past the window, then listed exactly once each to assert that a
+directory changed on the server is already correct on the **first** listing (not
+the second, which scenario 18 covers), that an unchanged one is confirmed by a
+single ETag probe instead of a full re-list, and that an aged listing is still
+served from cache — not turned into an error — while the server is unreachable.
+
 The final scenario also guards a **performance regression**: GLib content-type
 sniffing (an `O_NOATIME` read of the first ~16 KiB) must be answered with
 synthetic magic bytes rather than downloading the whole file, while ordinary
