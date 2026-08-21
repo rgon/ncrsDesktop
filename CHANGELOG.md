@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.52](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.51...ncrs-v0.1.52) (2026-08-21)
+
+
+### Features
+
+* **core:** keepalive the notify-push socket and revalidate the cache by etag on reconnect instead of forcing short max-stale windows ([433fd2c](https://github.com/rgon/ncrsDesktop/commit/433fd2c98f3da6fc6cf69392a80c9cbda0c9d92d))
+* **core:** probe the directory etag before re-listing an expired dir, default the window to 15min and relax it while notify-push is connected ([420f790](https://github.com/rgon/ncrsDesktop/commit/420f79016f3d80d601408162f446a1dc923617ba))
+* **core:** re-list a directory before serving it when its cached listing is older than dir_cache_max_stale_mins ([a2dc3d7](https://github.com/rgon/ncrsDesktop/commit/a2dc3d7c535c3b256dd8c5918e1e4ca571e893ff))
+
+
+### Bug Fixes
+
+* **ci:** add version.txt and disable draft releases to prevent changelog bloat ([ea3c3ba](https://github.com/rgon/ncrsDesktop/commit/ea3c3bae72f71db552bd95e601f1d65d69d0a3d0))
+* **ci:** keep draft releases to avoid double-build on PR approval ([5e328d1](https://github.com/rgon/ncrsDesktop/commit/5e328d1d03ef8291d944ed8dfec0b0cec261c07b))
+* **core:** close four paths that could still serve a listing past the max-stale window and detect reconnects by generation ([a6302b8](https://github.com/rgon/ncrsDesktop/commit/a6302b8b80ec9cc255c5ab33654e6dd1e732a9f9))
+* **core:** never serve a partial stream for a hard-expired dir and keep etag-confirmed listings out of the blocking re-list ([b4f916e](https://github.com/rgon/ncrsDesktop/commit/b4f916e973f9fcdc0873bff5d443d0e6992da051))
+* **core:** treat an empty getetag as no change token, so a directory is re-listed instead of trusted forever ([5ab4487](https://github.com/rgon/ncrsDesktop/commit/5ab448780261dd927193dc0c3ca4276c71f7e5d6))
+
 ## [0.1.51](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.50...ncrs-v0.1.51) (2026-08-10)
 
 
