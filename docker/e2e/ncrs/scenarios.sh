@@ -461,10 +461,16 @@ MAXSTALE_WINDOW=60                       # dir_cache_max_stale_mins: 1
 NCRS_LOG="${NCRS_LOG:-/tmp/ncrs.log}"
 STALE_DIRS="staleadd stalesame staledown"
 
-# The directory ETag the daemon's pre-serve probe compares against.
+# The directory ETag the daemon's pre-serve probe compares against. This must be
+# the *named* property request the daemon sends: an allprop PROPFIND omits getetag
+# on some servers (rclone), which looks identical to "no ETag" but isn't the same
+# question. Empty output means the server exposes no ETag for the collection, so
+# the daemon holds no token for it and can only re-list.
 dav_dir_etag() {
-    curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}$1/" \
-        | grep -o '<[^>]*getetag>[^<]*' | head -1
+    curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 0' -H 'Content-Type: application/xml' \
+        --data '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getetag /></d:prop></d:propfind>' \
+        "${URL}$1/" \
+        | sed -n 's#.*<[Dd]:getetag>\([^<]*\)</[Dd]:getetag>.*#\1#p' | head -1
 }
 
 for d in $STALE_DIRS; do
@@ -490,6 +496,13 @@ printf '%s' "$SA" > /tmp/staleadd.txt
 SAW="$(printf '%s' "$SA" | sha)"
 curl -s -u "$U:$P" -T /tmp/staleadd.txt "${URL}staleadd/late.txt" -o /dev/null
 ETAG_AFTER="$(dav_dir_etag staleadd)"
+# Precondition: without this the assertions below would blame the daemon for a
+# file that never reached the server.
+if [ "$(dav_code staleadd/late.txt)" = "200" ]; then
+    ok "setup: direct backend PUT landed (invisible to the daemon)"
+else
+    no "setup: direct backend PUT never landed (HTTP $(dav_code staleadd/late.txt))"
+fi
 
 echo "    (aging the three cached listings past ${MAXSTALE_WINDOW}s — no listing during the wait)"
 sleep $((MAXSTALE_WINDOW + 5))
@@ -499,18 +512,23 @@ log_since() { tail -n +"$LOG_MARK" "$NCRS_LOG" 2>/dev/null; }
 
 # ── The guarantee: correct on the FIRST listing, not the second ──────────────
 FIRST_LS="$(ls "$MOUNT/staleadd" 2>/dev/null)"
-if printf '%s\n' "$FIRST_LS" | grep -qx 'late.txt'; then
-    ok "server-added file present in the FIRST listing after the window"
-elif [ "$ETAG_BEFORE" = "$ETAG_AFTER" ]; then
-    echo "  ⓘ server did not change the dir ETag on child add (before==after) — the"
-    echo "    pre-serve probe has nothing to observe on this server; not a failure"
+if [ -z "$ETAG_AFTER" ] || [ "$ETAG_BEFORE" != "$ETAG_AFTER" ]; then
+    # Either the server exposes no collection ETag — so the daemon holds no token
+    # and must re-list — or it moved. Both mean the change is observable, so the
+    # first listing has no excuse for being stale.
+    if printf '%s\n' "$FIRST_LS" | grep -qx 'late.txt'; then
+        ok "server-added file present in the FIRST listing after the window"
+    else
+        no "first listing after the window was stale (no late.txt) — window not enforced"
+    fi
+    # Content, not just the name: the re-list must carry real entries.
+    wait_fuse_sha staleadd/late.txt "$SAW" 30 \
+        && ok "server-added file reads back byte-identical through the mount" \
+        || no "server-added file not readable through the mount (data loss)"
 else
-    no "first listing after the window was stale (no late.txt) — window not enforced"
+    echo "  ⓘ server keeps a collection ETag but did not move it on child add"
+    echo "    (${ETAG_BEFORE}) — the pre-serve probe has nothing to observe here"
 fi
-# Content, not just the name: the re-list must carry real entries.
-wait_fuse_sha staleadd/late.txt "$SAW" 30 \
-    && ok "server-added file reads back byte-identical through the mount" \
-    || no "server-added file not readable through the mount (data loss)"
 # Prove the window is what corrected it, rather than a coincidental refresh.
 if log_since | grep -q "DIR_HARD_EXPIRED $MOUNT/staleadd\|DIR_HARD_EXPIRED /staleadd"; then
     ok "aged listing was withheld pending a re-check (DIR_HARD_EXPIRED logged)"
@@ -526,8 +544,8 @@ else
     no "aged unchanged listing came back wrong: [${LS_SAME}]"
 fi
 if [ -z "$SAME_ETAG" ]; then
-    echo "  ⓘ server exposes no dir ETag — the daemon cannot take the cheap-probe"
-    echo "    path here, so it re-lists instead; not a failure"
+    echo "  ⓘ server exposes no collection ETag, so the daemon holds no token and"
+    echo "    re-lists instead of probing — correct here, just not the cheap path"
 elif log_since | grep -q "LIST_ETAG_CONFIRMED.*stalesame"; then
     ok "unchanged dir confirmed by etag probe alone (no full re-list)"
 else
