@@ -35,6 +35,9 @@ mount_point: "${MOUNT}"
 http3: false
 optimistic_listing: false
 auto_keep_cached_files: false
+# Scenario 19 ages cached listings past this window; 1 minute keeps that wait
+# short enough for CI while still exercising the real code path.
+dir_cache_max_stale_mins: 1
 EOF
 
 echo "[e2e] mounting ncrs daemon"
@@ -59,6 +62,9 @@ if ! mountpoint -q "$MOUNT"; then
 fi
 echo "[e2e] mounted at ${MOUNT}"
 
+# Scenario 19 asserts on the daemon's own log lines (DIR_HARD_EXPIRED /
+# LIST_ETAG_CONFIRMED), so it needs to know where the log is.
+export NCRS_LOG="$LOG"
 /e2e/scenarios.sh "$MOUNT" "$URL" "$USER" "$PASS"
 rc=$?
 
