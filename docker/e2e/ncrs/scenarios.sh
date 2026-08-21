@@ -432,15 +432,21 @@ curl -s -u "$U:$P" -T /tmp/rev.txt "${URL}revdir/rev.txt" -o /dev/null
 ETAG_AFTER="$(curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}revdir/" | grep -o '<[^>]*getetag>[^<]*' | head -1)"
 sleep 3                                      # get past the just-fetched suppression
 seen=""
-for _ in $(seq 1 12); do
+for _ in $(seq 1 25); do
     ls "$MOUNT/revdir" >/dev/null 2>&1       # each read schedules a background probe
     if [ "$(fuse_sha revdir/rev.txt)" = "$RVW" ]; then seen=$(( $(date +%s) - T_CACHE )); break; fi
     sleep 1
 done
-if [ -n "$seen" ] && [ "$seen" -lt 10 ]; then
-    ok "server-added file visible ${seen}s after caching (inside TTL → revalidation, not expiry)"
+# What proves the read-triggered path did this is the daemon's own diff line, not
+# the clock: an addition the background refresh discovers is deliberately ghosted
+# for GHOST_TTL (10s, GhostKind::HiddenAdd) so a file another client is still
+# uploading is never shown half-written. Visibility therefore cannot beat
+# GHOST_TTL, which is why a sub-TTL bound is the wrong assertion — it can only be
+# met by never ghosting. The bound here is that constant plus slack.
+if [ -n "$seen" ] && grep -q "proactive_refresh: .* added to /revdir" "${NCRS_LOG:-/tmp/ncrs.log}"; then
+    ok "server-added file surfaced by read-triggered revalidation (${seen}s, ghosted first)"
 elif [ -n "$seen" ]; then
-    no "server-added file only appeared after ${seen}s — TTL expiry, read-triggered revalidation not working"
+    no "server-added file appeared after ${seen}s but no revalidation diff logged — TTL expiry, not revalidation"
 elif [ "$ETAG_BEFORE" = "$ETAG_AFTER" ]; then
     echo "  ⓘ server did not change the dir ETag on child add (before==after) — the"
     echo "    revalidation probe has nothing to observe on this server; not a failure"
