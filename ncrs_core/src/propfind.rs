@@ -468,7 +468,19 @@ impl<R: std::io::BufRead> ResponseReader<R> {
                         }
                         "getetag" => {
                             let raw = self.read_text()?;
-                            resp.etag = Some(raw.trim_matches('"').to_string());
+                            let etag = raw.trim().trim_matches('"').trim();
+                            // A server with no ETag for this resource can still answer the
+                            // named property with an empty value — rclone returns
+                            // <getetag></getetag> under a 404 propstat for collections.
+                            // Storing "" as a token is worse than storing nothing: every
+                            // later comparison matches, so the resource looks unchanged
+                            // forever and is never re-listed or re-downloaded. Report the
+                            // absence honestly and let the caller fetch.
+                            resp.etag = if etag.is_empty() {
+                                None
+                            } else {
+                                Some(etag.to_string())
+                            };
                         }
                         "getcontenttype" => {
                             resp.content_type = Some(self.read_text()?);
@@ -754,6 +766,45 @@ mod tests {
         assert_eq!(dir.size, 2000000);
         assert!(!dir.has_preview);
         assert!(!dir.is_shared);
+    }
+
+    #[test]
+    fn empty_getetag_is_no_token_not_an_always_matching_one() {
+        // rclone answers a named getetag request on a collection like this.
+        const NO_ETAG: &str = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/user/sub/</d:href>
+    <d:propstat>
+      <d:prop><d:getetag></d:getetag></d:prop>
+      <d:status>HTTP/1.1 404 Not Found</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        let (dir_etag, _self_entry, _entries) =
+            parse_multistatus_str(NO_ETAG, "https://cloud.example.com/remote.php/dav/files/user").unwrap();
+        assert_eq!(
+            dir_etag, None,
+            "an empty ETag must read as absent — Some(\"\") matches every later probe, so the \
+             directory would be treated as unchanged forever and never re-listed"
+        );
+    }
+
+    #[test]
+    fn quoted_and_padded_etags_are_normalised() {
+        const PADDED: &str = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/user/sub/</d:href>
+    <d:propstat>
+      <d:prop><d:getetag>  "abc123"  </d:getetag></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        let (dir_etag, _s, _e) =
+            parse_multistatus_str(PADDED, "https://cloud.example.com/remote.php/dav/files/user").unwrap();
+        assert_eq!(dir_etag.as_deref(), Some("abc123"));
     }
 
     #[test]
