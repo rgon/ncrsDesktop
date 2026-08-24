@@ -2,7 +2,8 @@ pub mod api;
 pub mod commands;
 pub mod window_context;
 
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use ncrs_plugin::{NcrsPlugin, PluginMeta};
 use tauri::menu::MenuItem;
@@ -15,7 +16,13 @@ type WryRuntime = Wry<EventLoopMessage>;
 
 pub struct NcPasswordsState {
     pub credentials: Mutex<Option<(String, String, String)>>,
-    pub client: Mutex<Option<PasswordsClient>>,
+    /// Behind an `Arc` so a command can clone the handle out and drop the lock
+    /// before it touches the network. Holding the lock across a request let a
+    /// single stalled call block every other passwords command.
+    pub client: Mutex<Option<Arc<PasswordsClient>>>,
+    /// Mirrors `client.is_some()`. `nc_passwords_is_connected` runs on the main
+    /// thread, so it reads this instead of waiting on the mutex.
+    pub connected: AtomicBool,
     pub last_window_context: Mutex<Option<String>>,
 }
 
@@ -24,6 +31,7 @@ impl Default for NcPasswordsState {
         Self {
             credentials: Mutex::new(None),
             client: Mutex::new(None),
+            connected: AtomicBool::new(false),
             last_window_context: Mutex::new(None),
         }
     }
@@ -102,6 +110,7 @@ mod tests {
         let state = NcPasswordsState::default();
         assert!(state.credentials.lock().unwrap().is_none());
         assert!(state.client.lock().unwrap().is_none());
+        assert!(!state.connected.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
