@@ -27,6 +27,10 @@
 
     let connected = $state(false);
     let connecting = $state(false);
+    // The first connect happens on mount and now fails within the client's
+    // timeout instead of hanging, so the view has a real "still trying" phase
+    // to show rather than flashing the manual Connect panel.
+    let booting = $state(true);
     let passwords = $state<PasswordEntry[]>([]);
     let searchTerm = $state("");
     let expandedId = $state<string | null>(null);
@@ -51,6 +55,7 @@
     async function loadData() {
         try {
             passwords = await invoke<PasswordEntry[]>("nc_passwords_list");
+            error = null;
         } catch (e) {
             error = String(e);
         }
@@ -99,23 +104,31 @@
     });
 
     onMount(async () => {
-        connected = await invoke<boolean>("nc_passwords_is_connected");
-        if (connected) {
-            await loadData();
-        } else {
-            try {
+        try {
+            connected = await invoke<boolean>("nc_passwords_is_connected");
+            if (!connected) {
                 await invoke("nc_passwords_connect");
                 connected = true;
-                await loadData();
-            } catch {
-                // Auto-connect failed — show manual connect button
             }
+            await loadData();
+        } catch (e) {
+            // Auto-connect failed — fall back to the manual Connect button, but
+            // say why (unreachable server, bad credentials) instead of silently
+            // showing a button that will fail the same way.
+            error = String(e);
+        } finally {
+            booting = false;
         }
     });
 </script>
 
 <div class="flex flex-col flex-grow overflow-hidden">
-    {#if !connected}
+    {#if booting}
+        <div class="flex flex-col items-center justify-center flex-grow gap-3 p-6">
+            <span class="loading loading-spinner loading-md text-gray-400"></span>
+            <p class="text-sm text-gray-500">Connecting to Nextcloud Passwords…</p>
+        </div>
+    {:else if !connected}
         <div class="flex flex-col items-center justify-center flex-grow gap-4 p-6">
             <Icon class="w-12 h-12 text-gray-400" path={mdiLock} />
             <h2 class="text-lg font-semibold">Nextcloud Passwords</h2>
