@@ -45,7 +45,7 @@ pub async fn nc_passwords_connect(state: State<'_, NcPasswordsState>) -> Result<
 
     let (base_url, user, pass) = creds;
     let client = tauri::async_runtime::spawn_blocking(move || {
-        let mut client = PasswordsClient::new(&base_url, &user, &pass);
+        let mut client = PasswordsClient::new(&base_url, &user, &pass)?;
         client.open_session()?;
         Ok::<_, String>(client)
     })

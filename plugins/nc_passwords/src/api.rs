@@ -1,7 +1,15 @@
+use std::time::Duration;
+
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
 const BASE_FOLDER_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+// reqwest's blocking client has no default timeout, so a server that accepts
+// the connection and then goes quiet leaves the caller parked on the socket
+// forever. Same bounds ncrs_core uses for its Nextcloud API calls.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const API_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PasswordEntry {
@@ -66,19 +74,21 @@ pub struct PasswordsClient {
 }
 
 impl PasswordsClient {
-    pub fn new(server_url: &str, username: &str, password: &str) -> Self {
+    pub fn new(server_url: &str, username: &str, password: &str) -> Result<Self, String> {
         let base_url = server_url.trim_end_matches('/').to_string();
         let client = Client::builder()
             .cookie_store(true)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(API_TIMEOUT)
             .build()
-            .expect("failed to build HTTP client");
-        Self {
+            .map_err(|e| format!("build http client: {e}"))?;
+        Ok(Self {
             client,
             base_url,
             username: username.to_string(),
             password: password.to_string(),
             session_id: None,
-        }
+        })
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -331,7 +341,7 @@ mod tests {
 
     #[test]
     fn favicon_url_format() {
-        let client = PasswordsClient::new("https://cloud.example.com", "user", "pass");
+        let client = PasswordsClient::new("https://cloud.example.com", "user", "pass").unwrap();
         let url = client.favicon_url("github.com", 32);
         assert_eq!(
             url,
@@ -368,7 +378,7 @@ mod tests {
 
     #[test]
     fn client_trims_trailing_slash() {
-        let client = PasswordsClient::new("https://cloud.example.com/", "u", "p");
+        let client = PasswordsClient::new("https://cloud.example.com/", "u", "p").unwrap();
         let url = client.favicon_url("x.com", 16);
         assert!(
             url.starts_with("https://cloud.example.com/index.php/"),
@@ -378,7 +388,7 @@ mod tests {
 
     #[test]
     fn api_url_format() {
-        let client = PasswordsClient::new("https://cloud.example.com", "u", "p");
+        let client = PasswordsClient::new("https://cloud.example.com", "u", "p").unwrap();
         let url = client.api_url("/api/1.0/password/list");
         assert_eq!(
             url,
