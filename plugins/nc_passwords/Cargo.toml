@@ -9,7 +9,12 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-runtime-wry = "2.6.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.11", features = ["blocking", "json", "cookies"] }
+# Pinned to the same major as ncrs_core so the GUI links one reqwest/hyper/TLS
+# stack instead of two. Features mirror core's, plus cookies for the passwords
+# session.
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking", "json", "cookies", "charset", "http2", "rustls",
+] }
 log = "0.4"
 
 [dev-dependencies]
