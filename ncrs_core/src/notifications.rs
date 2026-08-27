@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const API_TIMEOUT: Duration = Duration::from_secs(10);
@@ -56,13 +57,22 @@ pub fn base_url(webdav_url: &str) -> String {
     webdav_url[..host_end].to_string()
 }
 
-fn client(http3: bool) -> reqwest::blocking::Client {
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(API_TIMEOUT);
-    if http3 {
-        builder = builder.http3_prior_knowledge();
-    }
-    builder.build().expect("reqwest client")
+/// Cached per HTTP/3 variant (both are reachable: the h3 calls fall back to h2).
+/// `fetch_notifications` polls every ~30s for the life of the daemon, and each
+/// `build()` would spawn a tokio runtime thread, a fresh rustls root store and —
+/// with http3 — a new QUIC endpoint/UDP socket.
+fn client(http3: bool) -> &'static reqwest::blocking::Client {
+    static H3: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    static H2: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    let cell = if http3 { &H3 } else { &H2 };
+    cell.get_or_init(|| {
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(API_TIMEOUT);
+        if http3 {
+            builder = builder.http3_prior_knowledge();
+        }
+        builder.build().expect("reqwest client")
+    })
 }
 
 pub fn fetch_notifications(

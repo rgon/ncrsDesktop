@@ -1,5 +1,6 @@
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const API_TIMEOUT: Duration = Duration::from_secs(10);
@@ -69,12 +70,20 @@ struct OcsSearchResponse {
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-fn client(http3: bool) -> reqwest::blocking::Client {
-    let mut b = reqwest::blocking::Client::builder().timeout(API_TIMEOUT);
-    if http3 {
-        b = b.http3_prior_knowledge();
-    }
-    b.build().expect("reqwest client")
+/// Cached per HTTP/3 variant: rebuilding spawns a tokio runtime thread, a fresh
+/// rustls root store and — with http3 — a new QUIC endpoint, which `search_all`
+/// would otherwise pay once per provider on every keystroke-driven search.
+fn client(http3: bool) -> &'static reqwest::blocking::Client {
+    static H3: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    static H2: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    let cell = if http3 { &H3 } else { &H2 };
+    cell.get_or_init(|| {
+        let mut b = reqwest::blocking::Client::builder().timeout(API_TIMEOUT);
+        if http3 {
+            b = b.http3_prior_knowledge();
+        }
+        b.build().expect("reqwest client")
+    })
 }
 
 fn decode_pct(s: &str) -> String {
