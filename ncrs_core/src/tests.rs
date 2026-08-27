@@ -1815,6 +1815,34 @@ password: "pass"
         assert!(mount_point.join("weird.sock").exists(), "leftover must be untouched on refusal");
     }
 
+    // ── Offline reads must not look like corruption ──────────────────────────
+
+    #[test]
+    fn offline_read_error_is_timeout_not_eio() {
+        // The whole point of OFFLINE_READ_ERR's wording: EIO tells apps the file is
+        // unreadable (mpv reports "Failed to recognize file format") and makes
+        // Nautilus mark the entire mount inaccessible. A brief outage must instead
+        // surface as a retryable, transient condition.
+        // `Errno` is not `PartialEq`, so compare the raw codes.
+        assert_eq!(i32::from(error_to_errno(OFFLINE_READ_ERR)), i32::from(Errno::ETIMEDOUT));
+        assert_ne!(i32::from(error_to_errno(OFFLINE_READ_ERR)), i32::from(Errno::EIO));
+    }
+
+    #[test]
+    fn offline_read_error_classifies_as_network_down() {
+        // It must also keep the daemon offline rather than reading as an
+        // application-level rejection, so the connectivity monitor stays in its
+        // fast 5s re-probe cadence.
+        assert!(read_err_is_network_down(OFFLINE_READ_ERR));
+    }
+
+    #[test]
+    fn the_old_offline_message_was_the_bug() {
+        // Regression guard: the previous string matched no arm in error_to_errno and
+        // fell through to EIO. If someone reintroduces that wording, this fails.
+        assert_eq!(i32::from(error_to_errno("file not available offline")), i32::from(Errno::EIO));
+    }
+
     // ── HTTP/3 demotion ──────────────────────────────────────────────────────
 
     fn test_clients(http3: bool) -> crate::http_clients::HttpClients {

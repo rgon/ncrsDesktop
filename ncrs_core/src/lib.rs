@@ -386,6 +386,72 @@ fn read_err_is_network_down(e: &str) -> bool {
     is_timeout_err(e) || is_transient_network_err(e)
 }
 
+/// How long a read will wait for connectivity to come back before giving up.
+/// Sized to cover one full connectivity-monitor cycle while offline: the monitor
+/// sleeps 5s, then spends up to a 5s probe timeout.
+const OFFLINE_READ_GRACE: Duration = Duration::from_secs(15);
+
+/// The error a read returns once it has waited out [`OFFLINE_READ_GRACE`].
+///
+/// The wording matters: [`error_to_errno`] classifies it, and "timed out" lands it
+/// on the `ETIMEDOUT` arm. It must never fall through to `EIO`, which makes
+/// Nautilus permanently mark the whole mount inaccessible (see the note on
+/// [`is_transient_network_err`]) and tells apps the file is corrupt rather than
+/// momentarily unavailable — that is what turned a brief outage into mpv's
+/// "Failed to recognize file format".
+const OFFLINE_READ_ERR: &str = "network: offline — timed out waiting for connectivity";
+
+/// Flip the daemon offline, recording when, so reads can distinguish a fresh blip
+/// from a sustained outage.
+fn mark_offline(is_offline: &AtomicBool, since: &Mutex<Option<Instant>>) {
+    if !is_offline.swap(true, Ordering::Relaxed) {
+        *since.safe_lock() = Some(Instant::now());
+    }
+}
+
+/// Clear the offline flag. Returns whether the daemon *was* offline.
+fn mark_online(is_offline: &AtomicBool, since: &Mutex<Option<Instant>>) -> bool {
+    let was_offline = is_offline.swap(false, Ordering::Relaxed);
+    if was_offline {
+        *since.safe_lock() = None;
+    }
+    was_offline
+}
+
+/// Block while the daemon is offline, but only for the remainder of
+/// [`OFFLINE_READ_GRACE`] measured from the moment connectivity was lost.
+///
+/// A read that arrives during a two-second blip should produce data, not an error
+/// — the connectivity monitor re-probes every 5s and will usually have cleared the
+/// flag well inside the window. Anchoring the deadline to when we went offline
+/// (rather than to when this read arrived) is what keeps the original fail-fast
+/// behaviour for a real outage: once we have been offline past the grace period,
+/// every subsequent read returns immediately instead of each stalling in turn,
+/// which is what would wreck an app doing a read-modify-write save.
+///
+/// Returns true if the daemon is online by the time we stop waiting.
+fn wait_out_offline_blip(conn: &ConnInfo) -> bool {
+    if !conn.is_offline.load(Ordering::Relaxed) {
+        return true;
+    }
+    let deadline = match *conn.offline_since.safe_lock() {
+        Some(since) => since + OFFLINE_READ_GRACE,
+        // Offline with no recorded transition (set before this bookkeeping existed,
+        // e.g. an offline-mode mount): treat it as a real outage, not a blip.
+        None => return false,
+    };
+    while Instant::now() < deadline {
+        if conn.shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(250));
+        if !conn.is_offline.load(Ordering::Relaxed) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Return the minimal magic byte sequence that identifies a given MIME type.
 ///
 /// # Background — GLib 2.80 MIME detection and FUSE latency
@@ -2041,6 +2107,10 @@ struct ConnInfo {
     read_throttle: Arc<Throttle>,
     prefetch_throttle: Arc<Throttle>,
     is_offline: Arc<AtomicBool>,
+    /// When `is_offline` last went false→true. Lets a read tell a momentary blip
+    /// (worth waiting out) from a sustained outage (fail fast) — see
+    /// [`wait_out_offline_blip`]. `None` while online.
+    offline_since: Arc<Mutex<Option<Instant>>>,
     active_streams: Arc<AtomicUsize>,
     deferred_invalidation: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -2266,6 +2336,7 @@ impl NextCloudFs {
             creds,
             mount_point: options.mount_point.clone(),
             clients,
+            offline_since: Arc::new(Mutex::new(options.offline.then(Instant::now))),
             throttle: Arc::new(Throttle::new(max_req)),
             read_throttle: Arc::new(Throttle::new(3)),
             prefetch_throttle: Arc::new(Throttle::new(5)),
@@ -2349,6 +2420,12 @@ impl NextCloudFs {
 
     pub fn dirty_set(&self) -> ipc::DirtySet {
         self.dirty.clone()
+    }
+
+    /// Companion to [`Self::is_offline_flag`]: the two must be updated together
+    /// via `mark_offline`/`mark_online` so the read grace window stays accurate.
+    pub(crate) fn offline_since_slot(&self) -> Arc<Mutex<Option<Instant>>> {
+        self.conn.offline_since.clone()
     }
 
     pub fn is_offline_flag(&self) -> Arc<AtomicBool> {
@@ -3713,7 +3790,7 @@ impl Filesystem for NextCloudFs {
                         Err(e) => {
                             log::warn!("stream read first bytes failed: {}", e);
                             if read_err_is_network_down(&e) {
-                                conn.is_offline.store(true, Ordering::Relaxed);
+                                mark_offline(&conn.is_offline, &conn.offline_since);
                             }
                             push_error(&elog, path.clone(), SyncErrorKind::NetworkError, format!("download failed: {}", e));
                             reply.error(Errno::EIO);
@@ -3727,7 +3804,7 @@ impl Filesystem for NextCloudFs {
                     // timeout; the connectivity monitor clears the flag (and replays
                     // the journal) within ~5s of the server coming back.
                     if read_err_is_network_down(&e) {
-                        conn.is_offline.store(true, Ordering::Relaxed);
+                        mark_offline(&conn.is_offline, &conn.offline_since);
                     }
                     // If we are offline (either the flip above or the connectivity
                     // monitor set it), the ensure_file_cached fallback below can only
@@ -4180,7 +4257,7 @@ impl Filesystem for NextCloudFs {
                             // and clears the flag (and replays the journal) once the server
                             // is back, so a brief hiccup self-heals quickly.
                             if e.is_network_down() {
-                                conn.is_offline.store(true, Ordering::Relaxed);
+                                mark_offline(&conn.is_offline, &conn.offline_since);
                             }
                             log::warn!("PUT {} deferred — {} (queued for retry)", remote_path.display(), e);
                             journal.safe_lock().mark_deferred(seq, e.to_string());
@@ -4891,8 +4968,11 @@ fn do_range_read_stream<'a>(
     size: usize,
     throttle: bool,
 ) -> Result<(reqwest::blocking::Response, Option<ThrottleGuard<'a>>), String> {
-    if conn.is_offline.load(Ordering::Relaxed) {
-        return Err("file not available offline".into());
+    // Offline is not a verdict on this read yet: give a blip the remainder of the
+    // grace window to clear before refusing, and refuse with a *transient* error so
+    // callers retry instead of treating the file as unreadable.
+    if !wait_out_offline_blip(conn) {
+        return Err(OFFLINE_READ_ERR.into());
     }
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
@@ -5156,6 +5236,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         {
             let backend_monitor = backend.clone();
             let offline = offline_flag.clone();
+            let offline_since_monitor = filesystem.offline_since_slot();
             let journal_for_monitor = filesystem.journal();
             let cache_for_monitor = filesystem.cache_ref();
             let dirty_for_monitor = filesystem.dirty_set();
@@ -5189,7 +5270,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
                     match backend_monitor.check_reachability(Duration::from_secs(5)) {
                         backend::ReachabilityStatus::Reachable => {
-                            let was_offline = offline.swap(false, Ordering::Relaxed);
+                            let was_offline = mark_online(&offline, &offline_since_monitor);
                             // Replay whenever there is queued work — both right after
                             // connectivity is restored AND periodically while online, so a
                             // PendingSync entry from a failed upload is retried on its own
@@ -5235,16 +5316,17 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                                 }
                                 Ok(false) => {
                                     log::info!("CONNECTIVITY: auth rejected but no wipe pending — token may be revoked");
-                                    offline.store(true, Ordering::Relaxed);
+                                    mark_offline(&offline, &offline_since_monitor);
                                 }
                                 Err(e) => {
                                     log::warn!("CONNECTIVITY: wipe check failed: {} — will retry", e);
-                                    offline.store(true, Ordering::Relaxed);
+                                    mark_offline(&offline, &offline_since_monitor);
                                 }
                             }
                         }
                         backend::ReachabilityStatus::Unreachable => {
-                            let was_offline = offline.swap(true, Ordering::Relaxed);
+                            let was_offline = offline.load(Ordering::Relaxed);
+                            mark_offline(&offline, &offline_since_monitor);
                             if !was_offline {
                                 log::warn!("CONNECTIVITY lost — serving from cache");
                             }
