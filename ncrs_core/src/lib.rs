@@ -6,6 +6,7 @@ pub mod edit_locally;
 pub mod filename_validation;
 pub mod fuse_notify;
 pub mod ipc;
+pub mod http_clients;
 pub mod mutation_journal;
 pub mod nextcloud;
 pub mod notifications;
@@ -2031,12 +2032,11 @@ struct ConnInfo {
     webdav_url: String,
     creds: auth::Credentials,
     mount_point: PathBuf,
-    http: reqwest::blocking::Client,
+    clients: crate::http_clients::HttpClients,
     optimistic_listing: bool,
     // None when dir_cache_max_stale_mins is 0 (check disabled).
     dir_cache_max_stale: Option<Duration>,
     notify_push_connected: Arc<AtomicBool>,
-    http_read: reqwest::blocking::Client,
     throttle: Arc<Throttle>,
     read_throttle: Arc<Throttle>,
     prefetch_throttle: Arc<Throttle>,
@@ -2206,21 +2206,38 @@ impl NextCloudFs {
         // its idle pool — those requests run off the FUSE read path (background PUTs,
         // the connectivity probe's own 5s timeout), so a stale warm connection there
         // never freezes an app.
-        let mut http_builder = reqwest::blocking::Client::builder()
-            .pool_max_idle_per_host(16)
-            .connect_timeout(CONNECT_TIMEOUT);
-        let mut read_builder = reqwest::blocking::Client::builder()
-            .pool_max_idle_per_host(0)
-            .tcp_nodelay(true)
-            .connect_timeout(CONNECT_TIMEOUT);
-        if use_http3 {
-            http_builder = http_builder.http3_prior_knowledge();
-            read_builder = read_builder.http3_prior_knowledge();
-        }
-        let http = http_builder.build()
-            .map_err(|e| format!("HTTP client: {}", e))?;
-        let http_read = read_builder.build()
-            .map_err(|e| format!("HTTP read client: {}", e))?;
+        //
+        // Both transports are built up front. `http3_prior_knowledge()` makes a client
+        // QUIC-only, so when UDP/443 is blocked or the server's QUIC listener is broken
+        // every request fails at the transport layer and the daemon mistakes that for
+        // "server unreachable". The HTTP/2 pair is the escape hatch the connectivity
+        // probe demotes to; see `http_clients`.
+        let build_pair = |http3: bool| -> Result<(reqwest::blocking::Client, reqwest::blocking::Client), String> {
+            let mut meta = reqwest::blocking::Client::builder()
+                .pool_max_idle_per_host(16)
+                .connect_timeout(CONNECT_TIMEOUT);
+            let mut read = reqwest::blocking::Client::builder()
+                .pool_max_idle_per_host(0)
+                .tcp_nodelay(true)
+                .connect_timeout(CONNECT_TIMEOUT);
+            if http3 {
+                meta = meta.http3_prior_knowledge();
+                read = read.http3_prior_knowledge();
+            }
+            Ok((
+                meta.build().map_err(|e| format!("HTTP client: {}", e))?,
+                read.build().map_err(|e| format!("HTTP read client: {}", e))?,
+            ))
+        };
+        let (http_h2, http_read_h2) = build_pair(false)?;
+        let (http_pref, http_read_pref) = if use_http3 {
+            build_pair(true)?
+        } else {
+            (http_h2.clone(), http_read_h2.clone())
+        };
+        let clients = crate::http_clients::HttpClients::new(
+            http_pref, http_read_pref, http_h2, http_read_h2, use_http3,
+        );
 
         let max_req = if options.max_concurrent_requests == 0 { 10 } else { options.max_concurrent_requests };
         log::info!("HTTP throttle: max {} concurrent requests", max_req);
@@ -2231,18 +2248,14 @@ impl NextCloudFs {
                 base_url.clone(),
                 options.url.clone(),
                 creds.clone(),
-                http.clone(),
-                http_read.clone(),
-                use_http3,
+                clients.clone(),
             ))
         } else {
             Arc::new(crate::nextcloud::NextcloudBackend::new(
                 base_url.clone(),
                 options.url.clone(),
                 creds.clone(),
-                http.clone(),
-                http_read.clone(),
-                use_http3,
+                clients.clone(),
             )?)
         };
 
@@ -2252,8 +2265,7 @@ impl NextCloudFs {
             webdav_url: options.url.clone(),
             creds,
             mount_point: options.mount_point.clone(),
-            http,
-            http_read,
+            clients,
             throttle: Arc::new(Throttle::new(max_req)),
             read_throttle: Arc::new(Throttle::new(3)),
             prefetch_throttle: Arc::new(Throttle::new(5)),
@@ -2507,7 +2519,7 @@ impl NextCloudFs {
                 let mtime = std::fs::metadata(&mount_path).ok()
                     .and_then(|m| m.modified().ok());
                 crate::preview::prefetch_thumbnail(
-                    &conn.http,
+                    conn.clients.get(),
                     &conn.base_url,
                     &conn.creds,
                     &conn.mount_point,
@@ -2939,7 +2951,7 @@ impl NextCloudFs {
                             thread::spawn(move || {
                                 thread::sleep(Duration::from_millis(200));
                                 preview::prefetch_directory_thumbnails(
-                                    &conn2.http,
+                                    conn2.clients.get(),
                                     &conn2.base_url,
                                     &conn2.creds,
                                     &conn2.mount_point,
@@ -4887,7 +4899,9 @@ fn do_range_read_stream<'a>(
     let mut delay = Duration::from_millis(500);
     for attempt in 0u32..=2 {
         let permit = if throttle { Some(conn.read_throttle.acquire()) } else { None };
-        let req = conn.http_read
+        // Re-read the client each attempt so a demotion to HTTP/2 (see `http_clients`)
+        // takes effect on the retry rather than only on the next read.
+        let req = conn.clients.read()
             .get(&url)
             .timeout(DOWNLOAD_TIMEOUT)
             .header("Range", format!("bytes={}-{}", offset, end));
@@ -5205,14 +5219,14 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                         }
                         backend::ReachabilityStatus::AuthRejected(code) => {
                             log::warn!("CONNECTIVITY: auth rejected (HTTP {}), checking for remote wipe", code);
-                            match remote_wipe::check_wipe(&conn_monitor.http, &conn_monitor.base_url, conn_monitor.creds.secret()) {
+                            match remote_wipe::check_wipe(conn_monitor.clients.get(), &conn_monitor.base_url, conn_monitor.creds.secret()) {
                                 Ok(true) => {
                                     log::warn!("REMOTE WIPE requested by server — executing");
                                     let config_path = config::config_path();
                                     if let Err(e) = remote_wipe::execute_wipe(&cache_dir_monitor, &config_path) {
                                         log::error!("REMOTE_WIPE execution error: {}", e);
                                     }
-                                    if let Err(e) = remote_wipe::confirm_wipe(&conn_monitor.http, &conn_monitor.base_url, conn_monitor.creds.secret()) {
+                                    if let Err(e) = remote_wipe::confirm_wipe(conn_monitor.clients.get(), &conn_monitor.base_url, conn_monitor.creds.secret()) {
                                         log::warn!("REMOTE_WIPE: failed to confirm to server: {}", e);
                                     }
                                     wipe_flag_monitor.store(true, Ordering::Relaxed);

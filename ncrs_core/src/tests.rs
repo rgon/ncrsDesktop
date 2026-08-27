@@ -1814,3 +1814,43 @@ password: "pass"
         assert!(err.contains("not auto-adopted"), "unexpected error: {}", err);
         assert!(mount_point.join("weird.sock").exists(), "leftover must be untouched on refusal");
     }
+
+    // ── HTTP/3 demotion ──────────────────────────────────────────────────────
+
+    fn test_clients(http3: bool) -> crate::http_clients::HttpClients {
+        let mk = || reqwest::blocking::Client::builder().build().unwrap();
+        let (h2, read_h2) = (mk(), mk());
+        // Stand-ins for the QUIC pair: we only assert which slot is handed out.
+        let (pref, read_pref) = if http3 { (mk(), mk()) } else { (h2.clone(), read_h2.clone()) };
+        crate::http_clients::HttpClients::new(pref, read_pref, h2, read_h2, http3)
+    }
+
+    #[test]
+    fn demotion_switches_both_clients_to_http2() {
+        let c = test_clients(true);
+        assert!(c.http3_active());
+        assert!(!std::ptr::eq(c.get(), c.h2()), "before demotion the preferred client is the h3 one");
+
+        c.demote();
+
+        assert!(!c.http3_active());
+        assert!(std::ptr::eq(c.get(), c.h2()), "after demotion every caller must get the h2 client");
+    }
+
+    #[test]
+    fn demotion_is_idempotent_and_one_way() {
+        let c = test_clients(true);
+        c.demote();
+        c.demote();
+        assert!(!c.http3_active(), "demotion must not flap back to HTTP/3");
+    }
+
+    #[test]
+    fn without_http3_there_is_nothing_to_demote() {
+        // check_reachability gates its h2 retry on http3_active(), so a plain-HTTP/2
+        // mount must never pay for a second probe.
+        let c = test_clients(false);
+        assert!(!c.http3_active());
+        c.demote();
+        assert!(!c.http3_active(), "demoting a non-http3 client set stays a no-op");
+    }

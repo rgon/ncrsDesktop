@@ -40,9 +40,7 @@ pub struct NextcloudBackend {
     base_url: String,
     webdav_url: String,
     creds: Credentials,
-    http: reqwest::blocking::Client,
-    http_read: reqwest::blocking::Client,
-    http3: bool,
+    clients: crate::http_clients::HttpClients,
     conns: Mutex<Vec<WebDAVFs>>,
 }
 
@@ -51,9 +49,7 @@ impl NextcloudBackend {
         base_url: String,
         webdav_url: String,
         creds: Credentials,
-        http: reqwest::blocking::Client,
-        http_read: reqwest::blocking::Client,
-        http3: bool,
+        clients: crate::http_clients::HttpClients,
     ) -> Result<Self, String> {
         if !creds.is_bearer() {
             let mut initial = WebDAVFs::new(creds.username(), creds.secret(), &webdav_url);
@@ -64,9 +60,7 @@ impl NextcloudBackend {
                 base_url,
                 webdav_url,
                 creds,
-                http,
-                http_read,
-                http3,
+                clients,
                 conns: Mutex::new(vec![initial]),
             })
         } else {
@@ -74,9 +68,7 @@ impl NextcloudBackend {
                 base_url,
                 webdav_url,
                 creds,
-                http,
-                http_read,
-                http3,
+                clients,
                 conns: Mutex::new(Vec::new()),
             })
         }
@@ -86,17 +78,13 @@ impl NextcloudBackend {
         base_url: String,
         webdav_url: String,
         creds: Credentials,
-        http: reqwest::blocking::Client,
-        http_read: reqwest::blocking::Client,
-        http3: bool,
+        clients: crate::http_clients::HttpClients,
     ) -> Self {
         NextcloudBackend {
             base_url,
             webdav_url,
             creds,
-            http,
-            http_read,
-            http3,
+            clients,
             conns: Mutex::new(Vec::new()),
         }
     }
@@ -168,7 +156,7 @@ impl CloudBackend for NextcloudBackend {
         timeout: Duration,
     ) -> Result<(Option<String>, Option<RemoteEntry>, Vec<RemoteEntry>), BackendReadError> {
         let (etag, self_entry, entries) = propfind::propfind_list(
-            &self.http,
+            self.clients.get(),
             &self.webdav_url,
             &self.creds,
             path,
@@ -190,7 +178,7 @@ impl CloudBackend for NextcloudBackend {
         self_tx: std::sync::mpsc::Sender<RemoteEntry>,
     ) -> Result<Option<String>, BackendReadError> {
         propfind::propfind_list_streaming(
-            &self.http,
+            self.clients.get(),
             &self.webdav_url,
             &self.creds,
             path,
@@ -207,7 +195,7 @@ impl CloudBackend for NextcloudBackend {
         timeout: Duration,
     ) -> Result<Option<String>, BackendReadError> {
         propfind::propfind_etag(
-            &self.http,
+            self.clients.get(),
             &self.webdav_url,
             &self.creds,
             path,
@@ -224,7 +212,7 @@ impl CloudBackend for NextcloudBackend {
     ) -> Result<u64, BackendReadError> {
         if self.creds.is_bearer() {
             let url = self.webdav_file_url(path);
-            let mut resp = self.creds.apply(self.http_read.get(&url).timeout(timeout))
+            let mut resp = self.creds.apply(self.clients.read().get(&url).timeout(timeout))
                 .send()
                 .map_err(|e| BackendReadError::Network(e.to_string()))?;
             let status = resp.status();
@@ -263,7 +251,8 @@ impl CloudBackend for NextcloudBackend {
         let url = self.webdav_file_url(path);
         let end = offset + buf.len() as u64 - 1;
         let resp = self
-            .http_read
+            .clients
+            .read()
             .get(&url)
             .timeout(timeout)
             .header("Range", format!("bytes={}-{}", offset, end))
@@ -294,7 +283,7 @@ impl CloudBackend for NextcloudBackend {
         if_match: Option<&str>,
     ) -> Result<PutResult, BackendWriteError> {
         webdav_ops::put_file_chunked(
-            &self.http,
+            self.clients.get(),
             &self.base_url,
             &self.creds,
             path,
@@ -312,7 +301,7 @@ impl CloudBackend for NextcloudBackend {
         if_match: Option<&str>,
     ) -> Result<PutResult, BackendWriteError> {
         webdav_ops::put_file_from_path(
-            &self.http,
+            self.clients.get(),
             &self.base_url,
             &self.creds,
             path,
@@ -325,7 +314,7 @@ impl CloudBackend for NextcloudBackend {
 
     fn mkdir(&self, path: &Path) -> Result<(), BackendWriteError> {
         webdav_ops::mkcol(
-            &self.http,
+            self.clients.get(),
             &self.base_url,
             &self.creds,
             path,
@@ -335,7 +324,7 @@ impl CloudBackend for NextcloudBackend {
 
     fn delete(&self, path: &Path) -> Result<(), BackendWriteError> {
         webdav_ops::delete(
-            &self.http,
+            self.clients.get(),
             &self.base_url,
             &self.creds,
             path,
@@ -345,7 +334,7 @@ impl CloudBackend for NextcloudBackend {
 
     fn rename(&self, from: &Path, to: &Path) -> Result<(), BackendWriteError> {
         webdav_ops::move_resource(
-            &self.http,
+            self.clients.get(),
             &self.base_url,
             &self.creds,
             from,
@@ -356,7 +345,7 @@ impl CloudBackend for NextcloudBackend {
 
     fn is_reachable(&self, timeout: Duration) -> bool {
         propfind::propfind_etag(
-            &self.http,
+            self.clients.get(),
             &self.webdav_url,
             &self.creds,
             Path::new("/"),
@@ -367,21 +356,32 @@ impl CloudBackend for NextcloudBackend {
 
     fn check_reachability(&self, timeout: Duration) -> crate::backend::ReachabilityStatus {
         use crate::backend::ReachabilityStatus;
-        match propfind::propfind_status(
-            &self.http,
-            &self.webdav_url,
-            &self.creds,
-            Path::new("/"),
-            timeout,
-        ) {
+        let probe = |client: &reqwest::blocking::Client| {
+            propfind::propfind_status(client, &self.webdav_url, &self.creds, Path::new("/"), timeout)
+        };
+        match probe(self.clients.get()) {
             Ok(()) => ReachabilityStatus::Reachable,
             Err(code) if code == 401 || code == 403 => ReachabilityStatus::AuthRejected(code),
+            // `propfind_status` reports a transport-level send failure as code 0. That is
+            // the one failure a QUIC-only client produces when UDP/443 is blocked or the
+            // server's HTTP/3 listener is broken — and it is indistinguishable, from here,
+            // from the server actually being down. Retry once over HTTP/2 before
+            // condemning the mount to offline: if plain HTTPS answers, the fault was the
+            // transport, not the server, so latch onto HTTP/2 and report Reachable.
+            Err(0) if self.clients.http3_active() => match probe(self.clients.h2()) {
+                Ok(()) => {
+                    self.clients.demote();
+                    ReachabilityStatus::Reachable
+                }
+                Err(code) if code == 401 || code == 403 => ReachabilityStatus::AuthRejected(code),
+                Err(_) => ReachabilityStatus::Unreachable,
+            },
             Err(_) => ReachabilityStatus::Unreachable,
         }
     }
 
     fn start_change_watcher(&self, callback: ChangeCallback) -> Box<dyn ChangeWatcherHandle> {
-        let http = self.http.clone();
+        let clients = self.clients.clone();
         let base_url = self.base_url.clone();
         let webdav_url = self.webdav_url.clone();
         let creds = self.creds.clone();
@@ -397,7 +397,7 @@ impl CloudBackend for NextcloudBackend {
 
         std::thread::spawn(move || {
             watcher_loop(
-                &http,
+                &clients,
                 &base_url,
                 &webdav_url,
                 &creds,
@@ -475,7 +475,7 @@ impl CloudBackend for NextcloudBackend {
     }
 
     fn quota(&self, timeout: Duration) -> Option<(u64, u64)> {
-        propfind::propfind_quota(&self.http, &self.webdav_url, &self.creds, timeout)
+        propfind::propfind_quota(self.clients.get(), &self.webdav_url, &self.creds, timeout)
             .map_err(|e| log::debug!("quota fetch: {}", e))
             .ok()
     }
@@ -509,7 +509,7 @@ impl Drop for NcChangeWatcher {
 }
 
 fn watcher_loop(
-    http: &reqwest::blocking::Client,
+    clients: &crate::http_clients::HttpClients,
     base_url: &str,
     webdav_url: &str,
     creds: &Credentials,
@@ -533,6 +533,12 @@ fn watcher_loop(
         }
 
         connected.store(false, Ordering::Relaxed);
+
+        // Resolved per reconnect rather than once at startup, so a mid-session
+        // demotion to HTTP/2 is picked up on the next attempt instead of leaving the
+        // change watcher stranded on a QUIC transport that has already been proven
+        // broken. Demotion is permanent, so re-reading it costs one atomic load.
+        let http = clients.get();
 
         let info = match crate::notify_push::discover_endpoints(http, base_url, creds) {
             Ok(info) => {
@@ -793,7 +799,7 @@ fn watcher_handle_event(
 
 impl Searchable for NextcloudBackend {
     fn fetch_search_providers(&self) -> Result<Vec<search::SearchProvider>, String> {
-        search::fetch_providers(&self.base_url, &self.creds, self.http3)
+        search::fetch_providers(&self.base_url, &self.creds, self.clients.http3_active())
     }
 
     fn search(
@@ -805,7 +811,7 @@ impl Searchable for NextcloudBackend {
             &self.base_url,
             &self.creds,
             term,
-            self.http3,
+            self.clients.http3_active(),
             provider_ids,
         )
     }
@@ -818,7 +824,7 @@ impl HasNotifications for NextcloudBackend {
         notifications::fetch_notifications(
             &self.base_url,
             &self.creds,
-            self.http3,
+            self.clients.http3_active(),
         )
     }
 
@@ -827,7 +833,7 @@ impl HasNotifications for NextcloudBackend {
             &self.base_url,
             &self.creds,
             id,
-            self.http3,
+            self.clients.http3_active(),
         )
     }
 }
@@ -844,7 +850,7 @@ impl HasPreviews for NextcloudBackend {
     ) {
         let fileid = self.file_id(entry);
         preview::prefetch_thumbnail(
-            &self.http,
+            self.clients.get(),
             &self.base_url,
             &self.creds,
             mount_point,
@@ -873,7 +879,7 @@ impl HasPreviews for NextcloudBackend {
         // active_streams check is a FUSE-layer concern, passed as 0 here
         let zero = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         preview::prefetch_directory_thumbnails(
-            &self.http,
+            self.clients.get(),
             &self.base_url,
             &self.creds,
             mount_point,
