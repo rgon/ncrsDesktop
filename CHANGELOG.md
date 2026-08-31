@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.58](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.57...ncrs-v0.1.58) (2026-08-31)
+
+
+### Bug Fixes
+
+* **config:** write the config through one owner-only helper instead of three fs::write sites ([ce352c0](https://github.com/rgon/ncrsDesktop/commit/ce352c0413f0baa0deda30a89e317b853478015e))
+* **gui:** apply the cached server accent before first paint to stop the colour flash ([3e31843](https://github.com/rgon/ncrsDesktop/commit/3e31843e88eea7aae04ffb5bd565080e8416d17a))
+* **gui:** inline the profile avatar as a data URI so the webview CSP allows it ([f13826b](https://github.com/rgon/ncrsDesktop/commit/f13826bcd05d75c0e3d1bb405973fb21c812eaa9))
+
+
+### Performance Improvements
+
+* **cache:** bound the directory cache with LRU eviction instead of growing forever ([5b17127](https://github.com/rgon/ncrsDesktop/commit/5b171277e999d1fd28569ac7a47b1433e569bdc3))
+* **gui:** create the main window on demand so the webview is not spawned at startup ([d17dac6](https://github.com/rgon/ncrsDesktop/commit/d17dac6ebef42489fda1e8a2abcecd2ef4d47092))
+* **startup:** probe credentials with a Depth 0 PROPFIND instead of listing the whole root ([4aee2f5](https://github.com/rgon/ncrsDesktop/commit/4aee2f5cc45ba9b573286d170cbc91b61915ec56))
+
 ## [0.1.57](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.56...ncrs-v0.1.57) (2026-08-31)
 
 
