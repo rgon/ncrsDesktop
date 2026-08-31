@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.59](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.58...ncrs-v0.1.59) (2026-08-31)
+
+
+### Performance Improvements
+
+* **read:** size read-ahead to the access pattern instead of fetching 64MB per miss ([d91848a](https://github.com/rgon/ncrsDesktop/commit/d91848a62a611d6ae41064e6880931ce0eb3ecec))
+
 ## [0.1.58](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.57...ncrs-v0.1.58) (2026-08-31)
 
 
