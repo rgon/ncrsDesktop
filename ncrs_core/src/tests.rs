@@ -1192,6 +1192,63 @@
         assert!(!is_trash_dir(OsStr::new("Trash")));
     }
 
+    // ── Adaptive read-ahead ───────────────────────────────────────────────────
+
+    const MB: usize = 1024 * 1024;
+
+    #[test]
+    fn sequential_access_grows_the_window_to_the_ceiling() {
+        let ceiling = 64 * MB;
+        let mut w = READ_AHEAD_INITIAL;
+        let mut steps = 0;
+        while w < ceiling {
+            w = next_read_ahead_window(w, true, ceiling);
+            steps += 1;
+            assert!(steps < 32, "window must converge, stuck at {}", w);
+        }
+        assert_eq!(w, ceiling, "streaming must still reach the configured maximum");
+        // And stay there.
+        assert_eq!(next_read_ahead_window(w, true, ceiling), ceiling);
+    }
+
+    #[test]
+    fn a_seek_resets_the_window() {
+        let ceiling = 64 * MB;
+        // A handle that had ramped all the way up...
+        assert_eq!(
+            next_read_ahead_window(ceiling, false, ceiling),
+            READ_AHEAD_INITIAL,
+            "a seek must not keep fetching the full read-ahead",
+        );
+        // ...and one that never ramped.
+        assert_eq!(next_read_ahead_window(READ_AHEAD_INITIAL, false, ceiling), READ_AHEAD_INITIAL);
+    }
+
+    #[test]
+    fn seeking_costs_the_initial_window_not_the_ceiling() {
+        // The reported bug: a player probing a 129 MB FLAC (header, seektable,
+        // playback position) missed the buffer ~5 times and pulled ~281 MB,
+        // because every miss fetched the full 64 MB read-ahead.
+        let ceiling = 64 * MB;
+        let seeks = 5;
+        let before = seeks * ceiling;
+        let after: usize = (0..seeks)
+            .map(|_| next_read_ahead_window(ceiling, false, ceiling))
+            .sum();
+        assert_eq!(before, 320 * MB);
+        assert_eq!(after, 5 * MB);
+        assert!(after * 60 < before, "expected a large reduction, got {} vs {}", after, before);
+    }
+
+    #[test]
+    fn the_window_never_exceeds_a_small_configured_read_ahead() {
+        // read_ahead_bytes below READ_AHEAD_INITIAL must still be respected —
+        // the user's ceiling wins over our starting point.
+        let ceiling = 256 * 1024;
+        assert_eq!(next_read_ahead_window(ceiling, false, ceiling), ceiling);
+        assert_eq!(next_read_ahead_window(ceiling, true, ceiling), ceiling);
+    }
+
     // ── Dir cache eviction ────────────────────────────────────────────────────
 
     fn dir_with(name: &str, n: usize) -> (PathBuf, Vec<RemoteEntry>) {

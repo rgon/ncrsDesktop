@@ -247,6 +247,26 @@ struct StreamState {
     done: bool,
 }
 
+/// Next read-ahead window for a handle.
+///
+/// Doubles while access stays sequential, up to `ceiling`; a seek resets to
+/// `READ_AHEAD_INITIAL`. Pure so the policy can be tested without a live mount.
+fn next_read_ahead_window(current: usize, sequential: bool, ceiling: usize) -> usize {
+    if sequential {
+        current.max(READ_AHEAD_INITIAL).saturating_mul(2).min(ceiling)
+    } else {
+        READ_AHEAD_INITIAL.min(ceiling)
+    }
+}
+
+/// First read-ahead window on a handle, and the window a seek falls back to.
+///
+/// Small enough that a stray seek costs ~1 MB instead of the full configured
+/// read-ahead, large enough to cover a metadata probe in one round trip. Six
+/// doublings reach a 64 MB ceiling, so sustained playback still ends up with the
+/// same large window it had before.
+const READ_AHEAD_INITIAL: usize = 1024 * 1024;
+
 struct ReadAheadBuf {
     start: u64,
     stream: Arc<(Mutex<StreamState>, Condvar)>,
@@ -276,6 +296,19 @@ struct OpenFile {
     // MIME magic-byte detection signature.  read() at offset 0 returns magic bytes
     // derived from this content type without touching the network.
     mime_detect_ct: Option<String>,
+    // Offset the next read would start at to continue sequentially, i.e. the end
+    // of the previous read on this handle. Updated on every read, whatever served
+    // it, so a run of buffer hits still counts as sequential.
+    next_expected_off: u64,
+    // Current read-ahead window, grown while reads stay sequential and reset to
+    // READ_AHEAD_INITIAL on a seek. Capped by the configured `read_ahead_bytes`.
+    //
+    // The window used to be a flat `read_ahead_bytes` (64 MB by default), fetched
+    // in full on *every* buffer miss. That is efficient for straight playback and
+    // ruinous for anything that seeks: a player opening a 129 MB FLAC (header,
+    // seektable, then the playback position) missed the single per-handle buffer
+    // about five times and pulled ~281 MB — 2.2x the file — before it could start.
+    read_ahead_window: usize,
 }
 
 
@@ -3546,6 +3579,8 @@ impl Filesystem for NextCloudFs {
                 original_etag: etag,
                 mime_detect_ct,
                 cache_fresh,
+                next_expected_off: 0,
+                read_ahead_window: READ_AHEAD_INITIAL,
             },
         );
         let fopen_flags = if mime_detect {
@@ -3577,6 +3612,22 @@ impl Filesystem for NextCloudFs {
 
         let off = offset;
         let sz = size as usize;
+
+        // Note where the next sequential read would start, and remember whether
+        // *this* read continues the previous one. Done here, before any of the
+        // fast paths below can return, so a run of read-ahead-buffer hits still
+        // counts as sequential access when a later read finally misses.
+        let sequential = {
+            let mut ofs = self.open_files.safe_lock();
+            match ofs.get_mut(&fh.0) {
+                Some(of) => {
+                    let continues = of.next_expected_off == off;
+                    of.next_expected_off = off.saturating_add(sz as u64);
+                    continues
+                }
+                None => false,
+            }
+        };
 
         // A locally-written-but-not-yet-uploaded edit is the newest version of the
         // file and MUST win over any cached/kept copy or the server copy. Serve it
@@ -3806,8 +3857,26 @@ impl Filesystem for NextCloudFs {
             .get(&fh.0)
             .map_or(false, |of| of.mime_detect_ct.is_some());
 
+        // Size the read-ahead for the access pattern rather than always fetching
+        // the configured maximum. Sequential reads double the window up to
+        // `read_ahead_bytes`, so streaming ends up with the same large window as
+        // before; a seek drops back to READ_AHEAD_INITIAL, so probing a file's
+        // header or seektable costs ~1 MB instead of 64 MB apiece.
+        let fetch = {
+            let ceiling = read_ahead.max(READ_AHEAD_INITIAL);
+            let mut ofs = self.open_files.safe_lock();
+            let window = match ofs.get_mut(&fh.0) {
+                Some(of) => {
+                    of.read_ahead_window =
+                        next_read_ahead_window(of.read_ahead_window, sequential, ceiling);
+                    of.read_ahead_window
+                }
+                None => READ_AHEAD_INITIAL.min(ceiling),
+            };
+            std::cmp::max(sz, window)
+        };
+
         thread::spawn(move || {
-            let fetch = std::cmp::max(sz, read_ahead);
             let use_throttle = fetch > sz;
             let _stream_guard = if use_throttle {
                 conn.active_streams.fetch_add(1, Ordering::Relaxed);
@@ -4506,6 +4575,8 @@ impl Filesystem for NextCloudFs {
                                     dirty: false, original_etag: None,
                                     mime_detect_ct: None,
                                     cache_fresh: true,
+                                    next_expected_off: 0,
+                                    read_ahead_window: READ_AHEAD_INITIAL,
                                 });
                                 log::info!("ghost create: {} (inotify trigger)", full_path.display());
                                 reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
@@ -4579,6 +4650,8 @@ impl Filesystem for NextCloudFs {
                 original_etag: None,
                 mime_detect_ct: None,
                 cache_fresh: true,
+                next_expected_off: 0,
+                read_ahead_window: READ_AHEAD_INITIAL,
             },
         );
 
