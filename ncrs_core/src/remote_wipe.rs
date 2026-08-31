@@ -79,7 +79,8 @@ pub fn execute_wipe(cache_dir: &Path, config_path: &Path) -> Result<(), String> 
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                std::fs::write(config_path, &cleared)
+                // Shared helper: rewriting the config must not widen its mode.
+                crate::config::write_private(config_path, cleared.as_bytes())
                     .map_err(|e| format!("failed to clear config credentials: {}", e))?;
                 log::info!(
                     "REMOTE_WIPE: cleared credentials in {}",

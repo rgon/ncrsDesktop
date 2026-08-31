@@ -238,12 +238,17 @@ pub fn config_path() -> PathBuf {
 
 /// Writes `content` to `path` readable only by the owner.
 ///
+/// Public because the config file is written from more than one place — the GUI's
+/// login flow and the remote-wipe handler both rewrite it — and every one of them
+/// must produce 0600. A plain `std::fs::write` at any of those sites silently
+/// undoes it.
+///
 /// The config file can hold `password:` / `bearer_token:` in cleartext, and
 /// `std::fs::write` creates a file at `0666 & ~umask` — 0644 under the usual
 /// umask, i.e. world-readable. The mode is applied to the handle before any
 /// content is written, and set again afterwards so an existing file that was
 /// already too permissive is tightened rather than left as found.
-fn write_private(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+pub fn write_private(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -578,6 +583,27 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
 #[cfg(test)]
 mod permission_tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn every_config_writer_goes_through_write_private() {
+        // Regression guard for the duplication this replaced: the GUI login flow
+        // and the remote-wipe handler each had their own `std::fs::write`, so a
+        // config created by logging in was 0644 and only warned about. Any new
+        // `fs::write` against the config path reintroduces that.
+        let sources = [
+            include_str!("../../ncrs-gui/src-tauri/src/lib.rs"),
+            include_str!("remote_wipe.rs"),
+        ];
+        for src in sources {
+            for (n, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("fs::write(") && code.contains("config") {
+                    panic!("line {} writes the config directly: {}", n + 1, line.trim());
+                }
+            }
+        }
+    }
 
     #[test]
     #[cfg(unix)]

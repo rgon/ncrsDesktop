@@ -653,8 +653,11 @@ fn write_config_from_login(
     if let Some(dir) = config_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
     }
-    std::fs::write(&config_path, config).map_err(|e| format!("write config: {}", e))?;
-    ncrs_core::config::warn_config_permissions(&config_path);
+    // Owner-only, and via the shared helper rather than a local `fs::write`:
+    // this file names the server and account, and the previous version created
+    // it world-readable and then only *warned* about it.
+    ncrs_core::config::write_private(&config_path, config.as_bytes())
+        .map_err(|e| format!("write config: {}", e))?;
     log::info!("config written to {}", config_path.display());
     Ok(())
 }
