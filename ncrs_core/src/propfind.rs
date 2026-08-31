@@ -239,7 +239,19 @@ fn parse_multistatus_stream<R: std::io::BufRead>(
 
     let mut is_first = true;
     while let Some(resp) = buf_reader.next_response()? {
-        let remote_path = href_to_remote_path(&resp.href, &prefix);
+        let remote_path = match href_to_remote_path(&resp.href, &prefix) {
+            Some(p) => p,
+            None => {
+                // Keep the self-entry slot aligned: the first response is the
+                // directory itself, so dropping it must not promote a child
+                // into its place.
+                if is_first {
+                    dir_etag = resp.etag;
+                    is_first = false;
+                }
+                continue;
+            }
+        };
 
         let entry = DavEntry {
             path: remote_path,
@@ -306,7 +318,19 @@ pub fn propfind_list_streaming<E: From<DavEntry> + Send>(
     let mut count: usize = 0;
     let mut is_first = true;
     while let Some(resp) = buf_reader.next_response()? {
-        let remote_path = href_to_remote_path(&resp.href, &prefix);
+        let remote_path = match href_to_remote_path(&resp.href, &prefix) {
+            Some(p) => p,
+            None => {
+                // Keep the self-entry slot aligned: the first response is the
+                // directory itself, so dropping it must not promote a child
+                // into its place.
+                if is_first {
+                    dir_etag = resp.etag;
+                    is_first = false;
+                }
+                continue;
+            }
+        };
         let entry = DavEntry {
             path: remote_path,
             is_dir: resp.is_collection,
@@ -351,23 +375,36 @@ fn webdav_prefix(webdav_url: &str) -> String {
     }
 }
 
-fn href_to_remote_path(href: &str, prefix: &str) -> PathBuf {
+/// Converts a `<d:href>` from a PROPFIND response into a remote path.
+///
+/// Returns `None` for an href carrying `..`. Those segments are stripped here
+/// rather than relied upon to be harmless downstream: nothing about a path in a
+/// server response is trustworthy, and the reason a malicious `..` cannot
+/// currently reach a local write is an invariant elsewhere (the inode namespace
+/// is rebuilt from `file_name()` alone) that no code enforces. Rejecting at the
+/// parse boundary means a future caller that does join a cached entry path onto
+/// a local directory cannot be made to escape it.
+fn href_to_remote_path(href: &str, prefix: &str) -> Option<PathBuf> {
     let decoded = percent_encoding::percent_decode_str(href)
         .decode_utf8_lossy()
         .into_owned();
+    if decoded.split(['/', '\\']).any(|seg| seg == "..") {
+        log::warn!("PROPFIND: ignoring entry with parent-directory segment in href {:?}", href);
+        return None;
+    }
     let trimmed = decoded.trim_end_matches('/');
     let remote = if !prefix.is_empty() && trimmed.starts_with(prefix) {
         &trimmed[prefix.len()..]
     } else {
         trimmed
     };
-    if remote.is_empty() {
+    Some(if remote.is_empty() {
         PathBuf::from("/")
     } else if remote.starts_with('/') {
         PathBuf::from(remote)
     } else {
         PathBuf::from(format!("/{}", remote))
-    }
+    })
 }
 
 // ── Streaming XML response reader ───────────────────────────────────────────
@@ -810,14 +847,14 @@ mod tests {
     #[test]
     fn href_decoding() {
         let prefix = "/remote.php/dav/files/user";
-        let p = href_to_remote_path("/remote.php/dav/files/user/My%20Files/", prefix);
+        let p = href_to_remote_path("/remote.php/dav/files/user/My%20Files/", prefix).unwrap();
         assert_eq!(p, PathBuf::from("/My Files"));
     }
 
     #[test]
     fn href_root() {
         let prefix = "/remote.php/dav/files/user";
-        let p = href_to_remote_path("/remote.php/dav/files/user/", prefix);
+        let p = href_to_remote_path("/remote.php/dav/files/user/", prefix).unwrap();
         assert_eq!(p, PathBuf::from("/"));
     }
 
@@ -834,7 +871,7 @@ mod tests {
             let mut dir_etag = None;
             let mut is_first = true;
             while let Some(resp) = buf_reader.next_response().unwrap() {
-                let remote_path = href_to_remote_path(&resp.href, &prefix);
+                let remote_path = href_to_remote_path(&resp.href, &prefix).unwrap();
                 let entry = DavEntry {
                     path: remote_path,
                     is_dir: resp.is_collection,
@@ -870,5 +907,49 @@ mod tests {
         assert_eq!(received[0].path, PathBuf::from("/Photos/sunset.jpg"));
         assert!(received[0].is_shared);
         assert_eq!(received[1].path, PathBuf::from("/Photos/Vacation 2024"));
+    }
+}
+
+#[cfg(test)]
+mod href_traversal_tests {
+    use super::{href_to_remote_path, webdav_prefix};
+    use std::path::PathBuf;
+
+    const URL: &str = "https://cloud.example.com/remote.php/dav/files/user";
+
+    #[test]
+    fn ordinary_hrefs_still_resolve() {
+        let prefix = webdav_prefix(URL);
+        assert_eq!(
+            href_to_remote_path("/remote.php/dav/files/user/Photos/a.jpg", &prefix),
+            Some(PathBuf::from("/Photos/a.jpg")),
+        );
+        // A name that merely contains dots is not a traversal.
+        assert_eq!(
+            href_to_remote_path("/remote.php/dav/files/user/..hidden", &prefix),
+            Some(PathBuf::from("/..hidden")),
+        );
+        assert_eq!(
+            href_to_remote_path("/remote.php/dav/files/user/a..b/c...d", &prefix),
+            Some(PathBuf::from("/a..b/c...d")),
+        );
+    }
+
+    #[test]
+    fn rejects_parent_directory_segments() {
+        let prefix = webdav_prefix(URL);
+        for hostile in [
+            "/remote.php/dav/files/user/../../../../etc/passwd",
+            "/remote.php/dav/files/user/a/../../../../.bashrc",
+            // Percent-encoded, which is how it would actually arrive.
+            "/remote.php/dav/files/user/%2e%2e/%2e%2e/.config/autostart/x.desktop",
+            "/remote.php/dav/files/user/..",
+            "/../etc/passwd",
+        ] {
+            assert_eq!(
+                href_to_remote_path(hostile, &prefix), None,
+                "{} must be rejected", hostile,
+            );
+        }
     }
 }
