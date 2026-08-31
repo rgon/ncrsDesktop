@@ -54,14 +54,24 @@ impl NextcloudBackend {
         // `WebDAVFs::connect()`; it now goes through the same PROPFIND path as
         // every other request, so there is one HTTP client, one TLS stack and
         // one set of redirect rules for the whole daemon.
-        propfind::propfind_list(
+        //
+        // Depth 0 deliberately: this only has to answer "do these credentials
+        // work". The first version used `propfind_list`, which is Depth 1 — a
+        // full listing of the account root, fetched and then thrown away. On a
+        // large root that measured 4.5 s of blocking startup before the mount
+        // came up, and the listing was not even kept.
+        propfind::propfind_status(
             clients.get(),
             &webdav_url,
             &creds,
             std::path::Path::new("/"),
             CONNECT_PROBE_TIMEOUT,
         )
-        .map_err(|e| format!("WebDAV connect failed: {}", e))?;
+        .map_err(|code| match code {
+            0 => "WebDAV connect failed: server unreachable".to_string(),
+            401 | 403 => format!("WebDAV connect failed: credentials rejected (HTTP {})", code),
+            other => format!("WebDAV connect failed: HTTP {}", other),
+        })?;
 
         Ok(NextcloudBackend { base_url, webdav_url, creds, clients })
     }
