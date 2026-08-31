@@ -66,6 +66,86 @@ pub(crate) struct NotifyPushInfo {
     pub pre_auth_url: Option<String>,
 }
 
+
+// -- Endpoint validation ------------------------------------------------------
+//
+// `notify_push` hands us `endpoints.websocket` and `endpoints.pre_auth` as
+// free-form strings from the capabilities response, and we send the account
+// credential to whichever host they name — the WebSocket handshake sends the
+// password (or a pre-auth ticket) as its first frames, and `fetch_pre_auth_ticket`
+// sends `Authorization` outright. An unvalidated value here is therefore a
+// credential disclosure, not merely a wrong URL: a compromised server, or a
+// Nextcloud app able to influence capabilities output, could name a third-party
+// host, or downgrade to `ws://`/`http://` and put the credential on the wire in
+// cleartext.
+//
+// So an advertised endpoint must live on the same host as the configured server
+// and must not downgrade the transport. The port is deliberately not pinned:
+// notify_push is commonly fronted on a different port of the same host, and a
+// different port on the same host cannot redirect the credential elsewhere.
+
+/// Transport family an endpoint is expected to use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EndpointKind {
+    /// `http` / `https` — the pre_auth POST.
+    Http,
+    /// `ws` / `wss` — the change-notification socket.
+    WebSocket,
+}
+
+impl EndpointKind {
+    fn schemes(self) -> (&'static str, &'static str) {
+        match self {
+            // (insecure, secure)
+            EndpointKind::Http => ("http", "https"),
+            EndpointKind::WebSocket => ("ws", "wss"),
+        }
+    }
+}
+
+/// Rejects a server-advertised endpoint that is not on the configured server's
+/// host, or that would carry the credential over an unencrypted transport when
+/// the configured server itself is HTTPS.
+pub(crate) fn validate_endpoint(
+    endpoint: &str,
+    base_url: &str,
+    kind: EndpointKind,
+) -> Result<(), String> {
+    let base = url::Url::parse(base_url)
+        .map_err(|e| format!("configured server URL is not a valid URL: {}", e))?;
+    let ep = url::Url::parse(endpoint)
+        .map_err(|e| format!("server advertised an unparseable endpoint {:?}: {}", endpoint, e))?;
+
+    let (insecure, secure) = kind.schemes();
+    if ep.scheme() != insecure && ep.scheme() != secure {
+        return Err(format!(
+            "server advertised endpoint {:?} with unexpected scheme {:?} (expected {} or {})",
+            endpoint, ep.scheme(), insecure, secure
+        ));
+    }
+
+    // Only a loopback server may be reached without TLS: everywhere else, an
+    // insecure endpoint means the credential would go out in the clear.
+    let base_is_secure = base.scheme() == "https";
+    if base_is_secure && ep.scheme() == insecure {
+        return Err(format!(
+            "server advertised insecure endpoint {:?} while the configured server is HTTPS —              refusing to send credentials over {}",
+            endpoint, insecure
+        ));
+    }
+
+    let base_host = base.host_str().unwrap_or("");
+    let ep_host = ep.host_str().unwrap_or("");
+    if base_host.is_empty() || !ep_host.eq_ignore_ascii_case(base_host) {
+        return Err(format!(
+            "server advertised endpoint on host {:?}, which is not the configured server {:?} —              refusing to send credentials to it",
+            ep_host, base_host
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn discover_endpoints(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -89,10 +169,21 @@ pub(crate) fn discover_endpoints(
         .capabilities
         .notify_push
         .ok_or_else(|| "notify_push capability not found (app not installed?)".to_string())?;
-    Ok(NotifyPushInfo {
-        ws_url: np.endpoints.websocket,
-        pre_auth_url: np.endpoints.pre_auth,
-    })
+    let ws_url = np.endpoints.websocket;
+    validate_endpoint(&ws_url, base_url, EndpointKind::WebSocket)?;
+    // A bad pre_auth endpoint drops the field rather than failing discovery:
+    // basic-auth accounts never use it, so they should still get push events.
+    let pre_auth_url = match np.endpoints.pre_auth {
+        Some(u) => match validate_endpoint(&u, base_url, EndpointKind::Http) {
+            Ok(()) => Some(u),
+            Err(e) => {
+                log::warn!("notify_push: ignoring pre_auth endpoint: {}", e);
+                None
+            }
+        },
+        None => None,
+    };
+    Ok(NotifyPushInfo { ws_url, pre_auth_url })
 }
 
 const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -100,8 +191,12 @@ const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) fn fetch_pre_auth_ticket(
     client: &reqwest::blocking::Client,
     pre_auth_url: &str,
+    base_url: &str,
     creds: &crate::auth::Credentials,
 ) -> Result<String, String> {
+    // Re-checked here and not only at discovery: this function attaches the
+    // credential, so it owns the guarantee that the target is the real server.
+    validate_endpoint(pre_auth_url, base_url, EndpointKind::Http)?;
     let resp = creds.apply(client.post(pre_auth_url).timeout(PRE_AUTH_TIMEOUT))
         .send()
         .map_err(|e| format!("pre_auth request failed: {}", e))?;
@@ -755,5 +850,79 @@ mod tests {
         assert_eq!(diff.renames.len(), 1);
         assert_eq!(diff.renames[0].0, PathBuf::from("/old.txt"));
         assert_eq!(diff.renames[0].1, PathBuf::from("/new.txt"));
+    }
+}
+
+#[cfg(test)]
+mod endpoint_validation_tests {
+    use super::{validate_endpoint, EndpointKind};
+
+    const BASE: &str = "https://cloud.example.com";
+
+    #[test]
+    fn accepts_the_endpoints_a_real_server_advertises() {
+        assert!(validate_endpoint("wss://cloud.example.com/push/ws", BASE, EndpointKind::WebSocket).is_ok());
+        assert!(validate_endpoint("https://cloud.example.com/push/pre_auth", BASE, EndpointKind::Http).is_ok());
+        // notify_push fronted on another port of the same host stays allowed:
+        // a different port cannot send the credential to a different party.
+        assert!(validate_endpoint("wss://cloud.example.com:7867/ws", BASE, EndpointKind::WebSocket).is_ok());
+        // Host comparison is case-insensitive, as DNS is.
+        assert!(validate_endpoint("wss://Cloud.Example.COM/ws", BASE, EndpointKind::WebSocket).is_ok());
+    }
+
+    #[test]
+    fn rejects_an_endpoint_on_a_foreign_host() {
+        // The credential-exfiltration case: a compromised server naming a host
+        // the user never configured.
+        for ep in [
+            "wss://attacker.example/ws",
+            "wss://cloud.example.com.attacker.example/ws",
+            "wss://attacker.example/?x=cloud.example.com",
+        ] {
+            let err = validate_endpoint(ep, BASE, EndpointKind::WebSocket)
+                .expect_err(&format!("{} must be rejected", ep));
+            assert!(err.contains("not the configured server"), "got: {}", err);
+        }
+        let err = validate_endpoint("https://attacker.example/pre_auth", BASE, EndpointKind::Http)
+            .expect_err("foreign pre_auth host must be rejected");
+        assert!(err.contains("not the configured server"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_a_transport_downgrade_on_the_right_host() {
+        // Same host, but plaintext: the password would go out on the wire.
+        let err = validate_endpoint("ws://cloud.example.com/ws", BASE, EndpointKind::WebSocket)
+            .expect_err("ws:// against an https server must be rejected");
+        assert!(err.contains("insecure"), "got: {}", err);
+        let err = validate_endpoint("http://cloud.example.com/pre_auth", BASE, EndpointKind::Http)
+            .expect_err("http:// against an https server must be rejected");
+        assert!(err.contains("insecure"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_unexpected_schemes() {
+        for ep in ["file:///etc/passwd", "javascript:alert(1)", "http://cloud.example.com/ws"] {
+            assert!(validate_endpoint(ep, BASE, EndpointKind::WebSocket).is_err(), "{}", ep);
+        }
+        // A ws:// URL must not be accepted where an HTTP endpoint is expected.
+        assert!(validate_endpoint("wss://cloud.example.com/x", BASE, EndpointKind::Http).is_err());
+    }
+
+    #[test]
+    fn rejects_unparseable_values() {
+        assert!(validate_endpoint("", BASE, EndpointKind::WebSocket).is_err());
+        assert!(validate_endpoint("not a url", BASE, EndpointKind::WebSocket).is_err());
+        assert!(validate_endpoint("/push/ws", BASE, EndpointKind::WebSocket).is_err());
+    }
+
+    #[test]
+    fn a_loopback_http_server_may_use_plaintext() {
+        // The Docker e2e suite and local dev run the server over http on
+        // loopback; that must keep working.
+        let base = "http://127.0.0.1:18087";
+        assert!(validate_endpoint("ws://127.0.0.1:18087/push/ws", base, EndpointKind::WebSocket).is_ok());
+        assert!(validate_endpoint("http://127.0.0.1:18087/pre_auth", base, EndpointKind::Http).is_ok());
+        // ...but still only on the configured host.
+        assert!(validate_endpoint("ws://attacker.example/ws", base, EndpointKind::WebSocket).is_err());
     }
 }

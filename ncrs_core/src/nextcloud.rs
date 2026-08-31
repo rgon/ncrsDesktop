@@ -544,7 +544,7 @@ fn watcher_loop(
         };
 
         match watcher_connect_and_listen(
-            &info, http, webdav_url, creds, connected, generation, shutdown, paused, callback,
+            &info, http, base_url, webdav_url, creds, connected, generation, shutdown, paused, callback,
         ) {
             Ok(()) => {
                 log::info!("change_watcher: connection closed cleanly");
@@ -567,6 +567,7 @@ fn watcher_loop(
 fn watcher_connect_and_listen(
     info: &crate::notify_push::NotifyPushInfo,
     http: &reqwest::blocking::Client,
+    base_url: &str,
     webdav_url: &str,
     creds: &Credentials,
     connected: &Arc<AtomicBool>,
@@ -580,12 +581,20 @@ fn watcher_connect_and_listen(
     let (ws_user, ws_secret) = if creds.is_bearer() {
         let pre_auth_url = info.pre_auth_url.as_deref()
             .ok_or_else(|| "bearer auth requires notify_push pre_auth endpoint, but server does not advertise it".to_string())?;
-        let ticket = crate::notify_push::fetch_pre_auth_ticket(http, pre_auth_url, creds)?;
+        let ticket = crate::notify_push::fetch_pre_auth_ticket(http, pre_auth_url, base_url, creds)?;
         log::info!("change_watcher: obtained pre_auth ticket");
         (String::new(), ticket)
     } else {
         (creds.username().to_string(), creds.secret().to_string())
     };
+
+    // Re-checked immediately before connecting, not just at discovery: the
+    // handshake below sends the account credential as its first two frames.
+    crate::notify_push::validate_endpoint(
+        &info.ws_url,
+        base_url,
+        crate::notify_push::EndpointKind::WebSocket,
+    )?;
 
     let (mut socket, _) =
         connect(&info.ws_url).map_err(|e| format!("WebSocket connect: {}", e))?;
