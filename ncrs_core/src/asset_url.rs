@@ -209,6 +209,42 @@ fn remember(url: &str, value: Option<String>) {
     }
 }
 
+
+/// Shared client for asset fetches, mirroring `notifications::client`: building
+/// one per call would spawn a tokio thread and a fresh rustls root store each
+/// time.
+fn asset_client() -> &'static reqwest::blocking::Client {
+    static C: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(ASSET_TIMEOUT)
+            .build()
+            .expect("reqwest client")
+    })
+}
+
+/// Fetches the account's avatar as a `data:` URI.
+///
+/// The GUI used to render `<img src="{server}/index.php/avatar/{user}/64">`
+/// directly. That stopped working the moment the webview got a real CSP, because
+/// `img-src 'self' data:` (deliberately) forbids reaching out to the server — the
+/// avatar silently fell back to the initials placeholder. Inlining it here is the
+/// same treatment search and notification icons already get.
+pub fn avatar_data_uri(
+    base_url: &str,
+    creds: &crate::auth::Credentials,
+    username: &str,
+    size: u32,
+) -> Option<String> {
+    let encoded = percent_encoding::utf8_percent_encode(
+        username,
+        percent_encoding::NON_ALPHANUMERIC,
+    );
+    let url = format!("{}/index.php/avatar/{}/{}", base_url.trim_end_matches('/'), encoded, size);
+    let inlined = inline_asset(asset_client(), base_url, creds, &url);
+    if inlined.is_empty() { None } else { Some(inlined) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::same_origin_asset;

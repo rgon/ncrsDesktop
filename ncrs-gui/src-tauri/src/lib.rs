@@ -219,22 +219,48 @@ pub struct UserInfo {
     pub username: String,
     pub server_url: String,
     pub mount_point: String,
+    /// Kept for compatibility with the field name the frontend already binds;
+    /// now a `data:` URI rather than a server URL, because the webview's CSP is
+    /// `img-src 'self' data:` and cannot fetch from the server.
     pub avatar_url: String,
 }
 
 #[tauri::command]
-fn get_user_info(state: State<Arc<AppState>>) -> Option<UserInfo> {
-    let opts = state.mount_options.lock().unwrap();
-    opts.as_ref().map(|o| {
-        let username = o.username.clone().unwrap_or_else(|| o.log_user.clone());
-        let base = ncrs_core::notifications::base_url(&o.url);
-        UserInfo {
-            avatar_url: format!("{}/index.php/avatar/{}/64", base, username),
-            username,
-            server_url: o.url.clone(),
-            mount_point: o.mount_point.to_string_lossy().into_owned(),
+async fn get_user_info(state: State<'_, Arc<AppState>>) -> Result<Option<UserInfo>, ()> {
+    let Some((username, base, server_url, mount_point, creds)) = ({
+        let opts = state.mount_options.lock().unwrap();
+        opts.as_ref().map(|o| {
+            let username = o.username.clone().unwrap_or_else(|| o.log_user.clone());
+            (
+                username,
+                ncrs_core::notifications::base_url(&o.url),
+                o.url.clone(),
+                o.mount_point.to_string_lossy().into_owned(),
+                o.credentials().ok(),
+            )
+        })
+    }) else {
+        return Ok(None);
+    };
+
+    // Fetched off-thread: it is one small HTTP request, cached in ncrs_core, but
+    // it must not block the command thread. A failure just leaves the frontend
+    // showing its initials placeholder.
+    let avatar_url = match creds {
+        Some(creds) => {
+            let (b, u) = (base.clone(), username.clone());
+            tokio::task::spawn_blocking(move || {
+                ncrs_core::asset_url::avatar_data_uri(&b, &creds, &u, 64)
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
         }
-    })
+        None => String::new(),
+    };
+
+    Ok(Some(UserInfo { avatar_url, username, server_url, mount_point }))
 }
 
 #[tauri::command]
