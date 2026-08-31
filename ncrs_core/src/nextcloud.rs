@@ -1,10 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use remotefs::RemoteFs;
-use remotefs_webdav::WebDAVFs;
 
 use crate::auth::Credentials;
 use crate::backend::{
@@ -13,7 +11,8 @@ use crate::backend::{
 };
 use crate::{notifications, preview, propfind, search, webdav_ops};
 
-const MAX_POOL_IDLE: usize = 8;
+/// Timeout for the credential probe run once at startup.
+const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const WS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 // The read loop swallows read timeouts, so without a keepalive a silently dead
@@ -41,7 +40,6 @@ pub struct NextcloudBackend {
     webdav_url: String,
     creds: Credentials,
     clients: crate::http_clients::HttpClients,
-    conns: Mutex<Vec<WebDAVFs>>,
 }
 
 impl NextcloudBackend {
@@ -51,27 +49,21 @@ impl NextcloudBackend {
         creds: Credentials,
         clients: crate::http_clients::HttpClients,
     ) -> Result<Self, String> {
-        if !creds.is_bearer() {
-            let mut initial = WebDAVFs::new(creds.username(), creds.secret(), &webdav_url);
-            initial
-                .connect()
-                .map_err(|e| format!("WebDAV connect failed: {}", e))?;
-            Ok(NextcloudBackend {
-                base_url,
-                webdav_url,
-                creds,
-                clients,
-                conns: Mutex::new(vec![initial]),
-            })
-        } else {
-            Ok(NextcloudBackend {
-                base_url,
-                webdav_url,
-                creds,
-                clients,
-                conns: Mutex::new(Vec::new()),
-            })
-        }
+        // Probe the credentials once up front so a bad password fails at mount
+        // time rather than on the user's first listing. This used to be
+        // `WebDAVFs::connect()`; it now goes through the same PROPFIND path as
+        // every other request, so there is one HTTP client, one TLS stack and
+        // one set of redirect rules for the whole daemon.
+        propfind::propfind_list(
+            clients.get(),
+            &webdav_url,
+            &creds,
+            std::path::Path::new("/"),
+            CONNECT_PROBE_TIMEOUT,
+        )
+        .map_err(|e| format!("WebDAV connect failed: {}", e))?;
+
+        Ok(NextcloudBackend { base_url, webdav_url, creds, clients })
     }
 
     pub fn new_offline(
@@ -80,33 +72,7 @@ impl NextcloudBackend {
         creds: Credentials,
         clients: crate::http_clients::HttpClients,
     ) -> Self {
-        NextcloudBackend {
-            base_url,
-            webdav_url,
-            creds,
-            clients,
-            conns: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn checkout(&self) -> Result<WebDAVFs, String> {
-        if let Some(conn) = self.conns.lock().unwrap_or_else(|e| e.into_inner()).pop() {
-            return Ok(conn);
-        }
-        if self.creds.is_bearer() {
-            return Err("WebDAVFs does not support bearer auth".into());
-        }
-        let mut conn = WebDAVFs::new(self.creds.username(), self.creds.secret(), &self.webdav_url);
-        conn.connect()
-            .map_err(|e| format!("WebDAV connect: {}", e))?;
-        Ok(conn)
-    }
-
-    fn checkin(&self, conn: WebDAVFs) {
-        let mut pool = self.conns.lock().unwrap_or_else(|e| e.into_inner());
-        if pool.len() < MAX_POOL_IDLE {
-            pool.push(conn);
-        }
+        NextcloudBackend { base_url, webdav_url, creds, clients }
     }
 
     fn webdav_file_url(&self, remote_path: &Path) -> String {
@@ -121,19 +87,6 @@ impl NextcloudBackend {
             self.webdav_url.trim_end_matches('/'),
             encoded
         )
-    }
-}
-
-#[derive(Clone, Default)]
-struct SharedCollector(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for SharedCollector {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
@@ -210,35 +163,23 @@ impl CloudBackend for NextcloudBackend {
         dest: &mut dyn std::io::Write,
         timeout: Duration,
     ) -> Result<u64, BackendReadError> {
-        if self.creds.is_bearer() {
-            let url = self.webdav_file_url(path);
-            let mut resp = self.creds.apply(self.clients.read().get(&url).timeout(timeout))
-                .send()
-                .map_err(|e| BackendReadError::Network(e.to_string()))?;
-            let status = resp.status();
-            if !status.is_success() {
-                if status == reqwest::StatusCode::NOT_FOUND {
-                    return Err(BackendReadError::NotFound);
-                }
-                let body = resp.text().unwrap_or_default();
-                return Err(BackendReadError::Server(status.as_u16(), body));
+        // One path for both auth types. The basic-auth branch used to go through
+        // remotefs-webdav, which buffered the entire file in memory before
+        // writing it out; this streams straight into `dest`.
+        let url = self.webdav_file_url(path);
+        let mut resp = self.creds.apply(self.clients.read().get(&url).timeout(timeout))
+            .send()
+            .map_err(|e| BackendReadError::Network(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(BackendReadError::NotFound);
             }
-            let size = resp.copy_to(dest)
-                .map_err(|e| BackendReadError::Network(e.to_string()))?;
-            Ok(size)
-        } else {
-            let mut conn = self.checkout().map_err(BackendReadError::Network)?;
-            let collector = SharedCollector::default();
-            let result = conn
-                .open_file(path, Box::new(collector.clone()))
-                .map_err(|e| BackendReadError::Network(e.to_string()));
-            self.checkin(conn);
-            let size = result?;
-            let data = collector.0.lock().unwrap_or_else(|e| e.into_inner());
-            dest.write_all(&data)
-                .map_err(|e| BackendReadError::Network(e.to_string()))?;
-            Ok(size)
+            let body = resp.text().unwrap_or_default();
+            return Err(BackendReadError::Server(status.as_u16(), body));
         }
+        resp.copy_to(dest)
+            .map_err(|e| BackendReadError::Network(e.to_string()))
     }
 
     fn read_file_range(
