@@ -687,7 +687,7 @@ mod tests {
     fn make_entry(path: &str, is_dir: bool, etag: Option<&str>, fileid: Option<u64>) -> RemoteEntry {
         let mut ext = EntryExtensions::default();
         if let Some(fid) = fileid {
-            ext.integers.insert("fileid".into(), fid);
+            ext.set_int("fileid", fid);
         }
         RemoteEntry {
             path: PathBuf::from(path),

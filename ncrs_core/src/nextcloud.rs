@@ -418,7 +418,7 @@ impl CloudBackend for NextcloudBackend {
     }
 
     fn permission_mode(&self, entry: &RemoteEntry) -> u16 {
-        let perms = entry.ext.strings.get("permissions").map(|s| s.as_str());
+        let perms = entry.ext.permissions.as_deref();
         match perms {
             Some(p) if entry.is_dir => {
                 if p.contains('C') || p.contains('K') {
@@ -445,33 +445,23 @@ impl CloudBackend for NextcloudBackend {
     }
 
     fn is_shared(&self, entry: &RemoteEntry) -> bool {
-        entry
-            .ext
-            .booleans
-            .get("is_shared")
-            .copied()
-            .unwrap_or(false)
+        entry.ext.is_shared
     }
 
     fn file_id(&self, entry: &RemoteEntry) -> Option<u64> {
-        entry.ext.integers.get("fileid").copied()
+        entry.ext.fileid
     }
 
     fn owner_display_name<'a>(&self, entry: &'a RemoteEntry) -> Option<&'a str> {
-        entry.ext.strings.get("owner_display_name").map(|s| s.as_str())
+        entry.ext.owner_display_name.as_deref()
     }
 
     fn owner_id<'a>(&self, entry: &'a RemoteEntry) -> Option<&'a str> {
-        entry.ext.strings.get("owner_id").map(|s| s.as_str())
+        entry.ext.owner_id.as_deref()
     }
 
     fn has_preview(&self, entry: &RemoteEntry) -> bool {
-        entry
-            .ext
-            .booleans
-            .get("has_preview")
-            .copied()
-            .unwrap_or(false)
+        entry.ext.has_preview
     }
 
     fn quota(&self, timeout: Duration) -> Option<(u64, u64)> {

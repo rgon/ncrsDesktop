@@ -24,7 +24,7 @@
     fn make_dav_entry(name: &str, fileid: Option<u64>) -> RemoteEntry {
         let mut ext = backend::EntryExtensions::default();
         if let Some(fid) = fileid {
-            ext.integers.insert("fileid".into(), fid);
+            ext.set_int("fileid", fid);
         }
         RemoteEntry {
             path: PathBuf::from(format!("/{}", name)),
@@ -95,9 +95,9 @@
     fn make_dav_entry_with_perms(dir: &str, name: &str, permissions: Option<&str>) -> RemoteEntry {
         let mut ext = backend::EntryExtensions::default();
         if let Some(p) = permissions {
-            ext.strings.insert("permissions".into(), p.to_string());
+            ext.set_str("permissions", p);
         }
-        ext.integers.insert("fileid".into(), 1);
+        ext.set_int("fileid", 1);
         RemoteEntry {
             path: PathBuf::from(format!("{}/{}", dir, name)),
             is_dir: false,
@@ -146,9 +146,9 @@
     fn make_dir_entry_with_perms(parent: &str, name: &str, permissions: Option<&str>) -> RemoteEntry {
         let mut ext = backend::EntryExtensions::default();
         if let Some(p) = permissions {
-            ext.strings.insert("permissions".into(), p.to_string());
+            ext.set_str("permissions", p);
         }
-        ext.integers.insert("fileid".into(), 2);
+        ext.set_int("fileid", 2);
         RemoteEntry {
             path: PathBuf::from(format!("{}/{}", parent, name)),
             is_dir: true,
@@ -570,7 +570,7 @@
     fn make_dav_entry_in(dir: &str, name: &str, fileid: Option<u64>) -> RemoteEntry {
         let mut ext = backend::EntryExtensions::default();
         if let Some(fid) = fileid {
-            ext.integers.insert("fileid".into(), fid);
+            ext.set_int("fileid", fid);
         }
         RemoteEntry {
             path: PathBuf::from(format!("{}/{}", dir, name)),
@@ -874,7 +874,7 @@
     fn make_dir_dav_entry_in(dir: &str, name: &str, fileid: Option<u64>) -> RemoteEntry {
         let mut ext = backend::EntryExtensions::default();
         if let Some(fid) = fileid {
-            ext.integers.insert("fileid".into(), fid);
+            ext.set_int("fileid", fid);
         }
         RemoteEntry {
             path: PathBuf::from(format!("{}/{}", dir, name)),
@@ -1201,7 +1201,7 @@
         map.insert("/Photos".to_string(), PersistedDirEntry {
             etag: Some("abc123".into()),
             self_entry: None,
-            files: vec![make_dav_entry("sunset.jpg", Some(1))],
+            files: std::sync::Arc::new(vec![make_dav_entry("sunset.jpg", Some(1))]),
             fetched_at: Some(saved_at.duration_since(UNIX_EPOCH).unwrap().as_secs()),
         });
         let json = serde_json::to_vec(&map).unwrap();
@@ -1216,6 +1216,123 @@
             entry.fetched_at.elapsed().unwrap() >= Duration::from_secs(3 * 3600),
             "the persisted fetch time must survive the restart, not reset to now"
         );
+        drop(c);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn boot_loads_legacy_nested_entry_extensions() {
+        // A dir_cache.json written by <= 0.1.56, when EntryExtensions was three
+        // HashMaps on the wire. An upgrade must keep reading it: the alternative
+        // is discarding a cache of tens of thousands of directories and
+        // re-PROPFINDing the whole tree one listing at a time.
+        let mut base = make_test_cache();
+        base.cache_dir = PathBuf::from("/tmp/ncrs-test-cache-legacy-ext");
+        let cache = Arc::new(Mutex::new(base));
+        let path = cache.safe_lock().cache_dir.join(DIR_CACHE_FILE);
+        let json = br#"{"/Photos":{"etag":"e1","self_entry":null,"files":[
+            {"path":"/Photos/sunset.jpg","is_dir":false,"size":42,
+             "modified":{"secs_since_epoch":1586232939,"nanos_since_epoch":0},
+             "change_token":"tok","content_type":"image/jpeg",
+             "ext":{"strings":{"owner_id":"rgon","owner_display_name":"Gonzalo Ruiz","permissions":"RGDNVW"},
+                    "integers":{"fileid":1234},
+                    "booleans":{"has_preview":true,"is_shared":false}}}
+        ],"fetched_at":1787672707}}"#;
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        std::fs::write(&path, json).unwrap();
+        load_dir_cache(&cache);
+
+        let c = cache.safe_lock();
+        let dir = c.dir_cache.get(&PathBuf::from("/Photos")).expect("legacy dir loaded");
+        let e = &dir.files[0];
+        assert_eq!(e.content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(e.ext.str("permissions"), Some("RGDNVW"));
+        assert_eq!(e.ext.str("owner_id"), Some("rgon"));
+        assert_eq!(e.ext.str("owner_display_name"), Some("Gonzalo Ruiz"));
+        assert_eq!(e.ext.int("fileid"), Some(1234));
+        assert!(e.ext.flag("has_preview"));
+        assert!(!e.ext.flag("is_shared"));
+        drop(c);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn dir_cache_round_trips_through_the_compact_format() {
+        let mut base = make_test_cache();
+        base.cache_dir = PathBuf::from("/tmp/ncrs-test-cache-roundtrip");
+        std::fs::create_dir_all(&base.cache_dir).ok();
+        let path = base.cache_dir.join(DIR_CACHE_FILE);
+        std::fs::remove_file(&path).ok();
+
+        let mut entry = make_dav_entry("sunset.jpg", Some(7));
+        entry.ext.set_str("permissions", "RGDNVW");
+        entry.ext.set_str("owner_id", "rgon");
+        entry.ext.set_flag("is_shared", true);
+        entry.content_type = Some(crate::backend::intern("image/jpeg"));
+
+        let cache = Arc::new(Mutex::new(base));
+        cache.safe_lock().put_dir_cache(
+            PathBuf::from("/Photos"), Some("e1".into()), None, vec![entry],
+        );
+        save_dir_cache_now(&cache);
+
+        // The written file must be the flat form, not the old nested maps.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains(r#""permissions":"RGDNVW""#), "got: {}", written);
+        assert!(!written.contains(r#""strings""#), "legacy shape was written: {}", written);
+
+        // And it must read back into an equivalent cache.
+        let reloaded = Arc::new(Mutex::new({
+            let mut b = make_test_cache();
+            b.cache_dir = PathBuf::from("/tmp/ncrs-test-cache-roundtrip");
+            b
+        }));
+        load_dir_cache(&reloaded);
+        let c = reloaded.safe_lock();
+        let dir = c.dir_cache.get(&PathBuf::from("/Photos")).expect("dir reloaded");
+        let e = &dir.files[0];
+        assert_eq!(e.ext.str("permissions"), Some("RGDNVW"));
+        assert_eq!(e.ext.str("owner_id"), Some("rgon"));
+        assert_eq!(e.ext.int("fileid"), Some(7));
+        assert!(e.ext.flag("is_shared"));
+        assert_eq!(e.content_type.as_deref(), Some("image/jpeg"));
+        drop(c);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn interning_hands_out_one_allocation_per_distinct_value() {
+        let a = crate::backend::intern("RGDNVW");
+        let b = crate::backend::intern("RGDNVW");
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "equal values must share one allocation");
+        let c = crate::backend::intern("RGDNVCK");
+        assert!(!std::sync::Arc::ptr_eq(&a, &c));
+        assert_eq!(&*c, "RGDNVCK");
+    }
+
+    #[test]
+    fn boot_load_does_not_preallocate_inodes_for_every_cached_file() {
+        // Pre-assigning an inode to every cached file cost two owned PathBufs
+        // each and bought nothing, since inode numbers do not survive a restart.
+        let mut base = make_test_cache();
+        base.cache_dir = PathBuf::from("/tmp/ncrs-test-cache-no-prealloc");
+        let cache = Arc::new(Mutex::new(base));
+        let path = cache.safe_lock().cache_dir.join(DIR_CACHE_FILE);
+        let json = br#"{"/Photos":{"etag":"e1","self_entry":null,"files":[
+            {"path":"/Photos/sunset.jpg","is_dir":false,"size":1,"modified":null,
+             "change_token":null,"content_type":null,"ext":{}}
+        ],"fetched_at":1787672707}}"#;
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        std::fs::write(&path, json).unwrap();
+        let before = cache.safe_lock().paths.len();
+        load_dir_cache(&cache);
+
+        let mut c = cache.safe_lock();
+        assert_eq!(c.paths.len(), before, "boot load must not populate the inode maps");
+        // But the listing is there, and looking a file up still assigns one.
+        assert!(c.dir_cache.contains_key(&PathBuf::from("/Photos")));
+        let ino = c.allocate_inode(PathBuf::from("/Photos/sunset.jpg"));
+        assert_eq!(c.get_inode(Path::new("/Photos/sunset.jpg")), Some(ino));
         drop(c);
         std::fs::remove_file(&path).ok();
     }

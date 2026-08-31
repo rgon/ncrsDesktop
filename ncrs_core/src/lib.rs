@@ -1100,7 +1100,10 @@ const DIR_CACHE_FILE: &str = "dir_cache.json";
 struct PersistedDirEntry {
     etag: Option<String>,
     self_entry: Option<RemoteEntry>,
-    files: Vec<RemoteEntry>,
+    /// `Arc` so that saving can snapshot a listing with a refcount bump instead
+    /// of deep-copying every entry, and loading can hand the same allocation
+    /// straight to `DirCacheEntry`.
+    files: Arc<Vec<RemoteEntry>>,
     /// Unix seconds when this listing was fetched, so its real age survives a
     /// restart and the max-stale check isn't fooled into treating it as fresh.
     #[serde(default)]
@@ -1109,53 +1112,133 @@ struct PersistedDirEntry {
 
 use std::sync::atomic::AtomicU64;
 
-static SAVE_SCHEDULED: AtomicU64 = AtomicU64::new(0);
+/// Last time a change asked for a save, in unix millis.
+static SAVE_DIRTY_AT: AtomicU64 = AtomicU64::new(0);
+/// First unserved change of the current burst, in unix millis. Bounds how long
+/// a continuous stream of listings can keep postponing the write.
+static SAVE_FIRST_DIRTY_AT: AtomicU64 = AtomicU64::new(0);
+/// Whether a saver thread is already armed.
+static SAVE_ARMED: AtomicBool = AtomicBool::new(false);
+
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
+/// Cap on total deferral, so a busy tree still gets persisted.
+const SAVE_MAX_DEFER: Duration = Duration::from_secs(60);
 
 fn is_gio_temp_file(name: &str) -> bool {
     name.starts_with(".goutputstream-") || name.starts_with(".xdp-")
 }
 
-fn schedule_save_dir_cache(cache: &Arc<Mutex<FsCache>>) {
-    let now = std::time::SystemTime::now()
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64;
-    let prev = SAVE_SCHEDULED.swap(now, Ordering::Relaxed);
-    if now.saturating_sub(prev) < 2000 {
+        .as_millis() as u64
+}
+
+/// Coalesces save requests: one saver thread waits until the cache has been
+/// quiet for `SAVE_DEBOUNCE` and then writes once.
+///
+/// The previous version armed a fresh 5 s timer for every request more than 2 s
+/// apart, so a trickle of listings produced a full write every couple of
+/// seconds — two complete rewrites of the cache landed within seconds of a
+/// startup where the user did nothing at all.
+fn schedule_save_dir_cache(cache: &Arc<Mutex<FsCache>>) {
+    let now = unix_millis();
+    SAVE_DIRTY_AT.store(now, Ordering::Relaxed);
+    if SAVE_ARMED.swap(true, Ordering::AcqRel) {
         return;
     }
+    SAVE_FIRST_DIRTY_AT.store(now, Ordering::Relaxed);
+
     let cache = cache.clone();
     thread::spawn(move || {
-        thread::sleep(SAVE_DEBOUNCE);
+        loop {
+            thread::sleep(SAVE_DEBOUNCE);
+            let now = unix_millis();
+            let quiet_for = now.saturating_sub(SAVE_DIRTY_AT.load(Ordering::Relaxed));
+            let waited = now.saturating_sub(SAVE_FIRST_DIRTY_AT.load(Ordering::Relaxed));
+            if quiet_for >= SAVE_DEBOUNCE.as_millis() as u64
+                || waited >= SAVE_MAX_DEFER.as_millis() as u64
+            {
+                break;
+            }
+        }
+        // Disarm before writing, so a change made *during* the write arms a new
+        // saver rather than being dropped until the next unrelated change.
+        SAVE_ARMED.store(false, Ordering::Release);
         save_dir_cache_now(&cache);
     });
 }
 
+/// Serialises the dir cache as a map without materialising one: the snapshot is
+/// a Vec of pairs, and `collect_map` streams it straight into the writer.
+struct DirCacheSnapshot(Vec<(String, PersistedDirEntry)>);
+
+impl Serialize for DirCacheSnapshot {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_map(self.0.iter().map(|(k, v)| (k, v)))
+    }
+}
+
 fn save_dir_cache_now(cache: &Mutex<FsCache>) {
-    let c = cache.safe_lock();
-    let path = c.cache_dir.join(DIR_CACHE_FILE);
-    let map: HashMap<String, PersistedDirEntry> = c.dir_cache.iter()
-        .map(|(k, v)| {
-            (k.to_string_lossy().into_owned(), PersistedDirEntry {
-                etag: v.etag.clone(),
-                self_entry: v.self_entry.clone(),
-                files: v.files.as_ref().clone(),
-                fetched_at: v.fetched_at.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()),
+    // Snapshot under the lock *without* deep-copying any listing: `files` is an
+    // Arc, so cloning it is a refcount bump. The previous version cloned every
+    // RemoteEntry in the cache and then serialised into one contiguous Vec<u8>,
+    // which on a large account meant a ~430 MB copy plus a ~180 MB buffer — RSS
+    // spiked past 1 GB on every save, twice within seconds of startup.
+    let (path, snapshot) = {
+        let c = cache.safe_lock();
+        let snapshot: Vec<(String, PersistedDirEntry)> = c.dir_cache.iter()
+            .map(|(k, v)| {
+                (k.to_string_lossy().into_owned(), PersistedDirEntry {
+                    etag: v.etag.clone(),
+                    self_entry: v.self_entry.clone(),
+                    files: Arc::clone(&v.files),
+                    fetched_at: v.fetched_at.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs()),
+                })
             })
-        })
-        .collect();
-    drop(c);
-    match serde_json::to_vec(&map) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                log::error!("DIR_CACHE write failed {}: {} — cache will be cold on restart", path.display(), e);
-            } else {
-                log::info!("DIR_CACHE saved {} dirs to {}", map.len(), path.display());
+            .collect();
+        (c.cache_dir.join(DIR_CACHE_FILE), snapshot)
+    };
+
+    let count = snapshot.len();
+    // Stream into a sibling temp file and rename over the real one: the JSON is
+    // never all resident, and a crash or a full disk mid-write leaves the
+    // previous cache intact rather than a truncated file that fails to parse.
+    let tmp = path.with_extension("json.tmp");
+    let file = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("DIR_CACHE create failed {}: {} — cache will be cold on restart", tmp.display(), e);
+            return;
+        }
+    };
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
+    if let Err(e) = serde_json::to_writer(&mut w, &DirCacheSnapshot(snapshot)) {
+        log::error!("DIR_CACHE serialize failed: {}", e);
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    match w.into_inner() {
+        Ok(f) => {
+            if let Err(e) = f.sync_all() {
+                log::error!("DIR_CACHE sync failed {}: {}", tmp.display(), e);
+                let _ = std::fs::remove_file(&tmp);
+                return;
             }
         }
-        Err(e) => log::error!("DIR_CACHE serialize failed: {}", e),
+        Err(e) => {
+            log::error!("DIR_CACHE flush failed {}: {}", tmp.display(), e);
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
     }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        log::error!("DIR_CACHE rename failed {}: {} — cache will be cold on restart", path.display(), e);
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    log::info!("DIR_CACHE saved {} dirs to {}", count, path.display());
 }
 
 fn load_dir_cache(cache: &Mutex<FsCache>) {
@@ -1163,6 +1246,12 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
         let c = cache.safe_lock();
         c.cache_dir.join(DIR_CACHE_FILE)
     };
+    // Read-then-parse rather than streaming from the file. Streaming would hold
+    // ~180 MB less at the peak, but serde_json's reader path measured ~1.9x
+    // slower than the slice path on a real 182 MB cache (21 s vs 11 s, same
+    // build), and this parse is on the critical path to having the mount up.
+    // The buffer is a few-second transient; the steady-state size is what
+    // actually mattered, and that is fixed by the entry layout instead.
     let data = match std::fs::read(&path) {
         Ok(d) => d,
         Err(_) => return,
@@ -1174,6 +1263,7 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
             return;
         }
     };
+    drop(data);
     let mut c = cache.safe_lock();
     let mut count = 0usize;
     for (k, v) in map {
@@ -1181,11 +1271,13 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
         if c.dir_cache.contains_key(&dir_path) {
             continue;
         }
-        for entry in &v.files {
-            if let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) {
-                c.allocate_inode(dir_path.join(name));
-            }
-        }
+        // Deliberately no inode pre-allocation here. Assigning one to every
+        // cached file cost two owned PathBufs each (`paths` and `inodes`) —
+        // ~150 MB on a large account — for directories the user may never open,
+        // and bought nothing: inode numbers are not stable across restarts
+        // anyway (the counter restarts and HashMap iteration order is random).
+        // `lookup` and the offset-0 leg of `readdir` already allocate on
+        // demand, and every `get_inode` caller handles a miss.
         // Cache files written before dir_cache_max_stale_mins existed carry no
         // fetch time: treat them as ancient so the first listing re-lists rather
         // than trusting a listing of unknown age.
@@ -1193,7 +1285,7 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
             .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
             .unwrap_or(UNIX_EPOCH);
         c.dir_cache.insert(dir_path, DirCacheEntry {
-            files: Arc::new(v.files),
+            files: v.files,
             self_entry: v.self_entry,
             etag: v.etag,
             at: Instant::now(),
@@ -3327,7 +3419,8 @@ impl Filesystem for NextCloudFs {
             // Fall back to octet-stream when the server did not supply a content-type
             // so that every O_NOATIME open is intercepted — no file is ever downloaded
             // solely to satisfy GLib's magic-byte check.
-            Some(ct.unwrap_or_else(|| "application/octet-stream".to_string()))
+            Some(ct.map(|c| c.to_string())
+                .unwrap_or_else(|| "application/octet-stream".to_string()))
         } else {
             None
         };
@@ -4358,7 +4451,7 @@ impl Filesystem for NextCloudFs {
 
         let now = SystemTime::now();
         let mut ext = backend::EntryExtensions::default();
-        ext.strings.insert("permissions".into(), "RGDNVW".into());
+        ext.set_str("permissions", "RGDNVW");
         let new_entry = RemoteEntry {
             path: remote_path.clone(),
             is_dir: false,
@@ -4448,7 +4541,7 @@ impl Filesystem for NextCloudFs {
 
         let now = SystemTime::now();
         let mut ext = backend::EntryExtensions::default();
-        ext.strings.insert("permissions".into(), "RGDNVCK".into());
+        ext.set_str("permissions", "RGDNVCK");
         let new_entry = RemoteEntry {
             path: remote_path.clone(),
             is_dir: true,
