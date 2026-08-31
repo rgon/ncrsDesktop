@@ -12,6 +12,16 @@
         mq.addEventListener('change', function (e) {
           document.documentElement.setAttribute('data-theme', e.matches ? 'dark' : 'light');
         });
+        // Apply the server's accent colour from the last session *before* first
+        // paint. Without this the window renders with the default accent and then
+        // repaints once get_nc_theme's network round-trip returns, which reads as
+        // a blue flash on every open.
+        try {
+          var accent = localStorage.getItem('ncrs.accent');
+          if (accent) {
+            document.documentElement.style.setProperty('--nc-accent', accent);
+          }
+        } catch (e) { /* private mode / storage disabled: just skip the cache */ }
       })();
     </script>
     %sveltekit.head%

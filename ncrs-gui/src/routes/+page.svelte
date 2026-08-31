@@ -96,6 +96,12 @@
     let storage = $state<StorageStats>({ kept_bytes: 0, cached_bytes: 0, remote_used: 0, remote_total: 0 });
     let pendingMutations = $state(0);
     let avatarError = $state(false);
+    // Last session's avatar, shown until (or instead of) the freshly fetched one.
+    // The backend has to make an HTTP request for it, so without this the
+    // initials placeholder shows on every window open.
+    let cachedAvatar = $state<string | null>((() => {
+        try { return localStorage.getItem("ncrs.avatar"); } catch (e) { return null; }
+    })());
     let activeView = $state<View>("notifications");
     let needsLogin = $state(false);
     let configServerUrl = $state("");
@@ -161,7 +167,17 @@
             activeView = "settings";
             return;
         }
-        userInfo = await invoke<UserInfo | null>("get_user_info");
+        // NB: userInfo must stay null until the backend really has it — the
+        // retry below keys off `userInfo === null` to re-poll while the daemon
+        // is still starting. The cached avatar is held separately (cachedAvatar)
+        // so it can render immediately without suppressing that retry.
+        const fetched = await invoke<UserInfo | null>("get_user_info");
+        if (fetched?.avatar_url) {
+            try { localStorage.setItem("ncrs.avatar", fetched.avatar_url); } catch (e) { /* ignore */ }
+            cachedAvatar = fetched.avatar_url;
+            avatarError = false;
+        }
+        userInfo = fetched;
         syncState = await invoke<string>("get_sync_state");
         notifications = await invoke<NcNotification[]>("get_notifications");
         errors = await invoke<SyncError[]>("get_errors");
@@ -171,6 +187,9 @@
         invoke<{ color: string; color_text: string } | null>("get_nc_theme").then(theme => {
             if (theme) {
                 document.documentElement.style.setProperty("--nc-accent", theme.color);
+                // Cached so the inline script in app.html can apply it before
+                // first paint next time, instead of flashing the default accent.
+                try { localStorage.setItem("ncrs.accent", theme.color); } catch (e) { /* ignore */ }
             }
         }).catch(() => {});
     }
@@ -305,9 +324,9 @@
             <!-- Avatar + status dropdown -->
             <div class="dropdown dropdown-hover dropdown-start" title="Set status">
                 <div tabindex="0" role="button" class="nc-avatar-wrap">
-                    {#if userInfo?.avatar_url && !avatarError}
+                    {#if (userInfo?.avatar_url || cachedAvatar) && !avatarError}
                         <img
-                            src={userInfo.avatar_url}
+                            src={userInfo?.avatar_url || cachedAvatar}
                             alt="Avatar"
                             class="nc-avatar"
                             onerror={() => { avatarError = true; }}
