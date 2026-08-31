@@ -11,74 +11,21 @@ permissions:
   pull-requests: write
 
 # Cancel the in-progress run when a new commit arrives on the same PR.
-# This is critical for release-please PRs: when update-lockfile pushes the
-# corrected Cargo.lock, the current run (which hasn't started building yet)
-# is cancelled and a fresh run starts with the correct lockfile already in place.
 # Master pushes are never cancelled — they always run to completion.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # ── Lockfile hygiene ─────────────────────────────────────────────────────────
-  # release-please bumps versions in Cargo.toml but never runs cargo, so
-  # Cargo.lock is stale on PR open. This job refreshes it (workspace entries
-  # only — external pins are untouched) and commits it back to the PR branch
-  # before any build job starts. The push triggers a fresh CI run; the
-  # concurrency group above cancels this run before build ever starts, so
-  # the build always sees a coherent Cargo.toml + Cargo.lock pair.
-  #
-  # NO job-level `if` here — the job must always succeed (instantly, as a
-  # no-op) on non-release-please runs. A skipped job propagates through the
-  # entire needs chain and silently skips e2e and release-please too.
-  update-lockfile:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      # Set only when a commit was pushed; used by build to check out the
-      # updated tree so hashFiles() in the cache key reflects the new lockfile.
-      head-sha: ${{ steps.push.outputs.sha }}
-    steps:
-      - uses: actions/checkout@v7
-        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
-        with:
-          ref: ${{ github.head_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: dtolnay/rust-toolchain@stable
-        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
-
-      - name: Refresh Cargo.lock for bumped workspace versions
-        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
-        run: cargo update --workspace
-
-      - name: Commit and push if lockfile changed
-        id: push
-        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
-        run: |
-          git diff --quiet Cargo.lock && exit 0
-          git config user.name  'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add Cargo.lock
-          git commit -m 'chore: update Cargo.lock for release'
-          git push
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
   # ── Build ────────────────────────────────────────────────────────────────────
   build:
-    needs: [update-lockfile]
     runs-on: ubuntu-22.04
     env:
       # Must be job-level so the sccache daemon starts with the GHA backend
       # enabled. Step-level env is too late — the daemon is already running.
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      # If update-lockfile pushed a new commit, check that out so hashFiles()
-      # in the cache key matches what will be on master after merge.
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.update-lockfile.outputs.head-sha || github.sha }}
 
       # Keyed by everything that affects compilation output. Also serves as the
       # cross-job transport for e2e and build-release (replaces upload-artifact,
@@ -192,10 +139,33 @@ jobs:
           PREBUILT_BINARY: "1"
         run: scripts/e2e.sh
 
+  # ── Release ──────────────────────────────────────────────────────────────────
+  # release-please runs TWICE per master push, as two separate jobs, and the
+  # order between them is the whole point:
+  #
+  #   release-please  cut the GitHub release for the release PR that just merged
+  #   build-release   attach the .deb and un-draft it  ← this is what creates the tag
+  #   release-pr      open/refresh the NEXT release PR
+  #
+  # `draft: true` means GitHub does not create the git tag until the release is
+  # published. release-please finds the previous release by tag lookup, so as
+  # long as both halves ran in one action invocation it looked for a tag that
+  # its own draft had not created yet:
+  #
+  #   ⚠ Expected 1 releases, only found 0
+  #   ❯ looking for tagName: ncrs-v0.1.55
+  #   ❯ Set(0) {}
+  #
+  # With no baseline commit it walked all 500 commits of history, so every
+  # release PR got the entire changelog AND always had "unreleased" feat/fix
+  # commits to release — which is why merging a release PR immediately produced
+  # another one (0.1.54 → 0.1.55 → 0.1.56 with no functional changes between).
+  # Splitting the halves around build-release means the tag exists before the
+  # next PR is built. Do not merge these two jobs back together.
   release-please:
-    # Manage the release PR and cut releases; pushes to master only.
+    # Cut the release only; the next PR is release-pr's job.
     # Gated on build + e2e: this repo has no branch protection (private/free tier),
-    # so the release-please PR auto-merges without required checks. Depending on
+    # so the release-please PR merges without required checks. Depending on
     # e2e here means a release is never cut (tag/PR never advanced) while e2e is
     # red — which is how 0.1.32–0.1.34 got tagged with no .deb.
     needs: [build, e2e]
@@ -211,6 +181,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
 
   build-release:
     # Assemble and publish the .deb using the binaries already built and tested
@@ -265,3 +236,55 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release delete "${{ needs.release-please.outputs.tag_name }}" --yes || true
+
+  release-pr:
+    # Open/refresh the release PR, now that build-release has published the tag
+    # for whatever was released above. Runs on every master push: when nothing
+    # was released, build-release is skipped and this still has to run, hence
+    # always() plus explicit result checks (a plain `needs` on a skipped job
+    # would skip this one too).
+    needs: [build, e2e, release-please, build-release]
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      needs.release-please.result == 'success' &&
+      needs.build-release.result != 'failure' &&
+      needs.build-release.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release_pr
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+      # release-please bumps workspace.package.version in Cargo.toml but never
+      # runs cargo, so Cargo.lock is stale on the branch it just pushed.
+      # This used to be a job on the release PR itself, which could not work:
+      # workflow runs on bot branches sit in `action_required` until a human
+      # approves them, and the same human merges the PR seconds later — for
+      # 0.1.55 the lockfile commit was pushed 11s AFTER the merge, onto a dead
+      # branch. Doing it here, on the master push that creates the PR, there is
+      # no approval gate and no human to race.
+      # `|| '{}'` keeps fromJSON from erroring on the unset output when no PR
+      # was opened; the step is skipped in that case anyway.
+      - uses: actions/checkout@v7
+        if: steps.release_pr.outputs.prs_created == 'true'
+        with:
+          ref: ${{ fromJSON(steps.release_pr.outputs.pr || '{}').headBranchName }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.release_pr.outputs.prs_created == 'true'
+
+      - name: Refresh Cargo.lock on the release branch
+        if: steps.release_pr.outputs.prs_created == 'true'
+        run: |
+          cargo update --workspace
+          git diff --quiet Cargo.lock && exit 0
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git commit -am 'chore: update Cargo.lock for release'
+          git push
