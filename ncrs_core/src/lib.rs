@@ -1,3 +1,4 @@
+pub mod asset_url;
 pub mod auth;
 pub mod backend;
 pub mod config;

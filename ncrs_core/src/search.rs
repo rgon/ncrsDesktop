@@ -127,7 +127,15 @@ pub fn fetch_providers(
         return Err(format!("providers API returned {}", resp.status()));
     }
     let ocs: OcsProvidersResponse = resp.json().map_err(|e| e.to_string())?;
-    Ok(ocs.ocs.data)
+    // Provider icons are rendered by the GUI too, and were reaching it as raw
+    // server strings.
+    let providers = ocs.ocs.data.into_iter()
+        .map(|mut p| {
+            p.icon = crate::asset_url::same_origin_asset(base, &p.icon);
+            p
+        })
+        .collect();
+    Ok(providers)
 }
 
 pub fn search_provider(
@@ -195,9 +203,14 @@ pub fn search_filtered(
                                 .map(|mut e| {
                                     e.title = decode_pct(&e.title);
                                     e.subline = decode_pct(&e.subline);
+                                    // A link may legitimately point off-site
+                                    // (the Bookmarks provider returns the
+                                    // bookmarked address); a rendered asset may
+                                    // not — see crate::asset_url.
                                     e.resource_url = absolutize(base, &e.resource_url);
-                                    e.icon = absolutize(base, &e.icon);
-                                    e.thumbnail_url = absolutize(base, &e.thumbnail_url);
+                                    e.icon = crate::asset_url::same_origin_asset(base, &e.icon);
+                                    e.thumbnail_url =
+                                        crate::asset_url::same_origin_asset(base, &e.thumbnail_url);
                                     e
                                 })
                                 .collect();
