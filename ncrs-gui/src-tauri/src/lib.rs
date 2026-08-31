@@ -776,10 +776,94 @@ fn open_main_window(app: &AppHandle) {
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
+
+// ── Shutdown and second-launch diagnostics ────────────────────────────────────
+
+/// Set by the SIGTERM/SIGINT handler; polled by the shutdown watcher thread.
+static TERMINATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Async-signal-safe: stores a flag and nothing else.
+extern "C" fn on_terminate(_sig: libc::c_int) {
+    TERMINATE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Unmounts on SIGTERM/SIGINT instead of dying with the mount still attached.
+///
+/// Without this, `systemctl --user stop`, a logout, or a plain `kill` left
+/// `~/Nextcloud` as a dead (ENOTCONN) mount until the next start — recoverable,
+/// since `prepare_mount_point` detaches a stale mount when it comes back up, but
+/// until then every `ls` in the user's home tree trips over it. The tray's Exit
+/// item already unmounts cleanly; this routes signals through the same path.
+fn install_shutdown_handlers(state: Arc<AppState>) {
+    unsafe {
+        libc::signal(libc::SIGTERM, on_terminate as *const () as usize);
+        libc::signal(libc::SIGINT, on_terminate as *const () as usize);
+    }
+    thread::spawn(move || {
+        while !TERMINATE.load(std::sync::atomic::Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(200));
+        }
+        log::info!("received termination signal — unmounting before exit");
+        graceful_unmount(&state);
+        std::process::exit(0);
+    });
+}
+
+/// The tray-quit unmount, reused for signal shutdown.
+fn graceful_unmount(state: &AppState) {
+    // Attach mode: the mount belongs to an external daemon, so it is not ours
+    // to tear down.
+    if state.attached.load(std::sync::atomic::Ordering::Relaxed) {
+        log::info!("shutdown: leaving external daemon's mount untouched");
+        return;
+    }
+    let mount_point = state
+        .mount_options
+        .lock()
+        .ok()
+        .and_then(|o| o.as_ref().map(|o| o.mount_point.to_string_lossy().to_string()));
+    if let Some(mp) = mount_point {
+        log::info!("shutdown: unmounting {}", mp);
+        // Deliberately not a lazy detach — same reasoning as try_clean_unmount:
+        // a busy mount is better left dying with the process (the next start
+        // detaches it) than freed while still in use.
+        if try_clean_unmount(&mp) {
+            let _ = std::fs::remove_dir(&mp);
+        }
+    }
+}
+
+/// Whether another ncRS instance is already serving the IPC socket.
+///
+/// `tauri-plugin-single-instance` handles the handoff by calling
+/// `std::process::exit(0)` in the *second* process — correct, but it prints
+/// nothing, so a launch that appears to do nothing at all is impossible to
+/// diagnose from a terminal. Detect the same condition ourselves first, purely
+/// so we can say what happened.
+fn running_instance_socket() -> Option<String> {
+    let sock = ncrs_core::ipc::socket_path();
+    // Existence alone is not enough: a killed instance can leave the path
+    // behind. Only a socket that still accepts a connection means "running".
+    match std::os::unix::net::UnixStream::connect(&sock) {
+        Ok(_) => Some(sock.to_string_lossy().into_owned()),
+        Err(_) => None,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Say something before the single-instance plugin exits this process, so a
+    // second launch is not a silent no-op.
+    if let Some(sock) = running_instance_socket() {
+        eprintln!(
+            "ncRS is already running (IPC socket {sock}) — focusing the existing \
+             window instead of starting a second daemon."
+        );
+    }
+
     // Logging is handled by tauri-plugin-log (see plugin registration below).
     let app_state = Arc::new(AppState::default());
+    install_shutdown_handlers(app_state.clone());
     let app_state_setup = app_state.clone();
     let app_state_menu = app_state.clone();
 

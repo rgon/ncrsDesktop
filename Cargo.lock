@@ -2973,6 +2973,7 @@ name = "ncrs-gui"
 version = "0.1.56"
 dependencies = [
  "dirs",
+ "libc",
  "log",
  "nc_gnome_integration",
  "nc_passwords",
