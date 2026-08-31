@@ -238,6 +238,32 @@ Package build + verification (what CI runs; `--container` needs Docker or Podman
 
 + [ ] eval performant cache if needed
 	with tokio_uring! https://gist.github.com/munro/14219f9a671484a8fe820eb35d26bb80
+
++ [ ] set a Content-Security-Policy in tauri.conf.json (currently `"csp": null`)
+	> The frontend has no `{@html}`, so Svelte's escaping holds and there is no
+	> known XSS. But server-supplied `entry.icon` / notification icons render as
+	> `<img src>`, so the server can point the webview at any host (discloses the
+	> user's IP; no credential is attached). A `default-src 'self'` policy with a
+	> tight `img-src` closes it.
+	> NEEDS MANUAL CHECK: cannot be verified without launching the GUI, and the
+	> live daemon holds the mount — see GOTCHAS. Confirm icons, fonts and inline
+	> styles still render before shipping.
+
++ [ ] deploy the dir-cache memory fix — a running 0.1.56 still idles at ~690 MB
+	> Fixed in-tree (610 MB -> 150 MB steady, no more ~1 GB spike per save) but
+	> /usr/bin/ncrs-gui is still the old build. Needs a release + clean swap;
+	> never launch target/release/ncrs-gui while the live instance holds the mount.
+	> First startup after the upgrade reads the old 182 MB dir_cache.json (the
+	> legacy nested `ext` shape is still accepted) and rewrites it compact.
+
++ [ ] host disk: `/` sits at ~98% (431G/466G). target/debug alone is ~14 GB.
+	> `rm -rf target/debug/incremental` (~2 GB, pure cache, no dependency
+	> recompiles) before a workspace build; linking ncrs-gui fails with ENOSPC
+	> otherwise.
+
++ [ ] considered and rejected: shrink `RemoteEntry.path` to a name-only Box<str>
+	> Measured at only a further 38 MB (150 -> 112 MB) and would touch the whole
+	> tree, since `entry.path` is treated as absolute everywhere. Not worth it.
 	+ https://github.com/foyer-rs/foyer
 	+ https://docs.rs/freqfs/0.4.3/freqfs/
 	+ https://github.com/pedrocr/syncer
