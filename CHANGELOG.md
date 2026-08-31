@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.57](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.56...ncrs-v0.1.57) (2026-08-31)
+
+
+### Bug Fixes
+
+* **gui:** show a real window when the frontend fails to load instead of transparent text ([68e2def](https://github.com/rgon/ncrsDesktop/commit/68e2def97663f271651b456ce1004bf330b416ee))
+* **gui:** unmount on SIGTERM and report when a second launch defers to a running instance ([9daf923](https://github.com/rgon/ncrsDesktop/commit/9daf92322d73110e27d88f6959385edf11456924))
+* **security:** create config.yaml and the IPC socket owner-only ([9a72197](https://github.com/rgon/ncrsDesktop/commit/9a72197db7bd554850c9dede0ac557ab6253dcbc))
+* **security:** inline server icons as data URIs so the CSP needs no remote img-src ([c6d2166](https://github.com/rgon/ncrsDesktop/commit/c6d216683a3013d747fe0a2bc8945f70f1b7ca44))
+* **security:** pin server-supplied icons and thumbnails to the configured origin ([ca5091a](https://github.com/rgon/ncrsDesktop/commit/ca5091a8f54855f4f6c850757c9197fb10bcf1a1))
+* **security:** reject WebDAV hrefs containing parent-directory segments ([78c65b7](https://github.com/rgon/ncrsDesktop/commit/78c65b7cfd53b15867fcbb6cc8ae2cfa28bf76d5))
+* **security:** restrict open_link to web schemes and drop non-web search URLs ([25c2190](https://github.com/rgon/ncrsDesktop/commit/25c2190a736bd17ba8061baf45ac9e9f5233b1b6))
+* **security:** set a Content-Security-Policy for the webview ([84c93c1](https://github.com/rgon/ncrsDesktop/commit/84c93c1c2a2f9b7258b4bd559548bd0e22f502d0))
+* **security:** validate server-advertised notify_push endpoints before sending credentials ([39e5dbe](https://github.com/rgon/ncrsDesktop/commit/39e5dbe356fa9cafb5383ec0de7a25744ccc0b0c))
+
+
+### Performance Improvements
+
+* **cache:** cut idle RSS from 610MB to 150MB by flattening dir cache entries ([57b2d77](https://github.com/rgon/ncrsDesktop/commit/57b2d77eb3576c32c1080853f10dd703f9af3f95))
+
 ## [0.1.56](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.55...ncrs-v0.1.56) (2026-08-31)
 
 
