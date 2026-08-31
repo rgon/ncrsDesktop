@@ -288,9 +288,31 @@ fn dismiss_notification(state: State<Arc<AppState>>, id: u64) {
     }
 }
 
+/// Schemes `open_link` will hand to the desktop's URL handler.
+///
+/// This command is reachable from the webview and is called with strings that
+/// originate on the server (`resourceUrl` on a unified-search hit, the login
+/// flow URL). `opener`'s Tauri scope does not apply here — that only gates the
+/// plugin's own JS commands, not our Rust call — so the allowlist has to live
+/// in this function. Without it a compromised server could get `file://`,
+/// `smb://` or any registered handler opened by having the user click a search
+/// result.
+const OPENABLE_SCHEMES: &[&str] = &["http", "https", "mailto"];
+
 #[tauri::command]
 fn open_link(url: String, app: AppHandle) {
+    if !is_openable_url(&url) {
+        log::warn!("open_link: refusing to open {:?}", url);
+        return;
+    }
     app.opener().open_url(&url, None::<&str>).ok();
+}
+
+fn is_openable_url(url: &str) -> bool {
+    match url::Url::parse(url) {
+        Ok(u) => OPENABLE_SCHEMES.contains(&u.scheme()),
+        Err(_) => false,
+    }
 }
 
 #[tauri::command]
@@ -1572,6 +1594,34 @@ async fn attached_poll_loop(
                     .unwrap_or_default();
                 state.journal.lock().unwrap().replace_from_remote(entries, conflicts);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod open_link_tests {
+    use super::is_openable_url;
+
+    #[test]
+    fn allows_web_and_mail_urls() {
+        assert!(is_openable_url("https://cloud.example.com/apps/files"));
+        assert!(is_openable_url("http://127.0.0.1:18087/index.php"));
+        assert!(is_openable_url("mailto:someone@example.com"));
+    }
+
+    #[test]
+    fn refuses_everything_else() {
+        for hostile in [
+            "file:///etc/passwd",
+            "file:///home/victim/.config/autostart/x.desktop",
+            "smb://attacker.example/share",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "",
+            "not a url",
+            "/etc/passwd",
+        ] {
+            assert!(!is_openable_url(hostile), "{} must be refused", hostile);
         }
     }
 }

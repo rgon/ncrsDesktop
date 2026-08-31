@@ -24,6 +24,8 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Scheme validation for `open_link`; same major as the one ncrs_core resolves.
+url = "2"
 tokio = { version = "1.45.1", features = ["rt"] }
 ncrs_core = { path = "../../ncrs_core" }
 log = "0.4"

@@ -90,13 +90,22 @@ fn decode_pct(s: &str) -> String {
     percent_decode_str(s).decode_utf8_lossy().into_owned()
 }
 
+/// Resolves a search-result URL against the server base.
+///
+/// Values here come from the server's unified-search providers and end up both
+/// in `<img src>` in the webview and, for `resourceUrl`, at `open_link`. A value
+/// that is neither absolute http(s) nor server-relative is therefore dropped
+/// rather than passed through: letting an arbitrary scheme survive would hand a
+/// compromised server a URI-handler invocation on the user's desktop.
 fn absolutize(base: &str, url: &str) -> String {
-    if url.is_empty() || url.starts_with("http://") || url.starts_with("https://") {
+    if url.is_empty() {
+        String::new()
+    } else if url.starts_with("http://") || url.starts_with("https://") {
         url.to_string()
     } else if url.starts_with('/') {
         format!("{}{}", base, url)
     } else {
-        url.to_string()
+        String::new()
     }
 }
 
@@ -212,4 +221,35 @@ pub fn search_filtered(
     });
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod absolutize_tests {
+    use super::absolutize;
+
+    const BASE: &str = "https://cloud.example.com";
+
+    #[test]
+    fn resolves_server_relative_and_keeps_absolute_web_urls() {
+        assert_eq!(absolutize(BASE, "/apps/files/?dir=/x"), "https://cloud.example.com/apps/files/?dir=/x");
+        assert_eq!(absolutize(BASE, "https://cloud.example.com/a"), "https://cloud.example.com/a");
+        assert_eq!(absolutize(BASE, "http://cloud.example.com/a"), "http://cloud.example.com/a");
+        assert_eq!(absolutize(BASE, ""), "");
+    }
+
+    #[test]
+    fn drops_values_with_a_non_web_scheme() {
+        // These used to be returned verbatim and could reach the desktop URL
+        // handler via open_link.
+        for hostile in [
+            "file:///etc/passwd",
+            "file:///home/victim/.config/autostart/x.desktop",
+            "smb://attacker.example/share",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "nc://open/x",
+        ] {
+            assert_eq!(absolutize(BASE, hostile), "", "{} must be dropped", hostile);
+        }
+    }
 }

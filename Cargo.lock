@@ -3108,6 +3108,7 @@ dependencies = [
  "tauri-runtime-wry",
  "tikv-jemallocator",
  "tokio",
+ "url",
 ]
 
 [[package]]
