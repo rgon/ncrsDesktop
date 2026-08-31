@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.56](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.55...ncrs-v0.1.56) (2026-08-31)
+
+
+### Bug Fixes
+
+* **ci:** split release-please in two so the tag exists before the next release PR is built ([05205b4](https://github.com/rgon/ncrsDesktop/commit/05205b4ce0e57eb7132cf08eff58ab4c63764b1c))
+
 ## [0.1.55](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.54...ncrs-v0.1.55) (2026-08-28)
 
 
