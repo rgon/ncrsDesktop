@@ -788,6 +788,17 @@ pub fn run() {
     let tray_id_menu = tray_icon_id.clone();
 
     tauri::Builder::default()
+        // Serves the built-in "interface failed to load" page. Registered here
+        // rather than shipped in the frontend bundle because the page has to be
+        // reachable precisely when the frontend is not.
+        .register_uri_scheme_protocol(ncrs_plugin::ERROR_SCHEME, |_ctx, _req| {
+            tauri::http::Response::builder()
+                .header("Content-Type", "text/html; charset=utf-8")
+                .body(ncrs_plugin::load_error_page().into_bytes())
+                .unwrap_or_else(|_| {
+                    tauri::http::Response::new(b"interface failed to load".to_vec())
+                })
+        })
         // Must be the first plugin: a second launch (e.g. the app-menu entry
         // while the autostarted instance runs) would spawn a second daemon
         // that steals the FUSE mount — surface the existing window instead.
