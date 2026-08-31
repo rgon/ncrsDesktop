@@ -10,6 +10,8 @@
             paths,
             next_inode: 2,
             dir_cache: HashMap::new(),
+            // Unbounded by default in tests; the eviction tests set it explicitly.
+            dir_cache_max_dirs: 0,
             pending_dirs: HashMap::new(),
             file_cache: HashMap::new(),
             cache_dir: PathBuf::from("/tmp/ncrs-test-cache"),
@@ -1188,6 +1190,107 @@
         assert!(!is_trash_dir(OsStr::new("Documents")));
         assert!(!is_trash_dir(OsStr::new(".hidden")));
         assert!(!is_trash_dir(OsStr::new("Trash")));
+    }
+
+    // ── Dir cache eviction ────────────────────────────────────────────────────
+
+    fn dir_with(name: &str, n: usize) -> (PathBuf, Vec<RemoteEntry>) {
+        let dir = PathBuf::from(format!("/{name}"));
+        let files = (0..n)
+            .map(|i| make_dav_entry(&format!("{name}-{i}.txt"), Some(i as u64 + 1)))
+            .collect();
+        (dir, files)
+    }
+
+    #[test]
+    fn unbounded_when_the_limit_is_zero() {
+        let mut c = make_test_cache();
+        c.dir_cache_max_dirs = 0;
+        for i in 0..50 {
+            let (d, f) = dir_with(&format!("d{i}"), 2);
+            c.put_dir_cache(d, None, None, f);
+        }
+        assert_eq!(c.dir_cache.len(), 50, "0 must mean no limit");
+    }
+
+    #[test]
+    fn evicts_down_to_the_ceiling_once_exceeded() {
+        let mut c = make_test_cache();
+        c.dir_cache_max_dirs = 10;
+        for i in 0..40 {
+            let (d, f) = dir_with(&format!("d{i}"), 2);
+            c.put_dir_cache(d, None, None, f);
+        }
+        assert!(c.dir_cache.len() <= 10, "must stay within the ceiling, got {}", c.dir_cache.len());
+        // Evicting to 90% of the ceiling rather than exactly the ceiling keeps a
+        // cache sitting at the limit from re-sorting on every insert.
+        assert!(c.dir_cache.len() >= 8, "must not over-evict, got {}", c.dir_cache.len());
+        // The most recent insert always survives.
+        assert!(c.dir_cache.contains_key(&PathBuf::from("/d39")));
+    }
+
+    #[test]
+    fn eviction_keeps_what_was_recently_accessed_not_recently_fetched() {
+        // The point of ordering by access: a listing refreshed by a staleness
+        // probe is not necessarily one anyone is looking at.
+        let mut c = make_test_cache();
+        c.dir_cache_max_dirs = 0;
+        for i in 0..12 {
+            let (d, f) = dir_with(&format!("d{i}"), 1);
+            c.put_dir_cache(d, None, None, f);
+        }
+        // Touch two of the oldest so they become the most recently used.
+        let keep_a = PathBuf::from("/d0");
+        let keep_b = PathBuf::from("/d1");
+        assert!(c.get_cached_dir(&keep_a, Duration::from_secs(600), None).is_some());
+        assert!(c.get_cached_dir_readonly(&keep_b).is_some());
+
+        // Now impose a ceiling and force an eviction pass with one more insert.
+        c.dir_cache_max_dirs = 6;
+        let (d, f) = dir_with("fresh", 1);
+        c.put_dir_cache(d, None, None, f);
+
+        assert!(c.dir_cache.contains_key(&keep_a), "a dir read via get_cached_dir must survive");
+        assert!(c.dir_cache.contains_key(&keep_b), "a dir read via get_cached_dir_readonly must survive");
+        assert!(c.dir_cache.contains_key(&PathBuf::from("/fresh")));
+        // Untouched middle entries are the ones that go.
+        assert!(!c.dir_cache.contains_key(&PathBuf::from("/d2")));
+    }
+
+    #[test]
+    fn a_refreshing_dir_is_never_evicted() {
+        // `refreshing` is the interlock preventing a second concurrent PROPFIND
+        // for the same directory; dropping the entry would lose it.
+        let mut c = make_test_cache();
+        c.dir_cache_max_dirs = 0;
+        for i in 0..12 {
+            let (d, f) = dir_with(&format!("d{i}"), 1);
+            c.put_dir_cache(d, None, None, f);
+        }
+        let pinned = PathBuf::from("/d0");
+        c.dir_cache.get_mut(&pinned).unwrap().refreshing = true;
+
+        c.dir_cache_max_dirs = 4;
+        let (d, f) = dir_with("fresh", 1);
+        c.put_dir_cache(d, None, None, f);
+
+        assert!(c.dir_cache.contains_key(&pinned), "a refreshing dir must be kept");
+    }
+
+    #[test]
+    fn evicted_listings_are_simply_a_cache_miss() {
+        // Eviction must never look like "directory does not exist" — it has to
+        // fall through to a re-list.
+        let mut c = make_test_cache();
+        c.dir_cache_max_dirs = 2;
+        for i in 0..20 {
+            let (d, f) = dir_with(&format!("d{i}"), 1);
+            c.put_dir_cache(d, None, None, f);
+        }
+        let gone = PathBuf::from("/d0");
+        assert!(!c.dir_cache.contains_key(&gone));
+        assert!(c.get_cached_dir(&gone, DIR_CACHE_TTL, None).is_none(), "must read as a miss");
+        assert!(c.get_cached_dir_readonly(&gone).is_none());
     }
 
     // ── Boot cache loading ────────────────────────────────────────────────────

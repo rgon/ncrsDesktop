@@ -35,6 +35,9 @@ pub struct MountOptions {
     /// 0 disables the check (always serve from cache when present).
     #[serde(default = "default_dir_cache_max_stale_mins")]
     pub dir_cache_max_stale_mins: u64,
+    /// Ceiling on how many directory listings stay in memory (LRU past that).
+    #[serde(default = "default_dir_cache_max_dirs")]
+    pub dir_cache_max_dirs: usize,
     #[serde(default)]
     pub auto_keep_locally_modified_files: bool,
     #[serde(default)]
@@ -138,6 +141,16 @@ fn default_cache_cleanup_interval() -> u64 { 3600 }
 fn default_stale_gio_temp_mins() -> u64 { 10 }
 
 fn default_dir_cache_max_stale_mins() -> u64 { 15 }
+/// Ceiling on cached directory listings.
+///
+/// The cache used to be unbounded, so anything that walked the mount (a file
+/// manager, a thumbnailer, a search indexer) permanently added to it: one real
+/// account reached 26,614 directories / 398,008 entries, about 150 MB resident,
+/// and a 12-second startup re-parsing them. At the ~15 entries per directory
+/// that account averages, 5,000 directories is roughly 75,000 entries — a few
+/// tens of MB — while still covering far more than anyone browses in a session.
+/// 0 disables the limit.
+fn default_dir_cache_max_dirs() -> usize { 5_000 }
 
 // ── YAML parser ───────────────────────────────────────────────────────────────
 
@@ -168,6 +181,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let max_concurrent_requests = doc["max_concurrent_requests"].as_i64().unwrap_or(10) as usize;
     let optimistic_listing = doc["optimistic_listing"].as_bool().unwrap_or(true);
     let dir_cache_max_stale_mins = doc["dir_cache_max_stale_mins"].as_i64().map(|v| v.max(0) as u64).unwrap_or_else(default_dir_cache_max_stale_mins);
+    let dir_cache_max_dirs = doc["dir_cache_max_dirs"].as_i64().map(|v| v.max(0) as usize).unwrap_or_else(default_dir_cache_max_dirs);
     let auto_keep_locally_modified_files = doc["auto_keep_locally_modified_files"].as_bool().unwrap_or(false);
     let auto_keep_cached_files = doc["auto_keep_cached_files"].as_bool().unwrap_or(false);
     let read_ahead_bytes = doc["read_ahead_bytes"].as_i64().map(|v| v as usize).unwrap_or(DEFAULT_READ_AHEAD);
@@ -184,7 +198,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let cleanup_stale_gio_temps = doc["cleanup_stale_gio_temps"].as_bool().unwrap_or(true);
     let stale_gio_temp_mins = doc["stale_gio_temp_mins"].as_i64().map(|v| v as u64).unwrap_or(10);
 
-    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins })
+    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
@@ -400,6 +414,10 @@ pub struct ConfigSettings {
     pub max_concurrent_requests: usize,
     pub optimistic_listing: bool,
     pub dir_cache_max_stale_mins: u64,
+    // Defaulted so a settings payload from an older frontend bundle (which does
+    // not know this field) still deserializes instead of failing the whole save.
+    #[serde(default = "default_dir_cache_max_dirs")]
+    pub dir_cache_max_dirs: usize,
     pub auto_keep_locally_modified_files: bool,
     pub auto_keep_cached_files: bool,
     pub read_ahead_bytes: usize,
@@ -424,6 +442,7 @@ impl Default for ConfigSettings {
             max_concurrent_requests: 10,
             optimistic_listing: true,
             dir_cache_max_stale_mins: default_dir_cache_max_stale_mins(),
+            dir_cache_max_dirs: default_dir_cache_max_dirs(),
             auto_keep_locally_modified_files: false,
             auto_keep_cached_files: false,
             read_ahead_bytes: DEFAULT_READ_AHEAD,
@@ -445,6 +464,7 @@ pub fn config_settings_from_opts(opts: &MountOptions) -> ConfigSettings {
         max_concurrent_requests: opts.max_concurrent_requests,
         optimistic_listing: opts.optimistic_listing,
         dir_cache_max_stale_mins: opts.dir_cache_max_stale_mins,
+        dir_cache_max_dirs: opts.dir_cache_max_dirs,
         auto_keep_locally_modified_files: opts.auto_keep_locally_modified_files,
         auto_keep_cached_files: opts.auto_keep_cached_files,
         read_ahead_bytes: opts.read_ahead_bytes,
@@ -525,6 +545,11 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# push notifications are down; while they work, a 24-hour backstop applies.\n");
     content.push_str("# 0 disables.\n");
     content.push_str(&format!("dir_cache_max_stale_mins: {}\n", settings.dir_cache_max_stale_mins));
+    content.push_str("# Maximum number of directory listings held in memory. Least-recently-used\n");
+    content.push_str("# listings are dropped past this; a dropped directory is simply re-listed the\n");
+    content.push_str("# next time it is opened. 0 removes the limit (the old unbounded behaviour,\n");
+    content.push_str("# which on a large tree can cost hundreds of MB of RAM).\n");
+    content.push_str(&format!("dir_cache_max_dirs: {}\n", settings.dir_cache_max_dirs));
     content.push_str(&format!("auto_keep_locally_modified_files: {}\n", settings.auto_keep_locally_modified_files));
     content.push_str(&format!("auto_keep_cached_files: {}\n", settings.auto_keep_cached_files));
     content.push_str(&format!("read_ahead_bytes: {}\n", settings.read_ahead_bytes));

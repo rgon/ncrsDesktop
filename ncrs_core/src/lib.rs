@@ -206,6 +206,22 @@ struct DirCacheEntry {
     // each one for the full PROPFIND timeout; this holds the check off briefly so
     // the cost is one attempt per cooldown rather than per listing.
     expiry_retry_after: Option<Instant>,
+    // Value of ACCESS_TICK when this listing was last read, for LRU eviction.
+    //
+    // A counter rather than a clock: `lookup` and `getattr` touch this on every
+    // path resolution, and a monotonic `fetch_add` is far cheaper than asking the
+    // OS for the time on a hot path. It is also an `Atomic` so the `&self`
+    // read path (`get_cached_dir_readonly`) can record an access too — a
+    // directory that only ever gets stat'ed is still in use.
+    last_access: AtomicU64,
+}
+
+/// Source of LRU ordering for the dir cache. Wraps after 2^64 accesses, which
+/// at a billion listings a second takes ~580 years.
+static ACCESS_TICK: AtomicU64 = AtomicU64::new(0);
+
+fn next_access_tick() -> u64 {
+    ACCESS_TICK.fetch_add(1, Ordering::Relaxed)
 }
 
 struct PendingDir {
@@ -735,6 +751,8 @@ pub(crate) struct FsCache {
     paths: HashMap<PathBuf, u64>,
     next_inode: u64,
     dir_cache: HashMap<PathBuf, DirCacheEntry>,
+    /// LRU ceiling on `dir_cache`; 0 means unbounded.
+    dir_cache_max_dirs: usize,
     pending_dirs: HashMap<PathBuf, PendingDir>,
     pub(crate) file_cache: HashMap<PathBuf, FileCacheEntry>,
     cache_dir: PathBuf,
@@ -781,7 +799,9 @@ impl FsCache {
     }
 
     fn get_cached_dir(&mut self, path: &Path, ttl: Duration, max_stale: Option<Duration>) -> Option<(Arc<Vec<RemoteEntry>>, bool)> {
+        let tick = next_access_tick();
         let entry = self.dir_cache.get_mut(path)?;
+        entry.last_access.store(tick, Ordering::Relaxed);
         if entry.invalidated || entry.hard_expired {
             return None;
         }
@@ -813,7 +833,10 @@ impl FsCache {
     }
 
     fn get_cached_dir_readonly(&self, path: &Path) -> Option<Arc<Vec<RemoteEntry>>> {
-        self.dir_cache.get(path).map(|e| Arc::clone(&e.files))
+        self.dir_cache.get(path).map(|e| {
+            e.last_access.store(next_access_tick(), Ordering::Relaxed);
+            Arc::clone(&e.files)
+        })
     }
 
     /// Returns the NC oc:permissions string for a directory by looking it up in its
@@ -847,7 +870,56 @@ impl FsCache {
         // Filter out files whose DELETE is still in flight: a racing PROPFIND
         // that completes before the server DELETE must not re-surface them.
         files.retain(|f| !self.deleting.contains(&f.path));
-        self.dir_cache.insert(path, DirCacheEntry { files: Arc::new(files), self_entry, etag, at: Instant::now(), fetched_at: SystemTime::now(), refreshing: false, invalidated: false, hard_expired: false, expiry_retry_after: None });
+        self.dir_cache.insert(path, DirCacheEntry {
+            files: Arc::new(files), self_entry, etag,
+            at: Instant::now(), fetched_at: SystemTime::now(),
+            refreshing: false, invalidated: false, hard_expired: false,
+            expiry_retry_after: None,
+            last_access: AtomicU64::new(next_access_tick()),
+        });
+        self.evict_dir_cache();
+    }
+
+    /// Drops least-recently-used directory listings once the cache exceeds
+    /// `dir_cache_max_dirs`.
+    ///
+    /// The dir cache had no bound at all: every directory anything ever listed
+    /// stayed resident for the life of the process. On a large account that meant
+    /// 26k directories / 398k entries — ~150 MB of listings, most of them a source
+    /// tree some indexer walked once and will never look at again — plus a 12 s
+    /// startup spent parsing them back off disk.
+    ///
+    /// Eviction is by last *access*, not last fetch: `fetched_at` is refreshed by
+    /// cheap staleness probes, so it says nothing about whether anyone is using
+    /// the listing. Evicting is always safe — the next readdir re-lists.
+    fn evict_dir_cache(&mut self) {
+        let max = self.dir_cache_max_dirs;
+        if max == 0 || self.dir_cache.len() <= max {
+            return;
+        }
+        // Evict down to 90% so a cache sitting at the ceiling doesn't re-sort on
+        // every single insert.
+        let target = max - max / 10;
+        let mut candidates: Vec<(u64, PathBuf)> = self.dir_cache.iter()
+            // Never evict a listing mid-refresh: its `refreshing` flag is the
+            // interlock stopping a second concurrent PROPFIND for the same dir.
+            .filter(|(_, e)| !e.refreshing)
+            .map(|(p, e)| (e.last_access.load(Ordering::Relaxed), p.clone()))
+            .collect();
+        candidates.sort_unstable_by_key(|(tick, _)| *tick);
+
+        let to_drop = self.dir_cache.len().saturating_sub(target);
+        let mut dropped = 0usize;
+        for (_, path) in candidates.into_iter().take(to_drop) {
+            self.dir_cache.remove(&path);
+            dropped += 1;
+        }
+        if dropped > 0 {
+            log::info!(
+                "DIR_CACHE evicted {} least-recently-used listings ({} of max {} remain)",
+                dropped, self.dir_cache.len(), max
+            );
+        }
     }
 
     /// Patch a single file entry's size in its parent's dir cache, returning true
@@ -1266,8 +1338,27 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
     };
     drop(data);
     let mut c = cache.safe_lock();
+
+    // Restore at most `dir_cache_max_dirs` listings, most recently fetched first.
+    // Without this the whole persisted cache is parsed and inserted only for
+    // eviction to throw most of it away moments later — on a large account that
+    // was 26k listings and a 12-second startup before the mount came up.
+    let mut entries: Vec<(String, PersistedDirEntry)> = map.into_iter().collect();
+    let max = c.dir_cache_max_dirs;
+    let total = entries.len();
+    if max > 0 && total > max {
+        // Newest fetch first. `fetched_at` is the only ordering the file carries;
+        // access ticks do not survive a restart.
+        entries.sort_unstable_by(|a, b| b.1.fetched_at.cmp(&a.1.fetched_at));
+        entries.truncate(max);
+        log::info!(
+            "DIR_CACHE restoring the {} most recent of {} persisted listings (dir_cache_max_dirs)",
+            max, total
+        );
+    }
+
     let mut count = 0usize;
-    for (k, v) in map {
+    for (k, v) in entries {
         let dir_path = PathBuf::from(&k);
         if c.dir_cache.contains_key(&dir_path) {
             continue;
@@ -1286,6 +1377,7 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
             .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
             .unwrap_or(UNIX_EPOCH);
         c.dir_cache.insert(dir_path, DirCacheEntry {
+            last_access: AtomicU64::new(next_access_tick()),
             files: v.files,
             self_entry: v.self_entry,
             etag: v.etag,
@@ -2451,6 +2543,7 @@ impl NextCloudFs {
                     paths,
                     next_inode: 2,
                     dir_cache: HashMap::new(),
+                    dir_cache_max_dirs: options.dir_cache_max_dirs,
                     pending_dirs: HashMap::new(),
                     file_cache: HashMap::new(),
                     cache_dir,
