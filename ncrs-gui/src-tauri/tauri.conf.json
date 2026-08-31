@@ -10,22 +10,7 @@
     "frontendDist": "../build"
   },
   "app": {
-    "windows": [
-      {
-        "title": "ncrs-gui",
-        "label": "main",
-        "width": 1860,
-        "height": 1000,
-        "resizable": false,
-        "minimizable": false,
-        "maximizable": false,
-        "closable": true,
-        "fullscreen": false,
-        "visible": false,
-        "decorations": false,
-        "transparent": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; media-src 'self'; object-src 'none'; child-src 'none'; frame-src 'none'; worker-src 'none'; frame-ancestors 'none'; form-action 'none'; base-uri 'self'"
     }

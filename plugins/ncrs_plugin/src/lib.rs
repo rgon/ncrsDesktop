@@ -236,10 +236,19 @@ pub fn open_main_window(app: &AppHandle) {
         }
     }
 
-    // The window is destroyed (not hidden) when closed to the tray, so the
-    // WebKitGTK webview stops eating idle CPU. Rebuild it from the same config
-    // the manifest declares before showing. Keep these attributes in sync with
-    // the `main` window entry in tauri.conf.json.
+    // This is the ONLY place the main window is created — `tauri.conf.json`
+    // deliberately declares no windows.
+    //
+    // Tauri instantiates a config-declared window at startup even with
+    // `visible: false`, which spawns WebKitGTK and its two helper processes
+    // (WebKitWebProcess + WebKitNetworkProcess measured at ~217 MB RSS between
+    // them) to render nothing at all, for a tray app whose window is usually
+    // never opened. Creating it on demand here defers all of that to the first
+    // tray click, and `close_window` destroying the webview then actually gives
+    // the memory back instead of it being re-created behind the user's back.
+    //
+    // The cost is that the first window open is slower, since WebKit initialises
+    // then rather than up front.
     let w = match app.get_webview_window("main") {
         Some(w) => w,
         None => match WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
