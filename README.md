@@ -239,15 +239,17 @@ Package build + verification (what CI runs; `--container` needs Docker or Podman
 + [ ] eval performant cache if needed
 	with tokio_uring! https://gist.github.com/munro/14219f9a671484a8fe820eb35d26bb80
 
-+ [ ] set a Content-Security-Policy in tauri.conf.json (currently `"csp": null`)
-	> The frontend has no `{@html}`, so Svelte's escaping holds and there is no
-	> known XSS. But server-supplied `entry.icon` / notification icons render as
-	> `<img src>`, so the server can point the webview at any host (discloses the
-	> user's IP; no credential is attached). A `default-src 'self'` policy with a
-	> tight `img-src` closes it.
-	> NEEDS MANUAL CHECK: cannot be verified without launching the GUI, and the
-	> live daemon holds the mount — see GOTCHAS. Confirm icons, fonts and inline
-	> styles still render before shipping.
++ [x] set a Content-Security-Policy in tauri.conf.json (was `"csp": null`)
+	> Verified headless: the built frontend loads with 0 violations under the new
+	> policy, and a deliberately strict control (`script-src 'self'`) produces 3
+	> violations and a dead 1.7 KB DOM — so the two `'unsafe-inline'` keywords are
+	> required, not lazy. Tauri only nonces `script[src^='http']` and `<style>`
+	> elements, never inline scripts, and app.html + SvelteKit ship two inline
+	> scripts plus a `style="display: contents"` attribute.
+	> `img-src` still allows https:/http: because the only legitimate remote image
+	> origin is the *user-configured* server, which a static CSP cannot name. That
+	> directive is a backstop; the actual control is `asset_url::same_origin_asset`
+	> on the Rust side.
 
 + [ ] deploy the dir-cache memory fix — a running 0.1.56 still idles at ~690 MB
 	> Fixed in-tree (610 MB -> 150 MB steady, no more ~1 GB spike per save) but
