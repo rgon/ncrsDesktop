@@ -120,12 +120,56 @@ pub struct StorageStats {
 pub type SharedStorageStats = Arc<Mutex<StorageStats>>;
 
 pub fn socket_path() -> PathBuf {
-    std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::runtime_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
-        })
-        .join("ncrs.sock")
+    socket_dir().join("ncrs.sock")
+}
+
+/// Directory holding the IPC socket.
+///
+/// `$XDG_RUNTIME_DIR` is per-user and mode 0700, so a socket there is already
+/// unreachable by other users. The fallback is not: dropping the socket straight
+/// into a shared `/tmp` would let any local user connect to the daemon — the IPC
+/// surface exposes file metadata and `PAUSE`/`PURGE_CACHE` — and would let one
+/// pre-create the path to deny or intercept the channel. So when there is no
+/// runtime dir, use a private per-uid subdirectory instead of the shared root.
+fn socket_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
+        if !d.is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    if let Some(d) = dirs::runtime_dir() {
+        return d;
+    }
+    #[cfg(unix)]
+    {
+        // Safe: getuid cannot fail and touches no memory we own.
+        let uid = unsafe { libc::getuid() };
+        let dir = std::env::temp_dir().join(format!("ncrs-{}", uid));
+        if let Err(e) = create_private_dir(&dir) {
+            log::warn!("could not secure IPC socket dir {}: {}", dir.display(), e);
+        }
+        return dir;
+    }
+    #[cfg(not(unix))]
+    std::env::temp_dir()
+}
+
+/// Creates `dir` as 0700, and tightens it if it already exists.
+#[cfg(unix)]
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if !dir.exists() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "IPC socket directory path exists but is not a directory",
+        ));
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
 }
 
 /// File-level sync status as seen by the daemon.
@@ -547,6 +591,18 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             return;
         }
     };
+    // `bind` applies the umask, so the socket can land group/other-writable —
+    // and on Linux, connect(2) is gated by write permission on the socket file.
+    // Narrow it to the owner before anyone can reach it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
+            log::error!("Cannot secure IPC socket {}: {} — refusing to serve", sock.display(), e);
+            let _ = std::fs::remove_file(&sock);
+            return;
+        }
+    }
     log::info!("IPC socket listening at {}", sock.display());
 
     // Drive daemon→GUI state pushes: the monitor rebuilds the snapshot and
@@ -1131,5 +1187,49 @@ mod tests {
         let recs = detaildir_records(Path::new("/dir"), &details, &sm, &shared, &children, "alice");
         assert_eq!(recs.len(), 1);
         assert!(recs[0].contains("\tShared with you\t"));
+    }
+}
+
+#[cfg(test)]
+mod socket_permission_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn socket_dir_falls_back_to_a_private_per_uid_dir_not_shared_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+        // Emulate a daemon started without a runtime dir (cron, a systemd unit
+        // without PAM). The socket must not land in the shared /tmp root.
+        let uid = unsafe { libc::getuid() };
+        let expected = std::env::temp_dir().join(format!("ncrs-{}", uid));
+        std::fs::remove_dir_all(&expected).ok();
+
+        assert!(create_private_dir(&expected).is_ok());
+        let mode = std::fs::metadata(&expected).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "fallback socket dir must be owner-only");
+
+        // Tightens a pre-existing permissive directory rather than trusting it.
+        std::fs::set_permissions(&expected, std::fs::Permissions::from_mode(0o777)).unwrap();
+        create_private_dir(&expected).unwrap();
+        let mode = std::fs::metadata(&expected).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+
+        assert_ne!(expected, std::env::temp_dir(), "must not be the shared tmp root");
+        std::fs::remove_dir_all(&expected).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_private_dir_refuses_a_non_directory_path() {
+        let p = std::env::temp_dir().join("ncrs-sockdir-is-a-file");
+        std::fs::write(&p, b"x").unwrap();
+        assert!(create_private_dir(&p).is_err(), "a planted file must not be accepted");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn socket_path_is_inside_the_socket_dir() {
+        assert_eq!(socket_path().parent().unwrap(), socket_dir().as_path());
+        assert_eq!(socket_path().file_name().unwrap(), "ncrs.sock");
     }
 }

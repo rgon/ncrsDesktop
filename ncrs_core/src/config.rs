@@ -222,6 +222,35 @@ pub fn config_path() -> PathBuf {
         .join("config.yaml")
 }
 
+/// Writes `content` to `path` readable only by the owner.
+///
+/// The config file can hold `password:` / `bearer_token:` in cleartext, and
+/// `std::fs::write` creates a file at `0666 & ~umask` — 0644 under the usual
+/// umask, i.e. world-readable. The mode is applied to the handle before any
+/// content is written, and set again afterwards so an existing file that was
+/// already too permissive is tightened rather than left as found.
+fn write_private(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(content)?;
+        f.sync_all()?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content)
+    }
+}
+
 /// Warn if the config file permissions are broader than 0600.
 /// Does not modify the file — just logs so the user knows to run `chmod 0600`.
 pub fn warn_config_permissions(path: &std::path::Path) {
@@ -320,7 +349,7 @@ pub fn load_config() -> Result<MountOptions, String> {
         let dir = path.parent().unwrap();
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("Cannot create config dir {}: {}", dir.display(), e))?;
-        std::fs::write(&path, DEFAULT_CONFIG)
+        write_private(&path, DEFAULT_CONFIG.as_bytes())
             .map_err(|e| format!("Cannot write default config: {}", e))?;
         warn_config_permissions(&path);
         return Err(format!(
@@ -516,9 +545,37 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
     }
-    std::fs::write(&path, &content).map_err(|e| format!("write config: {}", e))?;
+    write_private(&path, content.as_bytes()).map_err(|e| format!("write config: {}", e))?;
     warn_config_permissions(&path);
     Ok(())
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn config_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("ncrs-perm-test-write");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let _ = std::fs::remove_file(&path);
+
+        write_private(&path, b"password: \"hunter2\"\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config holding a password must not be readable by others");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "password: \"hunter2\"\n");
+
+        // An already-too-permissive file gets tightened, not left as found.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, b"password: \"other\"\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rewriting must tighten a world-readable config");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]
