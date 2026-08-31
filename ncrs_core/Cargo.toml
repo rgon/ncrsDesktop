@@ -24,6 +24,7 @@ tokio = { version = "1", features = ["rt", "time", "net", "macros"] }
 percent-encoding = "2"
 md5 = "0.7"
 crc32fast = "1"
+base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 quick-xml = "0.36"
 httpdate = "1"

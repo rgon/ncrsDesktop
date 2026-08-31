@@ -106,7 +106,7 @@ pub fn fetch_notifications(
     // server could point the webview at any host it liked. Pin it to the server.
     let notifications = ocs.ocs.data.into_iter()
         .map(|mut n| {
-            n.icon = crate::asset_url::same_origin_asset(base, &n.icon);
+            n.icon = crate::asset_url::inline_asset(client(http3), base, creds, &n.icon);
             n
         })
         .collect();

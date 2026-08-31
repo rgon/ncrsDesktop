@@ -2996,6 +2996,7 @@ dependencies = [
 name = "ncrs_core"
 version = "0.1.56"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "crc32fast",
  "dirs",

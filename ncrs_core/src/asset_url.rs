@@ -61,6 +61,154 @@ pub fn same_origin_asset(base: &str, url: &str) -> String {
     }
 }
 
+
+// -- Inlining assets so the webview never makes the request --------------------
+//
+// Pinning an asset to the server's origin (above) stops the *leak*, but the
+// webview still has to fetch it, which means the CSP has to permit some remote
+// origin — and the only legitimate one is the user's own server, which a static
+// `img-src` cannot name. So instead of widening the policy, the daemon fetches
+// the asset itself and hands the GUI a `data:` URI. The webview then contacts
+// nothing, `img-src 'self' data:` is enough, and the policy fails *closed*: if
+// anything here goes wrong the image is simply absent rather than fetched from
+// somewhere unexpected.
+//
+// This also makes icons work on servers that require authentication for them,
+// which a bare `<img src>` in the webview never could.
+
+/// Ceiling on an inlined asset. These are app icons and avatars; anything
+/// larger is not one, and a data: URI costs ~4/3 its bytes in the IPC payload.
+const MAX_ASSET_BYTES: usize = 256 * 1024;
+
+/// How many resolved assets to remember. Icons repeat heavily — typically one
+/// per search provider — so a small cache turns a per-keystroke fetch storm into
+/// one request per distinct icon per session.
+const CACHE_CAP: usize = 512;
+
+const ASSET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> {
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Content types allowed to be inlined.
+///
+/// SVG is included deliberately: script inside an SVG does **not** execute when
+/// the SVG is the source of an `<img>`, which is the only way these are rendered.
+fn is_inlinable_image(content_type: &str) -> bool {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        ct.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "image/svg+xml"
+            | "image/bmp"
+            | "image/x-icon"
+            | "image/vnd.microsoft.icon"
+    )
+}
+
+/// Builds a `data:` URI, or `None` if the type is not an inlinable image or the
+/// payload is too large / empty.
+pub fn to_data_uri(content_type: &str, bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() || bytes.len() > MAX_ASSET_BYTES || !is_inlinable_image(content_type) {
+        return None;
+    }
+    let ct = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    use base64::Engine as _;
+    Some(format!(
+        "data:{};base64,{}",
+        ct,
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+/// Resolves a server-supplied asset URL to something the webview can render
+/// without contacting anyone: a `data:` URI, or an empty string.
+///
+/// Failures are deliberately quiet — a missing icon is cosmetic, and the GUI
+/// already renders nothing when the field is empty.
+pub fn inline_asset(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    creds: &crate::auth::Credentials,
+    raw_url: &str,
+) -> String {
+    // Origin check first: never issue a request for something off the server.
+    let url = same_origin_asset(base, raw_url);
+    if url.is_empty() {
+        return String::new();
+    }
+    // Already inline.
+    if url.starts_with("data:") {
+        return url;
+    }
+
+    if let Ok(c) = cache().lock() {
+        if let Some(hit) = c.get(&url) {
+            return hit.clone().unwrap_or_default();
+        }
+    }
+
+    let resp = match creds.apply(client.get(&url).timeout(ASSET_TIMEOUT)).send() {
+        Ok(r) => r,
+        // Transient: do NOT cache, or one blip hides icons for the whole session.
+        Err(e) => {
+            log::debug!("asset inline: request failed for {}: {}", url, e);
+            return String::new();
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        if status.is_server_error() {
+            return String::new();
+        }
+        // 4xx is a property of the asset, so remember it.
+        remember(&url, None);
+        return String::new();
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = match resp.bytes() {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+
+    let data_uri = to_data_uri(&content_type, &bytes);
+    if data_uri.is_none() {
+        log::debug!(
+            "asset inline: refusing {} ({} bytes, type {:?})",
+            url,
+            bytes.len(),
+            content_type
+        );
+    }
+    remember(&url, data_uri.clone());
+    data_uri.unwrap_or_default()
+}
+
+fn remember(url: &str, value: Option<String>) {
+    if let Ok(mut c) = cache().lock() {
+        if c.len() < CACHE_CAP || c.contains_key(url) {
+            c.insert(url.to_string(), value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::same_origin_asset;
@@ -130,5 +278,48 @@ mod tests {
             "http://127.0.0.1:18087/a.png",
         );
         assert_eq!(same_origin_asset(base, "http://tracker.example/p.png"), "");
+    }
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::{is_inlinable_image, to_data_uri, MAX_ASSET_BYTES};
+
+    #[test]
+    fn builds_a_data_uri_for_real_image_types() {
+        // 1x1 GIF.
+        let gif = b"GIF89a\x01\x00\x01\x00\x00\xff\x00,";
+        let uri = to_data_uri("image/gif", gif).expect("gif inlines");
+        assert!(uri.starts_with("data:image/gif;base64,"), "{}", uri);
+        // Parameters on the header are stripped.
+        let uri = to_data_uri("image/svg+xml; charset=utf-8", b"<svg/>").expect("svg inlines");
+        assert!(uri.starts_with("data:image/svg+xml;base64,"), "{}", uri);
+        // Case-insensitive.
+        assert!(to_data_uri("IMAGE/PNG", b"x").is_some());
+    }
+
+    #[test]
+    fn refuses_non_images_and_oversized_payloads() {
+        // An HTML or script body must never become an <img> source.
+        assert_eq!(to_data_uri("text/html", b"<script>alert(1)</script>"), None);
+        assert_eq!(to_data_uri("application/javascript", b"alert(1)"), None);
+        assert_eq!(to_data_uri("", b"x"), None);
+        // Empty and oversized.
+        assert_eq!(to_data_uri("image/png", b""), None);
+        let huge = vec![0u8; MAX_ASSET_BYTES + 1];
+        assert_eq!(to_data_uri("image/png", &huge), None);
+        // Exactly at the cap is allowed.
+        let at_cap = vec![0u8; MAX_ASSET_BYTES];
+        assert!(to_data_uri("image/png", &at_cap).is_some());
+    }
+
+    #[test]
+    fn image_type_allowlist_is_closed() {
+        for ok in ["image/png", "image/jpeg", "image/svg+xml", "image/x-icon"] {
+            assert!(is_inlinable_image(ok), "{}", ok);
+        }
+        for bad in ["text/html", "image/", "application/octet-stream", "", "imagepng"] {
+            assert!(!is_inlinable_image(bad), "{}", bad);
+        }
     }
 }

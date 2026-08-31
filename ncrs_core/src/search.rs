@@ -131,7 +131,7 @@ pub fn fetch_providers(
     // server strings.
     let providers = ocs.ocs.data.into_iter()
         .map(|mut p| {
-            p.icon = crate::asset_url::same_origin_asset(base, &p.icon);
+            p.icon = crate::asset_url::inline_asset(client(http3), base, creds, &p.icon);
             p
         })
         .collect();
@@ -208,7 +208,21 @@ pub fn search_filtered(
                                     // bookmarked address); a rendered asset may
                                     // not — see crate::asset_url.
                                     e.resource_url = absolutize(base, &e.resource_url);
-                                    e.icon = crate::asset_url::same_origin_asset(base, &e.icon);
+                                    // Inlined, not just origin-pinned: the
+                                    // webview must not fetch it, so the CSP
+                                    // needs no remote img-src. Entries in a
+                                    // provider almost always share one icon, so
+                                    // this is one request per provider, cached.
+                                    e.icon = crate::asset_url::inline_asset(
+                                        client(http3), base, creds, &e.icon,
+                                    );
+                                    // Not rendered by the GUI today. Kept
+                                    // origin-pinned rather than inlined because
+                                    // a thumbnail is per-entry and full-size —
+                                    // inline it here and every keystroke would
+                                    // pull one image per hit. If it is ever
+                                    // rendered it must go through inline_asset,
+                                    // or the CSP will (correctly) block it.
                                     e.thumbnail_url =
                                         crate::asset_url::same_origin_asset(base, &e.thumbnail_url);
                                     e

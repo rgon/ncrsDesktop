@@ -246,10 +246,11 @@ Package build + verification (what CI runs; `--container` needs Docker or Podman
 	> required, not lazy. Tauri only nonces `script[src^='http']` and `<style>`
 	> elements, never inline scripts, and app.html + SvelteKit ship two inline
 	> scripts plus a `style="display: contents"` attribute.
-	> `img-src` still allows https:/http: because the only legitimate remote image
-	> origin is the *user-configured* server, which a static CSP cannot name. That
-	> directive is a backstop; the actual control is `asset_url::same_origin_asset`
-	> on the Rust side.
+	> `img-src` is `'self' data:` — no remote origin at all. That is only possible
+	> because the daemon inlines server icons as data: URIs
+	> (`asset_url::inline_asset`) instead of letting the webview fetch them, so
+	> the policy needs no user-configured origin and fails closed. Verified: a
+	> remote <img> is blocked, a data: <img> loads.
 
 + [ ] deploy the dir-cache memory fix — a running 0.1.56 still idles at ~690 MB
 	> Fixed in-tree (610 MB -> 150 MB steady, no more ~1 GB spike per save) but
