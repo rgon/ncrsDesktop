@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.64](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.63...ncrs-v0.1.64) (2026-09-01)
+
+
+### Bug Fixes
+
+* **http:** decide HTTP/3 demotion once at mount time, never mid-session ([b08d063](https://github.com/rgon/ncrsDesktop/commit/b08d063bd4fcad27b11ccf487698e68df23e108f))
+* **net:** retry a failed connectivity probe once before flagging the mount offline ([0f6a69e](https://github.com/rgon/ncrsDesktop/commit/0f6a69efd22312aee194d4ecd6a54328ecb53c9f))
+
 ## [0.1.63](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.62...ncrs-v0.1.63) (2026-09-01)
 
 
