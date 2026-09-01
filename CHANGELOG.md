@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.61](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.60...ncrs-v0.1.61) (2026-09-01)
+
+
+### Bug Fixes
+
+* **cache:** stop LRU eviction turning cached directories into empty or missing ones ([73a93dc](https://github.com/rgon/ncrsDesktop/commit/73a93dc47c92ebd6b5834ce29e055a66e5ff93ed))
+* center checkbox tick by replacing native control with custom SVG ([1a9e84c](https://github.com/rgon/ncrsDesktop/commit/1a9e84c1422b5adb885bf0a159cc7fc19d9825ed))
+
 ## [0.1.60](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.59...ncrs-v0.1.60) (2026-09-01)
 
 
