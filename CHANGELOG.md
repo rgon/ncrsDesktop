@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.63](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.62...ncrs-v0.1.63) (2026-09-01)
+
+
+### Features
+
+* **http:** remember an HTTP/3 demotion across restarts instead of re-paying the discovery blip ([357f213](https://github.com/rgon/ncrsDesktop/commit/357f2130cf49b49925532f6daa9d5bdd89702242))
+
+
+### Bug Fixes
+
+* **http:** stamp requests with Version::HTTP_3 so HTTP/3 is actually used ([9bd017c](https://github.com/rgon/ncrsDesktop/commit/9bd017ce7bf373d2cdf56fb7a37997b5f94a7af4))
+
 ## [0.1.62](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.61...ncrs-v0.1.62) (2026-09-01)
 
 
