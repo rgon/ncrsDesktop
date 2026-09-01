@@ -322,6 +322,10 @@ pub enum SyncState {
     Error(String),
     /// Partially operational: sync works but a subsystem (e.g. notify_push) is unavailable.
     Degraded(String),
+    /// Not operational at all: the server is unreachable, so WebDAV, notify_push
+    /// and every upload are down together. Distinct from `Degraded`, which
+    /// promises the rest of sync still works.
+    Offline,
 }
 
 impl std::fmt::Display for SyncState {
@@ -334,6 +338,7 @@ impl std::fmt::Display for SyncState {
             SyncState::Wiped => write!(f, "wiped"),
             SyncState::Error(e) => write!(f, "error:{}", e),
             SyncState::Degraded(r) => write!(f, "degraded:{}", r),
+            SyncState::Offline => write!(f, "offline"),
         }
     }
 }
@@ -500,6 +505,61 @@ fn wait_out_offline_blip(conn: &ConnInfo) -> bool {
         }
     }
     false
+}
+
+/// A read-only view of the daemon's connectivity, for a caller that renders
+/// status (the GUI, and the IPC state word).
+///
+/// Shares the flag the connectivity monitor flips rather than mirroring it, so a
+/// status can never lag behind the daemon.
+#[derive(Clone)]
+pub struct OfflineStatus {
+    is_offline: Arc<AtomicBool>,
+    since: Arc<Mutex<Option<Instant>>>,
+}
+
+impl Default for OfflineStatus {
+    fn default() -> Self {
+        OfflineStatus {
+            is_offline: Arc::new(AtomicBool::new(false)),
+            since: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl OfflineStatus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the outage has lasted long enough to be worth reporting.
+    ///
+    /// The same blip tolerance [`wait_out_offline_blip`] gives a read, and for the
+    /// same reason: a single failed request flips the flag eagerly, and the
+    /// connectivity monitor usually clears it within one 5s cycle. A status that
+    /// reacted instantly would flash a failure for every hiccup.
+    pub fn settled(&self) -> bool {
+        if !self.is_offline.load(Ordering::Relaxed) {
+            return false;
+        }
+        match *self.since.safe_lock() {
+            Some(since) => since.elapsed() >= OFFLINE_READ_GRACE,
+            // Offline with no recorded transition (an offline-mode mount): a
+            // standing state, not a blip.
+            None => true,
+        }
+    }
+}
+
+#[cfg(test)]
+impl OfflineStatus {
+    /// Offline as of `ago` in the past.
+    pub(crate) fn offline_for(ago: Duration) -> Self {
+        let st = OfflineStatus::new();
+        st.is_offline.store(true, Ordering::Relaxed);
+        *st.since.safe_lock() = Instant::now().checked_sub(ago);
+        st
+    }
 }
 
 /// Return the minimal magic byte sequence that identifies a given MIME type.
@@ -5426,7 +5486,12 @@ fn build_fuse_options() -> Vec<MountOption> {
     ]
 }
 
-pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>, paused: Option<Arc<AtomicBool>>, hpb_connected: Option<Arc<AtomicBool>>) -> Result<(), String> {
+/// `offline` and `hpb_connected` are out-parameters for a caller that renders
+/// status (the GUI): `offline` is *shared* with the filesystem, so it tracks the
+/// connectivity monitor live, while `hpb_connected` is mirrored by the watcher
+/// poll. A caller needs both to tell a total outage (server unreachable) from a
+/// partial one (notify_push down, WebDAV fine).
+pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>, paused: Option<Arc<AtomicBool>>, hpb_connected: Option<Arc<AtomicBool>>, offline: Option<OfflineStatus>) -> Result<(), String> {
     // Must run before anything that touches shared resources (the IPC socket,
     // cache dirs, journal): a refused second instance must leave the running
     // daemon's state untouched.
@@ -5447,6 +5512,18 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     // the IPC PAUSE/RESUME verbs — callers without their own flag get one.
     let paused_flag = paused.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     Arc::get_mut(&mut filesystem.conn).expect("conn not yet shared").paused = paused_flag.clone();
+    // Same for the offline flag and its transition timestamp: hand the caller the
+    // *same* pair the connectivity monitor flips, so its view of reachability can
+    // never lag behind the daemon's. Both must be installed together — `settled`
+    // reads the timestamp to tell a blip from an outage.
+    let offline_status = offline.unwrap_or_default();
+    offline_status.is_offline.store(options.offline, Ordering::Relaxed);
+    *offline_status.since.safe_lock() = None;
+    {
+        let conn = Arc::get_mut(&mut filesystem.conn).expect("conn not yet shared");
+        conn.is_offline = offline_status.is_offline.clone();
+        conn.offline_since = offline_status.since.clone();
+    }
 
     // Files that were written straight onto the (unmounted) real mount-point
     // directory during a previous session — see prepare_mount_point — are
@@ -5462,9 +5539,9 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let ipc_creds = options.credentials()?;
     let file_change_queue = filesystem.file_change_queue();
     let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.children_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), Some(purge_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone());
-
     let offline_flag = filesystem.is_offline_flag();
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.children_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), Some(purge_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone(), offline_status.clone());
+
     let backend = filesystem.conn.backend.clone();
     let notifier_slot = filesystem.notifier_slot();
     let wipe_flag = Arc::new(AtomicBool::new(false));

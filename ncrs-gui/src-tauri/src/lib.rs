@@ -12,7 +12,7 @@ use tauri::async_runtime::spawn;
 use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration};
 
-use ncrs_core::{mount_ncfs, mutation_journal::{self, SharedJournal, JournalEntry, ConflictRecord}, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, ipc::StorageStats, ErrorLog, MountOptions, SyncError, SyncState, TransferMap, TransferProgress};
+use ncrs_core::{mount_ncfs, mutation_journal::{self, SharedJournal, JournalEntry, ConflictRecord}, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, ipc::StorageStats, ErrorLog, MountOptions, OfflineStatus, SyncError, SyncState, TransferMap, TransferProgress};
 
 mod plugins;
 
@@ -33,6 +33,10 @@ pub struct AppState {
     pub login_flow_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Mirrors the notify_push connection flag; false when HPB is unavailable.
     pub hpb_connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the core's connectivity monitor: reports the server as
+    /// unreachable (so WebDAV is down too and nothing can sync) once the outage
+    /// has outlived the blip grace window.
+    pub offline: OfflineStatus,
     /// Set when the GUI detects a server auth failure (e.g. 401 from notifications API).
     /// Survives attached_poll_loop state overwrites; cleared on successful auth.
     pub auth_error: Mutex<Option<String>>,
@@ -53,6 +57,7 @@ impl Default for AppState {
             attached: std::sync::atomic::AtomicBool::new(false),
             login_flow_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hpb_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            offline: OfflineStatus::new(),
             auth_error: Mutex::new(None),
         }
     }
@@ -104,6 +109,7 @@ fn get_sync_state(state: State<Arc<AppState>>) -> String {
         SyncState::Wiped => "wiped".into(),
         SyncState::Error(ref e) => format!("error:{}", e),
         SyncState::Degraded(ref r) => format!("degraded:{}", r),
+        SyncState::Offline => "offline".into(),
     }
 }
 
@@ -737,7 +743,7 @@ fn rerender_tray_menu(
         builder = builder.item(&wiped_i);
     } else {
         let pause_text = match sync_state {
-            SyncState::Idle | SyncState::Degraded(_) => "Pause Sync",
+            SyncState::Idle | SyncState::Degraded(_) | SyncState::Offline => "Pause Sync",
             SyncState::Paused => "Resume Sync",
             SyncState::Syncing => "Pause Sync",
             SyncState::Unmounted | SyncState::Wiped => unreachable!(),
@@ -779,7 +785,9 @@ impl TrayIcon {
             SyncState::Idle => TrayIcon::Idle,
             SyncState::Paused | SyncState::Unmounted | SyncState::Wiped => TrayIcon::Paused,
             SyncState::Syncing => TrayIcon::Syncing,
-            SyncState::Error(_) => TrayIcon::Error,
+            // A total outage is a failure, not a warning: WebDAV, notify_push and
+            // every queued upload are down together.
+            SyncState::Error(_) | SyncState::Offline => TrayIcon::Error,
             SyncState::Degraded(_) => TrayIcon::Warning,
         }
     }
@@ -1016,7 +1024,7 @@ pub fn run() {
                 let Some(tray) = app_handle_listener.tray_by_id(&tray_id) else { return };
 
                 let icon_kind = match payload {
-                    "wiped" => TrayIcon::Error,
+                    "wiped" | "offline" => TrayIcon::Error,
                     "unmounted" | "paused" => TrayIcon::Paused,
                     "syncing" => TrayIcon::Syncing,
                     p if p.starts_with("degraded:") => TrayIcon::Warning,
@@ -1206,8 +1214,9 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
         let fuse_paused = state.paused.clone();
         let hpb_flag = state.hpb_connected.clone();
         state.hpb_connected.store(false, std::sync::atomic::Ordering::Relaxed);
+        let offline_flag = state.offline.clone();
         thread::spawn(move || {
-            let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal), Some(fuse_paused), Some(hpb_flag));
+            let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal), Some(fuse_paused), Some(hpb_flag), Some(offline_flag));
             match &result {
                 Ok(()) => {
                     log::info!("FUSE unmounted cleanly");
@@ -1235,38 +1244,46 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
             let _ = shutdown_tx.send(true);
         });
 
-        // HPB status monitor — emit degraded/idle when notify_push connects or disconnects.
-        // 30s grace period gives the watcher time to establish the connection before
-        // we declare it missing.
+        // Connection health monitor — see health_sync_state for the ranking.
+        // 30s grace period gives the watcher time to establish the connection
+        // before we declare anything missing.
         let hpb_state = state.clone();
         let hpb_flag = state.hpb_connected.clone();
+        let offline_flag = state.offline.clone();
         let hpb_app = app.clone();
         let hpb_shutdown = shutdown_rx.clone();
         spawn(async move {
             sleep(Duration::from_secs(30)).await;
             if *hpb_shutdown.borrow() { return; }
-            // After the grace period, treat "still disconnected" as degraded.
-            let mut prev_connected = true;
             loop {
                 if *hpb_shutdown.borrow() { break; }
-                let connected = hpb_flag.load(std::sync::atomic::Ordering::Relaxed);
-                if connected != prev_connected {
-                    prev_connected = connected;
-                    if connected {
-                        let mut ss = hpb_state.sync_state.lock().unwrap();
-                        if matches!(*ss, SyncState::Degraded(_)) {
-                            *ss = SyncState::Idle;
-                            drop(ss);
-                            hpb_app.emit("sync-state-changed", "idle").ok();
-                        }
+                let target = health_sync_state(
+                    offline_flag.settled(),
+                    hpb_flag.load(std::sync::atomic::Ordering::Relaxed),
+                    hpb_state.auth_error.lock().unwrap().is_some(),
+                );
+                let Some(target) = target else {
+                    sleep(Duration::from_secs(5)).await;
+                    continue;
+                };
+                // Only ever move between the three states this monitor owns: a
+                // Paused, Syncing, Error, Unmounted or Wiped state is somebody
+                // else's and must not be overwritten by a health tick.
+                let emit = {
+                    let mut ss = hpb_state.sync_state.lock().unwrap();
+                    let owned = matches!(
+                        *ss,
+                        SyncState::Idle | SyncState::Degraded(_) | SyncState::Offline
+                    );
+                    if owned && *ss != target {
+                        *ss = target.clone();
+                        Some(target.to_string())
                     } else {
-                        let mut ss = hpb_state.sync_state.lock().unwrap();
-                        if matches!(*ss, SyncState::Idle) {
-                            *ss = SyncState::Degraded("high-performance backend not connected".into());
-                            drop(ss);
-                            hpb_app.emit("sync-state-changed", "degraded:high-performance backend not connected").ok();
-                        }
+                        None
                     }
+                };
+                if let Some(payload) = emit {
+                    hpb_app.emit("sync-state-changed", payload).ok();
                 }
                 sleep(Duration::from_secs(5)).await;
             }
@@ -1492,6 +1509,31 @@ struct SnapshotCache {
     conflicts_json: String,
 }
 
+/// The state the connection health monitor wants, from the signals it owns.
+/// `None` means the monitor has nothing to say and must leave the state alone.
+///
+/// notify_push being down on its own is a partial outage: WebDAV still serves
+/// reads and uploads, so the mount is degraded. The server being unreachable
+/// takes notify_push down *with* WebDAV, and reporting that as "degraded"
+/// claimed a working sync path that does not exist — a total outage has to read
+/// as a failure, so the offline signal wins.
+///
+/// A live auth error outranks both. A revoked token makes the connectivity probe
+/// fail too (its 401 calls `mark_offline`), and "server unreachable" would be
+/// both wrong and a dead end: it hides the Log in button, which is the only way
+/// out of that state.
+fn health_sync_state(offline: bool, hpb_connected: bool, auth_error: bool) -> Option<SyncState> {
+    if auth_error {
+        None
+    } else if offline {
+        Some(SyncState::Offline)
+    } else if hpb_connected {
+        Some(SyncState::Idle)
+    } else {
+        Some(SyncState::Degraded("high-performance backend not connected".into()))
+    }
+}
+
 /// Map a daemon STATE word to a [`SyncState`] and store it, preserving a
 /// GUI-detected auth error against a daemon "idle" (the daemon can serve from
 /// cache and look healthy while creds are invalid). Returns the mapped state
@@ -1505,16 +1547,24 @@ fn apply_state_word(state: &Arc<AppState>, word: &str) -> Option<SyncState> {
         "wiped" => SyncState::Wiped,
         s if s.starts_with("error:") => SyncState::Error(s["error:".len()..].to_string()),
         s if s.starts_with("degraded:") => SyncState::Degraded(s["degraded:".len()..].to_string()),
+        "offline" => SyncState::Offline,
         _ => SyncState::Idle,
     };
     let mut ss = state.sync_state.lock().unwrap();
-    let auth_err_active =
-        matches!(*ss, SyncState::Error(_)) && state.auth_error.lock().unwrap().is_some();
-    let effective = if auth_err_active && matches!(new_state, SyncState::Idle) {
-        ss.clone()
+    let auth_err = state.auth_error.lock().unwrap().is_some();
+    // A revoked token trips the daemon's own connectivity probe (its 401 calls
+    // mark_offline), so the daemon reports "offline" for a server that is up and
+    // answering. Relabelling an auth failure as "server unreachable" is both
+    // wrong and a dead end — it hides the Log in button. Hold whatever the GUI
+    // already knows instead; the auth error it emitted stays on screen.
+    let hold = if auth_err && matches!(new_state, SyncState::Offline) {
+        true
     } else {
-        new_state.clone()
+        // Long-standing case: the daemon serves from cache and looks healthy
+        // while the credentials are invalid.
+        auth_err && matches!(*ss, SyncState::Error(_)) && matches!(new_state, SyncState::Idle)
     };
+    let effective = if hold { ss.clone() } else { new_state.clone() };
     if *ss != effective {
         *ss = effective;
         Some(new_state)
@@ -1747,5 +1797,78 @@ mod open_link_tests {
         ] {
             assert!(!is_openable_url(hostile), "{} must be refused", hostile);
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_state_tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_server_is_a_total_outage_not_a_degradation() {
+        // notify_push is down whenever the server is, so the HPB flag alone
+        // cannot distinguish the two — the offline signal has to win.
+        assert_eq!(health_sync_state(true, false, false), Some(SyncState::Offline));
+        assert_eq!(health_sync_state(true, true, false), Some(SyncState::Offline));
+    }
+
+    #[test]
+    fn hpb_down_on_a_reachable_server_is_still_degraded() {
+        assert!(matches!(
+            health_sync_state(false, false, false),
+            Some(SyncState::Degraded(_))
+        ));
+        assert_eq!(health_sync_state(false, true, false), Some(SyncState::Idle));
+    }
+
+    #[test]
+    fn a_live_auth_error_is_left_alone() {
+        // A revoked token trips the connectivity probe too; relabelling that as
+        // an outage would hide the only actionable diagnosis.
+        assert_eq!(health_sync_state(true, false, true), None);
+        assert_eq!(health_sync_state(false, true, true), None);
+    }
+
+    #[test]
+    fn offline_reads_as_a_failure_icon() {
+        assert!(matches!(
+            TrayIcon::for_state(&SyncState::Offline),
+            TrayIcon::Error
+        ));
+        assert!(matches!(
+            TrayIcon::for_state(&SyncState::Degraded("x".into())),
+            TrayIcon::Warning
+        ));
+    }
+
+    #[test]
+    fn a_revoked_token_keeps_its_auth_diagnosis() {
+        // The connectivity probe's 401 flags the daemon offline too, so the
+        // daemon's "offline" word must not bury the auth error — that error is
+        // what renders the Log in button.
+        let state = Arc::new(AppState::default());
+        *state.auth_error.lock().unwrap() = Some("authentication failed".into());
+        *state.sync_state.lock().unwrap() =
+            SyncState::Error("authentication failed — re-login required".into());
+        assert_eq!(apply_state_word(&state, "offline"), None);
+        assert!(matches!(*state.sync_state.lock().unwrap(), SyncState::Error(_)));
+
+        // The auth error is emitted as an event without ever being stored, so the
+        // hold must not depend on the stored state already being an Error.
+        let fresh = Arc::new(AppState::default());
+        *fresh.auth_error.lock().unwrap() = Some("authentication failed".into());
+        assert_eq!(apply_state_word(&fresh, "offline"), None);
+        assert_eq!(*fresh.sync_state.lock().unwrap(), SyncState::Idle);
+    }
+
+    #[test]
+    fn offline_survives_the_ipc_word_round_trip() {
+        // Attach mode mirrors an external daemon: the state word it sends must
+        // decode back to Offline, not fall through to the Idle default.
+        let state = Arc::new(AppState::default());
+        assert_eq!(
+            apply_state_word(&state, &SyncState::Offline.to_string()),
+            Some(SyncState::Offline)
+        );
     }
 }

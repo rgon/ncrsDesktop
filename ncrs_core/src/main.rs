@@ -132,7 +132,7 @@ fn main() {
         opts.auto_keep_locally_modified_files = true;
     }
 
-    if let Err(e) = ncrs_core::mount_ncfs(opts, None, None, None, None, None) {
+    if let Err(e) = ncrs_core::mount_ncfs(opts, None, None, None, None, None, None) {
         eprintln!("ncrs: {}", e);
         std::process::exit(1);
     }

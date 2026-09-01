@@ -462,26 +462,39 @@ fn serialize_journal(journal: &crate::mutation_journal::SharedJournal) -> (Strin
     (journal_entries_json(&j), conflicts_json(&j))
 }
 
+/// The daemon-wide state word, shared by the STATE verb and the pushed snapshot.
+///
+/// Pause wins: it is the user's own decision, and it stops sync whether or not
+/// the server is up. A settled outage comes next — with the server unreachable
+/// nothing works, so reporting the queued transfers as "syncing" would claim
+/// progress that cannot happen. `settled` (not the raw flag) is what keeps a
+/// two-second blip from flashing a failure at the user.
+fn state_word(paused: &AtomicBool, offline: &crate::OfflineStatus, active: bool) -> &'static str {
+    if paused.load(Ordering::Relaxed) {
+        "paused"
+    } else if offline.settled() {
+        "offline"
+    } else if active {
+        "syncing"
+    } else {
+        "idle"
+    }
+}
+
 /// The cheap (non-journal) snapshot fields: the STATE word, the errors and
 /// transfers JSON, and whether any transfer is active. Locks `transfer_map` and
 /// `error_log` once each. Cheap to recompute every monitor tick, unlike the
 /// journal, so it needs no version cache.
 fn collect_cheap_fields(
     paused: &AtomicBool,
+    offline: &crate::OfflineStatus,
     transfer_map: &crate::TransferMap,
     error_log: &crate::ErrorLog,
 ) -> (&'static str, String, String, bool) {
     let transfers: Vec<crate::TransferProgress> =
         transfer_map.safe_lock().values().cloned().collect();
     let active = !transfers.is_empty();
-    // Same derivation the STATE verb uses: pause wins, then transfer activity.
-    let state = if paused.load(Ordering::Relaxed) {
-        "paused"
-    } else if active {
-        "syncing"
-    } else {
-        "idle"
-    };
+    let state = state_word(paused, offline, active);
     let errors: Vec<crate::SyncError> = error_log.safe_lock().iter().cloned().collect();
     (
         state,
@@ -511,13 +524,14 @@ fn format_snapshot(
 /// one-shot initial send to a new subscriber; the monitor loop caches instead.
 fn build_state_snapshot(
     paused: &AtomicBool,
+    offline: &crate::OfflineStatus,
     transfer_map: &crate::TransferMap,
     error_log: &crate::ErrorLog,
     journal: &crate::mutation_journal::SharedJournal,
 ) -> String {
     let (journal_json, conflicts_json) = serialize_journal(journal);
     let (state, errors_json, transfers_json, _active) =
-        collect_cheap_fields(paused, transfer_map, error_log);
+        collect_cheap_fields(paused, offline, transfer_map, error_log);
     format_snapshot(state, &errors_json, &transfers_json, &journal_json, &conflicts_json)
 }
 
@@ -530,6 +544,7 @@ fn build_state_snapshot(
 fn spawn_state_monitor(
     push: Arc<StatePush>,
     paused: Arc<AtomicBool>,
+    offline: crate::OfflineStatus,
     transfer_map: crate::TransferMap,
     error_log: crate::ErrorLog,
     journal: crate::mutation_journal::SharedJournal,
@@ -551,7 +566,7 @@ fn spawn_state_monitor(
                 cached_version = version;
             }
             let (state, errors_json, transfers_json, active) =
-                collect_cheap_fields(&paused, &transfer_map, &error_log);
+                collect_cheap_fields(&paused, &offline, &transfer_map, &error_log);
             if journal_changed
                 || state != last_state
                 || errors_json != last_errors_json
@@ -580,7 +595,7 @@ fn spawn_state_monitor(
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, children_map: ChildrenMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, purge_cb: Option<PurgeCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, children_map: ChildrenMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, purge_cb: Option<PurgeCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>, offline: crate::OfflineStatus) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -611,6 +626,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
     spawn_state_monitor(
         state_push.clone(),
         paused.clone(),
+        offline.clone(),
         transfer_map.clone(),
         error_log.clone(),
         journal.clone(),
@@ -652,11 +668,12 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let fcq = file_change_queue.clone();
             let sstats = storage_stats.clone();
             let pause_flag = paused.clone();
+            let offline_flag = offline.clone();
             let sp = state_push.clone();
             let active = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, pu, elog, tmap, jrnl, fcq, sstats, pause_flag, sp);
+                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, pu, elog, tmap, jrnl, fcq, sstats, pause_flag, offline_flag, sp);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -697,6 +714,7 @@ fn handle_client(
     file_change_queue: FileChangeQueue,
     storage_stats: SharedStorageStats,
     paused: Arc<AtomicBool>,
+    offline: crate::OfflineStatus,
     state_push: Arc<StatePush>,
 ) {
     let mut write_half = match stream.try_clone() {
@@ -720,7 +738,7 @@ fn handle_client(
                 return;
             }
             let mut last_gen = state_push.current_generation();
-            let initial = build_state_snapshot(&paused, &transfer_map, &error_log, &journal);
+            let initial = build_state_snapshot(&paused, &offline, &transfer_map, &error_log, &journal);
             if writeln!(write_half, "SNAP\t{}", initial).is_err() {
                 return;
             }
@@ -981,14 +999,8 @@ fn handle_client(
             let stats = storage_stats.safe_lock().clone();
             serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())
         } else if trimmed == "STATE" {
-            // Same derivation the GUI uses: pause wins, then transfer activity.
-            if paused.load(Ordering::Relaxed) {
-                "paused".to_string()
-            } else if !transfer_map.safe_lock().is_empty() {
-                "syncing".to_string()
-            } else {
-                "idle".to_string()
-            }
+            let active = !transfer_map.safe_lock().is_empty();
+            state_word(&paused, &offline, active).to_string()
         } else if trimmed == "PAUSE" {
             paused.store(true, Ordering::Relaxed);
             log::info!("sync paused via IPC");
@@ -1058,6 +1070,48 @@ mod tests {
             size,
             is_dir,
         }
+    }
+
+    // ── Daemon state word ────────────────────────────────────────────────────
+
+    #[test]
+    fn unreachable_server_reports_offline_not_syncing() {
+        // The bug: a server that is fully down was reported as a working sync
+        // path, so the GUI showed a partial-outage status while nothing worked.
+        let paused = AtomicBool::new(false);
+        let offline = crate::OfflineStatus::offline_for(Duration::from_secs(60));
+        assert_eq!(state_word(&paused, &offline, false), "offline");
+        // Queued transfers do not make it "syncing": they cannot progress.
+        assert_eq!(state_word(&paused, &offline, true), "offline");
+    }
+
+    #[test]
+    fn a_blip_does_not_flash_a_failure() {
+        // One failed request flips the offline flag eagerly and the connectivity
+        // monitor clears it within a 5s cycle. Reporting that instantly would
+        // strobe the tray red on every hiccup, so the word only changes once the
+        // outage outlives the grace window.
+        let paused = AtomicBool::new(false);
+        let blip = crate::OfflineStatus::offline_for(Duration::from_secs(1));
+        assert_eq!(state_word(&paused, &blip, false), "idle");
+        assert_eq!(state_word(&paused, &blip, true), "syncing");
+    }
+
+    #[test]
+    fn pause_outranks_offline() {
+        // Pause is the user's own decision and holds whether or not the server
+        // is up, so it must survive an outage rather than be relabelled.
+        let paused = AtomicBool::new(true);
+        let offline = crate::OfflineStatus::offline_for(Duration::from_secs(60));
+        assert_eq!(state_word(&paused, &offline, false), "paused");
+    }
+
+    #[test]
+    fn reachable_server_keeps_the_old_derivation() {
+        let paused = AtomicBool::new(false);
+        let online = crate::OfflineStatus::new();
+        assert_eq!(state_word(&paused, &online, true), "syncing");
+        assert_eq!(state_word(&paused, &online, false), "idle");
     }
 
     fn build_children(details: &HashMap<PathBuf, FileDetail>) -> HashMap<PathBuf, HashSet<PathBuf>> {

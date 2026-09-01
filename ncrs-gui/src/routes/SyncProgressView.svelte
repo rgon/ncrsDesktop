@@ -39,6 +39,9 @@
     const hasTransfers = $derived(transfers.length > 0);
 
     const dotClass = $derived(() => {
+        // Offline is checked before transfers: queued uploads are stalled, not
+        // progressing, so a spinning "syncing" dot would be a lie.
+        if (syncState === "offline") return "nc-dot nc-dot-error";
         if (hasTransfers || syncState === "syncing") return "nc-dot nc-dot-syncing";
         if (syncState === "paused") return "nc-dot nc-dot-paused";
         if (syncState === "unmounted" || syncState === "wiped" || syncState.startsWith("error:")) return "nc-dot nc-dot-error";
@@ -47,6 +50,7 @@
     });
 
     const statusLabel = $derived(() => {
+        if (syncState === "offline") return "Offline — server unreachable";
         if (hasTransfers) {
             const dl = transfers.filter(t => t.direction === "Download").length;
             const ul = transfers.filter(t => t.direction === "Upload").length;
