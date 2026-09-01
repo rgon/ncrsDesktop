@@ -36,8 +36,14 @@ We avoid local thumbnail generation so that entire files don't have to be downlo
 Download and install the .deb file from the [/releases](https://github.com/rgon/ncrsDesktop/releases) page. You may simply double click the `.deb` to install it with your OS's package manager.
 
 ### First-time setup
-You may directly set it up using the GUI, including 'Authorize Device'-type login from the web browser. But you may configure it -fully or partially- using the config file, which is especially useful for fleet deployment.
+You may directly set it up using the GUI, following the interactive 'Authorize Device'-type login from the web browser. 
 
+The recommended configuration options are the defaults. However, you may modify them via the cogwheel icon in the application menu.
+
+## Non-interactive setup
+`ncrs-gui` writes its configuration to a yaml file, for easy view and editing.
+
+You may edit this file to configure it non-interactively, which is especially useful for remote/fleet deployment.
 
 **Create the config file** — run the daemon once to generate the skeleton, then fill it in:
 ```sh
@@ -45,7 +51,7 @@ cargo run -p ncrs_core        # exits immediately, writes ~/.config/ncrs/config.
 nano ~/.config/ncrs/config.yaml
 ```
 
-The file looks like this; use an [app password](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) rather than your main password:
+The file looks like this. You shall use an [app password](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) rather than the user's main password:
 ```yaml
 url: https://cloud.example.com/remote.php/dav/files/YOUR_USERNAME/
 username: youruser
