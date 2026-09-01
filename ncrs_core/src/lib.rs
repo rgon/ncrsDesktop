@@ -993,10 +993,19 @@ impl FsCache {
         // Evict down to 90% so a cache sitting at the ceiling doesn't re-sort on
         // every single insert.
         let target = max - max / 10;
+        // Parents of files whose PUT is still in flight. Such an entry exists
+        // *only* in its parent's cached listing — the server does not have the
+        // file yet — so dropping that listing makes a file the user just created
+        // vanish until the upload finishes. `put_dir_cache` re-merges uploads
+        // from the old entry, which is exactly what eviction would destroy.
+        let upload_parents: HashSet<&Path> = self.uploading.iter()
+            .filter_map(|p| p.parent())
+            .collect();
         let mut candidates: Vec<(u64, PathBuf)> = self.dir_cache.iter()
             // Never evict a listing mid-refresh: its `refreshing` flag is the
             // interlock stopping a second concurrent PROPFIND for the same dir.
             .filter(|(_, e)| !e.refreshing)
+            .filter(|(p, _)| !upload_parents.contains(p.as_path()))
             .map(|(p, e)| (e.last_access.load(Ordering::Relaxed), p.clone()))
             .collect();
         candidates.sort_unstable_by_key(|(tick, _)| *tick);
@@ -1449,6 +1458,10 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
             max, total
         );
     }
+    // Oldest fetch first, because the insert loop below stamps each entry with
+    // the next access tick: restoring newest-first would hand the most recently
+    // used listings the *lowest* ticks and make them the first ones evicted.
+    entries.sort_unstable_by(|a, b| a.1.fetched_at.cmp(&b.1.fetched_at));
 
     let mut count = 0usize;
     for (k, v) in entries {
@@ -2348,6 +2361,29 @@ fn make_dir_attr(inode: u64) -> FileAttr {
     }
 }
 
+/// Attributes for a regular file we have no listing entry for. Used where the
+/// caller already knows the target is a file — reaching for `make_dir_attr`
+/// there would report S_IFDIR for a plain file.
+fn make_unknown_file_attr(inode: u64, size: u64) -> FileAttr {
+    FileAttr {
+        ino: INodeNo(inode),
+        size,
+        blocks: (size + 511) / 512,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::RegularFile,
+        perm: 0o644,
+        nlink: 1,
+        uid: proc_uid(),
+        gid: proc_gid(),
+        rdev: 0,
+        flags: 0,
+        blksize: 512,
+    }
+}
+
 fn root_attr() -> FileAttr {
     FileAttr {
         ino: INodeNo(1),
@@ -2421,6 +2457,15 @@ impl Drop for StreamActiveGuard {
     }
 }
 
+/// One open directory stream. `snapshot` is the listing the offset-0 page was
+/// built from, pinned for the life of the handle so the continuation pages the
+/// kernel asks for are paged out of exactly the vector their offsets index —
+/// even if the dir cache evicts or refreshes the listing in between.
+struct OpenDir {
+    path: PathBuf,
+    snapshot: Option<Arc<Vec<RemoteEntry>>>,
+}
+
 pub struct NextCloudFs {
     cache: Arc<Mutex<FsCache>>,
     status: StatusMap,
@@ -2431,6 +2476,7 @@ pub struct NextCloudFs {
     children_map: ipc::ChildrenMap,
     conn: Arc<ConnInfo>,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+    open_dirs: Arc<Mutex<HashMap<u64, OpenDir>>>,
     next_fh: Arc<Mutex<u64>>,
     error_log: ErrorLog,
     transfer_map: TransferMap,
@@ -2657,6 +2703,7 @@ impl NextCloudFs {
             children_map,
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
+            open_dirs: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
             error_log: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             transfer_map: Arc::new(Mutex::new(HashMap::new())),
@@ -2927,7 +2974,22 @@ impl DirReply {
 }
 
 impl NextCloudFs {
-    fn readdir_common(&self, ino: INodeNo, offset: u64, mut reply: DirReply) {
+    /// Cached listing for `dir`, re-listing once if it is not resident.
+    ///
+    /// The dir cache is bounded, so a listing an inode was handed out from can
+    /// be gone by the time the kernel asks about that inode again. Every caller
+    /// that used to treat a miss as "does not exist" has to re-list first.
+    fn relist_if_missing(&self, dir: &Path) -> Option<Arc<Vec<RemoteEntry>>> {
+        if let Some(files) = self.cache.safe_lock().get_cached_dir_readonly(dir) {
+            return Some(files);
+        }
+        if let Err(e) = get_or_list_dir(&self.conn, &self.cache, dir.to_path_buf(), None) {
+            log::debug!("relist {}: {}", dir.display(), e);
+        }
+        self.cache.safe_lock().get_cached_dir_readonly(dir)
+    }
+
+    fn readdir_common(&self, ino: INodeNo, fh: u64, offset: u64, mut reply: DirReply) {
         let (path, parent_ino) = {
             let c = self.cache.safe_lock();
             let path = match c.get_path(ino.0) {
@@ -2965,6 +3027,7 @@ impl NextCloudFs {
         let ghost_entries = self.ghost_entries.clone();
         let refresh_debounce = self.refresh_debounce.clone();
         let file_change_queue = self.file_change_queue.clone();
+        let open_dirs = self.open_dirs.clone();
 
         thread::spawn(move || {
             if offset == 0 {
@@ -2983,22 +3046,66 @@ impl NextCloudFs {
             // Continuation pages (offset > 0): serve directly from cache, skip all heavy work.
             if offset > 0 {
                 let skip = (offset - 2) as usize;
+                // Page out of the listing the offset-0 page was built from. The
+                // offsets the kernel is resuming index *that* vector, and the dir
+                // cache is bounded, so by now it may have been evicted or
+                // replaced by a refresh. Serving an empty page on a miss (what
+                // this did before) silently truncated the directory to whatever
+                // the first page had already delivered — the kernel reads an
+                // empty page as end-of-directory.
+                let pinned = {
+                    let od = open_dirs.safe_lock();
+                    od.get(&fh).filter(|d| d.path == path).and_then(|d| d.snapshot.clone())
+                };
+                let entries = match pinned {
+                    Some(e) => Some(e),
+                    // No pinned snapshot (a handle whose offset-0 page we never
+                    // served, e.g. after a rewinddir): fall back to the cache,
+                    // re-listing if it is gone.
+                    None => match cache.safe_lock().get_cached_dir_readonly(&path) {
+                        Some(e) => Some(e),
+                        None => match get_or_list_dir(&conn, &cache, path.clone(), None) {
+                            Ok((files, _)) => Some(files),
+                            Err(e) => {
+                                log::warn!("readdir continuation {}: {}", path.display(), e);
+                                None
+                            }
+                        },
+                    },
+                };
                 // Collect under a short lock, then reply outside it so concurrent
                 // getattr/lookup calls aren't blocked while the kernel drains pages.
-                let rows: Vec<(INodeNo, u64, FileType, String, FileAttr)> = {
-                    let c = cache.safe_lock();
-                    match c.get_cached_dir_readonly(&path) {
-                        Some(entries) => entries.iter().enumerate().skip(skip).filter_map(|(i, entry)| {
-                            let name = entry.path.file_name().and_then(|n| n.to_str())?.to_string();
-                            let entry_path = path.join(&name);
-                            if entry.is_dir && exclude_folders.contains(&entry_path) { return None; }
-                            let ino = c.get_inode(&entry_path).unwrap_or(1);
-                            let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                            let attr = make_file_attr(ino, entry);
-                            Some((INodeNo(ino), (i + 3) as u64, kind, name, attr))
-                        }).collect(),
-                        None => vec![],
+                let rows: Vec<(INodeNo, u64, FileType, String, FileAttr)> = match entries {
+                    Some(entries) => {
+                        let mut c = cache.safe_lock();
+                        // Filtered then enumerated, so the indices match the
+                        // offset-0 page's — it enumerates a listing the GIO temps
+                        // have already been dropped from.
+                        entries.iter()
+                            .filter(|e| {
+                                let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                !is_gio_temp_file(name)
+                            })
+                            .enumerate()
+                            .skip(skip)
+                            .filter_map(|(i, entry)| {
+                                let name = entry.path.file_name().and_then(|n| n.to_str())?.to_string();
+                                let entry_path = path.join(&name);
+                                if entry.is_dir && exclude_folders.contains(&entry_path) { return None; }
+                                // Allocate rather than `get_inode(..).unwrap_or(1)`:
+                                // inodes are assigned on demand, and a page served
+                                // without its offset-0 leg (a re-list after
+                                // eviction) can be the first to name these paths.
+                                // Falling back to 1 would hand the kernel the root
+                                // inode for a child entry.
+                                let ino = c.allocate_inode(entry_path.clone());
+                                let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
+                                let attr = make_file_attr(ino, entry);
+                                Some((INodeNo(ino), (i + 3) as u64, kind, name, attr))
+                            })
+                            .collect()
                     }
+                    None => vec![],
                 };
                 for (ino, off, kind, name, attr) in rows {
                     if reply.add(ino, off, kind, &name, &attr) { break; }
@@ -3056,13 +3163,24 @@ impl NextCloudFs {
                             });
                         }
                     }
-                    let entries: Vec<RemoteEntry> = entries.iter()
+                    let entries: Arc<Vec<RemoteEntry>> = Arc::new(entries.iter()
                         .filter(|e| {
                             let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                             !is_gio_temp_file(name)
                         })
                         .cloned()
-                        .collect();
+                        .collect());
+                    // Pin it to this handle: the kernel will come back for the
+                    // rest of the listing at offsets that index this exact
+                    // vector, and nothing else keeps it alive.
+                    {
+                        let mut od = open_dirs.safe_lock();
+                        if let Some(d) = od.get_mut(&fh) {
+                            if d.path == path {
+                                d.snapshot = Some(Arc::clone(&entries));
+                            }
+                        }
+                    }
 
                     // Kick off background PROPFINDs for child dirs (opt-in via
                     // aggressive_prefetch; off by default until the serialisation
@@ -3446,21 +3564,37 @@ impl Filesystem for NextCloudFs {
         let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
 
-        let entries = {
+        let cached = {
             let c = self.cache.safe_lock();
             match c.get_cached_dir_readonly(&parent) {
-                Some(files) => files,
+                Some(files) => Some(files),
                 None => {
                     if c.dir_cache.contains_key(&path) || path == Path::new("/") {
                         drop(c);
                         reply.attr(&TTL, &make_dir_attr(ino.0));
-                    } else {
-                        reply.error(Errno::ENOENT);
+                        return;
                     }
-                    return;
+                    None
                 }
             }
             // Arc is cloned by get_cached_dir_readonly; guard drops here.
+        };
+        // A missing parent listing does not mean the file is gone: the dir cache
+        // is bounded, so the listing this inode was born from may simply have
+        // been evicted. Re-list before answering — `lookup` does the same.
+        // Reporting ENOENT here instead made a directory whose parent had aged
+        // out fail every stat(), which a file manager renders as an empty folder.
+        let entries = match cached {
+            Some(files) => files,
+            None => {
+                if let Err(e) = get_or_list_dir(&self.conn, &self.cache, parent.clone(), None) {
+                    log::debug!("getattr: re-list {} failed: {}", parent.display(), e);
+                }
+                match self.cache.safe_lock().get_cached_dir_readonly(&parent) {
+                    Some(files) => files,
+                    None => { reply.error(Errno::ENOENT); return; }
+                }
+            }
         };
 
         for entry in entries.iter() {
@@ -3483,7 +3617,10 @@ impl Filesystem for NextCloudFs {
         };
         let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        let entries = match self.cache.safe_lock().get_cached_dir_readonly(&parent) {
+        // An evicted parent listing must not turn into ENODATA: without
+        // user.xdg.mime.type GLib falls back to magic-byte sniffing, which
+        // downloads the file just to identify it.
+        let entries = match self.relist_if_missing(&parent) {
             Some(e) => e,
             None => { reply.error(Errno::ENODATA); return; }
         };
@@ -3512,7 +3649,7 @@ impl Filesystem for NextCloudFs {
         };
         let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        let entries = match self.cache.safe_lock().get_cached_dir_readonly(&parent) {
+        let entries = match self.relist_if_missing(&parent) {
             Some(e) => e,
             None => { if size == 0 { reply.size(0); } else { reply.data(b""); } return; }
         };
@@ -4199,12 +4336,32 @@ impl Filesystem for NextCloudFs {
         reply.ok();
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, reply: ReplyDirectory) {
-        self.readdir_common(ino, offset, DirReply::Plain(reply));
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let path = match self.cache.safe_lock().get_path(ino.0) {
+            Some(p) => p,
+            None => { reply.error(Errno::ENOENT); return; }
+        };
+        let fh = {
+            let mut n = self.next_fh.safe_lock();
+            let fh = *n;
+            *n += 1;
+            fh
+        };
+        self.open_dirs.safe_lock().insert(fh, OpenDir { path, snapshot: None });
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
-    fn readdirplus(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, reply: ReplyDirectoryPlus) {
-        self.readdir_common(ino, offset, DirReply::Plus(reply));
+    fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+        self.open_dirs.safe_lock().remove(&fh.0);
+        reply.ok();
+    }
+
+    fn readdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectory) {
+        self.readdir_common(ino, fh.0, offset, DirReply::Plain(reply));
+    }
+
+    fn readdirplus(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectoryPlus) {
+        self.readdir_common(ino, fh.0, offset, DirReply::Plus(reply));
     }
 
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
@@ -4274,18 +4431,29 @@ impl Filesystem for NextCloudFs {
                     of.dirty = true;
                 }
             }
-            let c = self.cache.safe_lock();
-            let path = c.get_path(ino.0);
-            let entry = path.as_ref().and_then(|p| {
+            let path = self.cache.safe_lock().get_path(ino.0);
+            let lookup_entry = |p: &Path| -> Option<RemoteEntry> {
                 let parent = p.parent().unwrap_or(Path::new("/")).to_path_buf();
-                c.get_cached_dir_readonly(&parent).and_then(|files| {
-                    files.iter().find(|e| e.path == **p).cloned()
+                self.cache.safe_lock().get_cached_dir_readonly(&parent)
+                    .and_then(|files| files.iter().find(|e| e.path == *p).cloned())
+            };
+            let entry = path.as_ref().and_then(|p| {
+                // The parent listing can have been evicted since this inode was
+                // handed out; re-list rather than answer from nothing.
+                lookup_entry(p).or_else(|| {
+                    let parent = p.parent().unwrap_or(Path::new("/")).to_path_buf();
+                    if let Err(e) = get_or_list_dir(&self.conn, &self.cache, parent.clone(), None) {
+                        log::debug!("setattr: re-list {} failed: {}", parent.display(), e);
+                    }
+                    lookup_entry(p)
                 })
             });
-            drop(c);
             let mut attr = match entry {
                 Some(ref e) => make_file_attr(ino.0, e),
-                None => make_dir_attr(ino.0),
+                // This branch only runs for a size change, i.e. a truncate of a
+                // regular file: a directory attr here would tell the writer its
+                // own file is a directory.
+                None => make_unknown_file_attr(ino.0, new_size),
             };
             attr.size = new_size;
             reply.attr(&TTL, &attr);

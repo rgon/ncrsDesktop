@@ -1315,6 +1315,73 @@
     }
 
     #[test]
+    fn a_dir_holding_a_pending_upload_is_never_evicted() {
+        // A file whose PUT is still in flight exists *only* in its parent's
+        // cached listing — the server does not have it yet. Evicting that
+        // listing makes the file the user just created disappear, and
+        // put_dir_cache's upload re-merge has nothing left to merge from.
+        let mut c = make_test_cache();
+        c.dir_cache_max_dirs = 0;
+        for i in 0..12 {
+            let (d, f) = dir_with(&format!("d{i}"), 1);
+            c.put_dir_cache(d, None, None, f);
+        }
+        let pinned = PathBuf::from("/d0");
+        c.uploading.insert(pinned.join("d0-0.txt"));
+
+        c.dir_cache_max_dirs = 4;
+        let (d, f) = dir_with("fresh", 1);
+        c.put_dir_cache(d, None, None, f);
+
+        assert!(c.dir_cache.contains_key(&pinned), "a dir with an in-flight upload must be kept");
+        assert!(c.dir_cache.len() <= 5, "the rest must still be evicted, got {}", c.dir_cache.len());
+    }
+
+    #[test]
+    fn a_restored_cache_evicts_the_oldest_listing_first() {
+        // load_dir_cache stamps every restored listing with the next access tick,
+        // so the order it inserts them in *is* their LRU order. Inserting
+        // newest-first would hand the newest listing the lowest tick and make it
+        // the first eviction candidate after a restart.
+        let dir = std::env::temp_dir().join(format!("ncrs-test-lru-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut seed = make_test_cache();
+        seed.cache_dir = dir.clone();
+        for i in 0..6 {
+            let (d, f) = dir_with(&format!("d{i}"), 1);
+            seed.put_dir_cache(d, None, None, f);
+        }
+        // Distinct fetch times: /d0 oldest … /d5 newest.
+        for i in 0..6u64 {
+            let e = seed.dir_cache.get_mut(&PathBuf::from(format!("/d{i}"))).unwrap();
+            e.fetched_at = UNIX_EPOCH + Duration::from_secs(1_000_000 + i * 60);
+        }
+        let seed = Mutex::new(seed);
+        save_dir_cache_now(&seed);
+
+        let mut restored = make_test_cache();
+        restored.cache_dir = dir.clone();
+        let restored = Mutex::new(restored);
+        load_dir_cache(&restored);
+
+        let mut c = restored.safe_lock();
+        assert_eq!(c.dir_cache.len(), 6, "all six listings must come back");
+        // Force one eviction pass without anything having been accessed since.
+        c.dir_cache_max_dirs = 5;
+        let (d, f) = dir_with("fresh", 1);
+        c.put_dir_cache(d, None, None, f);
+
+        assert!(c.dir_cache.contains_key(&PathBuf::from("/d5")),
+            "the most recently fetched listing must outlive the oldest");
+        assert!(!c.dir_cache.contains_key(&PathBuf::from("/d0")),
+            "the oldest restored listing is the first to go");
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_refreshing_dir_is_never_evicted() {
         // `refreshing` is the interlock preventing a second concurrent PROPFIND
         // for the same directory; dropping the entry would lose it.
