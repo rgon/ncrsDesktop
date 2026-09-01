@@ -1774,11 +1774,23 @@ fn list_dir_cached_or_fresh(
     dir_maps: Option<DirDetailArcs>,
 ) -> Result<(Arc<Vec<RemoteEntry>>, Option<RemoteEntry>), String> {
     if conn.is_offline.load(Ordering::Relaxed) {
-        let c = cache.safe_lock();
-        if let Some(entry) = c.dir_cache.get(&path) {
-            return Ok((Arc::clone(&entry.files), entry.self_entry.clone()));
+        {
+            let c = cache.safe_lock();
+            if let Some(entry) = c.dir_cache.get(&path) {
+                return Ok((Arc::clone(&entry.files), entry.self_entry.clone()));
+            }
         }
-        return Err(format!("{} not available offline", path.display()));
+        // Not cached, so failing here renders the directory empty in a file
+        // manager. The offline flag flips on a single failed probe (a QUIC-only
+        // network path does this routinely before the HTTP/2 demotion kicks in),
+        // and the connectivity monitor usually clears it within seconds — give
+        // this listing the same blip grace a read gets instead of trusting a
+        // flag that may already be stale. A sustained outage still fails fast:
+        // past the grace window wait_out_offline_blip returns immediately.
+        if !wait_out_offline_blip(conn) {
+            return Err(format!("{} not available offline", path.display()));
+        }
+        // Back online — fall through to a real listing.
     }
     let t0 = Instant::now();
     let ttl = effective_dir_ttl(conn.optimistic_listing, &conn.notify_push_connected);
@@ -5764,6 +5776,13 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                     let mut slept = Duration::ZERO;
                     while slept < interval {
                         if shutdown_monitor.load(Ordering::Relaxed) { break; }
+                        // A failed read flips the flag eagerly, between probes. Cut the
+                        // online-cadence sleep short so the 5s offline cadence starts when
+                        // the daemon *became* offline, not when this loop would next look:
+                        // snoozing out the rest of a 30s interval eats the whole
+                        // OFFLINE_READ_GRACE window, and every read and uncached listing
+                        // waiting out the blip then times out before the first re-probe.
+                        if !currently_offline && offline.load(Ordering::Relaxed) { break; }
                         thread::sleep(Duration::from_secs(1));
                         slept += Duration::from_secs(1);
                     }

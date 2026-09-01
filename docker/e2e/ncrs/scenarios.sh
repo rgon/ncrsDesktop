@@ -638,6 +638,58 @@ else
         || no "orphaned write never reached the backend (data loss)"
 fi
 
+echo "→ 21. CONNECTIVITY BLIP — uncached dir lists after the blip instead of appearing empty"
+# Reproduces the field report (2026-09-01): a momentary outage (a QUIC-only path
+# before the HTTP/2 demotion, a Wi-Fi roam) flips the daemon offline; a directory
+# whose listing is not in the bounded dir cache then errored instantly, which a
+# file manager renders as a folder with 0 items — and caches. An uncached listing
+# arriving inside the offline grace window must wait the blip out and then really
+# list. Setup: mkdir through the mount patches only the PARENT's cached listing,
+# so the new dir is visible while its own listing stays uncached; the file inside
+# it is created backend-side so only a real PROPFIND can ever return it.
+BLIPDIR="blipdir-$(date +%s%N)"
+mkdir "$MOUNT/$BLIPDIR"
+blip_ready=1
+for _ in $(seq 1 60); do
+    [ "$(dav_code "$BLIPDIR/")" != "404" ] && { blip_ready=0; break; }
+    sleep 1
+done
+printf 'blip payload' > /tmp/blip.txt
+curl -s -u "$U:$P" -T /tmp/blip.txt "${URL}${BLIPDIR}/blip.txt" -o /dev/null
+if [ "$blip_ready" -ne 0 ] || [ "$(dav_code "$BLIPDIR/blip.txt")" = "404" ]; then
+    no "scenario 21 setup failed (MKCOL or backend PUT never landed)"
+else
+    # An uncached file whose failed read flips the offline flag eagerly (same
+    # trick as scenario 17); server_down RSTs so the flip is near-instant and
+    # the grace window opens at a known moment.
+    BF="blipflip-$(date +%s%N)"
+    printf '%s' "$BF" > "$MOUNT/bflip21.txt"; WBF="$(printf '%s' "$BF" | sha)"
+    wait_dav_sha bflip21.txt "$WBF" 90
+    ls "$MOUNT" >/dev/null 2>&1; sleep 2   # drop staging so the read must hit the network
+
+    server_down
+    # The failed read flips the offline flag ~2-3s in (after its RST retries) and
+    # then blocks out its OWN 15s read grace — so it must run in the background:
+    # waiting for it to return would consume the entire offline grace window
+    # before the listing under test even starts.
+    timeout 30 cat "$MOUNT/bflip21.txt" >/dev/null 2>&1 &
+    FLIP21=$!
+    sleep 4                       # flag is set by now; the grace window is freshly opened
+    ( sleep 3; server_up ) &
+    UNBLIP=$!
+    t0=$(date +%s)
+    LS_BLIP="$(timeout 40 ls "$MOUNT/$BLIPDIR" 2>/dev/null)"; rc=$?
+    eb=$(( $(date +%s) - t0 ))
+    kill "$FLIP21" 2>/dev/null; wait "$FLIP21" 2>/dev/null
+    wait "$UNBLIP" 2>/dev/null || true
+    if [ "$rc" -eq 0 ] && printf '%s\n' "$LS_BLIP" | grep -qx 'blip.txt'; then
+        ok "uncached dir listed through a connectivity blip (waited ${eb}s, not \"0 items\")"
+    else
+        no "uncached dir failed across a blip (rc=$rc after ${eb}s: [$LS_BLIP]) — renders as an empty folder"
+    fi
+    sleep 3   # let the monitor settle online before the suite ends
+fi
+
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
