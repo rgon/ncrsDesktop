@@ -139,7 +139,7 @@ pub fn to_data_uri(content_type: &str, bytes: &[u8]) -> Option<String> {
 /// Failures are deliberately quiet — a missing icon is cosmetic, and the GUI
 /// already renders nothing when the field is empty.
 pub fn inline_asset(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base: &str,
     creds: &crate::auth::Credentials,
     raw_url: &str,
@@ -213,14 +213,17 @@ fn remember(url: &str, value: Option<String>) {
 /// Shared client for asset fetches, mirroring `notifications::client`: building
 /// one per call would spawn a tokio thread and a fresh rustls root store each
 /// time.
-fn asset_client() -> &'static reqwest::blocking::Client {
+fn asset_client() -> crate::http_clients::DavClient {
     static C: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
-    C.get_or_init(|| {
+    let raw = C.get_or_init(|| {
         reqwest::blocking::Client::builder()
             .timeout(ASSET_TIMEOUT)
             .build()
             .expect("reqwest client")
-    })
+    });
+    // Plain TCP: one-off asset fetches gain nothing from QUIC and this keeps
+    // the avatar path independent of the transport experiment entirely.
+    crate::http_clients::DavClient::new(raw.clone(), false)
 }
 
 /// Fetches the account's avatar as a `data:` URI.
@@ -241,7 +244,7 @@ pub fn avatar_data_uri(
         percent_encoding::NON_ALPHANUMERIC,
     );
     let url = format!("{}/index.php/avatar/{}/{}", base_url.trim_end_matches('/'), encoded, size);
-    let inlined = inline_asset(asset_client(), base_url, creds, &url);
+    let inlined = inline_asset(&asset_client(), base_url, creds, &url);
     if inlined.is_empty() { None } else { Some(inlined) }
 }
 

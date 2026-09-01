@@ -147,7 +147,7 @@ pub(crate) fn validate_endpoint(
 }
 
 pub(crate) fn discover_endpoints(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base_url: &str,
     creds: &crate::auth::Credentials,
 ) -> Result<NotifyPushInfo, String> {
@@ -189,7 +189,7 @@ pub(crate) fn discover_endpoints(
 const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) fn fetch_pre_auth_ticket(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     pre_auth_url: &str,
     base_url: &str,
     creds: &crate::auth::Credentials,

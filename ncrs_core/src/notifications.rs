@@ -61,18 +61,21 @@ pub fn base_url(webdav_url: &str) -> String {
 /// `fetch_notifications` polls every ~30s for the life of the daemon, and each
 /// `build()` would spawn a tokio runtime thread, a fresh rustls root store and —
 /// with http3 — a new QUIC endpoint/UDP socket.
-fn client(http3: bool) -> &'static reqwest::blocking::Client {
+fn client(http3: bool) -> crate::http_clients::DavClient {
     static H3: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     static H2: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     let cell = if http3 { &H3 } else { &H2 };
-    cell.get_or_init(|| {
+    let raw = cell.get_or_init(|| {
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(API_TIMEOUT);
         if http3 {
             builder = builder.http3_prior_knowledge();
         }
         builder.build().expect("reqwest client")
-    })
+    });
+    // Stamp HTTP/3 requests with their version: reqwest routes a request to
+    // the QUIC connector only when the request itself says Version::HTTP_3.
+    crate::http_clients::DavClient::new(raw.clone(), http3)
 }
 
 pub fn fetch_notifications(
@@ -106,7 +109,7 @@ pub fn fetch_notifications(
     // server could point the webview at any host it liked. Pin it to the server.
     let notifications = ocs.ocs.data.into_iter()
         .map(|mut n| {
-            n.icon = crate::asset_url::inline_asset(client(http3), base, creds, &n.icon);
+            n.icon = crate::asset_url::inline_asset(&client(http3), base, creds, &n.icon);
             n
         })
         .collect();

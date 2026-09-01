@@ -122,3 +122,24 @@ set or server configuration.
   these work for the specific extensions patched, but require manual
   maintenance for every new unusual extension a user encounters, and provide
   no protection for files with no extension at all.
+
+## 3. reqwest `http3_prior_knowledge()` does not actually send HTTP/3
+
+In reqwest 0.13, `ClientBuilder::http3_prior_knowledge()` only *builds* the QUIC
+connector. A request is routed to it solely when the request itself carries
+`Version::HTTP_3`; anything else silently rides TCP — and since the h3
+preference sets no ALPN on that TCP path, the "HTTP/3 client" actually speaks
+HTTP/1.1. The daemon shipped that way for months: every request was h1, and the
+"HTTP/3 unusable" demotions were two TCP probes racing an ordinary network blip.
+
+All requests therefore go through `http_clients::DavClient`, which stamps
+`Version::HTTP_3` while HTTP/3 is active. Never hand out a raw
+`reqwest::blocking::Client` for server traffic. Two more h3 surprises the
+wrapper's construction accounts for (see `build_pair` in `lib.rs`): the h3 pool
+ignores `pool_max_idle_per_host`, and `connect_timeout` never reaches the QUIC
+connector — the read client's fresh-connect / fail-fast guarantees have to be
+rebuilt with `pool_idle_timeout` + `http3_max_idle_timeout`.
+
+`ncrs_core/examples/h3probe.rs` probes a server end-to-end (`--v3` for real
+HTTP/3, sleeps to cross idle boundaries) and prints the negotiated version —
+use it before blaming the server or the network.

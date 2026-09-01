@@ -73,17 +73,20 @@ struct OcsSearchResponse {
 /// Cached per HTTP/3 variant: rebuilding spawns a tokio runtime thread, a fresh
 /// rustls root store and — with http3 — a new QUIC endpoint, which `search_all`
 /// would otherwise pay once per provider on every keystroke-driven search.
-fn client(http3: bool) -> &'static reqwest::blocking::Client {
+fn client(http3: bool) -> crate::http_clients::DavClient {
     static H3: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     static H2: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     let cell = if http3 { &H3 } else { &H2 };
-    cell.get_or_init(|| {
+    let raw = cell.get_or_init(|| {
         let mut b = reqwest::blocking::Client::builder().timeout(API_TIMEOUT);
         if http3 {
             b = b.http3_prior_knowledge();
         }
         b.build().expect("reqwest client")
-    })
+    });
+    // Stamp HTTP/3 requests with their version: reqwest routes a request to
+    // the QUIC connector only when the request itself says Version::HTTP_3.
+    crate::http_clients::DavClient::new(raw.clone(), http3)
 }
 
 fn decode_pct(s: &str) -> String {
@@ -131,7 +134,7 @@ pub fn fetch_providers(
     // server strings.
     let providers = ocs.ocs.data.into_iter()
         .map(|mut p| {
-            p.icon = crate::asset_url::inline_asset(client(http3), base, creds, &p.icon);
+            p.icon = crate::asset_url::inline_asset(&client(http3), base, creds, &p.icon);
             p
         })
         .collect();
@@ -214,7 +217,7 @@ pub fn search_filtered(
                                     // provider almost always share one icon, so
                                     // this is one request per provider, cached.
                                     e.icon = crate::asset_url::inline_asset(
-                                        client(http3), base, creds, &e.icon,
+                                        &client(http3), base, creds, &e.icon,
                                     );
                                     // Not rendered by the GUI today. Kept
                                     // origin-pinned rather than inlined because

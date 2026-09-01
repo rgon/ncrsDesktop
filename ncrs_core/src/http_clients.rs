@@ -30,6 +30,63 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// QUIC back on its own.
 const H3_DEMOTION_RETRY: Duration = Duration::from_secs(7 * 24 * 3600);
 
+/// A request-building handle that stamps the HTTP version its transport needs
+/// onto every request built through it.
+///
+/// reqwest 0.13's `http3_prior_knowledge()` only *builds* the QUIC connector:
+/// a request is routed to it solely when the request itself carries
+/// `Version::HTTP_3`. Without the stamp every request silently rides TCP —
+/// and with the h3 preference reqwest sets no ALPN on that TCP path, so the
+/// "HTTP/3 client" actually speaks HTTP/1.1. This wrapper is what makes the
+/// configured transport real, and it exposes the same builder surface as
+/// `reqwest::blocking::Client` so call sites read identically.
+#[derive(Clone)]
+pub struct DavClient {
+    client: reqwest::blocking::Client,
+    version: Option<reqwest::Version>,
+}
+
+impl DavClient {
+    fn stamp(&self, rb: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+        match self.version {
+            Some(v) => rb.version(v),
+            None => rb,
+        }
+    }
+
+    pub fn get<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::blocking::RequestBuilder {
+        self.stamp(self.client.get(url))
+    }
+
+    pub fn post<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::blocking::RequestBuilder {
+        self.stamp(self.client.post(url))
+    }
+
+    pub fn put<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::blocking::RequestBuilder {
+        self.stamp(self.client.put(url))
+    }
+
+    pub fn delete<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::blocking::RequestBuilder {
+        self.stamp(self.client.delete(url))
+    }
+
+    pub fn request<U: reqwest::IntoUrl>(&self, method: reqwest::Method, url: U) -> reqwest::blocking::RequestBuilder {
+        self.stamp(self.client.request(method, url))
+    }
+
+    /// `h3 = true` stamps every request with `Version::HTTP_3`; false builds
+    /// plain TCP requests. For client sets managed outside [`HttpClients`]
+    /// (the notifications and search side-clients).
+    pub fn new(client: reqwest::blocking::Client, h3: bool) -> Self {
+        DavClient { client, version: h3.then_some(reqwest::Version::HTTP_3) }
+    }
+
+    /// True when requests built through this handle go out over QUIC.
+    pub fn is_h3(&self) -> bool {
+        self.version == Some(reqwest::Version::HTTP_3)
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpClients {
     /// Preferred clients: HTTP/3 when configured, otherwise clones of the
@@ -72,8 +129,7 @@ impl HttpClients {
                 self.demoted.store(true, Ordering::Relaxed);
                 let retry_in = H3_DEMOTION_RETRY - age;
                 log::info!(
-                    "HTTP/3 was found unusable on this network {}h ago — starting on HTTP/2 \
-                     (retrying HTTP/3 in ~{}h; delete {} or set `http3: false` to decide manually)",
+                    "HTTP/3 was found unusable on this network {}h ago — starting on HTTP/2                      (retrying HTTP/3 in ~{}h; delete {} or set `http3: false` to decide manually)",
                     age.as_secs() / 3600,
                     retry_in.as_secs() / 3600,
                     path.display()
@@ -89,20 +145,34 @@ impl HttpClients {
         self
     }
 
+    /// The version requests must carry for the preferred transport, while it
+    /// is the active one.
+    fn pref_version(&self) -> Option<reqwest::Version> {
+        if self.http3_active() { Some(reqwest::Version::HTTP_3) } else { None }
+    }
+
     /// The metadata/write client every caller should use.
-    pub fn get(&self) -> &reqwest::blocking::Client {
-        if self.demoted.load(Ordering::Relaxed) { &self.h2 } else { &self.pref }
+    pub fn get(&self) -> DavClient {
+        if self.demoted.load(Ordering::Relaxed) {
+            DavClient { client: self.h2.clone(), version: None }
+        } else {
+            DavClient { client: self.pref.clone(), version: self.pref_version() }
+        }
     }
 
     /// The read client, which deliberately keeps no idle pool (see the comment
     /// at its construction in `lib.rs`).
-    pub fn read(&self) -> &reqwest::blocking::Client {
-        if self.demoted.load(Ordering::Relaxed) { &self.read_h2 } else { &self.read_pref }
+    pub fn read(&self) -> DavClient {
+        if self.demoted.load(Ordering::Relaxed) {
+            DavClient { client: self.read_h2.clone(), version: None }
+        } else {
+            DavClient { client: self.read_pref.clone(), version: self.pref_version() }
+        }
     }
 
     /// The HTTP/2 client, for the probe that decides whether to demote.
-    pub fn h2(&self) -> &reqwest::blocking::Client {
-        &self.h2
+    pub fn h2(&self) -> DavClient {
+        DavClient { client: self.h2.clone(), version: None }
     }
 
     /// True while requests still go out over QUIC — i.e. HTTP/3 is configured

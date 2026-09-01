@@ -54,10 +54,10 @@ fn main() {
     println!("xdg:        {} (exists={})", xdg.display(), xdg.exists());
 
     // Build an HTTP client (no HTTP/3 for simplicity)
-    let client = reqwest::blocking::Client::builder()
+    let client = ncrs_core::http_clients::DavClient::new(reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .expect("build client");
+        .expect("build client"), false);
 
     // ── PROPFIND parent to get fileid and has_preview ────────────────────────
     let parent = remote.parent().unwrap_or(Path::new("/"));
@@ -163,7 +163,7 @@ fn strip_username_from_path<'a>(path: &'a str, username: &str) -> &'a str {
 }
 
 fn probe_api(
-    client: &reqwest::blocking::Client,
+    client: &ncrs_core::http_clients::DavClient,
     base: &str,
     creds: &ncrs_core::auth::Credentials,
     remote_path: &str,

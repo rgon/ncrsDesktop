@@ -2628,7 +2628,17 @@ impl NextCloudFs {
                 .connect_timeout(CONNECT_TIMEOUT);
             if http3 {
                 meta = meta.http3_prior_knowledge();
-                read = read.http3_prior_knowledge();
+                // The h3 pool ignores pool_max_idle_per_host and connect_timeout
+                // never reaches the QUIC connector, so the read client's two
+                // load-bearing guarantees above — every foreground read connects
+                // fresh, and a dead path surfaces in seconds, not DOWNLOAD_TIMEOUT
+                // — are silently void over QUIC. Restore them with the knobs h3
+                // does have: a 1s pool idle (a burst still reuses; anything older
+                // redials) and a 5s QUIC idle/handshake timeout to match the TCP
+                // connect_timeout's fail-fast bound.
+                read = read.http3_prior_knowledge()
+                    .pool_idle_timeout(Duration::from_secs(1))
+                    .http3_max_idle_timeout(Duration::from_secs(5));
             }
             Ok((
                 meta.build().map_err(|e| format!("HTTP client: {}", e))?,
@@ -2938,7 +2948,7 @@ impl NextCloudFs {
                 let mtime = std::fs::metadata(&mount_path).ok()
                     .and_then(|m| m.modified().ok());
                 crate::preview::prefetch_thumbnail(
-                    conn.clients.get(),
+                    &conn.clients.get(),
                     &conn.base_url,
                     &conn.creds,
                     &conn.mount_point,
@@ -3441,7 +3451,7 @@ impl NextCloudFs {
                             thread::spawn(move || {
                                 thread::sleep(Duration::from_millis(200));
                                 preview::prefetch_directory_thumbnails(
-                                    conn2.clients.get(),
+                                    &conn2.clients.get(),
                                     &conn2.base_url,
                                     &conn2.creds,
                                     &conn2.mount_point,
@@ -5828,14 +5838,14 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                         }
                         backend::ReachabilityStatus::AuthRejected(code) => {
                             log::warn!("CONNECTIVITY: auth rejected (HTTP {}), checking for remote wipe", code);
-                            match remote_wipe::check_wipe(conn_monitor.clients.get(), &conn_monitor.base_url, conn_monitor.creds.secret()) {
+                            match remote_wipe::check_wipe(&conn_monitor.clients.get(), &conn_monitor.base_url, conn_monitor.creds.secret()) {
                                 Ok(true) => {
                                     log::warn!("REMOTE WIPE requested by server — executing");
                                     let config_path = config::config_path();
                                     if let Err(e) = remote_wipe::execute_wipe(&cache_dir_monitor, &config_path) {
                                         log::error!("REMOTE_WIPE execution error: {}", e);
                                     }
-                                    if let Err(e) = remote_wipe::confirm_wipe(conn_monitor.clients.get(), &conn_monitor.base_url, conn_monitor.creds.secret()) {
+                                    if let Err(e) = remote_wipe::confirm_wipe(&conn_monitor.clients.get(), &conn_monitor.base_url, conn_monitor.creds.secret()) {
                                         log::warn!("REMOTE_WIPE: failed to confirm to server: {}", e);
                                     }
                                     wipe_flag_monitor.store(true, Ordering::Relaxed);

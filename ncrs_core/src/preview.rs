@@ -138,7 +138,7 @@ pub fn xdg_thumbnail_path(file_uri: &str) -> PathBuf {
 // ── NC preview API ────────────────────────────────────────────────────────────
 
 fn fetch_preview_bytes(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base: &str,
     creds: &crate::auth::Credentials,
     remote_path: &Path,
@@ -218,7 +218,7 @@ fn inject_png_text_chunks(png: &[u8], entries: &[(&str, &str)]) -> Option<Vec<u8
 // ── Public interface ──────────────────────────────────────────────────────────
 
 pub fn prefetch_thumbnail(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base: &str,
     creds: &crate::auth::Credentials,
     mount_point: &Path,
@@ -306,7 +306,7 @@ pub fn prefetch_thumbnail(
 }
 
 fn prefetch_slow_path(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base: &str,
     creds: &crate::auth::Credentials,
     mount_point: &Path,
@@ -326,7 +326,7 @@ fn prefetch_slow_path(
 }
 
 pub fn prefetch_directory_thumbnails(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base: &str,
     creds: &crate::auth::Credentials,
     mount_point: &Path,

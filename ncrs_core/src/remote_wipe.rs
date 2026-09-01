@@ -4,7 +4,7 @@ use std::time::Duration;
 const WIPE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn check_wipe(
-    http: &reqwest::blocking::Client,
+    http: &crate::http_clients::DavClient,
     base_url: &str,
     token: &str,
 ) -> Result<bool, String> {
@@ -35,7 +35,7 @@ pub fn check_wipe(
 }
 
 pub fn confirm_wipe(
-    http: &reqwest::blocking::Client,
+    http: &crate::http_clients::DavClient,
     base_url: &str,
     token: &str,
 ) -> Result<(), String> {

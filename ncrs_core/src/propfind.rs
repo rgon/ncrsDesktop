@@ -43,7 +43,7 @@ pub struct DavEntry {
 }
 
 pub fn propfind_list(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     webdav_url: &str,
     creds: &crate::auth::Credentials,
     path: &std::path::Path,
@@ -76,7 +76,7 @@ pub fn propfind_list(
 }
 
 pub fn propfind_status(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     webdav_url: &str,
     creds: &crate::auth::Credentials,
     path: &std::path::Path,
@@ -101,7 +101,7 @@ pub fn propfind_status(
 }
 
 pub fn propfind_etag(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     webdav_url: &str,
     creds: &crate::auth::Credentials,
     path: &std::path::Path,
@@ -130,7 +130,7 @@ pub fn propfind_etag(
 }
 
 pub fn resolve_fileids(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     webdav_url: &str,
     creds: &crate::auth::Credentials,
     file_ids: &[u64],
@@ -281,7 +281,7 @@ fn parse_multistatus_stream<R: std::io::BufRead>(
 }
 
 pub fn propfind_list_streaming<E: From<DavEntry> + Send>(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     webdav_url: &str,
     creds: &crate::auth::Credentials,
     path: &std::path::Path,
@@ -651,7 +651,7 @@ const PROPFIND_QUOTA_BODY: &str = r#"<?xml version="1.0"?>
 </d:propfind>"#;
 
 pub fn propfind_quota(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     webdav_url: &str,
     creds: &crate::auth::Credentials,
     timeout: Duration,

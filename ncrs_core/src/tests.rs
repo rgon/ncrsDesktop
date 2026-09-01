@@ -2266,12 +2266,15 @@ password: "pass"
     fn demotion_switches_both_clients_to_http2() {
         let c = test_clients(true);
         assert!(c.http3_active());
-        assert!(!std::ptr::eq(c.get(), c.h2()), "before demotion the preferred client is the h3 one");
+        assert!(c.get().is_h3(), "before demotion requests are stamped Version::HTTP_3");
+        assert!(c.read().is_h3(), "the read client is stamped too");
+        assert!(!c.h2().is_h3(), "the escape-hatch client never stamps HTTP/3");
 
         c.demote();
 
         assert!(!c.http3_active());
-        assert!(std::ptr::eq(c.get(), c.h2()), "after demotion every caller must get the h2 client");
+        assert!(!c.get().is_h3(), "after demotion every request goes out unstamped over TCP");
+        assert!(!c.read().is_h3(), "reads too");
     }
 
     #[test]

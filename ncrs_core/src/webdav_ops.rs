@@ -59,7 +59,7 @@ fn dav_url(base_url: &str, username: &str, path: &Path) -> String {
 }
 
 pub fn put_file(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base_url: &str,
     creds: &crate::auth::Credentials,
     path: &Path,
@@ -98,7 +98,7 @@ pub fn put_file(
 }
 
 pub fn mkcol(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base_url: &str,
     creds: &crate::auth::Credentials,
     path: &Path,
@@ -123,7 +123,7 @@ pub fn mkcol(
 }
 
 pub fn delete(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base_url: &str,
     creds: &crate::auth::Credentials,
     path: &Path,
@@ -147,7 +147,7 @@ pub fn delete(
 }
 
 pub fn move_resource(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base_url: &str,
     creds: &crate::auth::Credentials,
     from: &Path,
@@ -179,7 +179,7 @@ const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const CHUNK_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub fn put_file_chunked(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base_url: &str,
     creds: &crate::auth::Credentials,
     path: &Path,
@@ -259,7 +259,7 @@ pub fn put_file_chunked(
 }
 
 pub fn put_file_from_path(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     base_url: &str,
     creds: &crate::auth::Credentials,
     path: &Path,
@@ -356,7 +356,7 @@ pub fn put_file_from_path(
 }
 
 fn cleanup_chunked_upload(
-    client: &reqwest::blocking::Client,
+    client: &crate::http_clients::DavClient,
     uploads_url: &str,
     creds: &crate::auth::Credentials,
 ) -> Result<(), WriteError> {
