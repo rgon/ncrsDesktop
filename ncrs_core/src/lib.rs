@@ -2643,7 +2643,11 @@ impl NextCloudFs {
         };
         let clients = crate::http_clients::HttpClients::new(
             http_pref, http_read_pref, http_h2, http_read_h2, use_http3,
-        );
+        )
+        // Remember a demotion across restarts (per server, in its cache dir):
+        // re-arming QUIC every session made each restart on a QUIC-hostile
+        // network pay one offline blip before latching onto HTTP/2 again.
+        .with_demotion_marker(cache_dir.join("h3_demoted"));
 
         let max_req = if options.max_concurrent_requests == 0 { 10 } else { options.max_concurrent_requests };
         log::info!("HTTP throttle: max {} concurrent requests", max_req);

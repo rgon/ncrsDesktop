@@ -2198,6 +2198,71 @@ password: "pass"
     }
 
     #[test]
+    fn a_demotion_is_remembered_by_the_next_session() {
+        let dir = std::env::temp_dir().join(format!("ncrs-test-h3marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("h3_demoted");
+
+        let first = test_clients(true).with_demotion_marker(marker.clone());
+        assert!(first.http3_active(), "no marker yet: the session starts on HTTP/3");
+        first.demote();
+        assert!(marker.exists(), "a demotion must be recorded for the next session");
+
+        let second = test_clients(true).with_demotion_marker(marker.clone());
+        assert!(!second.http3_active(), "a fresh marker must start the next session on HTTP/2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_demotion_marker_retries_http3() {
+        let dir = std::env::temp_dir().join(format!("ncrs-test-h3stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("h3_demoted");
+        // A demotion recorded 8 days ago — past the 7-day retry window.
+        let old_ts = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 8 * 24 * 3600;
+        std::fs::write(&marker, old_ts.to_string()).unwrap();
+
+        let c = test_clients(true).with_demotion_marker(marker.clone());
+        assert!(c.http3_active(), "an expired marker must give QUIC another chance");
+        assert!(!marker.exists(), "the expired marker is removed so the retry is real");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_garbage_demotion_marker_is_discarded() {
+        let dir = std::env::temp_dir().join(format!("ncrs-test-h3junk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("h3_demoted");
+        std::fs::write(&marker, "not a timestamp").unwrap();
+
+        let c = test_clients(true).with_demotion_marker(marker.clone());
+        assert!(c.http3_active(), "an unreadable marker must not pin the session to HTTP/2");
+        assert!(!marker.exists(), "the unreadable marker is removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_marker_is_inert_without_http3() {
+        let dir = std::env::temp_dir().join(format!("ncrs-test-h3off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("h3_demoted");
+        std::fs::write(&marker, "0").unwrap();   // ancient marker
+
+        let c = test_clients(false).with_demotion_marker(marker.clone());
+        assert!(!c.http3_active());
+        assert!(marker.exists(), "with http3 disabled the marker is left untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn demotion_switches_both_clients_to_http2() {
         let c = test_clients(true);
         assert!(c.http3_active());
