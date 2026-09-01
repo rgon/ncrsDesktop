@@ -1,39 +1,36 @@
-# GOTCHAS
+# GOTCHAS & 'BYPASSES' that we had to implement to fix platform issues
 
 Subtle platform behaviours and non-obvious design decisions that affect ncrs.
 
----
+## 1. Cannot absolutely place windows in wayland
 
-## GLib 2.80 MIME detection causes per-file WebDAV downloads on directory listing
+To avoid this, we create a display-sized transparent and undecorated window, with an on-click 'exit' handler on this transparent background, and draw a virtual floating window on the rightmost of the screen, to match the original Nextcloud client's behaviour.
 
-**Affects:** GLib 2.80+ (Ubuntu 24.04, Fedora 40, and later). Manifests in any
-application that uses GLib for file browsing — most notably Nautilus.
+## 2. GLib MIME detection causes per-file WebDAV downloads on directory listing
+
+**Confirmed affects:** GLib 2.80+ (Ubuntu 24.04, Fedora 40, and later). Manifests in any
+application that uses GLib for file browsing, tested with Nautilus.
 
 ### What changed in GLib 2.80
 
-Before GLib 2.80, GLib resolved MIME types by reading a `user.xdg.mime.type`
-extended attribute directly from the file's inode — a metadata-only operation
-that never required reading file content.
+> NOTE: this may not always be the case, read this note:
+> Before GLib 2.80, GLib resolved MIME types by reading a `user.xdg.mime.type` extended attribute directly from the file's inode — a metadata-only operation that never required reading file content.
+> GLib 2.80 removed this xattr check. For any file whose extension is unrecognised or ambiguous, 
 
-GLib 2.80 removed this xattr check. For any file whose extension is
-unrecognised or ambiguous, GLib now falls back to **magic-byte detection**: it
-opens the file and reads the first 16 KB to inspect the binary signature (e.g.
-`%PDF-` for PDF, `PK\x03\x04` for ZIP/Office, `\xFF\xD8\xFF` for JPEG, etc.).
+GLib now falls back to **magic-byte detection**: it opens the file and reads the first 16 KB to inspect the binary signature (e.g. `%PDF-` for PDF, `PK\x03\x04` for ZIP/Office, `\xFF\xD8\xFF` for JPEG, etc.).
 
 ### Why this is catastrophic on a FUSE/WebDAV mount
 
-On a local filesystem the 16 KB read is a microsecond. On a WebDAV-backed FUSE
-mount it triggers a full HTTP round-trip to download the beginning of the file
-from the remote server (~280 ms over a typical home internet connection).
++ On a local filesystem the 16 KB read is a microsecond. On a WebDAV-backed FUSE mount it triggers a full HTTP round-trip to download the beginning of the file from the remote server (~280 ms over a typical home internet connection).
 
-GLib's detection loop is sequential: `open(A) → read(A) → close(A) → open(B)
++ GLib's detection loop is sequential: `open(A) → read(A) → close(A) → open(B)
 → …`. Even with a fast connection, a directory containing 37 files with unusual
 extensions (e.g. Spanish tax forms stored with numeric extensions like `.036`,
 `.190`, `.349`) incurs 37 × 280 ms ≈ **10 seconds** of latency before Nautilus
 can display the directory — even though the directory listing PROPFIND itself
 completes in under 300 ms.
 
-The `user.xdg.mime.type` xattr that ncrs set on virtual inodes (added in
++ The `user.xdg.mime.type` xattr that ncrs set on virtual inodes (added in
 0.1.22 to address this) has **no effect** on GLib 2.80+: the xattr codepath
 was removed entirely, not just deprioritised.
 
@@ -80,7 +77,7 @@ distinguishing signal is the **read size**: GLib always requests exactly 16384
 bytes (`MAGIC_BYTES_BUFFER_SIZE` in `gcontenttype.c`), while copy tools use
 much larger buffers (`cp` uses 131072 bytes, GIO uses 65536 bytes).
 
-⚠️ **Kernel read-ahead inflates the magic read — do NOT guard on `sz <= 16384`.**
++  **Kernel read-ahead inflates the magic read — do NOT guard on `sz <= 16384`.**
 GLib asks userspace-side for 16384 bytes, but the kernel enlarges the *initial*
 FUSE `read` to fill its read-ahead window: measured at exactly **32768 bytes**
 (one 8-page window) for the first read of any file, even a multi-GB one, because
@@ -112,7 +109,7 @@ This fix applies to all users on GLib 2.80+, regardless of which file types or
 directory structures they have. It is not specific to any particular extension
 set or server configuration.
 
-### What does NOT work
+### Other attempted methods that did not work
 
 - Setting `user.xdg.mime.type` on FUSE virtual inodes — GLib 2.80 removed the
   xattr check entirely.
