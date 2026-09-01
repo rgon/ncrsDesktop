@@ -2294,3 +2294,113 @@ password: "pass"
         c.demote();
         assert!(!c.http3_active(), "demoting a non-http3 client set stays a no-op");
     }
+
+    // ── Connectivity probe retry ─────────────────────────────────────────────
+
+    /// A scripted HTTP/1.1 server: serves one canned status per accepted
+    /// connection, in order, then stops accepting. `Connection: close` forces
+    /// the client to dial fresh for every request, so each probe consumes the
+    /// next script entry.
+    fn scripted_server(statuses: &'static [u16]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for &status in statuses {
+                let (mut sock, _) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                // Drain the full request (headers + Content-Length body) before
+                // responding: closing a socket with unread data makes the kernel
+                // send RST, which can eat the response we just wrote.
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body_start = loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break None,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break Some(pos + 4);
+                            }
+                        }
+                    }
+                };
+                if let Some(body_start) = body_start {
+                    let headers = String::from_utf8_lossy(&req[..body_start]).to_ascii_lowercase();
+                    let content_length: usize = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let mut got = req.len() - body_start;
+                    while got < content_length {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => got += n,
+                        }
+                    }
+                }
+                let reason = match status {
+                    207 => "Multi-Status",
+                    401 => "Unauthorized",
+                    _ => "Internal Server Error",
+                };
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    status, reason
+                );
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    /// The scripted server answers the constructor's credential probe with the
+    /// script's first entry; `check_reachability` consumes the rest.
+    fn scripted_backend(url: &str) -> crate::nextcloud::NextcloudBackend {
+        crate::nextcloud::NextcloudBackend::new(
+            url.to_string(),
+            url.to_string(),
+            crate::auth::Credentials::Basic { username: "u".into(), password: "p".into() },
+            test_clients(false),
+        )
+        .expect("constructor probe against the scripted server")
+    }
+
+    #[test]
+    fn a_single_failed_probe_is_retried_not_believed() {
+        use crate::backend::{CloudBackend, ReachabilityStatus};
+        // QUIC connections idle out under NAT and lose single samples to
+        // congestion; one failed probe must trigger a retry, not an offline
+        // flip (nor, on an HTTP/3 mount, the week-long persisted demotion).
+        let url = scripted_server(&[207, 500, 207]);
+        let backend = scripted_backend(&url);
+        let status = backend.check_reachability(Duration::from_secs(5));
+        assert_eq!(
+            status,
+            ReachabilityStatus::Reachable,
+            "one bad sample must not condemn the mount"
+        );
+    }
+
+    #[test]
+    fn two_consecutive_failed_probes_mark_unreachable() {
+        use crate::backend::{CloudBackend, ReachabilityStatus};
+        let url = scripted_server(&[207, 500, 500]);
+        let backend = scripted_backend(&url);
+        let status = backend.check_reachability(Duration::from_secs(5));
+        assert_eq!(status, ReachabilityStatus::Unreachable);
+    }
+
+    #[test]
+    fn an_auth_rejection_is_not_retried() {
+        use crate::backend::{CloudBackend, ReachabilityStatus};
+        // 401 is an answer from the server, not a transport blip — retrying it
+        // would only delay the remote-wipe check the monitor runs on rejection.
+        let url = scripted_server(&[207, 401]);
+        let backend = scripted_backend(&url);
+        let status = backend.check_reachability(Duration::from_secs(5));
+        assert_eq!(status, ReachabilityStatus::AuthRejected(401));
+    }

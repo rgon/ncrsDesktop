@@ -13,6 +13,13 @@ use crate::{notifications, preview, propfind, search, webdav_ops};
 
 /// Timeout for the credential probe run once at startup.
 const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Pause between the connectivity probe's first failure and its one retry.
+/// Long enough for a fresh QUIC dial to escape whatever killed the first
+/// attempt (an idled-out connection, a NAT rebind, a congested uplink),
+/// short enough that a real outage is still declared well inside one
+/// monitor cycle.
+const PROBE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const WS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 // The read loop swallows read timeouts, so without a keepalive a silently dead
@@ -310,6 +317,22 @@ impl CloudBackend for NextcloudBackend {
         let probe = |client: &crate::http_clients::DavClient| {
             propfind::propfind_status(client, &self.webdav_url, &self.creds, Path::new("/"), timeout)
         };
+        match probe(&self.clients.get()) {
+            Ok(()) => return ReachabilityStatus::Reachable,
+            Err(code) if code == 401 || code == 403 => return ReachabilityStatus::AuthRejected(code),
+            Err(_) => {}
+        }
+        // One failed probe is not an outage. QUIC rides UDP, so a connection the
+        // server or a NAT quietly idled out fails exactly one request and works
+        // again on the next dial — and the probe also shares the uplink with up
+        // to 10 concurrent transfers, so a busy revalidation burst can time out a
+        // single sample against a perfectly healthy server. Believing that one
+        // sample flips the whole mount offline. Retry once before concluding
+        // anything: a genuinely down server costs one extra probe per monitor
+        // cycle, and a recovered server still answers the first probe, so
+        // recovery latency is unchanged.
+        log::debug!("CONNECTIVITY probe failed — retrying once in {:?}", PROBE_RETRY_DELAY);
+        std::thread::sleep(PROBE_RETRY_DELAY);
         match probe(&self.clients.get()) {
             Ok(()) => ReachabilityStatus::Reachable,
             Err(code) if code == 401 || code == 403 => ReachabilityStatus::AuthRejected(code),
