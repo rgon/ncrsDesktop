@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.62](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.61...ncrs-v0.1.62) (2026-09-01)
+
+
+### Bug Fixes
+
+* **cache:** wait out connectivity blips instead of failing an uncached directory listing ([4c2c199](https://github.com/rgon/ncrsDesktop/commit/4c2c19949868e7f34b7bbda43eadabf1247864bd))
+
 ## [0.1.61](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.60...ncrs-v0.1.61) (2026-09-01)
 
 
