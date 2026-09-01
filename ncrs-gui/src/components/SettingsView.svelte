@@ -389,11 +389,33 @@
 }
 
 .sv-check {
+    appearance: none;
+    -webkit-appearance: none;
     width: 16px;
     height: 16px;
-    accent-color: var(--nc-accent);
+    border: 1px solid var(--nc-border);
+    border-radius: 4px;
+    background: var(--nc-surface);
+    display: inline-block;
     cursor: pointer;
     flex-shrink: 0;
+    transition: background-color 0.12s, border-color 0.12s;
+}
+
+/* Tick geometry: stroke bbox is x [3,13] / y [4.05,11.95] in the 16 viewBox,
+   both centred on 8.0, so it stays centred at any background-size. */
+.sv-check:checked {
+    background-color: var(--nc-accent);
+    border-color: var(--nc-accent);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 8.15 L6.8 10.95 L12 5.05' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: contain;
+}
+
+.sv-check:focus-visible {
+    outline: 2px solid var(--nc-accent);
+    outline-offset: 2px;
 }
 
 /* ── Footer ──────────────────────────────── */
