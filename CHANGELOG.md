@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.60](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.59...ncrs-v0.1.60) (2026-09-01)
+
+
+### Bug Fixes
+
+* properly display red when nextcloud server is unaccessible, not just orange ([eeba96f](https://github.com/rgon/ncrsDesktop/commit/eeba96f81aa499a2fee6af433a40f372c993211a))
+
 ## [0.1.59](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.58...ncrs-v0.1.59) (2026-08-31)
 
 
