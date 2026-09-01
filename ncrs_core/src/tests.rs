@@ -2287,8 +2287,8 @@ password: "pass"
 
     #[test]
     fn without_http3_there_is_nothing_to_demote() {
-        // check_reachability gates its h2 retry on http3_active(), so a plain-HTTP/2
-        // mount must never pay for a second probe.
+        // The mount-time probe gates its h2 fallback on http3_active(), so a
+        // plain-HTTP/2 mount must never pay for a second probe.
         let c = test_clients(false);
         assert!(!c.http3_active());
         c.demote();
@@ -2390,6 +2390,55 @@ password: "pass"
         use crate::backend::{CloudBackend, ReachabilityStatus};
         let url = scripted_server(&[207, 500, 500]);
         let backend = scripted_backend(&url);
+        let status = backend.check_reachability(Duration::from_secs(5));
+        assert_eq!(status, ReachabilityStatus::Unreachable);
+    }
+
+    #[test]
+    fn a_broken_http3_transport_is_demoted_at_mount_time() {
+        use crate::backend::{CloudBackend, ReachabilityStatus};
+        // The h3 stand-ins are plain TCP clients, so an HTTP_3-stamped request
+        // through them fails at the transport layer exactly like real QUIC
+        // against a server with no HTTP/3 listener. The constructor must fall
+        // back to the h2 probe, demote, and still bring the mount up.
+        let url = scripted_server(&[207, 207]);
+        let clients = test_clients(true);
+        let watch = clients.clone();
+        let backend = crate::nextcloud::NextcloudBackend::new(
+            url.clone(),
+            url,
+            crate::auth::Credentials::Basic { username: "u".into(), password: "p".into() },
+            clients,
+        )
+        .expect("mount must come up on HTTP/2 when only QUIC is broken");
+        assert!(!watch.http3_active(), "the broken transport is demoted before the mount comes up");
+        // And mid-session probes run on the demoted (working) transport: a
+        // failure there is an outage, never another transport verdict.
+        let status = backend.check_reachability(Duration::from_secs(5));
+        assert_eq!(status, ReachabilityStatus::Reachable);
+    }
+
+    #[test]
+    fn a_mid_session_probe_failure_never_demotes() {
+        use crate::backend::{CloudBackend, ReachabilityStatus};
+        // Constructor h3 probe fails transport-side, h2 fallback sees 207 →
+        // demoted mount. Hand the next session's story to the runtime probe:
+        // both its attempts fail — the verdict must be Unreachable, with the
+        // transport latch untouched (there is nothing left to demote to).
+        //
+        // The stronger claim — an h3 mount whose startup succeeded is never
+        // demoted by a runtime failure — cannot be scripted without a real
+        // QUIC listener, but it holds by construction: check_reachability no
+        // longer references demote() at all.
+        let url = scripted_server(&[207, 500, 500]);
+        let clients = test_clients(true);
+        let backend = crate::nextcloud::NextcloudBackend::new(
+            url.clone(),
+            url,
+            crate::auth::Credentials::Basic { username: "u".into(), password: "p".into() },
+            clients,
+        )
+        .expect("mount comes up demoted");
         let status = backend.check_reachability(Duration::from_secs(5));
         assert_eq!(status, ReachabilityStatus::Unreachable);
     }

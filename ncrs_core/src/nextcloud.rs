@@ -67,14 +67,35 @@ impl NextcloudBackend {
         // full listing of the account root, fetched and then thrown away. On a
         // large root that measured 4.5 s of blocking startup before the mount
         // came up, and the listing was not even kept.
-        propfind::propfind_status(
+        let mut startup = propfind::propfind_status(
             &clients.get(),
             &webdav_url,
             &creds,
             std::path::Path::new("/"),
             CONNECT_PROBE_TIMEOUT,
-        )
-        .map_err(|code| match code {
+        );
+        // HTTP/3 is judged here, once, at mount time — not per request. A
+        // transport-level failure over QUIC while plain HTTPS answers the same
+        // probe means this network/server pairing cannot do HTTP/3 at all
+        // (UDP/443 filtered, a middlebox, a broken listener), so demote before
+        // the mount comes up and run the whole session on HTTP/2. Mid-session
+        // QUIC errors are NOT a demotion signal: once the transport has proven
+        // itself at startup, a later failure means the network is down and
+        // HTTP/2 would fail just the same — that is the connectivity monitor's
+        // outage handling, not a transport problem.
+        if matches!(startup, Err(0)) && clients.http3_active() {
+            startup = propfind::propfind_status(
+                &clients.h2(),
+                &webdav_url,
+                &creds,
+                std::path::Path::new("/"),
+                CONNECT_PROBE_TIMEOUT,
+            );
+            if startup.is_ok() {
+                clients.demote();
+            }
+        }
+        startup.map_err(|code| match code {
             0 => "WebDAV connect failed: server unreachable".to_string(),
             401 | 403 => format!("WebDAV connect failed: credentials rejected (HTTP {})", code),
             other => format!("WebDAV connect failed: HTTP {}", other),
@@ -327,29 +348,20 @@ impl CloudBackend for NextcloudBackend {
         // again on the next dial — and the probe also shares the uplink with up
         // to 10 concurrent transfers, so a busy revalidation burst can time out a
         // single sample against a perfectly healthy server. Believing that one
-        // sample flips the whole mount offline. Retry once before concluding
-        // anything: a genuinely down server costs one extra probe per monitor
-        // cycle, and a recovered server still answers the first probe, so
-        // recovery latency is unchanged.
+        // sample flips the whole mount offline (or, below, demotes HTTP/3 for a
+        // week). Retry once before concluding anything: a genuinely down server
+        // costs one extra probe per monitor cycle, and a recovered server still
+        // answers the first probe, so recovery latency is unchanged.
         log::debug!("CONNECTIVITY probe failed — retrying once in {:?}", PROBE_RETRY_DELAY);
         std::thread::sleep(PROBE_RETRY_DELAY);
+        // No HTTP/2 fallback and no demotion here: the transport was proven at
+        // mount time (see `NextcloudBackend::new`). A QUIC failure on a mount
+        // that has been speaking HTTP/3 all session means the network is down —
+        // HTTP/2 would fail the same way — so report the outage and let the
+        // monitor's re-probe cadence pick the recovery up.
         match probe(&self.clients.get()) {
             Ok(()) => ReachabilityStatus::Reachable,
             Err(code) if code == 401 || code == 403 => ReachabilityStatus::AuthRejected(code),
-            // `propfind_status` reports a transport-level send failure as code 0. That is
-            // the one failure a QUIC-only client produces when UDP/443 is blocked or the
-            // server's HTTP/3 listener is broken — and it is indistinguishable, from here,
-            // from the server actually being down. Retry once over HTTP/2 before
-            // condemning the mount to offline: if plain HTTPS answers, the fault was the
-            // transport, not the server, so latch onto HTTP/2 and report Reachable.
-            Err(0) if self.clients.http3_active() => match probe(&self.clients.h2()) {
-                Ok(()) => {
-                    self.clients.demote();
-                    ReachabilityStatus::Reachable
-                }
-                Err(code) if code == 401 || code == 403 => ReachabilityStatus::AuthRejected(code),
-                Err(_) => ReachabilityStatus::Unreachable,
-            },
             Err(_) => ReachabilityStatus::Unreachable,
         }
     }

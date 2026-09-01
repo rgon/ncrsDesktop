@@ -140,6 +140,14 @@ ignores `pool_max_idle_per_host`, and `connect_timeout` never reaches the QUIC
 connector — the read client's fresh-connect / fail-fast guarantees have to be
 rebuilt with `pool_idle_timeout` + `http3_max_idle_timeout`.
 
+HTTP/3 suitability is judged once, at mount time (`NextcloudBackend::new`):
+if the startup probe fails over QUIC while the same probe answers over plain
+HTTPS, the daemon demotes to HTTP/2 for the session and persists the verdict
+for a week (`h3_demoted` in the cache dir). Mid-session QUIC failures are
+outages, never transport verdicts — a mount whose HTTP/3 worked at startup
+would see HTTP/2 fail the same way, so `check_reachability` retries once and
+reports reachability without ever demoting.
+
 `ncrs_core/examples/h3probe.rs` probes a server end-to-end (`--v3` for real
 HTTP/3, sleeps to cross idle boundaries) and prints the negotiated version —
 use it before blaming the server or the network.

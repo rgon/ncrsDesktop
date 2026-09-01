@@ -537,9 +537,10 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# directory as soon as it is listed, even before the files are opened. Speeds\n");
     content.push_str("# up browsing but increases network traffic on large directories.\n");
     content.push_str(&format!("aggressive_prefetch: {}\n", settings.aggressive_prefetch));
-    content.push_str("# Prefer HTTP/3 (QUIC). When QUIC fails where plain HTTPS works, the daemon\n");
-    content.push_str("# falls back to HTTP/2 and remembers that for a week (h3_demoted in the cache\n");
-    content.push_str("# dir), so restarts don't re-pay the discovery blip.\n");
+    content.push_str("# Prefer HTTP/3 (QUIC). Probed once at mount time: if QUIC fails there while\n");
+    content.push_str("# plain HTTPS works, the daemon logs a warning, runs the session on HTTP/2 and\n");
+    content.push_str("# remembers the verdict for a week (h3_demoted in the cache dir), so restarts\n");
+    content.push_str("# don't re-pay the discovery blip. Set false if your network never does QUIC.\n");
     content.push_str(&format!("http3: {}\n", settings.http3));
     content.push_str(&format!("max_concurrent_requests: {}\n", settings.max_concurrent_requests));
     content.push_str("# When enabled, directory listings are returned immediately from the local cache\n");

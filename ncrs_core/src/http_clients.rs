@@ -8,11 +8,15 @@
 //! "the server is unreachable" and turns into a mount-wide offline state — while
 //! ordinary HTTPS to the same host works perfectly.
 //!
-//! So we build both pairs up front and keep a latch. The connectivity probe is
-//! the arbiter: when it fails over HTTP/3 but succeeds over HTTP/2, it calls
-//! [`HttpClients::demote`] and every caller transparently switches for the rest
-//! of the session. Demotion is one-way on purpose — flapping between transports
-//! would be worse than staying on the one we have proven works.
+//! So we build both pairs up front and keep a latch. The mount-time probe in
+//! `NextcloudBackend::new` is the sole arbiter: when it fails over HTTP/3 but
+//! succeeds over HTTP/2, it calls [`HttpClients::demote`] and every caller
+//! transparently uses HTTP/2 for the rest of the session. Nothing demotes
+//! mid-session — once HTTP/3 has worked at startup, a later QUIC failure means
+//! the network is down (HTTP/2 would fail the same way), which is the
+//! connectivity monitor's business, not a transport verdict. Demotion is
+//! one-way on purpose — flapping between transports would be worse than
+//! staying on the one we have proven works.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -170,7 +174,8 @@ impl HttpClients {
         }
     }
 
-    /// The HTTP/2 client, for the probe that decides whether to demote.
+    /// The HTTP/2 client, for the mount-time probe that decides whether to
+    /// demote.
     pub fn h2(&self) -> DavClient {
         DavClient { client: self.h2.clone(), version: None }
     }
@@ -186,9 +191,9 @@ impl HttpClients {
     pub fn demote(&self) {
         if !self.demoted.swap(true, Ordering::Relaxed) {
             log::warn!(
-                "HTTP/3 unusable (QUIC failed where HTTP/2 succeeded) — \
-                 falling back to HTTP/2 for the rest of this session; \
-                 set `http3: false` in config.yaml to skip this probe on startup"
+                "HTTP/3 unusable on this network (QUIC failed where HTTP/2 succeeded) — \
+                 running this session on HTTP/2; \
+                 set `http3: false` in config.yaml to stop probing QUIC at startup"
             );
             if let Some(ref path) = self.marker {
                 let now = SystemTime::now()
