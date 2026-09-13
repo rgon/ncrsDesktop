@@ -470,24 +470,82 @@ async fn search_nextcloud(
     let http3 = opts.http3;
     let mount_point = opts.mount_point.clone();
 
+    let dav_url = opts.url.clone();
+    let search_creds = creds.clone();
+
     let mut groups = tokio::task::spawn_blocking(move || {
-        ncrs_core::search::search_filtered(&base, &creds, &term, http3, &provider_ids)
+        ncrs_core::search::search_filtered(&base, &search_creds, &term, http3, &provider_ids)
     })
     .await
     .map_err(|e| format!("search task failed: {}", e))??;
 
     for group in &mut groups {
-        if group.provider_id == "files" {
-            for entry in &mut group.entries {
-                if let Some(dir) = extract_dir_param(&entry.resource_url) {
-                    let file_path = if dir == "/" {
-                        format!("/{}", entry.title)
-                    } else {
-                        format!("{}/{}", dir, entry.title)
-                    };
-                    let rel = file_path.strip_prefix('/').unwrap_or(&file_path);
-                    entry.local_path = Some(mount_point.join(rel).to_string_lossy().into_owned());
+        if group.provider_id != "files" {
+            continue;
+        }
+
+        // Nextcloud ≤ 27 puts the containing directory in the hit's URL; since
+        // 28 the URL is `/f/<fileid>` and the path has to come from the server.
+        // Read the cheap one first, then resolve whatever is left in one SEARCH
+        // rather than one round trip per hit.
+        let mut unresolved: Vec<(usize, u64)> = Vec::new();
+        for (i, entry) in group.entries.iter_mut().enumerate() {
+            if let Some(dir) = extract_dir_param(&entry.resource_url) {
+                let file_path = if dir == "/" {
+                    format!("/{}", entry.title)
+                } else {
+                    format!("{}/{}", dir, entry.title)
+                };
+                entry.local_path = local_path_for(&mount_point, &file_path);
+                if entry.local_path.is_some() {
+                    continue;
                 }
+            }
+            match extract_fileid(&entry.resource_url) {
+                Some(id) => unresolved.push((i, id)),
+                // Not fatal: the GUI falls back to opening the hit in the web
+                // UI. Logged because it means every hit from this server opens
+                // in a browser instead of the file manager.
+                None => log::warn!(
+                    "search: no dir or fileid in {:?} — {:?} cannot be opened locally",
+                    entry.resource_url,
+                    entry.title,
+                ),
+            }
+        }
+
+        if unresolved.is_empty() {
+            continue;
+        }
+
+        let ids: Vec<u64> = unresolved.iter().map(|(_, id)| *id).collect();
+        let url = dav_url.clone();
+        let resolve_creds = creds.clone();
+        let paths = tokio::task::spawn_blocking(move || {
+            ncrs_core::search::resolve_fileid_paths(&url, &resolve_creds, http3, &ids)
+        })
+        .await
+        .map_err(|e| format!("fileid resolve task failed: {}", e))?;
+
+        let paths = match paths {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("search: resolving file ids failed: {} — hits open in the web UI", e);
+                continue;
+            }
+        };
+
+        for (i, id) in unresolved {
+            match paths.get(&id) {
+                Some(remote) => {
+                    group.entries[i].local_path =
+                        local_path_for(&mount_point, &remote.to_string_lossy());
+                }
+                None => log::warn!(
+                    "search: fileid {} ({:?}) has no path on the server",
+                    id,
+                    group.entries[i].title,
+                ),
             }
         }
     }
@@ -692,6 +750,47 @@ fn write_config_from_login(
         .map_err(|e| format!("write config: {}", e))?;
     log::info!("config written to {}", config_path.display());
     Ok(())
+}
+
+/// Join a server-side path onto the mount point.
+///
+/// Both inputs to this are server-controlled (a search hit's `dir=` parameter,
+/// or a path the server reported for a file id), and the result is handed to
+/// the desktop's file manager — so a path that could climb out of the mount is
+/// dropped rather than revealed.
+fn local_path_for(mount_point: &std::path::Path, remote_path: &str) -> Option<String> {
+    let rel = remote_path.trim_start_matches('/');
+    if rel.is_empty() || rel.split(['/', '\\']).any(|seg| seg == ".." || seg == ".") {
+        return None;
+    }
+    Some(mount_point.join(rel).to_string_lossy().into_owned())
+}
+
+/// The file id in a Nextcloud ≥ 28 file hit (`…/index.php/f/1234`), or in the
+/// `?fileid=` form the Files app also emits.
+///
+/// The `f`/`files` segment is required: without it any hit whose URL happens to
+/// end in a number would be read as a file id and resolved against the server.
+fn extract_fileid(url: &str) -> Option<u64> {
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (url, None),
+    };
+    if let Some(query) = query {
+        if let Some(id) = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("fileid="))
+            .and_then(|v| v.parse().ok())
+        {
+            return Some(id);
+        }
+    }
+    let mut segments = path.trim_end_matches('/').rsplit('/');
+    let last = segments.next()?;
+    match segments.next()? {
+        "f" | "files" => last.parse().ok(),
+        _ => None,
+    }
 }
 
 fn extract_dir_param(url: &str) -> Option<String> {
@@ -1796,6 +1895,66 @@ mod open_link_tests {
             "/etc/passwd",
         ] {
             assert!(!is_openable_url(hostile), "{} must be refused", hostile);
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_path_tests {
+    use super::{extract_dir_param, extract_fileid, local_path_for};
+    use std::path::Path;
+
+    #[test]
+    fn reads_the_dir_parameter_of_a_legacy_hit() {
+        let url = "https://cloud.example.com/index.php/apps/files/?dir=/Deemix%20Downloads&scrollto=x.flac";
+        assert_eq!(extract_dir_param(url).as_deref(), Some("/Deemix Downloads"));
+    }
+
+    #[test]
+    fn reads_the_fileid_of_a_modern_hit() {
+        // What Nextcloud ≥ 28 returns for a files hit — no dir anywhere.
+        let url = "https://cloud.example.com/index.php/f/123456";
+        assert_eq!(extract_dir_param(url), None);
+        assert_eq!(extract_fileid(url), Some(123456));
+
+        assert_eq!(extract_fileid("https://cloud.example.com/apps/files/files/42"), Some(42));
+        assert_eq!(extract_fileid("https://cloud.example.com/index.php/f/42/"), Some(42));
+        assert_eq!(
+            extract_fileid("https://cloud.example.com/index.php/apps/files/?fileid=42&dir=/x"),
+            Some(42),
+        );
+    }
+
+    #[test]
+    fn refuses_a_trailing_number_that_is_not_a_fileid() {
+        for url in [
+            "https://cloud.example.com/index.php/apps/deck/board/7",
+            "https://cloud.example.com/index.php/f/not-a-number",
+            "https://cloud.example.com/",
+            "",
+        ] {
+            assert_eq!(extract_fileid(url), None, "{} must not yield a fileid", url);
+        }
+    }
+
+    #[test]
+    fn joins_a_server_path_onto_the_mount() {
+        let mount = Path::new("/home/u/Nextcloud");
+        assert_eq!(
+            local_path_for(mount, "/Deemix Downloads/a.flac").as_deref(),
+            Some("/home/u/Nextcloud/Deemix Downloads/a.flac"),
+        );
+        assert_eq!(
+            local_path_for(mount, "top.txt").as_deref(),
+            Some("/home/u/Nextcloud/top.txt"),
+        );
+    }
+
+    #[test]
+    fn refuses_a_path_that_climbs_out_of_the_mount() {
+        let mount = Path::new("/home/u/Nextcloud");
+        for hostile in ["/../.bashrc", "/a/../../b", "..\\..\\x", "/", ""] {
+            assert_eq!(local_path_for(mount, hostile), None, "{} must be refused", hostile);
         }
     }
 }

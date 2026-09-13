@@ -129,6 +129,7 @@ pub fn propfind_etag(
     Ok(dir_etag)
 }
 
+/// The paths of the files with these ids, in no particular order.
 pub fn resolve_fileids(
     client: &crate::http_clients::DavClient,
     webdav_url: &str,
@@ -136,6 +137,37 @@ pub fn resolve_fileids(
     file_ids: &[u64],
     timeout: Duration,
 ) -> Result<Vec<PathBuf>, String> {
+    Ok(search_fileids(client, webdav_url, creds, file_ids, timeout)?
+        .into_iter()
+        .map(|e| e.path)
+        .collect())
+}
+
+/// The same lookup keyed by id, for callers that have to map a specific hit
+/// back to the file it came from rather than just collect the set of paths.
+///
+/// Hits the server returns without an `oc:fileid` are dropped — there is no id
+/// to key them by — which is why [`resolve_fileids`] does not go through here.
+pub fn resolve_fileid_paths(
+    client: &crate::http_clients::DavClient,
+    webdav_url: &str,
+    creds: &crate::auth::Credentials,
+    file_ids: &[u64],
+    timeout: Duration,
+) -> Result<std::collections::HashMap<u64, PathBuf>, String> {
+    Ok(search_fileids(client, webdav_url, creds, file_ids, timeout)?
+        .into_iter()
+        .filter_map(|e| e.fileid.map(|id| (id, e.path)))
+        .collect())
+}
+
+fn search_fileids(
+    client: &crate::http_clients::DavClient,
+    webdav_url: &str,
+    creds: &crate::auth::Credentials,
+    file_ids: &[u64],
+    timeout: Duration,
+) -> Result<Vec<DavEntry>, String> {
     if file_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -195,17 +227,22 @@ pub fn resolve_fileids(
     }
 
     let reader = std::io::BufReader::new(resp);
-    let (_, self_entry, entries) = parse_multistatus_stream(reader, webdav_url)?;
+    let (_, self_entry, mut hits) = parse_multistatus_stream(reader, webdav_url)?;
 
-    let mut paths: Vec<PathBuf> = entries.into_iter().map(|e| e.path).collect();
+    // The parser reserves the first response for the collection a PROPFIND was
+    // issued against; in a SEARCH result it is an ordinary hit.
     if let Some(se) = self_entry {
         if se.path != PathBuf::from("/") {
-            paths.push(se.path);
+            hits.push(se);
         }
     }
 
-    log::info!("SEARCH resolve_fileids {:?} → {:?}", file_ids, paths);
-    Ok(paths)
+    log::info!(
+        "SEARCH resolve_fileids {:?} → {:?}",
+        file_ids,
+        hits.iter().map(|e| &e.path).collect::<Vec<_>>()
+    );
+    Ok(hits)
 }
 
 fn build_url(webdav_url: &str, path: &std::path::Path) -> String {

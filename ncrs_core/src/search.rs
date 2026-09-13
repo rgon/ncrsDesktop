@@ -166,6 +166,23 @@ pub fn search_provider(
     Ok(ocs.ocs.data.entries)
 }
 
+/// Resolve the file ids of `files` hits to their paths on the server.
+///
+/// Nextcloud ≤ 27 linked a file hit as `/apps/files/?dir=…&scrollto=…`, so the
+/// containing directory could be read straight out of `resourceUrl`. Since 28
+/// the link is `/f/<fileid>` and carries no path at all, so the id has to be
+/// resolved against the server before a hit can be pointed at the mounted copy.
+///
+/// `webdav_url` is the configured WebDAV endpoint, not the search base URL.
+pub fn resolve_fileid_paths(
+    webdav_url: &str,
+    creds: &crate::auth::Credentials,
+    http3: bool,
+    file_ids: &[u64],
+) -> Result<std::collections::HashMap<u64, std::path::PathBuf>, String> {
+    crate::propfind::resolve_fileid_paths(&client(http3), webdav_url, creds, file_ids, API_TIMEOUT)
+}
+
 /// Search all providers in parallel, returning only groups with results.
 pub fn search_all(
     base: &str,
