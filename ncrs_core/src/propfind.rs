@@ -177,7 +177,10 @@ fn search_fileids(
     let dav_root = {
         let path = parsed.path();
         let idx = path.find("/files/").unwrap_or(path.len());
-        format!("{}://{}{}/", parsed.scheme(), parsed.host_str().unwrap_or(""), &path[..idx])
+        // Origin, not scheme + host_str: the latter drops the port, so a server
+        // on https://cloud.example.com:8443 was sent this request — with its
+        // credentials attached — to port 443 instead.
+        format!("{}{}/", parsed.origin().ascii_serialization(), &path[..idx])
     };
     let scope = {
         let path = parsed.path().trim_end_matches('/');
@@ -570,6 +573,12 @@ impl<R: std::io::BufRead> ResponseReader<R> {
                             resp.permissions = Some(self.read_text()?);
                         }
                         "fileid" => {
+                            // Only overwrite with a value that parsed. A server
+                            // may echo the requested property back empty under a
+                            // trailing 404 propstat (see `getetag` above), and
+                            // this loop does not separate propstats by status —
+                            // so a bare `<oc:fileid/>` must not erase the id the
+                            // 200 propstat already gave us.
                             resp.fileid = self.read_text()?.parse().ok();
                         }
                         "owner-id" => {
