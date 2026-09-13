@@ -24,8 +24,8 @@ struct Cli {
     #[arg(long, value_name = "USER")]
     username: Option<String>,
 
-    /// Override password from config
-    #[arg(long, value_name = "PASS")]
+    /// [Deprecated: visible in `ps`; prefer auth_command or login flow]
+    #[arg(long, value_name = "PASS", hide = true)]
     password: Option<String>,
 
     /// Disable optimistic directory listing (re-list every 10s instead of relying on notify_push)
@@ -117,6 +117,7 @@ fn main() {
         opts.url = ncrs_core::login_flow::normalize_webdav_url(&url, username);
     }
     if let Some(password) = cli.password {
+        eprintln!("ncrs: warning: --password is deprecated (visible in process listing); use auth_command or the login flow instead");
         opts.password = Some(password);
     }
     if cli.offline {
