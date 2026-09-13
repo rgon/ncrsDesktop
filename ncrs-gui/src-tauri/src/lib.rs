@@ -752,18 +752,12 @@ fn write_config_from_login(
     Ok(())
 }
 
-/// Join a server-side path onto the mount point.
-///
-/// Both inputs to this are server-controlled (a search hit's `dir=` parameter,
-/// or a path the server reported for a file id), and the result is handed to
-/// the desktop's file manager — so a path that could climb out of the mount is
-/// dropped rather than revealed.
+/// A search hit's path inside the mount, in the string form the webview and
+/// `reveal_in_file_manager` use. See [`ncrs_core::mount_local_path`] for why
+/// server-supplied paths are constrained rather than joined directly.
 fn local_path_for(mount_point: &std::path::Path, remote_path: &str) -> Option<String> {
-    let rel = remote_path.trim_start_matches('/');
-    if rel.is_empty() || rel.split(['/', '\\']).any(|seg| seg == ".." || seg == ".") {
-        return None;
-    }
-    Some(mount_point.join(rel).to_string_lossy().into_owned())
+    ncrs_core::mount_local_path(mount_point, remote_path)
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// The file id in a Nextcloud ≥ 28 file hit (`…/index.php/f/1234`), or in the

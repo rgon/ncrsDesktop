@@ -2453,3 +2453,52 @@ password: "pass"
         let status = backend.check_reachability(Duration::from_secs(5));
         assert_eq!(status, ReachabilityStatus::AuthRejected(401));
     }
+
+#[cfg(test)]
+mod mount_local_path_tests {
+    use crate::mount_local_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resolves_a_path_inside_the_mount() {
+        let mount = Path::new("/home/u/Nextcloud");
+        assert_eq!(
+            mount_local_path(mount, "/Deemix Downloads/a.flac"),
+            Some(PathBuf::from("/home/u/Nextcloud/Deemix Downloads/a.flac")),
+        );
+        assert_eq!(
+            mount_local_path(mount, "top.txt"),
+            Some(PathBuf::from("/home/u/Nextcloud/top.txt")),
+        );
+    }
+
+    #[test]
+    fn contains_a_path_that_stays_absolute_after_one_slash_is_trimmed() {
+        // The regression: `strip_prefix('/')` trimmed only the first slash, so
+        // these stayed absolute and `Path::join` threw the mount point away and
+        // handed back the server's own path. Trimming every leading slash keeps
+        // them inside the mount, where at worst they name nothing.
+        let mount = Path::new("/home/u/Nextcloud");
+        for escape in [
+            "//home/u/.bashrc",
+            "///etc/passwd",
+            "//home/u/.local/share/applications/evil.desktop",
+        ] {
+            let resolved = mount_local_path(mount, escape).expect("stays a usable relative path");
+            assert!(
+                resolved.starts_with(mount),
+                "{} escaped the mount as {}",
+                escape,
+                resolved.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_traversal_and_empty_paths() {
+        let mount = Path::new("/home/u/Nextcloud");
+        for bad in ["/../.bashrc", "/a/../../b", "..\\..\\x", "/./x", "/", "", "///"] {
+            assert_eq!(mount_local_path(mount, bad), None, "{:?} must be refused", bad);
+        }
+    }
+}

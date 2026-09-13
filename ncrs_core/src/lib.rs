@@ -34,6 +34,31 @@ use fuser::{
 };
 
 pub use config::{configuration_parser, MountOptions};
+
+/// Resolve a server-supplied remote path to its location inside the mount.
+///
+/// Every caller of this feeds the result to something that acts on it — the
+/// desktop file manager, `xdg-open` — from a path the *server* chose: a search
+/// hit's directory, the `pathForUser` of an edit-locally token. Two ways out of
+/// the mount have to be closed, and only one of them is obvious:
+///
+/// - a `..` segment walks up from inside;
+/// - a path that is still absolute after trimming makes [`Path::join`] discard
+///   the mount point entirely and return the server's path verbatim. Trimming
+///   only the first `/` (`strip_prefix`) leaves `//etc/passwd` absolute, which
+///   is how this was missed.
+///
+/// `None` for anything that does not name a file inside `mount_point`.
+pub fn mount_local_path(mount_point: &Path, remote_path: &str) -> Option<PathBuf> {
+    let rel = remote_path.trim_start_matches('/');
+    if rel.is_empty() || rel.split(['/', '\\']).any(|seg| seg == ".." || seg == ".") {
+        return None;
+    }
+    let joined = mount_point.join(rel);
+    // The checks above already guarantee this; it is asserted rather than
+    // assumed because the cost of being wrong here is arbitrary-path access.
+    joined.starts_with(mount_point).then_some(joined)
+}
 use ipc::{FileStatus, StatusMap};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use backend::RemoteEntry;

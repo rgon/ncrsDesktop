@@ -45,12 +45,13 @@ fn main() {
     };
 
     let remote_path = &data.path_for_user;
-    let rel = remote_path.strip_prefix('/').unwrap_or(remote_path);
-    if rel.split(['/', '\\']).any(|seg| seg == "..") {
-        eprintln!("ncrs-open: rejecting path with parent-directory segment");
-        std::process::exit(1);
-    }
-    let local_path = config.mount_point.join(rel);
+    let local_path = match ncrs_core::mount_local_path(&config.mount_point, remote_path) {
+        Some(p) => p,
+        None => {
+            eprintln!("ncrs-open: refusing {:?} — not a path inside the mount", remote_path);
+            std::process::exit(1);
+        }
+    };
 
     let sock_path = ncrs_core::ipc::socket_path();
     if let Ok(mut stream) = UnixStream::connect(&sock_path) {
