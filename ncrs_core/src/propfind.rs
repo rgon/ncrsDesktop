@@ -579,7 +579,9 @@ impl<R: std::io::BufRead> ResponseReader<R> {
                             // this loop does not separate propstats by status —
                             // so a bare `<oc:fileid/>` must not erase the id the
                             // 200 propstat already gave us.
-                            resp.fileid = self.read_text()?.parse().ok();
+                            if let Ok(id) = self.read_text()?.parse() {
+                                resp.fileid = Some(id);
+                            }
                         }
                         "owner-id" => {
                             resp.owner_id = Some(self.read_text()?);
