@@ -46,6 +46,10 @@ fn main() {
 
     let remote_path = &data.path_for_user;
     let rel = remote_path.strip_prefix('/').unwrap_or(remote_path);
+    if rel.split(['/', '\\']).any(|seg| seg == "..") {
+        eprintln!("ncrs-open: rejecting path with parent-directory segment");
+        std::process::exit(1);
+    }
     let local_path = config.mount_point.join(rel);
 
     let sock_path = ncrs_core::ipc::socket_path();
