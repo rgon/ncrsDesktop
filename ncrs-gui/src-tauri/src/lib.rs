@@ -495,17 +495,19 @@ async fn search_nextcloud(
     .await
     .map_err(|e| format!("search task failed: {}", e))??;
 
-    for group in &mut groups {
-        if group.provider_id != "files" {
-            continue;
-        }
-
-        // Nextcloud ≤ 27 puts the containing directory in the hit's URL; since
-        // 28 the URL is `/f/<fileid>` and the path has to come from the server.
-        // Read the cheap one first, then resolve whatever is left in one SEARCH
-        // rather than one round trip per hit.
-        let mut unresolved: Vec<(usize, u64)> = Vec::new();
-        for (i, entry) in group.entries.iter_mut().enumerate() {
+    // Not gated on `provider_id == "files"`: the URL shape is the real
+    // discriminator, and it is not only the Files provider that returns file
+    // hits — a `comments` hit links to the commented-on file with the very same
+    // `/f/<fileid>`. A provider with neither form (calendar, contacts, settings)
+    // yields nothing here and keeps its web link, which is what it wants.
+    //
+    // Nextcloud ≤ 27 put the containing directory in the URL; since 28 only the
+    // file id is there and the path has to come from the server. Read the free
+    // one first and collect the rest across every group, so the round trip is
+    // one SEARCH for the whole result set rather than one per provider.
+    let mut unresolved: Vec<(usize, usize, u64)> = Vec::new();
+    for (gi, group) in groups.iter_mut().enumerate() {
+        for (ei, entry) in group.entries.iter_mut().enumerate() {
             if let Some(dir) = extract_dir_param(&entry.resource_url) {
                 let file_path = if dir == "/" {
                     format!("/{}", entry.title)
@@ -518,51 +520,54 @@ async fn search_nextcloud(
                 }
             }
             match extract_fileid(&entry.resource_url) {
-                Some(id) => unresolved.push((i, id)),
-                // Not fatal: the GUI falls back to opening the hit in the web
-                // UI. Logged because it means every hit from this server opens
-                // in a browser instead of the file manager.
-                None => log::warn!(
+                Some(id) => unresolved.push((gi, ei, id)),
+                // Only worth reporting for the Files provider, where a hit that
+                // yields no path means every file result now opens in a browser
+                // instead of the file manager. Elsewhere it is just a hit that
+                // was never a file.
+                None if group.provider_id == "files" => log::warn!(
                     "search: no dir or fileid in {:?} — {:?} cannot be opened locally",
                     entry.resource_url,
                     entry.title,
                 ),
+                None => {}
             }
         }
+    }
 
-        if unresolved.is_empty() {
-            continue;
-        }
-
-        let ids: Vec<u64> = unresolved.iter().map(|(_, id)| *id).collect();
-        let url = dav_url.clone();
+    if !unresolved.is_empty() {
+        let ids: Vec<u64> = unresolved.iter().map(|(_, _, id)| *id).collect();
         let resolve_creds = creds.clone();
         let paths = tokio::task::spawn_blocking(move || {
-            ncrs_core::search::resolve_fileid_paths(&url, &resolve_creds, http3, &ids)
+            ncrs_core::search::resolve_fileid_paths(&dav_url, &resolve_creds, http3, &ids)
         })
         .await
         .map_err(|e| format!("fileid resolve task failed: {}", e))?;
 
-        let paths = match paths {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("search: resolving file ids failed: {} — hits open in the web UI", e);
-                continue;
-            }
-        };
-
-        for (i, id) in unresolved {
-            match paths.get(&id) {
-                Some(remote) => {
-                    group.entries[i].local_path =
-                        local_path_for(&mount_point, &remote.to_string_lossy());
+        match paths {
+            Ok(paths) => {
+                for (gi, ei, id) in unresolved {
+                    let entry = &mut groups[gi].entries[ei];
+                    match paths.get(&id) {
+                        Some(remote) => {
+                            entry.local_path =
+                                local_path_for(&mount_point, &remote.to_string_lossy());
+                        }
+                        // A hit that is not a file after all (a provider whose
+                        // URL merely looked like one), or one the account can no
+                        // longer see. Either way the web link still works.
+                        None => log::debug!(
+                            "search: fileid {} ({:?}) has no path on the server",
+                            id,
+                            entry.title,
+                        ),
+                    }
                 }
-                None => log::warn!(
-                    "search: fileid {} ({:?}) has no path on the server",
-                    id,
-                    group.entries[i].title,
-                ),
             }
+            Err(e) => log::warn!(
+                "search: resolving file ids failed: {} — those hits open in the web UI",
+                e,
+            ),
         }
     }
 
@@ -1948,6 +1953,23 @@ mod search_path_tests {
             "",
         ] {
             assert_eq!(extract_fileid(url), None, "{} must not yield a fileid", url);
+        }
+    }
+
+    #[test]
+    fn a_non_file_providers_hit_yields_no_path_at_all() {
+        // What makes it safe to run the resolution over every provider rather
+        // than only `files`: a hit that is not a file matches neither form, so
+        // it keeps its web link and costs no lookup.
+        for url in [
+            "https://cloud.example.com/index.php/apps/calendar/dayGridMonth/now",
+            "https://cloud.example.com/index.php/apps/contacts/All%20contacts/x~contacts",
+            "https://cloud.example.com/index.php/call/abc123",
+            "https://cloud.example.com/index.php/settings/user/security",
+            "https://bookmarked.example.org/some/article",
+        ] {
+            assert_eq!(extract_fileid(url), None, "{} must not yield a fileid", url);
+            assert_eq!(extract_dir_param(url), None, "{} must not yield a dir", url);
         }
     }
 
