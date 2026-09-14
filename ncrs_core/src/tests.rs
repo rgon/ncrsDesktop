@@ -2502,3 +2502,61 @@ mod mount_local_path_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod http3_available_tests {
+    use crate::http_clients::{http3_available, HttpClients};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ncrs-test-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn clients(http3: bool) -> HttpClients {
+        let mk = || reqwest::blocking::Client::builder().build().unwrap();
+        let (h2, read_h2) = (mk(), mk());
+        let (pref, read_pref) = if http3 { (mk(), mk()) } else { (h2.clone(), read_h2.clone()) };
+        HttpClients::new(pref, read_pref, h2, read_h2, http3)
+    }
+
+    #[test]
+    fn the_side_clients_agree_with_the_daemon_about_the_transport() {
+        // The whole point of the shared marker: search and notifications must
+        // reach the same verdict as the mount, or they keep dialling QUIC on a
+        // network where the mount already gave up on it.
+        let dir = tmp("h3side");
+        let marker = dir.join("h3_demoted");
+
+        let c = clients(true).with_demotion_marker(marker.clone());
+        assert!(c.http3_active());
+        assert!(http3_available(true, &marker), "no marker: both use HTTP/3");
+
+        c.demote();
+        assert!(!c.http3_active());
+        assert!(!http3_available(true, &marker), "after a demotion neither may use HTTP/3");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_marker_lets_the_side_clients_retry_http3() {
+        let dir = tmp("h3sidestale");
+        let marker = dir.join("h3_demoted");
+        let old = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 8 * 24 * 3600;
+        std::fs::write(&marker, old.to_string()).unwrap();
+
+        assert!(http3_available(true, &marker), "past the retry window QUIC is armed again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn http3_off_in_config_is_never_overridden_by_a_marker() {
+        let dir = tmp("h3sideoff");
+        let marker = dir.join("h3_demoted");
+        assert!(!http3_available(false, &marker), "no marker, but HTTP/3 is not configured");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

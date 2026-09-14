@@ -35,6 +35,18 @@ use fuser::{
 
 pub use config::{configuration_parser, MountOptions};
 
+/// The transport the out-of-band clients — unified search, notifications —
+/// should use for this server right now.
+///
+/// [`MountOptions::http3`] is only what the user configured. Once the mount-time
+/// probe has found QUIC unusable on this network the daemon runs on HTTP/2 and
+/// records it, but those clients are built outside [`http_clients::HttpClients`]
+/// and cannot see that through the options alone. Ask this instead: a QUIC-only
+/// client on a network that blocks UDP/443 fails every call it makes.
+pub fn http3_effective(options: &MountOptions) -> bool {
+    http_clients::http3_available(options.http3, &h3_demotion_marker(&options.url))
+}
+
 /// Resolve a server-supplied remote path to its location inside the mount.
 ///
 /// Every caller of this feeds the result to something that acts on it — the
@@ -2682,7 +2694,7 @@ impl NextCloudFs {
         // Remember a demotion across restarts (per server, in its cache dir):
         // re-arming QUIC every session made each restart on a QUIC-hostile
         // network pay one offline blip before latching onto HTTP/2 again.
-        .with_demotion_marker(cache_dir.join("h3_demoted"));
+        .with_demotion_marker(h3_demotion_marker(&options.url));
 
         let max_req = if options.max_concurrent_requests == 0 { 10 } else { options.max_concurrent_requests };
         log::info!("HTTP throttle: max {} concurrent requests", max_req);
@@ -6298,6 +6310,11 @@ fn ncrs_cache_dir(url: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("ncrs")
         .join(url_to_dir_name(url))
+}
+
+/// Where an HTTP/3 demotion for `url`'s server is recorded, and read back from.
+fn h3_demotion_marker(url: &str) -> PathBuf {
+    ncrs_cache_dir(url).join("h3_demoted")
 }
 
 fn mount_marker_path(cache_dir: &Path) -> PathBuf {

@@ -309,7 +309,7 @@ fn dismiss_notification(state: State<Arc<AppState>>, id: u64) {
             Ok(c) => c,
             Err(e) => { log::warn!("dismiss notification: {}", e); return; }
         };
-        let http3 = opts.http3;
+        let http3 = ncrs_core::http3_effective(&opts);
         thread::spawn(move || {
             if let Err(e) =
                 ncrs_core::notifications::dismiss_notification(&base, &creds, id, http3)
@@ -460,7 +460,7 @@ async fn fetch_search_providers(
         .ok_or_else(|| "not connected".to_string())?;
     let base = ncrs_core::notifications::base_url(&opts.url);
     let creds = opts.credentials()?;
-    let http3 = opts.http3;
+    let http3 = ncrs_core::http3_effective(&opts);
 
     tokio::task::spawn_blocking(move || {
         ncrs_core::search::fetch_providers(&base, &creds, http3)
@@ -483,7 +483,7 @@ async fn search_nextcloud(
         .ok_or_else(|| "not connected".to_string())?;
     let base = ncrs_core::notifications::base_url(&opts.url);
     let creds = opts.credentials()?;
-    let http3 = opts.http3;
+    let http3 = ncrs_core::http3_effective(&opts);
     let mount_point = opts.mount_point.clone();
 
     let dav_url = opts.url.clone();
@@ -1406,7 +1406,7 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
             let poll_state = state.clone();
             let poll_app = app.clone();
             let poll_url = opts.url.clone();
-            let poll_http3 = opts.http3;
+            let poll_opts = opts.clone();
             let notif_shutdown = shutdown_rx.clone();
             log::info!("notification polling starting for {}", ncrs_core::notifications::base_url(&poll_url));
             spawn(async move {
@@ -1415,6 +1415,10 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
                     if *notif_shutdown.borrow() { break; }
                     let b = base.clone();
                     let c = poll_creds.clone();
+                    // Re-read per poll rather than captured once: this loop
+                    // starts before the mount-time probe has decided, so a
+                    // demotion would otherwise never reach it this session.
+                    let poll_http3 = ncrs_core::http3_effective(&poll_opts);
                     match tokio::task::spawn_blocking(move || {
                         ncrs_core::notifications::fetch_notifications(&b, &c, poll_http3)
                     }).await {

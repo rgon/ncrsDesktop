@@ -208,6 +208,25 @@ impl HttpClients {
     }
 }
 
+/// Whether HTTP/3 is usable for the server whose demotion marker is `path`.
+///
+/// [`HttpClients`] answers this for the daemon's own requests, but the search
+/// and notification clients are built outside it (`search::client`,
+/// `notifications::client`) and used to read the raw config flag instead. On a
+/// network where QUIC is blocked that made them the only part of the app still
+/// dialling a QUIC-only client: the mount demoted and worked while every search
+/// and every notification poll failed for the whole session.
+///
+/// The marker is the shared signal on purpose — it is written by whichever
+/// process owns the mount, so this also answers correctly in the GUI's attached
+/// mode, where there is no in-process `HttpClients` to consult at all.
+pub fn http3_available(http3_configured: bool, marker: &Path) -> bool {
+    if !http3_configured {
+        return false;
+    }
+    !matches!(read_marker_age(marker), Some(age) if age < H3_DEMOTION_RETRY)
+}
+
 /// Age of the demotion marker at `path`, or `None` when there is no readable
 /// marker. A timestamp in the future (clock stepped backwards since it was
 /// written) reads as age zero — still demoted — rather than as garbage.
