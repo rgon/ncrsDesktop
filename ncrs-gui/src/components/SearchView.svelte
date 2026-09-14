@@ -48,6 +48,9 @@
 
     let providers = $state<SearchProvider[]>([]);
     let selectedProviders = $state<Set<string>>(new Set());
+    // Why the last click or search did nothing. Transient, so it is not a
+    // SyncError: none of it is a sync failure and none of it outlives the panel.
+    let notice = $state("");
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -67,6 +70,7 @@
             results = [];
             searched = false;
             loading = false;
+            notice = "";
             return;
         }
         searchGen++;
@@ -81,6 +85,7 @@
                 results = [];
                 searched = false;
                 loading = false;
+                notice = "";
                 searchGen++;
             } else {
                 onclose?.();
@@ -119,22 +124,40 @@
             if (gen !== searchGen) return;
             console.error("search failed:", e);
             results = [];
+            notice = typeof e === "string" ? e : "Search failed.";
         }
         loading = false;
         searched = true;
     }
 
     async function openResult(entry: SearchEntry) {
-        if (entry.local_path) {
-            await invoke("reveal_in_file_manager", { path: entry.local_path });
-        } else if (entry.resource_url) {
-            await invoke("open_link", { url: entry.resource_url });
+        // Every branch here reports: a result that silently does nothing when
+        // clicked is indistinguishable from a dead panel, which is exactly how
+        // the missing file-id resolution went unnoticed.
+        try {
+            if (entry.local_path) {
+                await invoke("reveal_in_file_manager", { path: entry.local_path });
+            } else if (entry.resource_url) {
+                await invoke("open_link", { url: entry.resource_url });
+            } else {
+                notice = `"${entry.title}" cannot be opened from here.`;
+                return;
+            }
+            notice = "";
+        } catch (e) {
+            notice = typeof e === "string" ? e : `Could not open "${entry.title}".`;
         }
     }
 
     async function viewOnline(e: MouseEvent | KeyboardEvent, url: string) {
         e.stopPropagation();
-        if (url) await invoke("open_link", { url });
+        if (!url) return;
+        try {
+            await invoke("open_link", { url });
+            notice = "";
+        } catch (err) {
+            notice = typeof err === "string" ? err : "Could not open the link.";
+        }
     }
 
     function clearQuery() {
@@ -142,6 +165,7 @@
         results = [];
         searched = false;
         loading = false;
+        notice = "";
         searchGen++;
     }
 </script>
@@ -188,6 +212,16 @@
                 {p.name}
             </button>
         {/each}
+    </div>
+    {/if}
+
+    <!-- Why the last action did nothing -->
+    {#if notice}
+    <div class="flex items-start gap-2 px-3 py-2 text-xs text-warning border-b border-gray-200">
+        <span class="flex-1">{notice}</span>
+        <button class="btn btn-ghost btn-xs btn-circle" onclick={() => { notice = ""; }} aria-label="Dismiss">
+            <Icon class="w-3 h-3" path={mdiClose} />
+        </button>
     </div>
     {/if}
 

@@ -332,12 +332,17 @@ fn dismiss_notification(state: State<Arc<AppState>>, id: u64) {
 const OPENABLE_SCHEMES: &[&str] = &["http", "https", "mailto"];
 
 #[tauri::command]
-fn open_link(url: String, app: AppHandle) {
+fn open_link(url: String, app: AppHandle) -> Result<(), String> {
     if !is_openable_url(&url) {
         log::warn!("open_link: refusing to open {:?}", url);
-        return;
+        return Err("That link cannot be opened.".into());
     }
-    app.opener().open_url(&url, None::<&str>).ok();
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| {
+            log::warn!("open_link: {:?}: {}", url, e);
+            "Could not open the link in a browser.".into()
+        })
 }
 
 fn is_openable_url(url: &str) -> bool {
@@ -348,8 +353,19 @@ fn is_openable_url(url: &str) -> bool {
 }
 
 #[tauri::command]
-fn reveal_in_file_manager(path: String, app: AppHandle) {
-    app.opener().reveal_item_in_dir(&path).ok();
+fn reveal_in_file_manager(path: String, app: AppHandle) -> Result<(), String> {
+    // Checked before handing it over because the file manager's reaction to a
+    // path that is not there is to do nothing at all, and the two ways to get
+    // here with one — the mount is not up, or the file was removed on the
+    // server since the search ran — are the likeliest failures, not the rarest.
+    if !std::path::Path::new(&path).exists() {
+        log::warn!("reveal_in_file_manager: {:?} is not present", path);
+        return Err("That file is not in the mount — is your Nextcloud folder mounted?".into());
+    }
+    app.opener().reveal_item_in_dir(&path).map_err(|e| {
+        log::warn!("reveal_in_file_manager: {:?}: {}", path, e);
+        "Could not open the file manager.".into()
+    })
 }
 
 #[tauri::command]
