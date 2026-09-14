@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.65](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.64...ncrs-v0.1.65) (2026-09-14)
+
+
+### Bug Fixes
+
+* **edit-locally:** contain server paths that survive a single-slash trim ([26ec842](https://github.com/rgon/ncrsDesktop/commit/26ec8420d77c818b684f563ab2bc8002c8e185e5))
+* **edit-locally:** reject server paths that climb out of the mount point ([fa3cb06](https://github.com/rgon/ncrsDesktop/commit/fa3cb060b3e5f3d5d0045b4a695c69672ca972dc))
+* **http:** honour the HTTP/3 demotion in the search and notification clients ([f15da7a](https://github.com/rgon/ncrsDesktop/commit/f15da7a4e905903a938a9f3198e10783d2670ecf))
+* **propfind:** keep the port when deriving the DAV root for fileid lookups ([4114627](https://github.com/rgon/ncrsDesktop/commit/4114627f1374fb5ff5b8a5148edb1051e9c1a50d))
+* **propfind:** never let an empty property erase a parsed fileid ([648fc2b](https://github.com/rgon/ncrsDesktop/commit/648fc2bf9568a788365a5d1c0361225efe1413fe))
+* **search:** report why a result did not open instead of failing silently ([50a8f5b](https://github.com/rgon/ncrsDesktop/commit/50a8f5ba4208f5c03583c682a617a4d24dbcae5f))
+* **search:** resolve file hits from every provider, not just the Files one ([c2f428c](https://github.com/rgon/ncrsDesktop/commit/c2f428c8662ba4bfeb7dc62a9f59bd3501a7ada1))
+* **search:** resolve file ids so Nextcloud 28+ hits open in the file manager ([0e3e7f7](https://github.com/rgon/ncrsDesktop/commit/0e3e7f7828b0bbe9133ecb637bb9f60997f23ebc))
+
 ## [0.1.64](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.63...ncrs-v0.1.64) (2026-09-01)
 
 
