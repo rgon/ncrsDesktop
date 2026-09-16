@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.66](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.65...ncrs-v0.1.66) (2026-09-16)
+
+
+### Features
+
+* **upload:** stream large sequential writes in bounded chunks instead of full local staging ([f9a4b9b](https://github.com/rgon/ncrsDesktop/commit/f9a4b9b7b02d8d67f6e97b47fd3039b908faae5d))
+
+
+### Bug Fixes
+
+* **purge:** reclaim orphaned write-staging files, not just download cache ([ce3b11d](https://github.com/rgon/ncrsDesktop/commit/ce3b11d563a29354ea6b39c10f11362525ecf786))
+
 ## [0.1.65](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.64...ncrs-v0.1.65) (2026-09-14)
 
 
