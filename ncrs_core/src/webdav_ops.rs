@@ -175,21 +175,20 @@ pub fn move_resource(
     }
 }
 
-const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+pub(crate) const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const CHUNK_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
-pub fn put_file_chunked(
+/// Opens a new Nextcloud chunked-upload session (MKCOL on a fresh transfer
+/// collection under `remote.php/dav/uploads/<user>/`) and returns its base
+/// URL. Chunks are PUT to `<base>/<index>` (see `put_chunk`) in any order and
+/// concatenated by index when `finish_chunked_upload` assembles them — this is
+/// what lets a caller stream chunks in as they become available instead of
+/// handing over the whole file up front.
+pub fn open_chunked_session(
     client: &crate::http_clients::DavClient,
     base_url: &str,
     creds: &crate::auth::Credentials,
-    path: &Path,
-    body: Vec<u8>,
-    if_match_etag: Option<&str>,
-) -> Result<PutResult, WriteError> {
-    if body.len() <= CHUNK_SIZE {
-        return put_file(client, base_url, creds, path, body, if_match_etag);
-    }
-
+) -> Result<String, WriteError> {
     let transfer_id = format!("ncrs-{}-{}", std::process::id(), std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
 
@@ -208,27 +207,48 @@ pub fn put_file_chunked(
     if !resp.status().is_success() && resp.status().as_u16() != 405 {
         return Err(WriteError::Server(resp.status().as_u16(), format!("chunked MKCOL: {}", resp.text().unwrap_or_default())));
     }
+    Ok(uploads_base)
+}
 
-    let total_chunks = (body.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    for (i, chunk) in body.chunks(CHUNK_SIZE).enumerate() {
-        let chunk_url = format!("{}/{:010}", uploads_base, i);
-        log::info!("CHUNKED_UPLOAD {}/{} ({} bytes)", i + 1, total_chunks, chunk.len());
-        let resp = creds.apply(client
-            .put(&chunk_url)
-            .timeout(CHUNK_UPLOAD_TIMEOUT))
-            .body(chunk.to_vec())
-            .send()
-            .map_err(|e| {
-                let _ = cleanup_chunked_upload(client, &uploads_base, creds);
-                WriteError::Network(format!("chunk {} upload: {}", i, e))
-            })?;
-        let status = resp.status().as_u16();
-        if status != 200 && status != 201 && status != 204 {
-            let _ = cleanup_chunked_upload(client, &uploads_base, creds);
-            return Err(WriteError::Server(status, format!("chunk {} upload: {}", i, resp.text().unwrap_or_default())));
-        }
+/// PUTs one chunk into a session opened by `open_chunked_session`. Leaves the
+/// session intact on failure — a caller streaming chunks in over time (rather
+/// than handing over a complete file) may want to retry the same index without
+/// losing chunks already accepted; callers that want cleanup-on-error call
+/// `abort_chunked_upload` themselves.
+pub fn put_chunk(
+    client: &crate::http_clients::DavClient,
+    creds: &crate::auth::Credentials,
+    uploads_base: &str,
+    index: u64,
+    body: Vec<u8>,
+) -> Result<(), WriteError> {
+    let len = body.len();
+    let chunk_url = format!("{}/{:010}", uploads_base, index);
+    log::info!("CHUNKED_UPLOAD chunk {} ({} bytes) -> {}", index, len, uploads_base);
+    let resp = creds.apply(client
+        .put(&chunk_url)
+        .timeout(CHUNK_UPLOAD_TIMEOUT))
+        .body(body)
+        .send()
+        .map_err(|e| WriteError::Network(format!("chunk {} upload: {}", index, e)))?;
+    let status = resp.status().as_u16();
+    if status != 200 && status != 201 && status != 204 {
+        return Err(WriteError::Server(status, format!("chunk {} upload ({} bytes): {}", index, len, resp.text().unwrap_or_default())));
     }
+    Ok(())
+}
 
+/// Assembles a chunked-upload session into `path` via the collection's
+/// `.file` MOVE target, applying `if_match_etag` as an optimistic-concurrency
+/// guard exactly like a normal PUT's If-Match.
+pub fn finish_chunked_upload(
+    client: &crate::http_clients::DavClient,
+    base_url: &str,
+    creds: &crate::auth::Credentials,
+    uploads_base: &str,
+    path: &Path,
+    if_match_etag: Option<&str>,
+) -> Result<PutResult, WriteError> {
     let dest_url = dav_url(base_url, creds.username(), path);
     let assemble_url = format!("{}/.file", uploads_base);
     let mut req = creds.apply(client
@@ -258,6 +278,41 @@ pub fn put_file_chunked(
     }
 }
 
+/// Best-effort teardown of an abandoned or failed chunked-upload session —
+/// errors are not actionable by any caller, so they are swallowed.
+pub fn abort_chunked_upload(
+    client: &crate::http_clients::DavClient,
+    creds: &crate::auth::Credentials,
+    uploads_base: &str,
+) {
+    let _ = cleanup_chunked_upload(client, uploads_base, creds);
+}
+
+pub fn put_file_chunked(
+    client: &crate::http_clients::DavClient,
+    base_url: &str,
+    creds: &crate::auth::Credentials,
+    path: &Path,
+    body: Vec<u8>,
+    if_match_etag: Option<&str>,
+) -> Result<PutResult, WriteError> {
+    if body.len() <= CHUNK_SIZE {
+        return put_file(client, base_url, creds, path, body, if_match_etag);
+    }
+
+    let uploads_base = open_chunked_session(client, base_url, creds)?;
+    let total_chunks = (body.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    for (i, chunk) in body.chunks(CHUNK_SIZE).enumerate() {
+        log::info!("CHUNKED_UPLOAD {}/{} ({} bytes)", i + 1, total_chunks, chunk.len());
+        if let Err(e) = put_chunk(client, creds, &uploads_base, i as u64, chunk.to_vec()) {
+            let _ = cleanup_chunked_upload(client, &uploads_base, creds);
+            return Err(e);
+        }
+    }
+
+    finish_chunked_upload(client, base_url, creds, &uploads_base, path, if_match_etag)
+}
+
 pub fn put_file_from_path(
     client: &crate::http_clients::DavClient,
     base_url: &str,
@@ -276,25 +331,7 @@ pub fn put_file_from_path(
         return put_file(client, base_url, creds, path, body, if_match_etag);
     }
 
-    let transfer_id = format!("ncrs-{}-{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
-
-    let uploads_base = format!(
-        "{}/remote.php/dav/uploads/{}/{}",
-        base_url.trim_end_matches('/'),
-        percent_encoding::utf8_percent_encode(creds.username(), PATH_COMPONENT),
-        percent_encoding::utf8_percent_encode(&transfer_id, PATH_COMPONENT),
-    );
-
-    let resp = creds.apply(client
-        .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &uploads_base)
-        .timeout(WRITE_TIMEOUT))
-        .send()
-        .map_err(|e| WriteError::Network(format!("chunked MKCOL: {}", e)))?;
-    if !resp.status().is_success() && resp.status().as_u16() != 405 {
-        return Err(WriteError::Server(resp.status().as_u16(), resp.text().unwrap_or_default()));
-    }
-
+    let uploads_base = open_chunked_session(client, base_url, creds)?;
     let total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
     let mut file = std::fs::File::open(staging_path)
         .map_err(|e| WriteError::Network(format!("staging open: {}", e)))?;
@@ -303,56 +340,18 @@ pub fn put_file_from_path(
     for i in 0..total_chunks {
         let chunk_size = CHUNK_SIZE.min(file_size - i * CHUNK_SIZE);
         let mut chunk = vec![0u8; chunk_size];
-        file.read_exact(&mut chunk).map_err(|e| {
+        if let Err(e) = file.read_exact(&mut chunk) {
             let _ = cleanup_chunked_upload(client, &uploads_base, creds);
-            WriteError::Network(format!("staging read chunk {}: {}", i, e))
-        })?;
-
-        let chunk_url = format!("{}/{:010}", uploads_base, i);
+            return Err(WriteError::Network(format!("staging read chunk {}: {}", i, e)));
+        }
         log::info!("CHUNKED_UPLOAD {}/{} ({} bytes)", i + 1, total_chunks, chunk.len());
-        let resp = creds.apply(client
-            .put(&chunk_url)
-            .timeout(CHUNK_UPLOAD_TIMEOUT))
-            .body(chunk)
-            .send()
-            .map_err(|e| {
-                let _ = cleanup_chunked_upload(client, &uploads_base, creds);
-                WriteError::Network(format!("chunk {} upload: {}", i, e))
-            })?;
-        let status = resp.status().as_u16();
-        if status != 200 && status != 201 && status != 204 {
+        if let Err(e) = put_chunk(client, creds, &uploads_base, i as u64, chunk) {
             let _ = cleanup_chunked_upload(client, &uploads_base, creds);
-            return Err(WriteError::Server(status, format!("chunk {}: {}", i, resp.text().unwrap_or_default())));
+            return Err(e);
         }
     }
 
-    let dest_url = dav_url(base_url, creds.username(), path);
-    let assemble_url = format!("{}/.file", uploads_base);
-    let mut req = creds.apply(client
-        .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &assemble_url)
-        .timeout(WRITE_TIMEOUT))
-        .header("Destination", &dest_url)
-        .header("Overwrite", "T");
-
-    if let Some(etag) = if_match_etag {
-        req = req.header("If-Match", format!("\"{}\"", etag.trim_matches('"')));
-    }
-
-    let resp = req.send().map_err(|e| WriteError::Network(format!("chunked MOVE: {}", e)))?;
-    let status = resp.status().as_u16();
-    match status {
-        200 | 201 | 204 => {
-            let new_etag = resp
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim_matches('"').to_string());
-            Ok(PutResult { new_etag })
-        }
-        412 => Err(WriteError::Conflict),
-        423 => Err(WriteError::Locked),
-        _ => Err(WriteError::Server(status, resp.text().unwrap_or_default())),
-    }
+    finish_chunked_upload(client, base_url, creds, &uploads_base, path, if_match_etag)
 }
 
 fn cleanup_chunked_upload(

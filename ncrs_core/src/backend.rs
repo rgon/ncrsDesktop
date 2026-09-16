@@ -218,6 +218,9 @@ pub enum BackendWriteError {
     Forbidden,
     QuotaExceeded,
     Server(u16, String),
+    /// The backend does not implement this operation (e.g. chunked-upload
+    /// streaming on a non-Nextcloud backend). Never queued for retry.
+    Unsupported,
 }
 
 impl BackendWriteError {
@@ -236,7 +239,7 @@ impl BackendWriteError {
             // 5xx = server-side outage/error; 408 request timeout; 429 too many
             // requests. All resolve on their own once the server recovers.
             Self::Server(code, _) => *code >= 500 || *code == 408 || *code == 429,
-            Self::Conflict | Self::Forbidden | Self::QuotaExceeded => false,
+            Self::Conflict | Self::Forbidden | Self::QuotaExceeded | Self::Unsupported => false,
         }
     }
 
@@ -262,6 +265,7 @@ impl std::fmt::Display for BackendWriteError {
             Self::Forbidden => write!(f, "permission denied"),
             Self::QuotaExceeded => write!(f, "quota exceeded"),
             Self::Server(code, msg) => write!(f, "server error {}: {}", code, msg),
+            Self::Unsupported => write!(f, "operation not supported by this backend"),
         }
     }
 }
@@ -294,6 +298,17 @@ pub enum ReachabilityStatus {
 
 pub struct PutResult {
     pub new_change_token: Option<String>,
+}
+
+/// A backend-opaque handle to an in-progress chunked upload, opened by
+/// `CloudBackend::open_chunked_upload` and fed to `put_chunk`/
+/// `finish_chunked_upload`/`abort_chunked_upload`. `uploads_base` is
+/// Nextcloud-specific (the WebDAV collection URL chunks are PUT under) — a
+/// future non-Nextcloud backend implementing this would need its own session
+/// representation, but nothing outside `nextcloud.rs`/`webdav_ops.rs` inspects
+/// the field.
+pub struct ChunkedUploadSession {
+    pub uploads_base: String,
 }
 
 // -- Change watcher -----------------------------------------------------------
@@ -388,6 +403,42 @@ pub trait CloudBackend: Send + Sync + 'static {
     fn delete(&self, path: &Path) -> Result<(), BackendWriteError>;
 
     fn rename(&self, from: &Path, to: &Path) -> Result<(), BackendWriteError>;
+
+    // -- Bounded chunked-upload streaming --------------------------------------
+    //
+    // Lets a caller PUT a large file's chunks as they become available instead
+    // of handing over the whole body (or a whole local staging file) up front —
+    // see write()'s stream_eligible handling in lib.rs for the caller side. A
+    // backend that cannot support this (no chunked-upload extension) simply
+    // returns Unsupported, and the caller falls back to full local staging.
+
+    fn open_chunked_upload(&self, _path: &Path) -> Result<ChunkedUploadSession, BackendWriteError> {
+        Err(BackendWriteError::Unsupported)
+    }
+
+    fn put_chunk(
+        &self,
+        _session: &ChunkedUploadSession,
+        _index: u64,
+        _body: Vec<u8>,
+    ) -> Result<(), BackendWriteError> {
+        Err(BackendWriteError::Unsupported)
+    }
+
+    fn finish_chunked_upload(
+        &self,
+        _session: &ChunkedUploadSession,
+        _path: &Path,
+        _if_match: Option<&str>,
+    ) -> Result<PutResult, BackendWriteError> {
+        Err(BackendWriteError::Unsupported)
+    }
+
+    /// Best-effort teardown of a session abandoned after `open_chunked_upload`
+    /// succeeded — e.g. a chunk PUT failed, or the writer went away without
+    /// finishing. Never returns an error: there is no retry path for a stream
+    /// that was never journaled, so a failure here can only be logged.
+    fn abort_chunked_upload(&self, _session: &ChunkedUploadSession) {}
 
     // -- Connectivity ---------------------------------------------------------
 

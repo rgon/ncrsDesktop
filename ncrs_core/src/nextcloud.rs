@@ -291,6 +291,44 @@ impl CloudBackend for NextcloudBackend {
         .map_err(BackendWriteError::from)
     }
 
+    fn open_chunked_upload(&self, _path: &Path) -> Result<crate::backend::ChunkedUploadSession, BackendWriteError> {
+        webdav_ops::open_chunked_session(&self.clients.get(), &self.base_url, &self.creds)
+            .map(|uploads_base| crate::backend::ChunkedUploadSession { uploads_base })
+            .map_err(BackendWriteError::from)
+    }
+
+    fn put_chunk(
+        &self,
+        session: &crate::backend::ChunkedUploadSession,
+        index: u64,
+        body: Vec<u8>,
+    ) -> Result<(), BackendWriteError> {
+        webdav_ops::put_chunk(&self.clients.get(), &self.creds, &session.uploads_base, index, body)
+            .map_err(BackendWriteError::from)
+    }
+
+    fn finish_chunked_upload(
+        &self,
+        session: &crate::backend::ChunkedUploadSession,
+        path: &Path,
+        if_match: Option<&str>,
+    ) -> Result<PutResult, BackendWriteError> {
+        webdav_ops::finish_chunked_upload(
+            &self.clients.get(),
+            &self.base_url,
+            &self.creds,
+            &session.uploads_base,
+            path,
+            if_match,
+        )
+        .map(PutResult::from)
+        .map_err(BackendWriteError::from)
+    }
+
+    fn abort_chunked_upload(&self, session: &crate::backend::ChunkedUploadSession) {
+        webdav_ops::abort_chunked_upload(&self.clients.get(), &self.creds, &session.uploads_base);
+    }
+
     fn mkdir(&self, path: &Path) -> Result<(), BackendWriteError> {
         webdav_ops::mkcol(
             &self.clients.get(),
