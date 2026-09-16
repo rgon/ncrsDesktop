@@ -2914,23 +2914,31 @@ impl NextCloudFs {
     /// content — the recovery for a cache tainted by a past bug. A file with a
     /// pending upload is skipped: its staged bytes are the only copy of an
     /// unsynced edit, so purging it would be data loss. Directory listings are
-    /// invalidated too, so stale sizes/etags are re-fetched. The mutation journal
-    /// and write-staging files are never touched.
+    /// invalidated too, so stale sizes/etags are re-fetched. Orphaned write-staging
+    /// files — no longer referenced by the journal and not backing a handle a
+    /// client still has open — are reclaimed too; anything still in either set is
+    /// left untouched to avoid destroying an in-flight or unsynced edit.
     pub fn purge_callback(&self) -> ipc::PurgeCallback {
         let cache = self.cache.clone();
         let status = self.status.clone();
         let dirty = self.dirty.clone();
         let journal = self.journal.clone();
+        let open_files = self.open_files.clone();
         let notifier_slot = self.notifier_slot.clone();
         Arc::new(move || {
             // Paths with a queued Put must be preserved — their local bytes are
             // unsynced. Collect them under the journal lock alone to avoid nesting.
-            let protected: std::collections::HashSet<PathBuf> = {
+            let (protected, staged): (std::collections::HashSet<PathBuf>, std::collections::HashSet<PathBuf>) = {
                 let j = journal.safe_lock();
-                j.entries().iter().filter_map(|e| match &e.op {
-                    mutation_journal::MutationOp::Put { remote_path, .. } => Some(remote_path.clone()),
-                    _ => None,
-                }).collect()
+                let mut protected = std::collections::HashSet::new();
+                let mut staged = std::collections::HashSet::new();
+                for e in j.entries() {
+                    if let mutation_journal::MutationOp::Put { remote_path, staging_path, .. } = &e.op {
+                        protected.insert(remote_path.clone());
+                        staged.insert(staging_path.clone());
+                    }
+                }
+                (protected, staged)
             };
             let to_remove: Vec<(PathBuf, PathBuf)> = {
                 let c = cache.safe_lock();
@@ -2955,11 +2963,46 @@ impl NextCloudFs {
                 purged += 1;
             }
             save_file_cache(&cache);
+
+            // Reclaim orphaned write_<fh> staging files: skip anything the journal
+            // still needs for upload replay, and anything whose fh a client still
+            // holds open (write() may have succeeded once and not yet flushed, or
+            // failed mid-write leaving the handle dirty) — an unparsable filename
+            // is left alone rather than guessed at.
+            let mut staging_purged = 0usize;
+            let cache_dir = cache.safe_lock().cache_dir.clone();
+            let open_fhs: std::collections::HashSet<u64> = open_files.safe_lock().keys().copied().collect();
+            if let Ok(dir_entries) = std::fs::read_dir(&cache_dir) {
+                for entry in dir_entries.flatten() {
+                    let path = entry.path();
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+                    let Some(fh_str) = name.strip_prefix("write_") else { continue };
+                    if staged.contains(&path) {
+                        continue;
+                    }
+                    let fh: u64 = match fh_str.parse() {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if open_fhs.contains(&fh) {
+                        continue;
+                    }
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => staging_purged += 1,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => log::warn!("purge: failed to remove orphaned staging file {}: {}", path.display(), e),
+                    }
+                }
+            }
+
             // Drop in-memory directory listings so the next access re-PROPFINDs
             // fresh metadata rather than trusting possibly-stale cached sizes/etags.
             notify_push::invalidate_all_dirs(&cache, &dirty, &notifier_slot);
-            log::info!("purge: cleared {} cached file(s) ({} protected by pending upload)", purged, protected.len());
-            Ok(purged)
+            log::info!(
+                "purge: cleared {} cached file(s) ({} protected by pending upload), {} orphaned staging file(s)",
+                purged, protected.len(), staging_purged
+            );
+            Ok(purged + staging_purged)
         })
     }
 
