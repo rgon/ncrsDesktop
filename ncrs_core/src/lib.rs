@@ -296,6 +296,42 @@ fn next_read_ahead_window(current: usize, sequential: bool, ceiling: usize) -> u
     }
 }
 
+/// Whether a `read()` may answer a `sz`-byte request at `off` with only `avail`
+/// bytes.
+///
+/// POSIX lets `read(2)` come back short, but a short FUSE *reply* does not mean the
+/// same thing: on a page-cached handle the kernel records it as end-of-file for the
+/// whole inode, and every later read past `off + avail` returns 0 bytes without ever
+/// reaching us. The file reads as truncated from that offset on — a player hits it
+/// one read-ahead window into the track, sees the track end and skips to the next
+/// one, and only a fresh `open()` clears it. The MIME-magic path dodges the same
+/// trap with FOPEN_DIRECT_IO; see `mime_magic_bytes`.
+///
+/// So a short reply is only ever safe when it really is the end of the file.
+/// Anything else has to be fetched in full or fail — never quietly truncated.
+/// `file_size` of 0 means "unknown", which proves nothing and so allows nothing.
+fn short_reply_ok(off: u64, avail: usize, sz: usize, file_size: u64) -> bool {
+    avail >= sz || (file_size > 0 && off.saturating_add(avail as u64) >= file_size)
+}
+
+/// `read_at` retried until `buf` is full or the file ends.
+///
+/// A single `read_at` may return fewer bytes than asked for without being at EOF,
+/// and handing that straight to `reply.data` is exactly the truncation
+/// `short_reply_ok` exists to prevent.
+fn read_at_full(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match f.read_at(&mut buf[filled..], off + filled as u64) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
 /// First read-ahead window on a handle, and the window a seek falls back to.
 ///
 /// Small enough that a stray seek costs ~1 MB instead of the full configured
@@ -4155,6 +4191,10 @@ impl Filesystem for NextCloudFs {
 
         let off = offset;
         let sz = size as usize;
+        // What the dir cache believes this file's length is. Used throughout the
+        // read paths below to tell a legitimate end-of-file short reply from a
+        // truncating one; see `short_reply_ok`.
+        let file_size = self.cache.safe_lock().find_entry(&path).map(|e| e.size).unwrap_or(0);
 
         // Note where the next sequential read would start, and remember whether
         // *this* read continues the previous one. Done here, before any of the
@@ -4187,7 +4227,9 @@ impl Filesystem for NextCloudFs {
             if let Some(sp) = staging {
                 if let Ok(f) = std::fs::File::open(&sp) {
                     let mut buf = vec![0u8; sz];
-                    if let Ok(n) = f.read_at(&mut buf, off) {
+                    // The staging file *is* the current content, so its length is the
+                    // file's length and a short read here is a real EOF.
+                    if let Ok(n) = read_at_full(&f, &mut buf, off) {
                         buf.truncate(n);
                         reply.data(&buf);
                         return;
@@ -4237,10 +4279,15 @@ impl Filesystem for NextCloudFs {
                     if of.cache_fresh {
                         if let Ok(f) = std::fs::File::open(local) {
                             let mut buf = vec![0u8; sz];
-                            if let Ok(n) = f.read_at(&mut buf, off) {
-                                buf.truncate(n);
-                                reply.data(&buf);
-                                return;
+                            if let Ok(n) = read_at_full(&f, &mut buf, off) {
+                                // A cached copy shorter than the file — a partial or
+                                // truncated download — must not be replied short; that
+                                // latches EOF on the inode. Fall through and fetch.
+                                if short_reply_ok(off, n, sz, file_size) {
+                                    buf.truncate(n);
+                                    reply.data(&buf);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -4273,13 +4320,23 @@ impl Filesystem for NextCloudFs {
                                     return;
                                 }
                                 if guard.done {
-                                    let end = start + guard.data.len() as u64;
-                                    if off < end {
-                                        let s = (off - start) as usize;
-                                        let e = std::cmp::min(s + sz, guard.data.len());
-                                        reply.data(&guard.data[s..e]);
+                                    // The window promised these bytes and then stopped
+                                    // early — a transport error, or another read on this
+                                    // handle superseded the stream. Replying with what
+                                    // did arrive (or with nothing) tells the kernel the
+                                    // file ends here and truncates it for every handle,
+                                    // so fail the read unless this really is the end.
+                                    let s = (off - start) as usize;
+                                    let avail = guard.data.len().saturating_sub(s);
+                                    if file_size == 0 || short_reply_ok(off, avail, sz, file_size) {
+                                        let e = guard.data.len().min(s.saturating_add(sz));
+                                        reply.data(if s < guard.data.len() { &guard.data[s..e] } else { &[] });
                                     } else {
-                                        reply.data(&[]);
+                                        log::warn!(
+                                            "read-ahead stream ended {} bytes short of offset {} — failing the read rather than reporting EOF",
+                                            sz.saturating_sub(avail), off,
+                                        );
+                                        reply.error(Errno::EIO);
                                     }
                                     return;
                                 }
@@ -4300,50 +4357,77 @@ impl Filesystem for NextCloudFs {
                         });
                         return;
                     }
-                    // Condition 3: read request starts within the buf range but exceeds
-                    // target_len (common for MIME magic detection which requests 16 KiB
-                    // from small prefetched files).  Wait for the download to finish, then
-                    // serve however many bytes are available — POSIX allows short reads.
+                    // Condition 3: the request starts inside this window but runs past
+                    // the end of what the window will ever hold — a read straddling the
+                    // read-ahead boundary, or GLib's MIME probe asking for 16 KiB of a
+                    // small, fully prefetched file.
+                    //
+                    // The window can only answer such a read short, and a short reply is
+                    // safe *only* when it lands on the real end of the file (see
+                    // `short_reply_ok`). Otherwise the kernel latches EOF on the inode
+                    // and the rest of the file becomes unreadable on every handle until
+                    // a fresh open() — which is how a 30 MB FLAC read in 16 KiB chunks
+                    // used to stop dead at exactly 2 MiB, the first window boundary.
+                    // So serve the end-of-file case, and let every other straddling read
+                    // fall through to the network fetch below, which re-reads from `off`
+                    // and satisfies the request in full.
                     if off >= ra.start && off < ra.start + ra.target_len {
+                        let o = (off - ra.start) as usize;
+                        let window_end = ra.start + ra.target_len;
                         if ss.done {
-                            let o = (off - ra.start) as usize;
-                            let e = ss.data.len().min(o.saturating_add(sz));
-                            reply.data(if o < ss.data.len() { &ss.data[o..e] } else { &[] });
+                            let avail = ss.data.len().saturating_sub(o);
+                            if short_reply_ok(off, avail, sz, file_size) {
+                                let e = ss.data.len().min(o.saturating_add(sz));
+                                reply.data(&ss.data[o..e]);
+                                drop(ss);
+                                drop(files);
+                                return;
+                            }
+                        } else if short_reply_ok(off, (window_end - off) as usize, sz, file_size) {
+                            // Still downloading, and even a complete window stops short
+                            // of this request — but only because the file itself ends
+                            // inside it. Wait for the bytes and serve what there is.
+                            let shared = Arc::clone(&ra.stream);
+                            let start = ra.start;
                             drop(ss);
                             drop(files);
+                            thread::spawn(move || {
+                                let (ref mtx, ref cv) = *shared;
+                                let mut guard = mtx.lock().unwrap();
+                                let deadline = Instant::now() + Duration::from_secs(30);
+                                loop {
+                                    if guard.done {
+                                        let o = (off - start) as usize;
+                                        let avail = guard.data.len().saturating_sub(o);
+                                        if file_size == 0 || short_reply_ok(off, avail, sz, file_size) {
+                                            let e = guard.data.len().min(o.saturating_add(sz));
+                                            reply.data(if o < guard.data.len() { &guard.data[o..e] } else { &[] });
+                                        } else {
+                                            log::warn!(
+                                                "prefetch ended {} bytes short of offset {} — failing the read rather than reporting EOF",
+                                                sz.saturating_sub(avail), off,
+                                            );
+                                            reply.error(Errno::EIO);
+                                        }
+                                        return;
+                                    }
+                                    let remaining = deadline.saturating_duration_since(Instant::now());
+                                    if remaining.is_zero() {
+                                        log::warn!("prefetch wait timeout at offset {}", off);
+                                        reply.error(Errno::EIO);
+                                        return;
+                                    }
+                                    let (g, res) = cv.wait_timeout(guard, remaining).unwrap();
+                                    guard = g;
+                                    if res.timed_out() && !guard.done {
+                                        log::warn!("prefetch wait timeout at offset {}", off);
+                                        reply.error(Errno::EIO);
+                                        return;
+                                    }
+                                }
+                                });
                             return;
                         }
-                        let shared = Arc::clone(&ra.stream);
-                        let start = ra.start;
-                        drop(ss);
-                        drop(files);
-                        thread::spawn(move || {
-                            let (ref mtx, ref cv) = *shared;
-                            let mut guard = mtx.lock().unwrap();
-                            let deadline = Instant::now() + Duration::from_secs(30);
-                            loop {
-                                if guard.done {
-                                    let o = (off - start) as usize;
-                                    let e = guard.data.len().min(o.saturating_add(sz));
-                                    reply.data(if o < guard.data.len() { &guard.data[o..e] } else { &[] });
-                                    return;
-                                }
-                                let remaining = deadline.saturating_duration_since(Instant::now());
-                                if remaining.is_zero() {
-                                    log::warn!("prefetch wait timeout at offset {}", off);
-                                    reply.error(Errno::EIO);
-                                    return;
-                                }
-                                let (g, res) = cv.wait_timeout(guard, remaining).unwrap();
-                                guard = g;
-                                if res.timed_out() && !guard.done {
-                                    log::warn!("prefetch wait timeout at offset {}", off);
-                                    reply.error(Errno::EIO);
-                                    return;
-                                }
-                            }
-                        });
-                        return;
                     }
                     drop(ss);
                 }
@@ -4369,11 +4453,15 @@ impl Filesystem for NextCloudFs {
             if let Some(ref local) = cached_local {
                 if let Ok(f) = std::fs::File::open(local) {
                     let mut buf = vec![0u8; sz];
-                    if let Ok(n) = f.read_at(&mut buf, off) {
-                        buf.truncate(n);
-                        reply.data(&buf);
-                        self.open_files.safe_lock().entry(fh.0).and_modify(|of| of.local = Some(local.clone()));
-                        return;
+                    if let Ok(n) = read_at_full(&f, &mut buf, off) {
+                        // Same rule as the of.local path: a cached copy that is
+                        // shorter than the file must be refetched, not replied short.
+                        if short_reply_ok(off, n, sz, file_size) {
+                            buf.truncate(n);
+                            reply.data(&buf);
+                            self.open_files.safe_lock().entry(fh.0).and_modify(|of| of.local = Some(local.clone()));
+                            return;
+                        }
                     }
                 }
             }
@@ -4391,7 +4479,7 @@ impl Filesystem for NextCloudFs {
         let auto_keep_cached = self.auto_keep_cached_files;
         let read_ahead = self.read_ahead_bytes;
         let cache_streamed = self.cache_streamed_reads;
-        let file_total_size = self.cache.safe_lock().find_entry(&path).map(|e| e.size).unwrap_or(0);
+        let file_total_size = file_size;
         let ino_u64 = ino.0;
         // True when the file was not locally cached at open() time. For such handles
         // there is no guarantee the file_cache has valid content, so the ensure_file_cached
@@ -4446,6 +4534,23 @@ impl Filesystem for NextCloudFs {
                         .or_else(|| if off == 0 { resp.content_length() } else { None });
                     match read_exact_from_stream(&mut resp, sz) {
                         Ok(first) => {
+                            // Content-Range is authoritative for the file's length, with
+                            // the dir-cache size as fallback. A body that stops before
+                            // either is a truncated transfer, not end-of-file, and
+                            // replying it short would latch EOF on the inode for every
+                            // handle (see `short_reply_ok`). Fail instead — transiently,
+                            // so the caller retries against real data.
+                            let total_known = server_total.unwrap_or(file_total_size);
+                            if total_known > 0 && !short_reply_ok(off, first.len(), sz, total_known) {
+                                log::warn!(
+                                    "range read {} returned {} of {} bytes at offset {} (file is {}) — truncated transfer",
+                                    path.display(), first.len(), sz, off, total_known,
+                                );
+                                push_error(&elog, path.clone(), SyncErrorKind::NetworkError,
+                                    "download truncated".to_string());
+                                reply.error(Errno::EIO);
+                                return;
+                            }
                             reply.data(&first);
                             // Reconcile the getattr size with reality. On a plain
                             // WebDAV server (rclone) a child edit does not bump the
@@ -4525,10 +4630,21 @@ impl Filesystem for NextCloudFs {
                                                 .get(&fh.0)
                                                 .and_then(|of| of.buf.as_ref())
                                                 .map_or(true, |b| !Arc::ptr_eq(&b.stream, &shared));
-                                            if superseded { break; }
+                                            if superseded {
+                                                log::debug!("read-ahead stream for {} superseded, stopping early",
+                                                    path.display());
+                                                break;
+                                            }
                                         }
                                     }
-                                    Err(_) => break,
+                                    Err(e) => {
+                                        // Stops the window short of target_len. Readers
+                                        // parked on it get EIO rather than a phantom EOF
+                                        // (see the waiters in read()).
+                                        log::warn!("read-ahead stream for {} broke after {} of {} bytes: {}",
+                                            path.display(), mtx.lock().unwrap().data.len(), fetch, e);
+                                        break;
+                                    }
                                 }
                             }
                             let mut ss = mtx.lock().unwrap();

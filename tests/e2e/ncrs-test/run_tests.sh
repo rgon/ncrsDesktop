@@ -555,6 +555,97 @@ fi
 
 stop_ncrs
 
+# ── Test 10: Streaming read across read-ahead window boundaries ──
+run_test "Streaming read — small sequential reads cross read-ahead windows"
+
+# Regression test for the read-ahead boundary truncation: a file read in chunks
+# smaller than the kernel's read-ahead used to stop dead at the first window
+# boundary (2 MiB). The read that straddled the boundary was answered short, and
+# the kernel latches a short FUSE reply as EOF for the whole inode — so every
+# later read returned 0 bytes without reaching the daemon and the file looked
+# truncated. A media player saw the track end one window in and skipped it.
+# 6 MiB crosses the 1 MiB → 2 MiB → 4 MiB ramp at least twice. Each check gets
+# its own copy on the server so none of them is answered from the page cache
+# the previous one warmed.
+python3 -c "
+import sys
+sys.stdout.buffer.write(bytes((i * 31 + (i >> 8) * 7) % 256 for i in range(6 * 1024 * 1024)))
+" > /tmp/stream_src.bin
+SRC_SUM=$(md5sum /tmp/stream_src.bin | awk '{print $1}')
+for n in a b c; do
+    curl -sf -u testuser:testpass -T /tmp/stream_src.bin "$(dav_url "stream_read_$n.bin")" > /dev/null
+done
+
+start_ncrs
+
+# 16 KiB reads: smaller than the kernel's 128 KiB read-ahead, so the read-ahead
+# request straddles the window boundary instead of landing on it.
+if python3 - "$MOUNT/stream_read_a.bin" 16384 0 "$SRC_SUM" <<'PY'
+import hashlib, os, sys
+path, chunk, start, want_sum = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+size = os.path.getsize(path)
+h = hashlib.md5()
+fd = os.open(path, os.O_RDONLY)
+off = start
+try:
+    while off < size:
+        b = os.pread(fd, chunk, off)
+        if not b:
+            print(f"    read returned EOF at {off} of {size} bytes")
+            sys.exit(1)
+        h.update(b)
+        off += len(b)
+finally:
+    os.close(fd)
+if want_sum and start == 0 and h.hexdigest() != want_sum:
+    print(f"    content mismatch after reading {off} bytes")
+    sys.exit(1)
+sys.exit(0)
+PY
+then
+    pass "6 MiB file read intact in 16 KiB chunks"
+else
+    fail "16 KiB sequential read truncated at a read-ahead window boundary"
+fi
+
+# Same shape, but starting half a chunk in so no read is aligned to the window.
+if python3 - "$MOUNT/stream_read_b.bin" 16384 8192 "" <<'PY'
+import hashlib, os, sys
+path, chunk, start, want_sum = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+size = os.path.getsize(path)
+h = hashlib.md5()
+fd = os.open(path, os.O_RDONLY)
+off = start
+try:
+    while off < size:
+        b = os.pread(fd, chunk, off)
+        if not b:
+            print(f"    read returned EOF at {off} of {size} bytes")
+            sys.exit(1)
+        h.update(b)
+        off += len(b)
+finally:
+    os.close(fd)
+if want_sum and start == 0 and h.hexdigest() != want_sum:
+    print(f"    content mismatch after reading {off} bytes")
+    sys.exit(1)
+sys.exit(0)
+PY
+then
+    pass "Unaligned 16 KiB reads reach the end of the file"
+else
+    fail "Unaligned sequential read truncated at a read-ahead window boundary"
+fi
+
+# A large aligned read of a third, still uncached copy must be byte-exact.
+if [ "$(md5sum "$MOUNT/stream_read_c.bin" | awk '{print $1}')" = "$SRC_SUM" ]; then
+    pass "Whole-file read matches the server copy"
+else
+    fail "Whole-file read does not match the server copy"
+fi
+
+stop_ncrs
+
 # ── Summary ───────────────────────────────────────────────────
 echo ""
 echo "=================================="

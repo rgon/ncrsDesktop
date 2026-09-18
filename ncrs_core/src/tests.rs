@@ -1249,6 +1249,109 @@
         assert_eq!(next_read_ahead_window(ceiling, true, ceiling), ceiling);
     }
 
+    // ── Short replies at read-ahead window boundaries ─────────────────────────
+
+    #[test]
+    fn a_read_straddling_a_window_boundary_is_never_answered_short() {
+        // The reported bug: a 30 MB FLAC on the mount, read sequentially in 16 KiB
+        // chunks, stopped dead at exactly 2 MiB — the end of the first read-ahead
+        // window. The kernel's read-ahead read straddles that boundary; the old code
+        // replied with the bytes the window happened to hold, and a short FUSE reply
+        // is latched by the kernel as EOF for the whole inode. Every later read
+        // returned 0 bytes without reaching the daemon, so VLC saw the track end one
+        // window in and skipped to the next one. Only a fresh open() cleared it.
+        let file_size = 30 * MB as u64;
+        let window_end = 2 * MB as u64;
+        let sz = 128 * 1024;
+        let off = window_end - 16 * 1024;
+        let avail = (window_end - off) as usize;
+
+        assert!(avail < sz, "this read straddles the boundary");
+        assert!(
+            !short_reply_ok(off, avail, sz, file_size),
+            "a straddling read must be refetched in full, never answered short",
+        );
+    }
+
+    #[test]
+    fn a_short_reply_at_the_real_end_of_file_is_allowed() {
+        // GLib's MIME probe: 16 KiB asked of a 4 KiB file that is fully prefetched.
+        assert!(short_reply_ok(0, 4096, 16 * 1024, 4096));
+        // And the tail of a large file.
+        let file_size = 30 * MB as u64;
+        assert!(short_reply_ok(file_size - 1000, 1000, 128 * 1024, file_size));
+    }
+
+    #[test]
+    fn a_full_length_reply_is_always_allowed() {
+        assert!(short_reply_ok(0, 128 * 1024, 128 * 1024, 30 * MB as u64));
+        // Even when the size is unknown — nothing is being truncated.
+        assert!(short_reply_ok(0, 128 * 1024, 128 * 1024, 0));
+    }
+
+    #[test]
+    fn an_unknown_file_size_never_authorises_a_short_reply() {
+        // size 0 means the dir cache has no entry. That proves nothing about where
+        // the file ends, so the caller must fetch rather than risk latching EOF.
+        assert!(!short_reply_ok(0, 16 * 1024, 128 * 1024, 0));
+    }
+
+    #[test]
+    fn no_window_boundary_of_a_sequential_read_can_truncate_the_file() {
+        // Walk a 30 MB file the way a player does, over the windows the ramp
+        // actually produces, and check the read that straddles each boundary.
+        // Every one of them must be refused as a short reply; only the last
+        // window, the one the file ends in, may answer short.
+        let file_size = 30 * MB as u64;
+        let ceiling = 64 * MB;
+        let sz = 128 * 1024;
+        let mut window = READ_AHEAD_INITIAL;
+        let mut start = 0u64;
+        let mut boundaries = 0;
+
+        while start < file_size {
+            window = next_read_ahead_window(window, true, ceiling);
+            let end = (start + window as u64).min(file_size);
+            let off = end - (sz as u64 / 2);
+            let avail = (end - off) as usize;
+            if end < file_size {
+                assert!(
+                    !short_reply_ok(off, avail, sz, file_size),
+                    "a read at {} would truncate the file at window boundary {}",
+                    off, end,
+                );
+                boundaries += 1;
+            } else {
+                assert!(short_reply_ok(off, avail, sz, file_size), "the last window ends the file");
+            }
+            start = end;
+        }
+        assert!(boundaries >= 3, "expected several window boundaries, got {}", boundaries);
+    }
+
+    #[test]
+    fn read_at_full_fills_the_buffer_across_short_reads() {
+        let dir = std::env::temp_dir()
+            .join(format!("ncrs-test-readatfull-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blob");
+        let body: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &body).unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        assert_eq!(read_at_full(&f, &mut buf, 1024).unwrap(), 4096);
+        assert_eq!(buf, &body[1024..5120]);
+
+        // Past the end it stops at EOF, and the caller decides whether that is a
+        // legitimate short reply.
+        let mut tail = vec![0u8; 4096];
+        assert_eq!(read_at_full(&f, &mut tail, 6144).unwrap(), 2048);
+        assert!(short_reply_ok(6144, 2048, 4096, body.len() as u64));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Dir cache eviction ────────────────────────────────────────────────────
 
     fn dir_with(name: &str, n: usize) -> (PathBuf, Vec<RemoteEntry>) {
