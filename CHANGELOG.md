@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.67](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.66...ncrs-v0.1.67) (2026-09-18)
+
+
+### Bug Fixes
+
+* **read:** never reply short unless it is the real end of the file ([3d053b8](https://github.com/rgon/ncrsDesktop/commit/3d053b823b4eca74bf7d5b07da5d5f8f893c1c36))
+
 ## [0.1.66](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.65...ncrs-v0.1.66) (2026-09-16)
 
 
