@@ -2759,13 +2759,42 @@ impl NextCloudFs {
                 // never reaches the QUIC connector, so the read client's two
                 // load-bearing guarantees above — every foreground read connects
                 // fresh, and a dead path surfaces in seconds, not DOWNLOAD_TIMEOUT
-                // — are silently void over QUIC. Restore them with the knobs h3
-                // does have: a 1s pool idle (a burst still reuses; anything older
-                // redials) and a 5s QUIC idle/handshake timeout to match the TCP
-                // connect_timeout's fail-fast bound.
+                // — are silently void over QUIC. `pool_idle_timeout(1s)` restores
+                // the "connect fresh" guarantee (a burst still reuses; anything
+                // older redials).
+                //
+                // `http3_max_idle_timeout` used to also be set to 5s here, to
+                // reproduce the TCP connect_timeout's fail-fast bound. But unlike
+                // connect_timeout — which only bounds the connect phase —
+                // max_idle_timeout governs an *already-established* connection's
+                // tolerance for silence in either direction for its entire
+                // lifetime. At 5s, any gap that long during an active read-ahead
+                // stream (a slow server response under load, a brief network
+                // hiccup, this process not being scheduled promptly for a few
+                // seconds) tore down an otherwise-healthy QUIC connection —
+                // observed live as "read-ahead stream broke: request or response
+                // body error" during ordinary playback, not just on a dead path.
+                // quinn's own upstream default is 30s (`quinn_proto::TransportConfig`),
+                // which is also what Chrome's QUIC stack uses; restoring that
+                // gives a real connection enough slack to survive realistic
+                // jitter without materially weakening dead-path detection — the
+                // periodic connectivity probe (see `http_clients`/offline
+                // handling) doesn't depend on any single read's timeout, and a
+                // still-broken stream now retries in-process (see the read-ahead
+                // body loop) instead of surfacing straight to the caller.
+                //
+                // The stream receive window is also bumped: quinn's default
+                // (~1.25 MB, sized for 100 Mbps at 100 ms RTT) can rate-limit a
+                // single stream below what a 64 MiB read-ahead window wants on a
+                // higher-RTT path. BBR is a better fit than the default CUBIC for
+                // exactly this kind of path (real-world jitter / non-congestion
+                // loss, which CUBIC misreads as congestion and backs off from
+                // unnecessarily).
                 read = read.http3_prior_knowledge()
                     .pool_idle_timeout(Duration::from_secs(1))
-                    .http3_max_idle_timeout(Duration::from_secs(5));
+                    .http3_max_idle_timeout(Duration::from_secs(30))
+                    .http3_stream_receive_window(4 * 1024 * 1024)
+                    .http3_congestion_bbr();
             }
             Ok((
                 meta.build().map_err(|e| format!("HTTP client: {}", e))?,
@@ -4619,7 +4648,7 @@ impl Filesystem for NextCloudFs {
                             // otherwise get EIO (see the waiters in read()), which every
                             // player has to notice and recover from itself; VLC in
                             // particular does this slowly enough to look like a stall.
-                            const MAX_BODY_RETRIES: u32 = 3;
+                            const MAX_BODY_RETRIES: u32 = 1;
                             let mut retries = 0u32;
                             loop {
                                 use std::io::Read;
