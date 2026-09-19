@@ -11,7 +11,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.67" # x-release-please-version
 edition = "2021"
-authors = ["Gonzalo Ruiz <gonza@logo.cl>"]
+authors = ["Gonzalo Ruiz <foss@rgon.es>"]
 
 [workspace.dependencies]
 clap = "4.5.40"
