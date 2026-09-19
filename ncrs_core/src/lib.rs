@@ -4522,7 +4522,7 @@ impl Filesystem for NextCloudFs {
                 None
             };
             match do_range_read_stream(&conn, &path, off, fetch, use_throttle) {
-                Ok((mut resp, _permit)) => {
+                Ok((mut resp, mut _permit)) => {
                     let t0 = Instant::now();
                     // The authoritative current size, read from the response headers
                     // before the body is consumed (see the reconciliation after
@@ -4611,6 +4611,16 @@ impl Filesystem for NextCloudFs {
                             let (ref mtx, ref cv) = *shared;
                             let mut chunk = [0u8; 256 * 1024];
                             let mut since_check = 0usize;
+                            // A body read error mid-stream is usually a transient blip
+                            // (dropped connection, reset stream) rather than the server
+                            // actually having nothing left to give — resume with a fresh
+                            // Range request for exactly the missing tail instead of
+                            // giving up immediately. Readers parked on this window would
+                            // otherwise get EIO (see the waiters in read()), which every
+                            // player has to notice and recover from itself; VLC in
+                            // particular does this slowly enough to look like a stall.
+                            const MAX_BODY_RETRIES: u32 = 3;
+                            let mut retries = 0u32;
                             loop {
                                 use std::io::Read;
                                 match resp.read(&mut chunk) {
@@ -4638,11 +4648,32 @@ impl Filesystem for NextCloudFs {
                                         }
                                     }
                                     Err(e) => {
-                                        // Stops the window short of target_len. Readers
-                                        // parked on it get EIO rather than a phantom EOF
-                                        // (see the waiters in read()).
-                                        log::warn!("read-ahead stream for {} broke after {} of {} bytes: {}",
-                                            path.display(), mtx.lock().unwrap().data.len(), fetch, e);
+                                        let have = mtx.lock().unwrap().data.len() as u64;
+                                        let remaining = (fetch as u64).saturating_sub(have);
+                                        if retries < MAX_BODY_RETRIES && remaining > 0 {
+                                            retries += 1;
+                                            log::warn!(
+                                                "read-ahead stream for {} broke after {} of {} bytes (retry {}/{}): {:?}",
+                                                path.display(), have, fetch, retries, MAX_BODY_RETRIES, e,
+                                            );
+                                            thread::sleep(Duration::from_millis(300 * retries as u64));
+                                            match do_range_read_stream(&conn, &path, off + have, remaining as usize, use_throttle) {
+                                                Ok((new_resp, new_permit)) => {
+                                                    resp = new_resp;
+                                                    _permit = new_permit;
+                                                    continue;
+                                                }
+                                                Err(resume_err) => {
+                                                    log::warn!("read-ahead resume for {} failed: {}", path.display(), resume_err);
+                                                }
+                                            }
+                                        } else {
+                                            // Stops the window short of target_len. Readers
+                                            // parked on it get EIO rather than a phantom EOF
+                                            // (see the waiters in read()).
+                                            log::warn!("read-ahead stream for {} broke after {} of {} bytes, giving up: {:?}",
+                                                path.display(), have, fetch, e);
+                                        }
                                         break;
                                     }
                                 }
