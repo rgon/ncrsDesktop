@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.68](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.67...ncrs-v0.1.68) (2026-09-19)
+
+
+### Bug Fixes
+
+* **http3:** relax read client's QUIC idle timeout, tune windows, retry once ([cea96c6](https://github.com/rgon/ncrsDesktop/commit/cea96c6f5fa76e0f7479dad16b1ede775137b428))
+* **preview:** cap concurrent fetches, cache 404s, skip audio without cover art ([24fba60](https://github.com/rgon/ncrsDesktop/commit/24fba60c430f5aeccc8d0b692ed3a3a93e427c5a))
+* **read:** resume broken read-ahead streams and log full error detail ([0d96727](https://github.com/rgon/ncrsDesktop/commit/0d9672737d2788d7498fd0bf590212ed714a2b42))
+
 ## [0.1.67](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.66...ncrs-v0.1.67) (2026-09-18)
 
 
