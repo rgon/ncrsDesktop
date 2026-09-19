@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
@@ -43,12 +44,78 @@ const RAW_THUMB_INTERVAL_SECS: u64 = 2;
 // (1500 files × 300 ms ≈ 7.5 min vs 50 min at the RAW rate).
 const ON_DEMAND_PREVIEWABLE_INTERVAL_MS: u64 = 300;
 
+// Global cap on concurrent NC preview API requests, shared by every caller
+// (directory prefetch batches across however many directories are being read
+// at once, plus the per-file Nautilus-thumbnailer IPC path). Without this, a
+// burst of readdir()s across many sibling directories — e.g. Nautilus computing
+// list-view item counts for a whole library — fans out into an unbounded
+// number of simultaneous requests and starves the server of PHP workers for
+// ordinary FUSE/sync traffic.
+const MAX_CONCURRENT_PREVIEW_FETCHES: usize = 6;
+static INFLIGHT_PREVIEW_FETCHES: AtomicUsize = AtomicUsize::new(0);
+
+struct FetchPermit;
+
+impl FetchPermit {
+    fn acquire() -> Self {
+        loop {
+            let cur = INFLIGHT_PREVIEW_FETCHES.load(Ordering::Acquire);
+            if cur < MAX_CONCURRENT_PREVIEW_FETCHES
+                && INFLIGHT_PREVIEW_FETCHES
+                    .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return FetchPermit;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for FetchPermit {
+    fn drop(&mut self) {
+        INFLIGHT_PREVIEW_FETCHES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+// Remembers fileIds the preview API has already 404'd (or otherwise failed) so
+// repeated readdirs of the same directory don't re-request a preview we already
+// know doesn't exist. Entries expire so a preview added later (e.g. cover art
+// embedded after the fact) gets retried eventually.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+fn negative_cache() -> &'static Mutex<HashMap<u64, Instant>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Instant>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_negatively_cached(fileid: u64) -> bool {
+    let cache = negative_cache().lock().unwrap();
+    cache
+        .get(&fileid)
+        .is_some_and(|t| t.elapsed() < NEGATIVE_CACHE_TTL)
+}
+
+fn mark_negative(fileid: u64) {
+    let mut cache = negative_cache().lock().unwrap();
+    cache.insert(fileid, Instant::now());
+    if cache.len() > 20_000 {
+        let now = Instant::now();
+        cache.retain(|_, t| now.duration_since(*t) < NEGATIVE_CACHE_TTL);
+    }
+}
+
 const PREVIEWABLE: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic",
     "mp3", "flac", "ogg", "m4a", "wav", "opus",
     "mp4", "mkv", "avi", "mov", "webm",
     "pdf",
 ];
+
+// Audio formats never get a Nextcloud preview unless the server already found
+// embedded cover art (nc:has-preview=true). Unlike RAW images, there is no
+// on-demand generation path worth trying — attempting one is a guaranteed 404.
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "m4a", "wav", "opus"];
 
 // RAW camera formats whose MIME types Nextcloud may not report as has_preview=true
 // even when a server-side preview provider (Imagick/VIPS) can generate them.
@@ -84,6 +151,13 @@ fn is_raw_image(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| RAW_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn is_audio(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
 }
 
@@ -144,6 +218,7 @@ fn fetch_preview_bytes(
     remote_path: &Path,
     fileid: u64,
 ) -> Result<Vec<u8>, String> {
+    let _permit = FetchPermit::acquire();
     let t0 = std::time::Instant::now();
     let url = format!("{}/core/preview", base);
     let size = PREVIEW_SIZE.to_string();
@@ -237,10 +312,16 @@ pub fn prefetch_thumbnail(
         return;
     };
 
+    if is_negatively_cached(fileid) {
+        log::debug!("thumbnail {}: fileId={} negatively cached, skipping", remote_path.display(), fileid);
+        return;
+    }
+
     let t_total = std::time::Instant::now();
     let raw = match fetch_preview_bytes(client, base, creds, remote_path, fileid) {
         Ok(d) => d,
         Err(e) => {
+            mark_negative(fileid);
             log::debug!("thumbnail {}: {}", remote_path.display(), e);
             return;
         }
@@ -344,11 +425,16 @@ pub fn prefetch_directory_thumbnails(
         .filter(|(path, _, has_preview, _)| !*has_preview && is_raw_image(path))
         .collect();
 
-    // Other previewable types (PDF, video, audio…) without a server-cached preview.
+    // Other previewable types (PDF, video…) without a server-cached preview.
     // The NC preview API generates these on-demand; rate-limit like RAW to avoid
     // starving PHP workers of capacity for FUSE ops.
+    //
+    // Audio is excluded here: Nextcloud only has a preview for audio when it
+    // already found embedded cover art, which is exactly what has_preview=true
+    // reports (handled in the fast path above). Attempting one on-demand for
+    // audio without has_preview is a guaranteed 404.
     let on_demand_previewable: Vec<_> = entries.iter()
-        .filter(|(path, _, has_preview, _)| !*has_preview && !is_raw_image(path) && is_previewable(path))
+        .filter(|(path, _, has_preview, _)| !*has_preview && !is_raw_image(path) && !is_audio(path) && is_previewable(path))
         .collect();
 
     // ── Fast path: server-cached previews (batch, short gap) ────────────────
@@ -420,5 +506,41 @@ mod tests {
         let path = xdg_thumbnail_path(&uri);
         let expected_hash = format!("{:x}", md5::compute(uri.as_bytes()));
         assert_eq!(path.file_stem().unwrap().to_str().unwrap(), expected_hash);
+    }
+
+    #[test]
+    fn is_audio_matches_known_extensions_only() {
+        assert!(is_audio(Path::new("/Music/track.mp3")));
+        assert!(is_audio(Path::new("/Music/track.FLAC")));
+        assert!(!is_audio(Path::new("/Music/cover.jpg")));
+        assert!(!is_audio(Path::new("/Music/album")));
+    }
+
+    #[test]
+    fn negative_cache_round_trip() {
+        // Use a fileId unlikely to collide with other tests sharing the process-wide cache.
+        let fileid = 900_000_001;
+        assert!(!is_negatively_cached(fileid));
+        mark_negative(fileid);
+        assert!(is_negatively_cached(fileid));
+    }
+
+    #[test]
+    fn fetch_permit_caps_concurrency() {
+        // Drain the global permit pool down to zero, confirm acquiring one more blocks
+        // until a permit is released.
+        let mut permits: Vec<FetchPermit> = (0..MAX_CONCURRENT_PREVIEW_FETCHES)
+            .map(|_| FetchPermit::acquire())
+            .collect();
+        assert_eq!(
+            INFLIGHT_PREVIEW_FETCHES.load(Ordering::Acquire),
+            MAX_CONCURRENT_PREVIEW_FETCHES
+        );
+        permits.pop(); // release one permit
+        let _p = FetchPermit::acquire(); // must not block now
+        assert_eq!(
+            INFLIGHT_PREVIEW_FETCHES.load(Ordering::Acquire),
+            MAX_CONCURRENT_PREVIEW_FETCHES
+        );
     }
 }
