@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.69](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.68...ncrs-v0.1.69) (2026-09-20)
+
+
+### Features
+
+* **fuse:** add zero-copy kernel passthrough for fully-cached file reads ([369a7f1](https://github.com/rgon/ncrsDesktop/commit/369a7f12420994814a65c6b48db8349484af8cb8))
+
 ## [0.1.68](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.67...ncrs-v0.1.68) (2026-09-19)
 
 
