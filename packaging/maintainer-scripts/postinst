@@ -13,6 +13,20 @@ case "$1" in
                 systemctl --global disable ncrs.service || true
             fi
         fi
+        # Grant CAP_SYS_ADMIN via a file capability so ncrs — an ordinary
+        # per-user process, not root or setuid — can use kernel
+        # FUSE_PASSTHROUGH (zero-copy reads for fully-cached files, Linux
+        # 6.9+). Best-effort: setcap comes from libcap2-bin, a Recommends
+        # (not a hard Depends), so its absence is expected on minimal
+        # installs. ncrs detects the missing capability itself at runtime
+        # and falls back to normal reads, so this is never fatal to the
+        # install. A daemon already running from a previous version must be
+        # restarted (e.g. via the tray menu or `systemctl --user restart
+        # ncrs.service`) before it picks up the new capability.
+        if command -v setcap >/dev/null 2>&1; then
+            setcap cap_sys_admin+ep /usr/bin/ncrs || \
+                echo "ncrs: setcap failed — FUSE passthrough will stay disabled (buffered reads still work normally)" >&2
+        fi
         # Register the nc:// URI handler and other desktop entries
         if command -v update-desktop-database >/dev/null 2>&1; then
             update-desktop-database -q /usr/share/applications || true

@@ -130,12 +130,18 @@ Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: Gonzalo Ruiz <gonza@logo.cl>
 Depends: ${DEPENDS}
+Recommends: libcap2-bin
 Section: net
 Priority: optional
 Description: Nextcloud FUSE virtual filesystem client
  ncrs mounts your Nextcloud as a local FUSE filesystem with offline
  caching, real-time sync, conflict detection, and GNOME/Nautilus
  integration including a GNOME Shell search provider.
+ .
+ libcap2-bin (setcap) is used at install time to grant the ncrs binary
+ CAP_SYS_ADMIN, which enables zero-copy kernel read passthrough for
+ fully-cached files on Linux 6.9+. Without it, ncrs runs identically but
+ always falls back to normal buffered reads.
 EOF
 
 # ── Copy maintainer scripts ───────────────────────────────────────────────────

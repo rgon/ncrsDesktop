@@ -595,7 +595,7 @@ fn spawn_state_monitor(
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, children_map: ChildrenMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, purge_cb: Option<PurgeCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>, offline: crate::OfflineStatus) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, children_map: ChildrenMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, purge_cb: Option<PurgeCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>, offline: crate::OfflineStatus, passthrough_enabled: Arc<AtomicBool>, passthrough_capable: Arc<AtomicBool>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -670,10 +670,12 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let pause_flag = paused.clone();
             let offline_flag = offline.clone();
             let sp = state_push.clone();
+            let pt_enabled = passthrough_enabled.clone();
+            let pt_capable = passthrough_capable.clone();
             let active = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, pu, elog, tmap, jrnl, fcq, sstats, pause_flag, offline_flag, sp);
+                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, pu, elog, tmap, jrnl, fcq, sstats, pause_flag, offline_flag, sp, pt_enabled, pt_capable);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -716,6 +718,8 @@ fn handle_client(
     paused: Arc<AtomicBool>,
     offline: crate::OfflineStatus,
     state_push: Arc<StatePush>,
+    passthrough_enabled: Arc<AtomicBool>,
+    passthrough_capable: Arc<AtomicBool>,
 ) {
     let mut write_half = match stream.try_clone() {
         Ok(s) => s,
@@ -1009,6 +1013,23 @@ fn handle_client(
             paused.store(false, Ordering::Relaxed);
             log::info!("sync resumed via IPC");
             "ok".to_string()
+        } else if trimmed == "PASSTHROUGH_ON" {
+            passthrough_enabled.store(true, Ordering::Relaxed);
+            log::info!("FUSE passthrough enabled via IPC");
+            "ok".to_string()
+        } else if trimmed == "PASSTHROUGH_OFF" {
+            passthrough_enabled.store(false, Ordering::Relaxed);
+            log::info!("FUSE passthrough disabled via IPC");
+            "ok".to_string()
+        } else if trimmed == "PASSTHROUGH_STATUS" {
+            // "on"/"off" reflects the live toggle; the second field is whether a
+            // passthrough attempt has actually succeeded this session (false
+            // stays false once CAP_SYS_ADMIN or kernel support is found missing).
+            format!(
+                "{}:{}",
+                if passthrough_enabled.load(Ordering::Relaxed) { "on" } else { "off" },
+                if passthrough_capable.load(Ordering::Relaxed) { "capable" } else { "unavailable" },
+            )
         } else if trimmed == "PURGE_CACHE" {
             match &purge_cb {
                 Some(cb) => match cb() {

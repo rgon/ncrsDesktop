@@ -60,6 +60,11 @@ pub struct MountOptions {
     pub cleanup_stale_gio_temps: bool,
     #[serde(default = "default_stale_gio_temp_mins")]
     pub stale_gio_temp_mins: u64,
+    /// Attempt kernel FUSE_PASSTHROUGH (zero-copy read) for files served from a
+    /// complete, fresh local cache copy. Requires Linux 6.9+ and CAP_SYS_ADMIN;
+    /// silently falls back to buffered reads when either is unavailable.
+    #[serde(default = "default_true")]
+    pub fuse_passthrough: bool,
 }
 
 impl std::fmt::Debug for MountOptions {
@@ -197,8 +202,9 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
         .unwrap_or_default();
     let cleanup_stale_gio_temps = doc["cleanup_stale_gio_temps"].as_bool().unwrap_or(true);
     let stale_gio_temp_mins = doc["stale_gio_temp_mins"].as_i64().map(|v| v as u64).unwrap_or(10);
+    let fuse_passthrough = doc["fuse_passthrough"].as_bool().unwrap_or(true);
 
-    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins })
+    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
@@ -432,6 +438,9 @@ pub struct ConfigSettings {
     pub cache_streamed_reads: bool,
     pub cleanup_stale_gio_temps: bool,
     pub stale_gio_temp_mins: u64,
+    // Defaulted for the same forward-compat reason as dir_cache_max_dirs above.
+    #[serde(default = "default_true")]
+    pub fuse_passthrough: bool,
 }
 
 impl Default for ConfigSettings {
@@ -457,6 +466,7 @@ impl Default for ConfigSettings {
             cache_streamed_reads: false,
             cleanup_stale_gio_temps: true,
             stale_gio_temp_mins: 10,
+            fuse_passthrough: true,
         }
     }
 }
@@ -479,6 +489,7 @@ pub fn config_settings_from_opts(opts: &MountOptions) -> ConfigSettings {
         cache_streamed_reads: opts.cache_streamed_reads,
         cleanup_stale_gio_temps: opts.cleanup_stale_gio_temps,
         stale_gio_temp_mins: opts.stale_gio_temp_mins,
+        fuse_passthrough: opts.fuse_passthrough,
     }
 }
 
@@ -575,6 +586,13 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# manager. Orphans from crashed copies are cleaned up on the next directory open.\n");
     content.push_str(&format!("cleanup_stale_gio_temps: {}\n", settings.cleanup_stale_gio_temps));
     content.push_str(&format!("stale_gio_temp_mins: {}\n", settings.stale_gio_temp_mins));
+    content.push_str("# Zero-copy reads for fully-cached files: once a file is downloaded and\n");
+    content.push_str("# verified fresh, the kernel serves reads directly from the backing cache\n");
+    content.push_str("# file, bypassing ncRS entirely. Requires Linux 6.9+ and CAP_SYS_ADMIN\n");
+    content.push_str("# (granted via a file capability on the ncrs binary in the .deb package);\n");
+    content.push_str("# silently falls back to normal reads when either is unavailable. Can be\n");
+    content.push_str("# toggled live from the tray/settings without remounting.\n");
+    content.push_str(&format!("fuse_passthrough: {}\n", settings.fuse_passthrough));
 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
