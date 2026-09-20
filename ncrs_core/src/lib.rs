@@ -27,10 +27,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    BackingId, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
 pub use config::{configuration_parser, MountOptions};
@@ -407,6 +407,12 @@ struct OpenFile {
     // seektable, then the playback position) missed the single per-handle buffer
     // about five times and pulled ~281 MB — 2.2x the file — before it could start.
     read_ahead_window: usize,
+    // Present only when this handle was granted kernel FUSE_PASSTHROUGH at
+    // open() — reads/writes for it bypass ncrs entirely from then on. Held here
+    // purely so it drops (and tells the kernel to tear down the backing
+    // registration) when the handle is removed from open_files in release().
+    #[allow(dead_code)]
+    backing_id: Option<BackingId>,
 }
 
 /// Appends `data` to a chunk-streaming tail staging file, creating it if this
@@ -2568,6 +2574,13 @@ struct ConnInfo {
     deferred_invalidation: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    // Live on/off switch for kernel FUSE_PASSTHROUGH, hot-toggleable over IPC
+    // (PASSTHROUGH_ON/OFF) without a remount. Seeded from MountOptions.fuse_passthrough.
+    passthrough_enabled: Arc<AtomicBool>,
+    // Sticky per-session verdict: flipped false the first time open_backing()
+    // fails (missing CAP_SYS_ADMIN, kernel <6.9, etc.) so every later open()
+    // just falls back to a normal reply instead of re-probing and re-logging.
+    passthrough_capable: Arc<AtomicBool>,
 }
 
 /// Clears an in-progress flag on drop, so a panicking worker cannot latch it.
@@ -2855,6 +2868,8 @@ impl NextCloudFs {
             deferred_invalidation: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
+            passthrough_enabled: Arc::new(AtomicBool::new(options.fuse_passthrough)),
+            passthrough_capable: Arc::new(AtomicBool::new(true)),
         });
 
         Ok(NextCloudFs {
@@ -2958,6 +2973,14 @@ impl NextCloudFs {
 
     pub fn paused_flag(&self) -> Arc<AtomicBool> {
         self.conn.paused.clone()
+    }
+
+    pub fn passthrough_enabled_flag(&self) -> Arc<AtomicBool> {
+        self.conn.passthrough_enabled.clone()
+    }
+
+    pub fn passthrough_capable_flag(&self) -> Arc<AtomicBool> {
+        self.conn.passthrough_capable.clone()
     }
 
     pub(crate) fn conn(&self) -> Arc<ConnInfo> {
@@ -4173,6 +4196,42 @@ impl Filesystem for NextCloudFs {
         // and true when offline (no remote etag to compare) so offline reads of a
         // kept copy are never forced into an unsatisfiable re-download.
         let cache_fresh = self.cache.safe_lock().file_cache_matches_remote(&path);
+
+        // Kernel FUSE_PASSTHROUGH: only offered for a read-only open already
+        // backed by a complete, fresh local cache copy — never for a handle
+        // that may be served from the in-flight streaming buffer (of.buf) or
+        // the write staging path, both of which require ncrs to stay on the
+        // data path (see OpenFile::backing_id and the read()/write() handlers).
+        // is_mime_detect implies local.is_none(), so it can never reach here.
+        let backing_id: Option<BackingId> = if !writable
+            && local.is_some()
+            && cache_fresh
+            && self.conn.passthrough_enabled.load(Ordering::Relaxed)
+            && self.conn.passthrough_capable.load(Ordering::Relaxed)
+        {
+            let lp = local.clone().unwrap();
+            match std::fs::File::open(&lp).and_then(|f| reply.open_backing(f)) {
+                Ok(id) => {
+                    log::debug!("FUSE passthrough granted for {}", lp.display());
+                    Some(id)
+                }
+                Err(e) => {
+                    // Sticky for the rest of this session — a missing
+                    // CAP_SYS_ADMIN or a pre-6.9 kernel will not fix itself
+                    // mid-run, so don't retry (and re-log) on every open().
+                    if self.conn.passthrough_capable.swap(false, Ordering::Relaxed) {
+                        log::info!(
+                            "FUSE passthrough unavailable ({}) — falling back to buffered reads for the rest of this session",
+                            e
+                        );
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         self.open_files.safe_lock().insert(
             fh,
             OpenFile {
@@ -4189,6 +4248,7 @@ impl Filesystem for NextCloudFs {
                 total_written: 0,
                 stream_eligible: local.is_none(),
                 chunk_upload: None,
+                backing_id,
             },
         );
         let fopen_flags = if mime_detect {
@@ -4196,7 +4256,16 @@ impl Filesystem for NextCloudFs {
         } else {
             FopenFlags::empty()
         };
-        reply.opened(FileHandle(fh), fopen_flags);
+        // The BackingId must stay alive through and after this reply (the
+        // crate's own doc warns dropping it right after replying can cause
+        // the kernel to return EIO) — it now lives in the open_files entry
+        // just inserted above, so borrow it back from there rather than the
+        // now-moved local, and let it drop naturally in release().
+        let files = self.open_files.safe_lock();
+        match files.get(&fh).and_then(|of| of.backing_id.as_ref()) {
+            Some(id) => reply.opened_passthrough(FileHandle(fh), fopen_flags, id),
+            None => reply.opened(FileHandle(fh), fopen_flags),
+        }
     }
 
     fn read(
@@ -4918,6 +4987,25 @@ impl Filesystem for NextCloudFs {
         // per entry on large directories; `ls` keeps using plain readdir. Best
         // effort — silently ignored if the running kernel lacks support.
         let _ = config.add_capabilities(InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO);
+        // Negotiate FUSE_PASSTHROUGH support unconditionally — cheap and
+        // harmless if unused. Whether any given open() actually hands the
+        // kernel a backing fd is decided per-open against passthrough_enabled/
+        // passthrough_capable, not here; this only makes the *option* available
+        // for the life of the mount. Both calls are required: set_max_stack_depth
+        // alone does NOT add FUSE_PASSTHROUGH to the requested capability set —
+        // add_capabilities is what actually asks the kernel for it, and it only
+        // succeeds if the kernel already advertised support (6.9+). Best effort:
+        // silently ignored otherwise.
+        //
+        // Depth 2 (the kernel's hard max) rather than 1: depth 1 only covers a
+        // backing file on a plain (non-stacked) filesystem. The cache dir is
+        // frequently on a stacked fs in practice (e.g. a container root on
+        // overlay2, or the user's home on an overlay/bind mount) — with depth
+        // 1, open_backing() on such a file fails ELOOP ("too many levels").
+        // There is no reason not to request the max: it costs nothing when
+        // the backing fs isn't stacked.
+        let _ = config.add_capabilities(InitFlags::FUSE_PASSTHROUGH);
+        let _ = config.set_max_stack_depth(2);
         Ok(())
     }
 
@@ -5440,6 +5528,7 @@ impl Filesystem for NextCloudFs {
                                     total_written: 0,
                                     stream_eligible: false,
                                     chunk_upload: None,
+                                    backing_id: None,
                                 });
                                 log::info!("ghost create: {} (inotify trigger)", full_path.display());
                                 reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
@@ -5518,6 +5607,7 @@ impl Filesystem for NextCloudFs {
                 total_written: 0,
                 stream_eligible: true,
                 chunk_upload: None,
+                backing_id: None,
             },
         );
 
@@ -6346,7 +6436,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let file_change_queue = filesystem.file_change_queue();
     let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
     let offline_flag = filesystem.is_offline_flag();
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.children_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), Some(purge_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone(), offline_status.clone());
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.children_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), Some(purge_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone(), offline_status.clone(), filesystem.passthrough_enabled_flag(), filesystem.passthrough_capable_flag());
 
     let backend = filesystem.conn.backend.clone();
     let notifier_slot = filesystem.notifier_slot();

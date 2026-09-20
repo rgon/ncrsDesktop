@@ -18,6 +18,7 @@
         cache_streamed_reads: boolean;
         cleanup_stale_gio_temps: boolean;
         stale_gio_temp_mins: number;
+        fuse_passthrough: boolean;
     }
 
     let { forced = false }: { forced?: boolean } = $props();
@@ -29,6 +30,8 @@
     let remounting = $state(false);
     let purging = $state(false);
     let purgeMsg = $state("");
+    let passthroughStatus = $state<string | null>(null);
+    let passthroughBusy = $state(false);
 
     // Displayed as MB / GB; stored as bytes
     let readAheadMb = $state(64);
@@ -43,7 +46,34 @@
         version = ver;
         readAheadMb = Math.round(cfg.read_ahead_bytes / (1024 * 1024));
         cacheMaxGb = Math.round(cfg.cache_max_size_bytes / (1024 * 1024 * 1024));
+        refreshPassthroughStatus();
     });
+
+    async function refreshPassthroughStatus() {
+        try {
+            passthroughStatus = await invoke<string | null>("get_passthrough_status");
+        } catch {
+            passthroughStatus = null;
+        }
+    }
+
+    // Applied live via IPC (no remount needed) as soon as it's toggled, unlike
+    // the rest of this form which only takes effect after "Save" + "Remount".
+    async function togglePassthrough(e: Event) {
+        if (!settings) return;
+        const enabled = (e.target as HTMLInputElement).checked;
+        passthroughBusy = true;
+        try {
+            await invoke("set_passthrough_enabled", { enabled });
+            settings.fuse_passthrough = enabled;
+        } catch (err: unknown) {
+            errorMsg = String(err);
+            status = "error";
+        } finally {
+            passthroughBusy = false;
+            await refreshPassthroughStatus();
+        }
+    }
 
     async function save() {
         if (!settings) return;
@@ -209,6 +239,38 @@
                         min="1"
                         max="512"
                         bind:value={readAheadMb}
+                    />
+                </div>
+
+                <div class="sv-toggle">
+                    <div>
+                        <label class="sv-toggle-label" for="passthrough">Zero-copy passthrough reads</label>
+                        <p class="sv-hint">
+                            Once a file is fully downloaded and cached, let the kernel serve reads
+                            directly from the cached copy, bypassing ncRS entirely. Requires Linux
+                            6.9+ and a capability granted at install time; falls back to normal
+                            reads automatically when unavailable. Applies immediately, no remount
+                            needed.
+                        </p>
+                        {#if passthroughStatus}
+                            {@const [, capability] = passthroughStatus.split(":")}
+                            <p class="sv-hint">
+                                {#if capability === "capable"}
+                                    Available this session.
+                                {:else}
+                                    Not available this session (missing capability or kernel
+                                    support) — reads fall back to normal, no action needed.
+                                {/if}
+                            </p>
+                        {/if}
+                    </div>
+                    <input
+                        id="passthrough"
+                        type="checkbox"
+                        class="sv-check"
+                        checked={settings.fuse_passthrough}
+                        disabled={passthroughBusy}
+                        onchange={togglePassthrough}
                     />
                 </div>
 

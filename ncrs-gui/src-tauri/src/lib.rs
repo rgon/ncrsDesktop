@@ -619,6 +619,33 @@ fn save_config_values(values: ncrs_core::config::ConfigSettings) -> Result<(), S
     ncrs_core::config::rewrite_config_settings(&values)
 }
 
+/// Toggle kernel FUSE_PASSTHROUGH live, without a remount. Persists the choice
+/// (so it's also the default next time ncrs mounts) and, if a daemon is
+/// currently running — attached or embedded in this process, the IPC socket
+/// exists either way — forwards it immediately over IPC.
+#[tauri::command]
+fn set_passthrough_enabled(enabled: bool) -> Result<(), String> {
+    let mut settings = ncrs_core::config::load_config()
+        .map(|opts| ncrs_core::config::config_settings_from_opts(&opts))
+        .unwrap_or_default();
+    settings.fuse_passthrough = enabled;
+    ncrs_core::config::rewrite_config_settings(&settings)?;
+
+    let verb = if enabled { "PASSTHROUGH_ON" } else { "PASSTHROUGH_OFF" };
+    if ipc_request(&[verb]).is_none() {
+        log::warn!("could not forward {} to daemon (not running?)", verb);
+    }
+    Ok(())
+}
+
+/// "on"/"off" (the live toggle) and "capable"/"unavailable" (whether a
+/// passthrough open has actually succeeded this session), joined with ':'.
+/// None when no daemon is currently reachable over IPC.
+#[tauri::command]
+fn get_passthrough_status() -> Option<String> {
+    ipc_request(&["PASSTHROUGH_STATUS"]).and_then(|r| r.into_iter().next())
+}
+
 #[tauri::command]
 fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -1089,6 +1116,8 @@ pub fn run() {
             logout,
             get_config_values,
             save_config_values,
+            set_passthrough_enabled,
+            get_passthrough_status,
             get_app_version,
             nc_passwords::commands::nc_passwords_connect,
             nc_passwords::commands::nc_passwords_disconnect,
