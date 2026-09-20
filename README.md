@@ -15,6 +15,7 @@ Designed to perform well in installations with a very large amount of shared fil
 | Nextcloud Notifications         | ✅ | ❌ | ✅ |
 | Nautilus integration: syncing/downloaded/shared    | ✅ (partial)                | N/A since it's only online                    | ✅   |
 | Instant local access      | ✅                | ❌                     | ✅   |
+| Zero-copy reads for cached files (kernel serves the file directly, ncRS never touches the data) | ❌ | ❌ | ✅ (Linux 6.9+, via kernel FUSE passthrough) |
 | Nextcloud-generated thumbnails         | ❌ | ❌ | ✅ (even for RAW images!) |
 | Local cached file pruning      | ❌                | ❌                     | ✅ intelligently keeps local copies of often-used files  |
 | Dynamically cache files/keep part locally | ❌                | ❌ (No internet = no files) | ✅   |
