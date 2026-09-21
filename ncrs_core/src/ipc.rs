@@ -24,7 +24,7 @@
 ///   PAUSE\n / RESUME\n                → ok (suspend/resume background sync)
 ///   THUMBNAIL <abs-path>\n           → ok | error: <msg>  (fetch NC preview → XDG thumb cache)
 ///   VERSION <n>\n                     → <daemon-protocol>\t<pkg-version>  (n = extension protocol)
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -35,6 +35,12 @@ use crate::{MutexExt, RwLockExt};
 
 const MAX_IPC_CLIENTS: usize = 64;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest request line a client may send. `BufRead::lines()` buffers an
+/// unbounded amount before yielding, so a peer that never sends `\n` (or
+/// sends a huge one) could otherwise grow that buffer without limit. Well
+/// above PATH_MAX (4096) to leave room for percent-encoding and command
+/// prefixes, far below "unbounded".
+const MAX_IPC_LINE_LEN: usize = 16 * 1024;
 
 /// Counts how often directory-status aggregation takes the O(N_total)
 /// whole-status-map fallback because the `ChildrenMap` had no entry for the
@@ -682,6 +688,32 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
     });
 }
 
+/// Read one `\n`-terminated line, capped at `max_len` bytes. Returns `Ok(None)`
+/// on clean EOF with nothing pending, `Err` if the line exceeds `max_len`
+/// before a newline arrives (the caller should drop the connection — the
+/// stream position after an overlong line is not a line boundary anymore).
+fn read_line_bounded<R: BufRead>(reader: &mut R, max_len: usize) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    for byte in reader.bytes() {
+        let b = byte?;
+        if b == b'\n' {
+            return Ok(Some(String::from_utf8_lossy(&buf).trim_end_matches('\r').to_string()));
+        }
+        buf.push(b);
+        if buf.len() > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("IPC request line exceeds {} bytes", max_len),
+            ));
+        }
+    }
+    if buf.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(String::from_utf8_lossy(&buf).trim_end_matches('\r').to_string()))
+    }
+}
+
 fn strip_mount<'a>(path: &'a Path, mount_point: &Path) -> Option<PathBuf> {
     if path.starts_with(mount_point) {
         Some(
@@ -725,12 +757,16 @@ fn handle_client(
         Ok(s) => s,
         Err(_) => return,
     };
-    let reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream);
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
+    loop {
+        let line = match read_line_bounded(&mut reader, MAX_IPC_LINE_LEN) {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!("IPC client sent an oversized or unreadable request: {}", e);
+                break;
+            }
         };
         let trimmed = line.trim();
 
