@@ -98,6 +98,7 @@ install -Dm644 shell_integration/thumbnailer/cr3.thumbnailer               "$PKG
 # template. This executes the staged binary, so it must be runnable on the
 # build host (cross-built packages need a matching host or qemu-user).
 mkdir -p "$PKG_DIR/usr/share/doc/ncrs"
+install -Dm644 packaging/copyright "$PKG_DIR/usr/share/doc/ncrs/copyright"
 if ! target/release/ncrs --print-default-config > "$PKG_DIR/usr/share/doc/ncrs/config.yaml.example"; then
     echo "error: 'target/release/ncrs --print-default-config' failed (stale or non-host-arch binary?)" >&2
     exit 1

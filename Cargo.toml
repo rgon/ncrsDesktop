@@ -12,6 +12,7 @@ resolver = "2"
 version = "0.1.71" # x-release-please-version
 edition = "2021"
 authors = ["Gonzalo Ruiz <foss@rgon.es>"]
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 clap = "4.5.40"

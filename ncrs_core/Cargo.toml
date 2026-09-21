@@ -3,6 +3,7 @@ name = "ncrs_core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 default-run = "ncrs"
 
 [[bin]]

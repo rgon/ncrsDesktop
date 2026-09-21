@@ -2,6 +2,7 @@
 <component type="desktop-application">
   <id>es.rgon.ncrs</id>
   <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
   <name>ncRS</name>
   <summary>Mount and sync your Nextcloud as a local filesystem</summary>
   <description>

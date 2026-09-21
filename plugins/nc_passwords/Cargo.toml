@@ -2,6 +2,7 @@
 name = "nc_passwords"
 version.workspace = true
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 ncrs_plugin = { path = "../ncrs_plugin" }

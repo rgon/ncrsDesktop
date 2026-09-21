@@ -2,6 +2,7 @@
 name = "nc_gnome_integration"
 version.workspace = true
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 ncrs_plugin = { path = "../ncrs_plugin" }
