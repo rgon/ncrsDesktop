@@ -97,6 +97,38 @@ fn ncrs_binary_path() -> std::path::PathBuf {
     std::path::PathBuf::from("ncrs")
 }
 
+/// Spawn the ncrs daemon, preferring a systemd-managed transient scope over a
+/// bare child process — this gets it the same supervision the `ncrs.service`
+/// path already has (its own cgroup, `systemctl --user status ncrs.scope`,
+/// `journalctl --user` capturing its output instead of it being lost in
+/// ncrs-gui's own stdout) without needing that unit pre-enabled.
+///
+/// `systemd-run --scope` execs directly into the target rather than forking a
+/// wrapper that lingers, so the `Child` this returns on success — whichever
+/// branch is taken — always *is* the ncrs process itself.
+///
+/// Falls back to a plain spawn if `systemd-run` is missing, or if the user
+/// session bus is unreachable: `systemd-run` itself then exits almost
+/// immediately (well before ncrs could open its IPC socket), which is
+/// detectable, unlike a spawn() failure — the D-Bus round-trip happens after
+/// the fork, so `Command::spawn()` alone cannot tell the two cases apart.
+fn spawn_ncrs_daemon(ncrs_bin: &std::path::Path) -> std::io::Result<std::process::Child> {
+    if let Ok(mut child) = std::process::Command::new("systemd-run")
+        .args(["--user", "--scope", "--collect", "--unit=ncrs", "--"])
+        .arg(ncrs_bin)
+        .spawn()
+    {
+        thread::sleep(Duration::from_millis(300));
+        match child.try_wait() {
+            Ok(None) => return Ok(child), // still running — handed off cleanly
+            _ => log::warn!("systemd-run exited immediately — falling back to a plain spawn"),
+        }
+    } else {
+        log::info!("systemd-run unavailable — falling back to a plain spawn");
+    }
+    std::process::Command::new(ncrs_bin).spawn()
+}
+
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1372,7 +1404,10 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
         // all, and keeps that capability out of this much larger process.
         let ncrs_bin = ncrs_binary_path();
         log::info!("no ncrs daemon found — spawning {}", ncrs_bin.display());
-        match std::process::Command::new(&ncrs_bin).spawn() {
+        match tokio::task::spawn_blocking(move || spawn_ncrs_daemon(&ncrs_bin))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+        {
             Ok(mut child) => {
                 // Purely bookkeeping so the child never lingers as a zombie;
                 // attached_subscribe_loop below is what detects the daemon
