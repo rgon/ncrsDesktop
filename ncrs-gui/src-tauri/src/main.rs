@@ -16,6 +16,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // background_thread: a purge thread returns dirty/muzzy pages to the OS.
 // *_decay_ms:1000: pages freed by the app are released after ~1 s idle rather
 // than the multi-second default, keeping RSS close to the live working set.
+// narenas:4: jemalloc's default is ncpu*4 (32 on an 8-core box). This daemon's
+// allocation concurrency comes from a handful of FUSE/tokio worker threads,
+// not a web-server-scale request fanout, so 32-way arena parallelism buys
+// nothing but multiplies fixed per-arena overhead (each arena keeps at least
+// one retained chunk plus its own dirty-page run) by the arena count. Capping
+// it at 4 measurably cut idle RSS without introducing lock contention at this
+// concurrency level.
 //
 // `#[used]` and the `unprefixed_malloc_on_supported_platforms` feature are both
 // required: without the feature jemalloc reads `_rjem_malloc_conf` and ignores
@@ -25,7 +32,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[allow(non_upper_case_globals)]
 #[used]
 #[export_name = "malloc_conf"]
-pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+pub static malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4\0";
 
 fn main() {
     ncrs_gui_lib::run()
