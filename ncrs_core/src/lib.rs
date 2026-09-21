@@ -3252,6 +3252,53 @@ impl DirReply {
     }
 }
 
+// Bounds how many readdir() background workers can be doing real work (a
+// PROPFIND round trip, cache population, an etag revalidation) at once.
+// `readdir_common` spawns a fresh OS thread per call and returns immediately
+// (fuser's single dispatch thread must never block on one directory's network
+// round trip), so nothing on the fast path otherwise limits how many of these
+// can be live simultaneously. A single caller doing a bulk recursive crawl of
+// the mount — a desktop search indexer's file miner, `find`, a backup tool —
+// fans that out into one thread per directory it visits *at once*: thousands
+// of them, each pulling a PROPFIND response, holding cache locks, and
+// contending the allocator's arenas, which is what pegs the CPU and drives
+// RSS into the gigabytes even though only a handful can usefully make network
+// progress concurrently anyway. Mirrors `preview::FetchPermit`, which the
+// same failure mode already forced onto the thumbnail-fetch path — this is
+// the equivalent for the directory-listing path itself, which never got one.
+//
+// The permit is acquired *inside* the spawned thread, not before spawning
+// it: gating the spawn itself would mean blocking fuser's one dispatch
+// thread until a slot frees, which would stall every other FUSE operation
+// (open, read, write, getattr on files the user is actively using) behind
+// whatever is saturating readdir — worse than the resource usage this fixes.
+const MAX_CONCURRENT_READDIR_WORKERS: usize = 24;
+static INFLIGHT_READDIR_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct ReaddirWorkerPermit;
+
+impl ReaddirWorkerPermit {
+    fn acquire() -> Self {
+        loop {
+            let cur = INFLIGHT_READDIR_WORKERS.load(Ordering::Acquire);
+            if cur < MAX_CONCURRENT_READDIR_WORKERS
+                && INFLIGHT_READDIR_WORKERS
+                    .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return ReaddirWorkerPermit;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for ReaddirWorkerPermit {
+    fn drop(&mut self) {
+        INFLIGHT_READDIR_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl NextCloudFs {
     /// Called from write() once the tail staging file has accumulated at
     /// least one full CHUNK_SIZE of unsent bytes. Lazily opens the
@@ -3521,6 +3568,7 @@ impl NextCloudFs {
         let open_dirs = self.open_dirs.clone();
 
         thread::spawn(move || {
+            let _readdir_permit = ReaddirWorkerPermit::acquire();
             if offset == 0 {
                 let dot_attr = make_dir_attr(ino.0);
                 if reply.add(ino, 1, FileType::Directory, ".", &dot_attr) {
