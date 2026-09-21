@@ -424,12 +424,24 @@ fn webdav_prefix(webdav_url: &str) -> String {
 /// is rebuilt from `file_name()` alone) that no code enforces. Rejecting at the
 /// parse boundary means a future caller that does join a cached entry path onto
 /// a local directory cannot be made to escape it.
+///
+/// Also returns `None` for an href whose decoded path contains a control
+/// character (e.g. a raw `\n`). Nothing downstream expects one — in
+/// particular, filenames reach shell-integration helpers (Nautilus, the
+/// thumbnailer) over a newline-delimited local IPC protocol, where an
+/// embedded `\n` would be parsed as a second, attacker-chosen command. Local
+/// writes already go through `filename_validation`; server-supplied names
+/// need the same floor.
 fn href_to_remote_path(href: &str, prefix: &str) -> Option<PathBuf> {
     let decoded = percent_encoding::percent_decode_str(href)
         .decode_utf8_lossy()
         .into_owned();
     if decoded.split(['/', '\\']).any(|seg| seg == "..") {
         log::warn!("PROPFIND: ignoring entry with parent-directory segment in href {:?}", href);
+        return None;
+    }
+    if decoded.chars().any(|c| c.is_control()) {
+        log::warn!("PROPFIND: ignoring entry with control character in href {:?}", href);
         return None;
     }
     let trimmed = decoded.trim_end_matches('/');
@@ -993,6 +1005,22 @@ mod href_traversal_tests {
             "/remote.php/dav/files/user/%2e%2e/%2e%2e/.config/autostart/x.desktop",
             "/remote.php/dav/files/user/..",
             "/../etc/passwd",
+        ] {
+            assert_eq!(
+                href_to_remote_path(hostile, &prefix), None,
+                "{} must be rejected", hostile,
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        let prefix = webdav_prefix(URL);
+        for hostile in [
+            // A raw newline, as it would actually arrive percent-encoded.
+            "/remote.php/dav/files/user/evil.jpg%0APAUSE",
+            "/remote.php/dav/files/user/evil%0D%0Aname",
+            "/remote.php/dav/files/user/evil\x01name",
         ] {
             assert_eq!(
                 href_to_remote_path(hostile, &prefix), None,
