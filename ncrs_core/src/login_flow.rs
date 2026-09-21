@@ -2,6 +2,7 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
+#[derive(Debug)]
 pub struct LoginFlowInit {
     pub login_url: String,
     pub poll_token: String,
