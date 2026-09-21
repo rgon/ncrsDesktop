@@ -12,7 +12,7 @@ use tauri::async_runtime::spawn;
 use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration};
 
-use ncrs_core::{mount_ncfs, mutation_journal::{self, SharedJournal, JournalEntry, ConflictRecord}, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, ipc::StorageStats, ErrorLog, MountOptions, OfflineStatus, SyncError, SyncState, TransferMap, TransferProgress};
+use ncrs_core::{mutation_journal::{self, SharedJournal, JournalEntry, ConflictRecord}, notifications::NcNotification, search::{SearchProvider, SearchResultGroup}, ipc::StorageStats, ErrorLog, MountOptions, SyncError, SyncState, TransferMap, TransferProgress};
 
 mod plugins;
 
@@ -26,17 +26,13 @@ pub struct AppState {
     pub transfer_map: TransferMap,
     pub journal: SharedJournal,
     pub paused: Arc<std::sync::atomic::AtomicBool>,
-    /// True when mirroring an external daemon (systemd service) over IPC
-    /// instead of owning the mount in-process.
+    /// True when the daemon we're mirroring belongs to somebody else (found
+    /// already running at attach time, e.g. the ncrs systemd service) rather
+    /// than one we spawned ourselves — so quit/remount must leave its mount
+    /// and process alone instead of tearing it down.
     pub attached: std::sync::atomic::AtomicBool,
     /// Set to true to cancel an in-progress login flow poll loop.
     pub login_flow_cancel: Arc<std::sync::atomic::AtomicBool>,
-    /// Mirrors the notify_push connection flag; false when HPB is unavailable.
-    pub hpb_connected: Arc<std::sync::atomic::AtomicBool>,
-    /// Shared with the core's connectivity monitor: reports the server as
-    /// unreachable (so WebDAV is down too and nothing can sync) once the outage
-    /// has outlived the blip grace window.
-    pub offline: OfflineStatus,
     /// Set when the GUI detects a server auth failure (e.g. 401 from notifications API).
     /// Survives attached_poll_loop state overwrites; cleared on successful auth.
     pub auth_error: Mutex<Option<String>>,
@@ -56,8 +52,6 @@ impl Default for AppState {
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             attached: std::sync::atomic::AtomicBool::new(false),
             login_flow_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            hpb_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            offline: OfflineStatus::new(),
             auth_error: Mutex::new(None),
         }
     }
@@ -85,6 +79,22 @@ fn ipc_request(verbs: &[&str]) -> Option<Vec<String>> {
         replies.push(line.trim().to_string());
     }
     Some(replies)
+}
+
+/// Resolve the `ncrs` daemon binary: prefer one next to our own executable
+/// (dev builds, where both land in the same target/{debug,release} dir),
+/// falling back to a bare `ncrs` resolved via PATH (the installed /usr/bin
+/// case).
+fn ncrs_binary_path() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("ncrs");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    std::path::PathBuf::from("ncrs")
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
@@ -1215,13 +1225,14 @@ pub fn run() {
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
-                // Attach mode: the external daemon owns sync — forward the
-                // toggle over IPC (the attach poll confirms the new state).
-                if app_state_menu.attached.load(std::sync::atomic::Ordering::Relaxed) {
+                // The daemon always runs out-of-process now (spawned by us or
+                // owned externally) — forward the toggle over IPC either way;
+                // the subscribe/poll loop mirrors the confirmed state back.
+                {
                     let verb = if new_state == SyncState::Paused { "PAUSE" } else { "RESUME" };
                     thread::spawn(move || {
                         if ipc_request(&[verb]).is_none() {
-                            log::warn!("could not forward {} to external daemon", verb);
+                            log::warn!("could not forward {} to ncrs daemon", verb);
                         }
                     });
                 }
@@ -1346,98 +1357,53 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
         .is_some();
 
     if external_daemon {
-        // Attach mode: another daemon (e.g. the ncrs systemd user service)
-        // already owns the mount — mirror its state over IPC instead of
-        // mounting a second time.
+        // Another daemon (e.g. the ncrs systemd user service) already owns
+        // the mount — mark it as not ours to tear down, then attach like any
+        // other daemon below.
         log::info!("existing ncrs daemon detected — attaching via IPC");
         state.attached.store(true, std::sync::atomic::Ordering::Relaxed);
-        spawn(attached_subscribe_loop(app.clone(), state.clone(), shutdown_tx));
     } else {
-        // FUSE mount thread — share error_log and transfer_map with the core
-        let fuse_opts = opts.clone();
-        let error_log = state.error_log.clone();
-        let transfer_map = state.transfer_map.clone();
-        let journal = state.journal.clone();
-        let fuse_app = app.clone();
-        let fuse_state = state.clone();
-        let fuse_paused = state.paused.clone();
-        let hpb_flag = state.hpb_connected.clone();
-        state.hpb_connected.store(false, std::sync::atomic::Ordering::Relaxed);
-        let offline_flag = state.offline.clone();
-        thread::spawn(move || {
-            let result = mount_ncfs(fuse_opts, Some(error_log), Some(transfer_map), Some(journal), Some(fuse_paused), Some(hpb_flag), Some(offline_flag));
-            match &result {
-                Ok(()) => {
-                    log::info!("FUSE unmounted cleanly");
-                    *fuse_state.sync_state.lock().unwrap() = SyncState::Unmounted;
-                    fuse_app.emit("sync-state-changed", "unmounted").ok();
-                }
-                Err(e) if e == "REMOTE_WIPE" => {
-                    log::warn!("FUSE unmounted due to remote wipe");
-                    *fuse_state.sync_state.lock().unwrap() = SyncState::Wiped;
-                    fuse_app.emit("sync-state-changed", "wiped").ok();
-                    fuse_app
-                        .notification()
-                        .builder()
-                        .title("Nextcloud: Device Wiped")
-                        .body("This device has been remotely wiped. All cached data has been deleted and credentials cleared.")
-                        .show()
-                        .ok();
-                }
-                Err(e) => {
-                    log::error!("FUSE error: {}", e);
-                    *fuse_state.sync_state.lock().unwrap() = SyncState::Error(e.clone());
-                    fuse_app.emit("sync-state-changed", format!("error:{}", e)).ok();
-                }
+        // No daemon owns the mount yet — spawn one and attach to it the same
+        // way. The FUSE loop never runs in this process: only the small,
+        // single-purpose `ncrs` binary is granted CAP_SYS_ADMIN (see
+        // packaging/maintainer-scripts/postinst), so spawning it here — rather
+        // than calling mount_ncfs() in-process — is what makes kernel
+        // FUSE_PASSTHROUGH reachable from the GUI's default autostart path at
+        // all, and keeps that capability out of this much larger process.
+        let ncrs_bin = ncrs_binary_path();
+        log::info!("no ncrs daemon found — spawning {}", ncrs_bin.display());
+        match std::process::Command::new(&ncrs_bin).spawn() {
+            Ok(mut child) => {
+                // Purely bookkeeping so the child never lingers as a zombie;
+                // attached_subscribe_loop below is what detects the daemon
+                // going away and drives sync_state.
+                thread::spawn(move || match child.wait() {
+                    Ok(status) => log::info!("ncrs daemon exited: {}", status),
+                    Err(e) => log::warn!("ncrs daemon wait() failed: {}", e),
+                });
             }
-            let _ = shutdown_tx.send(true);
-        });
-
-        // Connection health monitor — see health_sync_state for the ranking.
-        // 30s grace period gives the watcher time to establish the connection
-        // before we declare anything missing.
-        let hpb_state = state.clone();
-        let hpb_flag = state.hpb_connected.clone();
-        let offline_flag = state.offline.clone();
-        let hpb_app = app.clone();
-        let hpb_shutdown = shutdown_rx.clone();
-        spawn(async move {
-            sleep(Duration::from_secs(30)).await;
-            if *hpb_shutdown.borrow() { return; }
-            loop {
-                if *hpb_shutdown.borrow() { break; }
-                let target = health_sync_state(
-                    offline_flag.settled(),
-                    hpb_flag.load(std::sync::atomic::Ordering::Relaxed),
-                    hpb_state.auth_error.lock().unwrap().is_some(),
-                );
-                let Some(target) = target else {
-                    sleep(Duration::from_secs(5)).await;
-                    continue;
-                };
-                // Only ever move between the three states this monitor owns: a
-                // Paused, Syncing, Error, Unmounted or Wiped state is somebody
-                // else's and must not be overwritten by a health tick.
-                let emit = {
-                    let mut ss = hpb_state.sync_state.lock().unwrap();
-                    let owned = matches!(
-                        *ss,
-                        SyncState::Idle | SyncState::Degraded(_) | SyncState::Offline
-                    );
-                    if owned && *ss != target {
-                        *ss = target.clone();
-                        Some(target.to_string())
-                    } else {
-                        None
-                    }
-                };
-                if let Some(payload) = emit {
-                    hpb_app.emit("sync-state-changed", payload).ok();
-                }
-                sleep(Duration::from_secs(5)).await;
+            Err(e) => {
+                let msg = format!("failed to start ncrs: {}", e);
+                log::error!("{}", msg);
+                *state.sync_state.lock().unwrap() = SyncState::Error(msg.clone());
+                app.emit("sync-state-changed", format!("error:{}", msg)).ok();
+                let _ = shutdown_tx.send(true);
+                return Ok(());
             }
-        });
+        }
+        // Give the daemon a moment to open its IPC socket before attaching —
+        // attached_subscribe_loop already retries/backs off on its own, but a
+        // short poll here avoids logging spurious "disconnected" noise on the
+        // very first attempt.
+        for _ in 0..50 {
+            if ipc_request(&["STATE"]).is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
     }
+
+    spawn(attached_subscribe_loop(app.clone(), state.clone(), shutdown_tx));
 
     // Notification polling — async on Tokio runtime, no dedicated OS thread
     match opts.credentials() {
@@ -1499,87 +1465,6 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
             });
         }
     }
-
-    // Embedded mode only: poll the locally-owned state maps every 2s and emit.
-    // In attach mode the daemon pushes these via the SUBSCRIBE snapshot, so
-    // running these timers too would double-emit and re-notify errors.
-    if !external_daemon {
-    // Error log polling — check every 2s, emit event + desktop notification on new errors
-    let err_state = state.clone();
-    let err_app = app.clone();
-    let err_shutdown = shutdown_rx.clone();
-    spawn(async move {
-        let mut prev_count = 0usize;
-        loop {
-            if *err_shutdown.borrow() { break; }
-            sleep(Duration::from_secs(2)).await;
-            let errors: Vec<SyncError> = err_state.error_log.lock().unwrap().iter().cloned().collect();
-            let count = errors.len();
-            if count != prev_count {
-                if count > prev_count {
-                    for err in errors.iter().skip(prev_count) {
-                        err_app.notification()
-                            .builder()
-                            .title("ncRS: Sync Error")
-                            .body(&format!("{}: {}", err.path.display(), err.message))
-                            .show()
-                            .ok();
-                    }
-                }
-                err_app.emit("sync-errors-updated", &errors).ok();
-                prev_count = count;
-            }
-        }
-    });
-
-    // Transfer progress polling — 500ms when active, 2s when idle
-    let xfer_state = state.clone();
-    let xfer_app = app.clone();
-    let xfer_shutdown = shutdown_rx.clone();
-    spawn(async move {
-        let mut was_active = false;
-        loop {
-            if *xfer_shutdown.borrow() { break; }
-            let transfers: Vec<TransferProgress> = xfer_state.transfer_map.lock().unwrap().values().cloned().collect();
-            let active = !transfers.is_empty();
-            if active || was_active {
-                xfer_app.emit("transfers-updated", &transfers).ok();
-            }
-            was_active = active;
-            if active {
-                sleep(Duration::from_millis(500)).await;
-            } else {
-                sleep(Duration::from_secs(2)).await;
-            }
-        }
-    });
-
-    // Journal + conflicts polling
-    let jrnl_state = state.clone();
-    let jrnl_app = app.clone();
-    let jrnl_shutdown = shutdown_rx.clone();
-    spawn(async move {
-        let mut prev_pending = 0usize;
-        let mut prev_conflicts = 0usize;
-        loop {
-            if *jrnl_shutdown.borrow() { break; }
-            sleep(Duration::from_secs(2)).await;
-            let j = jrnl_state.journal.lock().unwrap();
-            let pending = j.len();
-            let conflicts: Vec<ConflictRecord> = j.unresolved_conflicts().into_iter().cloned().collect();
-            let conflict_count = conflicts.len();
-            drop(j);
-            if pending != prev_pending {
-                jrnl_app.emit("journal-updated", pending).ok();
-                prev_pending = pending;
-            }
-            if conflict_count != prev_conflicts {
-                jrnl_app.emit("conflicts-updated", &conflicts).ok();
-                prev_conflicts = conflict_count;
-            }
-        }
-    });
-    } // end embedded-only pollers
 
     Ok(())
 }
@@ -1660,31 +1545,6 @@ struct SnapshotCache {
     transfers_json: String,
     journal_json: String,
     conflicts_json: String,
-}
-
-/// The state the connection health monitor wants, from the signals it owns.
-/// `None` means the monitor has nothing to say and must leave the state alone.
-///
-/// notify_push being down on its own is a partial outage: WebDAV still serves
-/// reads and uploads, so the mount is degraded. The server being unreachable
-/// takes notify_push down *with* WebDAV, and reporting that as "degraded"
-/// claimed a working sync path that does not exist — a total outage has to read
-/// as a failure, so the offline signal wins.
-///
-/// A live auth error outranks both. A revoked token makes the connectivity probe
-/// fail too (its 401 calls `mark_offline`), and "server unreachable" would be
-/// both wrong and a dead end: it hides the Log in button, which is the only way
-/// out of that state.
-fn health_sync_state(offline: bool, hpb_connected: bool, auth_error: bool) -> Option<SyncState> {
-    if auth_error {
-        None
-    } else if offline {
-        Some(SyncState::Offline)
-    } else if hpb_connected {
-        Some(SyncState::Idle)
-    } else {
-        Some(SyncState::Degraded("high-performance backend not connected".into()))
-    }
 }
 
 /// Map a daemon STATE word to a [`SyncState`] and store it, preserving a
@@ -2033,31 +1893,6 @@ mod search_path_tests {
 #[cfg(test)]
 mod sync_state_tests {
     use super::*;
-
-    #[test]
-    fn unreachable_server_is_a_total_outage_not_a_degradation() {
-        // notify_push is down whenever the server is, so the HPB flag alone
-        // cannot distinguish the two — the offline signal has to win.
-        assert_eq!(health_sync_state(true, false, false), Some(SyncState::Offline));
-        assert_eq!(health_sync_state(true, true, false), Some(SyncState::Offline));
-    }
-
-    #[test]
-    fn hpb_down_on_a_reachable_server_is_still_degraded() {
-        assert!(matches!(
-            health_sync_state(false, false, false),
-            Some(SyncState::Degraded(_))
-        ));
-        assert_eq!(health_sync_state(false, true, false), Some(SyncState::Idle));
-    }
-
-    #[test]
-    fn a_live_auth_error_is_left_alone() {
-        // A revoked token trips the connectivity probe too; relabelling that as
-        // an outage would hide the only actionable diagnosis.
-        assert_eq!(health_sync_state(true, false, true), None);
-        assert_eq!(health_sync_state(false, true, true), None);
-    }
 
     #[test]
     fn offline_reads_as_a_failure_icon() {
