@@ -11,7 +11,7 @@ const BASE_FOLDER_UUID: &str = "00000000-0000-0000-0000-000000000000";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const API_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PasswordEntry {
     pub id: String,
     pub label: String,
@@ -35,6 +35,29 @@ pub struct PasswordEntry {
     pub updated: u64,
     #[serde(default)]
     pub edited: u64,
+}
+
+// Hand-written so `password` can never end up in a log line or panic message
+// via a stray `{:?}` — the derive would print it in the clear.
+impl std::fmt::Debug for PasswordEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordEntry")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("url", &self.url)
+            .field("notes", &self.notes)
+            .field("folder", &self.folder)
+            .field("favorite", &self.favorite)
+            .field("trashed", &self.trashed)
+            .field("hidden", &self.hidden)
+            .field("status_code", &self.status_code)
+            .field("created", &self.created)
+            .field("updated", &self.updated)
+            .field("edited", &self.edited)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +306,32 @@ impl PasswordsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_entry_debug_redacts_password() {
+        let entry = PasswordEntry {
+            id: "abc-123".into(),
+            label: "Example".into(),
+            username: "user".into(),
+            password: "super-secret-value".into(),
+            url: "https://example.com".into(),
+            notes: "".into(),
+            folder: "".into(),
+            favorite: false,
+            trashed: false,
+            hidden: false,
+            status_code: "".into(),
+            created: 0,
+            updated: 0,
+            edited: 0,
+        };
+        let debug_output = format!("{entry:?}");
+        assert!(
+            !debug_output.contains("super-secret-value"),
+            "Debug output must never contain the plaintext password: {debug_output}"
+        );
+        assert!(debug_output.contains("[REDACTED]"));
+    }
 
     #[test]
     fn password_entry_deserializes() {
