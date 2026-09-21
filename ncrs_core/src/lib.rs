@@ -16,6 +16,7 @@ pub mod preview;
 pub mod propfind;
 pub mod remote_wipe;
 pub mod search;
+mod seccomp_harden;
 pub mod webdav_ops;
 
 use std::collections::{HashMap, HashSet};
@@ -6613,6 +6614,9 @@ fn build_fuse_options() -> Vec<MountOption> {
 /// poll. A caller needs both to tell a total outage (server unreachable) from a
 /// partial one (notify_push down, WebDAV fine).
 pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>, paused: Option<Arc<AtomicBool>>, hpb_connected: Option<Arc<AtomicBool>>, offline: Option<OfflineStatus>) -> Result<(), String> {
+    // Must run before any other thread is spawned (see seccomp_harden::install).
+    seccomp_harden::install();
+
     // Must run before anything that touches shared resources (the IPC socket,
     // cache dirs, journal): a refused second instance must leave the running
     // daemon's state untouched.
