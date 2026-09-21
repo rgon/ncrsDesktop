@@ -6971,6 +6971,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     log::info!("FUSE notifier ready");
 
     let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;
+
+    {
+        let mount_point = options.mount_point.clone();
+        thread::spawn(move || ensure_desktop_index_excluded(&mount_point));
+    }
+
     let result = bg.guard.join().map_err(|panic_payload| {
         let msg = panic_payload
             .downcast_ref::<&str>().map(|s| s.to_string())
@@ -7129,6 +7135,40 @@ fn write_mount_marker(cache_dir: &Path, mount_point: &Path) {
     let _ = std::fs::create_dir_all(cache_dir);
     if let Err(e) = std::fs::write(mount_marker_path(cache_dir), canon.to_string_lossy().as_bytes()) {
         log::warn!("failed to record mount marker for {}: {}", canon.display(), e);
+    }
+}
+
+/// Drops an empty `.trackerignore` at the mount root, best-effort, if nothing
+/// is there yet. GNOME Tracker's file miner (and other desktop indexers that
+/// follow the same `.trackerignore`/`.nomedia` convention) skips a directory's
+/// content when it finds one — this is what stops a recursive index crawl from
+/// fanning out across the whole remote tree the moment the mount lands under
+/// an indexed location (an XDG special folder, `$HOME` itself, …). See the
+/// `ReaddirWorkerPermit` cap above for the other half of that fix: this marker
+/// keeps the crawl from starting at all; the cap keeps a crawl that starts
+/// anyway (a different indexer, `find`, a backup tool) from spawning an
+/// unbounded number of readdir workers.
+///
+/// Written as a real file through the mount rather than out-of-band: it needs
+/// to be visible to Tracker's own directory walk to work, and syncing it also
+/// protects this same account's mount on any other Linux desktop it's used
+/// from. Runs once per mount (existence check makes it idempotent), and reruns
+/// on every mount — so a changed mount point, or a remount elsewhere, always
+/// gets covered without needing to track "the old path" anywhere. Never
+/// recreated once deleted within a single mount's lifetime — if the entry
+/// exists (even as something the user put there and removed and Tracker
+/// re-created empty, unlikely) this only checks presence, not content, so a
+/// user who deliberately removes it to opt back into indexing stays opted out
+/// only until the next mount.
+fn ensure_desktop_index_excluded(mount_point: &Path) {
+    let marker = mount_point.join(".trackerignore");
+    match marker.try_exists() {
+        Ok(true) => {}
+        Ok(false) => match std::fs::write(&marker, b"") {
+            Ok(()) => log::info!("wrote {} to exclude the mount from desktop file indexing", marker.display()),
+            Err(e) => log::warn!("could not write {}: {} — the mount may get crawled by a desktop indexer", marker.display(), e),
+        },
+        Err(e) => log::debug!("could not check for {}: {}", marker.display(), e),
     }
 }
 

@@ -2243,6 +2243,32 @@ password: "pass"
     }
 
     #[test]
+    fn ensure_desktop_index_excluded_creates_marker_when_missing() {
+        let base = test_tmp("tracker_marker_missing");
+        std::fs::create_dir_all(&base).unwrap();
+
+        ensure_desktop_index_excluded(&base);
+
+        let marker = base.join(".trackerignore");
+        assert!(marker.exists());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"");
+    }
+
+    #[test]
+    fn ensure_desktop_index_excluded_leaves_existing_marker_untouched() {
+        // A user who deliberately deleted-then-recreated it, or edited it,
+        // keeps whatever they put there — this only checks presence.
+        let base = test_tmp("tracker_marker_present");
+        std::fs::create_dir_all(&base).unwrap();
+        let marker = base.join(".trackerignore");
+        std::fs::write(&marker, b"custom content").unwrap();
+
+        ensure_desktop_index_excluded(&base);
+
+        assert_eq!(std::fs::read(&marker).unwrap(), b"custom content");
+    }
+
+    #[test]
     fn prepare_mount_point_refuses_when_leftovers_look_implausible() {
         // An entry that isn't a plain file or directory (e.g. a socket) is not
         // a plausible stray app-write — refuse rather than guess, and leave it
