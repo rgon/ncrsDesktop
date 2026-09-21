@@ -36,6 +36,52 @@ fn build_client() -> Result<Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// True when `host` names this machine — the only place a plaintext
+/// connection cannot be redirected or intercepted between here and the
+/// server, since it never leaves the box.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Rejects a server URL that would send credentials over plaintext to a
+/// real network host. `https://` is always fine. `http://` is only fine
+/// when the host is loopback (the daemon talking to a server on the same
+/// machine, e.g. local dev or the Docker e2e suite) — anywhere else, a
+/// plaintext connection can be read or MITM'd by anything on the path, so it
+/// takes an explicit `allow_insecure_http: true` opt-in in the config file
+/// (the interactive login flow never allows it, and has none to opt into).
+pub fn validate_server_scheme(server_url: &str, allow_insecure_http: bool) -> Result<(), String> {
+    let url = url::Url::parse(base_server(server_url))
+        .map_err(|e| format!("server URL {:?} is not a valid URL: {}", server_url, e))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = url.host_str().unwrap_or("");
+            if is_loopback_host(host) || allow_insecure_http {
+                Ok(())
+            } else {
+                Err(format!(
+                    "refusing to use plaintext http:// for {:?} — credentials would be sent unencrypted; \
+                     only loopback addresses (127.0.0.1, ::1, localhost) may use http, \
+                     use https:// or set allow_insecure_http if you really mean it",
+                    server_url
+                ))
+            }
+        }
+        other => Err(format!(
+            "unsupported URL scheme {:?} in {:?} — use https://",
+            other, server_url
+        )),
+    }
+}
+
 /// Strip any path that shouldn't be part of the server base URL.
 /// Handles cases where the user pastes a full WebDAV or index.php URL.
 fn base_server(server_url: &str) -> &str {
@@ -50,6 +96,9 @@ fn base_server(server_url: &str) -> &str {
 }
 
 pub fn init_login_flow(server_url: &str) -> Result<LoginFlowInit, String> {
+    // The interactive login flow has no config to opt into plaintext, so this
+    // never allows it — a real server must be https.
+    validate_server_scheme(server_url, false)?;
     let server = base_server(server_url);
     let url = format!("{}/index.php/login/v2", server);
     let client = build_client()?;
@@ -135,6 +184,11 @@ pub fn fetch_server_theme(server_url: &str) -> Option<ThemeColors> {
 /// response is trustworthy just because it arrived over an authenticated
 /// connection to *some* server.
 pub fn validate_login_server(returned_server: &str, requested_server: &str) -> Result<(), String> {
+    // Independent of what was requested: the returned server goes on to carry
+    // the app password, so it must never be a plaintext connection to a real
+    // host, even if `requested_server` somehow was too.
+    validate_server_scheme(returned_server, false)?;
+
     let requested = url::Url::parse(base_server(requested_server))
         .map_err(|e| format!("requested server URL is not a valid URL: {}", e))?;
     let returned = url::Url::parse(base_server(returned_server))
@@ -288,5 +342,52 @@ mod tests {
             "http://cloud.example.com",
             "https://cloud.example.com",
         ).is_err());
+    }
+
+    #[test]
+    fn validate_server_scheme_accepts_https() {
+        assert!(validate_server_scheme("https://cloud.example.com", false).is_ok());
+    }
+
+    #[test]
+    fn validate_server_scheme_rejects_plaintext_public_host() {
+        // The core case from the security report: a user configuring an
+        // ordinary http:// server must not be allowed to send credentials
+        // over it unless they explicitly opted in.
+        let err = validate_server_scheme("http://example.com", false)
+            .expect_err("plaintext http to a public host must be rejected");
+        assert!(err.contains("plaintext"), "got: {}", err);
+        assert!(validate_server_scheme("http://example.com", true).is_ok());
+    }
+
+    #[test]
+    fn validate_server_scheme_allows_loopback_plaintext() {
+        for host in ["http://127.0.0.1:8080", "http://[::1]:8080", "http://localhost:8080"] {
+            assert!(validate_server_scheme(host, false).is_ok(), "{} should be allowed", host);
+        }
+    }
+
+    #[test]
+    fn validate_server_scheme_rejects_other_schemes() {
+        assert!(validate_server_scheme("ftp://cloud.example.com", false).is_err());
+    }
+
+    #[test]
+    fn login_server_plaintext_returned_rejected_even_if_requested_was_plaintext() {
+        // Defense in depth: even if the requested server were somehow a
+        // non-loopback http:// URL, the returned server must still be
+        // rejected — nothing about a same-scheme response makes it safe.
+        let err = validate_login_server(
+            "http://example.com",
+            "http://example.com",
+        ).expect_err("plaintext login server must be rejected regardless of what was requested");
+        assert!(err.contains("plaintext"), "got: {}", err);
+    }
+
+    #[test]
+    fn init_login_flow_rejects_plaintext_public_host() {
+        let err = init_login_flow("http://example.com")
+            .expect_err("init_login_flow must refuse a plaintext non-loopback server");
+        assert!(err.contains("plaintext"), "got: {}", err);
     }
 }

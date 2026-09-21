@@ -144,6 +144,9 @@ aggressive_prefetch: false
 http3: false
 max_concurrent_requests: 4
 optimistic_listing: false
+# The e2e WebDAV server is a container on the compose network, not loopback,
+# so it needs the explicit opt-in for its deliberately plain-http setup.
+allow_insecure_http: true
 EOF
 
 mkdir -p "$MOUNT" "$CACHE_DIR"

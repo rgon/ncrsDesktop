@@ -32,6 +32,9 @@ username: "${USER}"
 password: "${PASS}"
 user: "${USER}"
 mount_point: "${MOUNT}"
+# The e2e WebDAV server is a container on the compose network, not loopback,
+# so it needs the explicit opt-in for its deliberately plain-http setup.
+allow_insecure_http: true
 http3: false
 optimistic_listing: false
 auto_keep_cached_files: false

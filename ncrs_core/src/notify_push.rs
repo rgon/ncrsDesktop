@@ -124,18 +124,24 @@ pub(crate) fn validate_endpoint(
         ));
     }
 
-    // Only a loopback server may be reached without TLS: everywhere else, an
-    // insecure endpoint means the credential would go out in the clear.
-    let base_is_secure = base.scheme() == "https";
-    if base_is_secure && ep.scheme() == insecure {
-        return Err(format!(
-            "server advertised insecure endpoint {:?} while the configured server is HTTPS —              refusing to send credentials over {}",
-            endpoint, insecure
-        ));
-    }
-
     let base_host = base.host_str().unwrap_or("");
     let ep_host = ep.host_str().unwrap_or("");
+
+    // Only a loopback server may be reached without TLS: everywhere else, an
+    // insecure endpoint means the credential would go out in the clear. This
+    // mirrors `login_flow::validate_server_scheme` rather than merely asking
+    // "is the *configured* server secure": a configured `http://` server that
+    // is not loopback is itself only reachable via an explicit
+    // `allow_insecure_http` opt-in, but that opt-in covers WebDAV, not a
+    // license to also downgrade notify_push — so plaintext here is gated on
+    // the host being loopback, independent of the base URL's own scheme.
+    let base_is_secure = base.scheme() == "https";
+    if ep.scheme() == insecure && (base_is_secure || !crate::login_flow::is_loopback_host(base_host)) {
+        return Err(format!(
+            "server advertised insecure endpoint {:?} for configured server {:?} — refusing to send credentials over {} to a non-loopback host",
+            endpoint, base_url, insecure
+        ));
+    }
     if base_host.is_empty() || !ep_host.eq_ignore_ascii_case(base_host) {
         return Err(format!(
             "server advertised endpoint on host {:?}, which is not the configured server {:?} —              refusing to send credentials to it",
@@ -924,5 +930,21 @@ mod endpoint_validation_tests {
         assert!(validate_endpoint("http://127.0.0.1:18087/pre_auth", base, EndpointKind::Http).is_ok());
         // ...but still only on the configured host.
         assert!(validate_endpoint("ws://attacker.example/ws", base, EndpointKind::WebSocket).is_err());
+    }
+
+    #[test]
+    fn a_plaintext_public_server_may_not_use_plaintext_endpoints() {
+        // The security-report case: a configured `http://` server that is NOT
+        // loopback (e.g. someone pasted a bare http:// domain) must not get a
+        // free pass to plaintext just because the base URL itself is http.
+        let base = "http://example.com";
+        let err = validate_endpoint("ws://example.com/push/ws", base, EndpointKind::WebSocket)
+            .expect_err("plaintext endpoint on a non-loopback http server must be rejected");
+        assert!(err.contains("insecure"), "got: {}", err);
+        let err = validate_endpoint("http://example.com/pre_auth", base, EndpointKind::Http)
+            .expect_err("plaintext endpoint on a non-loopback http server must be rejected");
+        assert!(err.contains("insecure"), "got: {}", err);
+        // A secure endpoint is still fine even though the base is plaintext.
+        assert!(validate_endpoint("wss://example.com/push/ws", base, EndpointKind::WebSocket).is_ok());
     }
 }

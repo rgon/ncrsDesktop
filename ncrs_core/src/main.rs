@@ -114,7 +114,12 @@ fn main() {
     }
     if let Some(url) = cli.url {
         let username = opts.username.as_deref().unwrap_or("");
-        opts.url = ncrs_core::login_flow::normalize_webdav_url(&url, username);
+        let url = ncrs_core::login_flow::normalize_webdav_url(&url, username);
+        if let Err(e) = ncrs_core::login_flow::validate_server_scheme(&url, opts.allow_insecure_http) {
+            eprintln!("ncrs: {}", e);
+            std::process::exit(1);
+        }
+        opts.url = url;
     }
     if let Some(password) = cli.password {
         eprintln!("ncrs: warning: --password is deprecated (visible in process listing); use auth_command or the login flow instead");

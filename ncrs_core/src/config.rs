@@ -65,6 +65,14 @@ pub struct MountOptions {
     /// silently falls back to buffered reads when either is unavailable.
     #[serde(default = "default_true")]
     pub fuse_passthrough: bool,
+    /// Allow a plaintext `http://`/`ws://` connection to a non-loopback
+    /// server. Off by default: `url` must be `https://` unless it points at
+    /// loopback (127.0.0.1 / ::1 / localhost), since otherwise the account
+    /// password or app token would go out on the wire in the clear. Only
+    /// meant for a controlled test/dev deployment (e.g. the Docker e2e
+    /// suite) — never enable this for a real server.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 impl std::fmt::Debug for MountOptions {
@@ -175,6 +183,12 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
         .to_string();
     let username = doc["username"].as_str().map(str::to_string);
     let url = crate::login_flow::normalize_webdav_url(&url, username.as_deref().unwrap_or(""));
+    let allow_insecure_http = doc["allow_insecure_http"].as_bool().unwrap_or(false);
+    // An empty `url` is the fresh-default-config state; `load_config` gives a
+    // friendlier "please fill it in" error for that, so don't shadow it here.
+    if !url.is_empty() {
+        crate::login_flow::validate_server_scheme(&url, allow_insecure_http)?;
+    }
     let password = doc["password"].as_str().map(str::to_string);
     let bearer_token = doc["bearer_token"].as_str().map(str::to_string);
     let auth_command = doc["auth_command"].as_str().map(str::to_string);
@@ -204,7 +218,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let stale_gio_temp_mins = doc["stale_gio_temp_mins"].as_i64().map(|v| v as u64).unwrap_or(10);
     let fuse_passthrough = doc["fuse_passthrough"].as_bool().unwrap_or(true);
 
-    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough })
+    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough, allow_insecure_http })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
@@ -213,6 +227,8 @@ pub const DEFAULT_CONFIG: &str = r#"# ncRS Desktop configuration
 # Generated on first run — fill in your Nextcloud credentials.
 
 # Full WebDAV URL, e.g. https://cloud.example.com/remote.php/dav/files/USERNAME/
+# Must be https:// unless the host is loopback (127.0.0.1 / ::1 / localhost) —
+# see allow_insecure_http below.
 url: ""
 
 username: ""
@@ -233,6 +249,12 @@ user: ""
 # unchanged directory costs one small request. Only applies while push
 # notifications are down; while they work, a 24-hour backstop applies. 0 disables.
 # dir_cache_max_stale_mins: 15
+
+# Only for a controlled test/dev server that is not loopback and cannot use
+# TLS: allows url to be http:// (and its notify_push endpoints to be
+# ws:///http://) anyway. Never enable this for a real Nextcloud server —
+# your credentials would be sent unencrypted.
+# allow_insecure_http: false
 "#;
 
 pub fn config_path() -> PathBuf {
@@ -713,6 +735,26 @@ mod tests {
         let debug = format!("{:?}", opts);
         assert!(!debug.contains("super-secret"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn plaintext_url_to_a_public_host_rejected() {
+        let yaml = "url: \"http://cloud.example.com\"\nusername: \"user\"\npassword: \"pw\"\nmount_point: \"/mnt/nc\"\nuser: test\n";
+        let err = configuration_parser(yaml).expect_err("plaintext http to a public host must be rejected");
+        assert!(err.contains("plaintext"), "got: {}", err);
+    }
+
+    #[test]
+    fn plaintext_url_allowed_with_explicit_opt_in() {
+        let yaml = "url: \"http://cloud.example.com\"\nusername: \"user\"\npassword: \"pw\"\nmount_point: \"/mnt/nc\"\nuser: test\nallow_insecure_http: true\n";
+        let opts = configuration_parser(yaml).unwrap();
+        assert!(opts.allow_insecure_http);
+    }
+
+    #[test]
+    fn plaintext_loopback_url_allowed_without_opt_in() {
+        let yaml = "url: \"http://127.0.0.1:8080\"\nusername: \"user\"\npassword: \"pw\"\nmount_point: \"/mnt/nc\"\nuser: test\n";
+        assert!(configuration_parser(yaml).is_ok());
     }
 
     #[test]
