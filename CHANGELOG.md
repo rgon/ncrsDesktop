@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.72](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.71...ncrs-v0.1.72) (2026-09-21)
+
+
+### Features
+
+* **fuse:** deny CAP_SYS_ADMIN-only syscalls with no legitimate use via seccomp ([732a36a](https://github.com/rgon/ncrsDesktop/commit/732a36af1d59bc9c68abeb4da8bde96b8591b484))
+
+
+### Bug Fixes
+
+* **fuse:** avoid proven deadlock by moving unlink/rmdir notifications off the fuser thread ([4caf29f](https://github.com/rgon/ncrsDesktop/commit/4caf29f64df901a7175de65f6cb59b2f5452ebcd))
+* **ipc:** cap request line length to bound unbounded-read DoS ([d453549](https://github.com/rgon/ncrsDesktop/commit/d453549a705ac385588be06758511b8196036efd))
+* **login_flow:** derive Debug on LoginFlowInit to fix test build ([8ac6fd8](https://github.com/rgon/ncrsDesktop/commit/8ac6fd8cd79f26ea557e86d7c7657dc916282548))
+* **nc_passwords:** clear password state from view on unmount ([82a9bd1](https://github.com/rgon/ncrsDesktop/commit/82a9bd1ad02470ee7dfb59f19693688fac39f5b3))
+* **nc_passwords:** redact password field from PasswordEntry Debug output ([40e4d79](https://github.com/rgon/ncrsDesktop/commit/40e4d7908ea5ee7427bb10906e0925da49a54d51))
+* **nc_passwords:** validate and encode domain in favicon URL ([2f016ef](https://github.com/rgon/ncrsDesktop/commit/2f016eff5805df0d90aaacb56f8df8bf4206d542))
+* **security:** reject plaintext http/ws to non-loopback servers unless explicitly allowed ([ce6f562](https://github.com/rgon/ncrsDesktop/commit/ce6f5623fb4234c2906d657d135212849fb98bf2))
+
 ## [0.1.71](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.70...ncrs-v0.1.71) (2026-09-21)
 
 
