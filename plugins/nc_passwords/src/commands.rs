@@ -169,5 +169,5 @@ pub fn nc_passwords_favicon_url(
         .map_err(|e| e.to_string())?
         .clone()
         .ok_or_else(|| "passwords: not connected".to_string())?;
-    Ok(client.favicon_url(&domain, 32))
+    client.favicon_url(&domain, 32)
 }

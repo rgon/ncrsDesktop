@@ -11,6 +11,21 @@ const BASE_FOLDER_UUID: &str = "00000000-0000-0000-0000-000000000000";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const API_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// RFC 3986 percent-encodes everything but unreserved characters, so the
+/// result is always safe to insert as a single URL path segment.
+fn encode_path_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PasswordEntry {
     pub id: String,
@@ -291,11 +306,26 @@ impl PasswordsClient {
             .map_err(|e| format!("parse tags: {e}"))
     }
 
-    pub fn favicon_url(&self, domain: &str, size: u32) -> String {
-        format!(
+    /// `domain` ends up as a raw path segment in an authenticated request to
+    /// the Nextcloud host, so it's validated as hostname-shaped and
+    /// percent-encoded before insertion — a stray `/`, `?`, or `#` (from a
+    /// malformed entry or a server response) must not be able to redirect the
+    /// request to a different path or add query parameters.
+    pub fn favicon_url(&self, domain: &str, size: u32) -> Result<String, String> {
+        if domain.is_empty()
+            || domain.len() > 253
+            || !domain
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return Err(format!("favicon: invalid domain {domain:?}"));
+        }
+        Ok(format!(
             "{}/index.php/apps/passwords/api/1.0/service/favicon/{}/{}",
-            self.base_url, domain, size
-        )
+            self.base_url,
+            encode_path_segment(domain),
+            size
+        ))
     }
 
     pub fn base_folder_id() -> &'static str {
@@ -391,11 +421,29 @@ mod tests {
     #[test]
     fn favicon_url_format() {
         let client = PasswordsClient::new("https://cloud.example.com", "user", "pass").unwrap();
-        let url = client.favicon_url("github.com", 32);
+        let url = client.favicon_url("github.com", 32).unwrap();
         assert_eq!(
             url,
             "https://cloud.example.com/index.php/apps/passwords/api/1.0/service/favicon/github.com/32"
         );
+    }
+
+    #[test]
+    fn favicon_url_rejects_path_traversal_domain() {
+        let client = PasswordsClient::new("https://cloud.example.com", "user", "pass").unwrap();
+        assert!(client.favicon_url("../../etc/passwd", 32).is_err());
+        assert!(client.favicon_url("evil.com/../../admin", 32).is_err());
+        assert!(client.favicon_url("evil.com?x=1", 32).is_err());
+        assert!(client.favicon_url("evil.com#frag", 32).is_err());
+        assert!(client.favicon_url("", 32).is_err());
+    }
+
+    #[test]
+    fn favicon_url_percent_encodes_unexpected_characters() {
+        // Validation already rejects anything outside [A-Za-z0-9.-], so this
+        // only exercises the encoder directly to pin its behavior.
+        assert_eq!(encode_path_segment("a/b?c#d"), "a%2Fb%3Fc%23d");
+        assert_eq!(encode_path_segment("github.com"), "github.com");
     }
 
     #[test]
@@ -428,7 +476,7 @@ mod tests {
     #[test]
     fn client_trims_trailing_slash() {
         let client = PasswordsClient::new("https://cloud.example.com/", "u", "p").unwrap();
-        let url = client.favicon_url("x.com", 16);
+        let url = client.favicon_url("x.com", 16).unwrap();
         assert!(
             url.starts_with("https://cloud.example.com/index.php/"),
             "URL should not have double slash: {url}"
