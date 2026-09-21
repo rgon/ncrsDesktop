@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.71](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.70...ncrs-v0.1.71) (2026-09-21)
+
+
+### Features
+
+* **fuse:** drop a .trackerignore marker so mounts don't get crawled by desktop indexers ([4962397](https://github.com/rgon/ncrsDesktop/commit/4962397dccb372cc13e705ca3bc7919860e8fcd0))
+
+
+### Bug Fixes
+
+* **ci:** stop fork PRs from spoofing the release-please automerge gate ([f72a2db](https://github.com/rgon/ncrsDesktop/commit/f72a2db2fcad4ddd7f7580a2128b6466f0f7892b))
+* **fuse:** cap concurrent readdir workers to stop indexer-triggered thread storms ([ce3c1cc](https://github.com/rgon/ncrsDesktop/commit/ce3c1ccb24313af1c4b252b847d96d0d31f91197))
+* **fuse:** overlay the .trackerignore marker instead of writing it to Nextcloud ([9e6c5d7](https://github.com/rgon/ncrsDesktop/commit/9e6c5d7bb278df2b4033fd0b409b824075cd4949))
+* **fuse:** reject control characters in server-supplied filenames ([b4903b1](https://github.com/rgon/ncrsDesktop/commit/b4903b1496be92234e6cfbfc2b0900649a8d6587))
+* **login:** pin the login-flow server field to the requested host ([8451e2d](https://github.com/rgon/ncrsDesktop/commit/8451e2da8e885b6b90a1a5bda0d287e1af5ec4f1))
+
 ## [0.1.70](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.69...ncrs-v0.1.70) (2026-09-21)
 
 
