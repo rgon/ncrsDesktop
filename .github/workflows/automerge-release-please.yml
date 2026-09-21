@@ -16,10 +16,10 @@ jobs:
   enable-automerge:
     if: >-
       github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
       (
         github.event.pull_request.user.login == 'release-please[bot]' ||
-        github.event.pull_request.user.login == 'github-actions[bot]' ||
-        startsWith(github.event.pull_request.head.ref, 'release-please--')
+        github.event.pull_request.user.login == 'github-actions[bot]'
       )
     runs-on: ubuntu-latest
     steps:
