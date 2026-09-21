@@ -3,7 +3,7 @@
     // by the ncrs-gui vite alias at build time; these imports aren't resolvable
     // from the plugin's location during static analysis.
     import { invoke } from "@tauri-apps/api/core";
-    import { onMount } from "svelte";
+    import { onMount, onDestroy } from "svelte";
     import Icon from "$components/Icon.svelte";
     import {
         mdiLock, mdiMagnify, mdiDotsVertical, mdiContentCopy,
@@ -119,6 +119,16 @@
         } finally {
             booting = false;
         }
+    });
+
+    // Passwords only need to live in memory while this view is on screen —
+    // drop them (and which ones were revealed) as soon as it unmounts, so
+    // navigating away doesn't leave plaintext sitting in JS heap/state.
+    onDestroy(() => {
+        passwords = [];
+        revealedPasswords = new Set();
+        expandedId = null;
+        searchTerm = "";
     });
 </script>
 
