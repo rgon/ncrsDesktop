@@ -150,7 +150,13 @@ if $CONTAINER; then
             test -f /usr/share/icons/hicolor/128x128/apps/ncrs.png || { echo "FAIL: icon missing"; exit 1; }
             '
         fi
-        "$RUNTIME" run --rm -v "$DEB_ABS:/pkg.deb:ro" "$IMAGE" bash -ec "
+        # --privileged: postinst setcaps /usr/bin/ncrs (cap_sys_admin, for
+        # FUSE passthrough). Podman's rootless container sandboxing refuses
+        # to exec a file-capability-bearing binary, which isn't
+        # representative of a real (unsandboxed) user login session —
+        # --privileged removes that confinement for this throwaway
+        # container so the smoke test can actually run the installed binary.
+        "$RUNTIME" run --rm --privileged -v "$DEB_ABS:/pkg.deb:ro" "$IMAGE" bash -ec "
             # Minimized cloud images exclude /usr/share/doc — undo so we can
             # assert the provisioning example config actually installs.
             rm -f /etc/dpkg/dpkg.cfg.d/excludes
