@@ -3262,49 +3262,67 @@ impl NextCloudFs {
     /// leftover bytes. Must be called without `open_files` locked: this
     /// performs network I/O, and that mutex guards every open handle in the
     /// mount, not just this one.
+    ///
+    /// On failure, returns the most recent server-confirmed session state
+    /// alongside the error (rather than just discarding it) — including one
+    /// opened by *this* call, if the MKCOL succeeded but a subsequent chunk
+    /// PUT then failed. The caller must store it back into `of.chunk_upload`
+    /// even on the error path, otherwise a freshly-opened session the caller
+    /// never learns the `uploads_base` of leaks server-side: release()'s
+    /// abandoned-session cleanup can only abort a session it knows about.
     fn graduate_chunk(
         &self,
         remote_path: &Path,
         wp: &Path,
         mut state: Option<ChunkUploadState>,
         total_written: u64,
-    ) -> Result<ChunkUploadState, String> {
+    ) -> Result<ChunkUploadState, (String, Option<ChunkUploadState>)> {
         loop {
             let bytes_confirmed = state.as_ref().map_or(0, |s| s.bytes_confirmed);
             let tail_len = total_written - bytes_confirmed;
             if tail_len < webdav_ops::CHUNK_SIZE as u64 {
-                return state.ok_or_else(|| "graduate_chunk called with nothing to graduate".to_string());
+                return state.clone().ok_or((
+                    "graduate_chunk called with nothing to graduate".to_string(),
+                    state,
+                ));
             }
 
             if state.is_none() {
                 let session = retry_chunk_write("chunked-upload open", || {
                     self.conn.backend.open_chunked_upload(remote_path)
-                }).map_err(|e| e.to_string())?;
+                }).map_err(|e| (e.to_string(), None))?;
                 state = Some(ChunkUploadState {
                     uploads_base: session.uploads_base,
                     next_index: 0,
                     bytes_confirmed: 0,
                 });
             }
+            // Snapshot the session as the server last confirmed it, before
+            // attempting this chunk — on failure below this is what the
+            // caller needs to be able to find and abort the session later.
+            let confirmed_state = state.clone();
             let s = state.as_mut().expect("just ensured Some above");
 
             let mut chunk = vec![0u8; webdav_ops::CHUNK_SIZE];
             {
                 use std::io::Read;
-                let mut f = std::fs::File::open(wp).map_err(|e| format!("staging read: {}", e))?;
-                f.read_exact(&mut chunk).map_err(|e| format!("staging read: {}", e))?;
+                let mut f = std::fs::File::open(wp)
+                    .map_err(|e| (format!("staging read: {}", e), confirmed_state.clone()))?;
+                f.read_exact(&mut chunk)
+                    .map_err(|e| (format!("staging read: {}", e), confirmed_state.clone()))?;
             }
 
             let session = backend::ChunkedUploadSession { uploads_base: s.uploads_base.clone() };
             let index = s.next_index;
             retry_chunk_write("chunk upload", || {
                 self.conn.backend.put_chunk(&session, index, chunk.clone())
-            }).map_err(|e| e.to_string())?;
+            }).map_err(|e| (e.to_string(), confirmed_state.clone()))?;
+            let s = state.as_mut().expect("just ensured Some above");
             s.next_index += 1;
             s.bytes_confirmed += webdav_ops::CHUNK_SIZE as u64;
 
             shrink_tail_file(wp, webdav_ops::CHUNK_SIZE as u64)
-                .map_err(|e| format!("tail rewrite: {}", e))?;
+                .map_err(|e| (format!("tail rewrite: {}", e), state.clone()))?;
         }
     }
 
@@ -5213,7 +5231,20 @@ impl Filesystem for NextCloudFs {
         // of the whole file landing on disk before any upload starts. See
         // ChunkUploadState's doc comment for why any deviation once a chunk has
         // actually been sent fails the handle instead of trying to reconcile.
-        if of.stream_eligible && offset == of.total_written && !self.conn.is_offline.load(Ordering::Relaxed) {
+        //
+        // `is_offline` only gates *starting* a fresh session (chunk_upload is
+        // still None): it is a mount-wide flag that unrelated traffic on any
+        // other file handle (a read, a PROPFIND) can flip momentarily, and once
+        // a session has a chunk sitting on the server there is no local-only
+        // fallback for it — bailing out here on every such blip would abort a
+        // perfectly healthy in-progress upload of file B just because file A's
+        // read hit a transient error at the same moment. Once streaming has
+        // actually begun, let the tail keep buffering locally and let the next
+        // real network call (graduate_chunk, which now retries transient
+        // failures) be the one to decide whether the server is actually gone.
+        let blocked_by_offline =
+            of.chunk_upload.is_none() && self.conn.is_offline.load(Ordering::Relaxed);
+        if of.stream_eligible && offset == of.total_written && !blocked_by_offline {
             if let Err(e) = append_to_tail_file(&wp, data) {
                 log::error!("write to staging tail file: {}", e);
                 reply.error(Errno::EIO);
@@ -5233,8 +5264,15 @@ impl Filesystem for NextCloudFs {
                             of.chunk_upload = Some(new_state);
                         }
                     }
-                    Err(e) => {
+                    Err((e, partial_state)) => {
                         log::warn!("write: chunk upload failed for {}, aborting handle: {}", path.display(), e);
+                        // Persist whatever session state the server actually confirmed
+                        // (including a session opened by this very call) so release()'s
+                        // abandoned-session cleanup can still find and abort it instead
+                        // of leaking it server-side.
+                        if let Some(of) = self.open_files.safe_lock().get_mut(&fh.0) {
+                            of.chunk_upload = partial_state;
+                        }
                         reply.error(Errno::EIO);
                         return;
                     }
