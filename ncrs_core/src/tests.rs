@@ -20,6 +20,7 @@
             pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
             uploading: HashSet::new(),
             deleting: HashSet::new(),
+            trackerignore_hidden: false,
         }
     }
 
@@ -241,7 +242,9 @@
     #[test]
     fn get_cached_dir_returns_none_for_invalidated_entry() {
         let mut cache = make_test_cache();
-        let path = PathBuf::from("/");
+        // A non-root path: root also carries the synthetic .trackerignore overlay
+        // entry, which is unrelated to what this test is checking.
+        let path = PathBuf::from("/dir");
         cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("a.txt", None)]);
 
         let result = cache.get_cached_dir(&path, DIR_CACHE_TTL, None);
@@ -523,7 +526,9 @@
     #[test]
     fn hard_expired_fallback_returns_stale_listing_once() {
         let mut cache = make_test_cache();
-        let path = PathBuf::from("/");
+        // A non-root path: root also carries the synthetic .trackerignore overlay
+        // entry, which is unrelated to what this test is checking.
+        let path = PathBuf::from("/dir");
         cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("f.txt", None)]);
         cache.dir_cache.get_mut(&path).unwrap().fetched_at =
             SystemTime::now() - Duration::from_secs(3 * 3600);
@@ -2243,29 +2248,48 @@ password: "pass"
     }
 
     #[test]
-    fn ensure_desktop_index_excluded_creates_marker_when_missing() {
-        let base = test_tmp("tracker_marker_missing");
-        std::fs::create_dir_all(&base).unwrap();
+    fn trackerignore_overlay_appears_in_root_listing_without_a_write() {
+        let mut cache = make_test_cache();
+        cache.put_dir_cache(PathBuf::from("/"), None, None, vec![make_dav_entry("real.txt", None)]);
 
-        ensure_desktop_index_excluded(&base);
+        let root = cache.get_cached_dir_readonly(&PathBuf::from("/")).unwrap();
+        assert!(root.iter().any(|e| e.path == trackerignore_path()));
+        assert!(root.iter().any(|e| e.path == PathBuf::from("/real.txt")));
 
-        let marker = base.join(".trackerignore");
-        assert!(marker.exists());
-        assert_eq!(std::fs::read(&marker).unwrap(), b"");
+        // Never spliced into a non-root directory.
+        cache.put_dir_cache(PathBuf::from("/sub"), None, None, vec![make_dav_entry("child.txt", None)]);
+        let sub = cache.get_cached_dir_readonly(&PathBuf::from("/sub")).unwrap();
+        assert!(!sub.iter().any(|e| e.path == trackerignore_path()));
     }
 
     #[test]
-    fn ensure_desktop_index_excluded_leaves_existing_marker_untouched() {
-        // A user who deliberately deleted-then-recreated it, or edited it,
-        // keeps whatever they put there — this only checks presence.
-        let base = test_tmp("tracker_marker_present");
-        std::fs::create_dir_all(&base).unwrap();
-        let marker = base.join(".trackerignore");
-        std::fs::write(&marker, b"custom content").unwrap();
+    fn trackerignore_overlay_survives_a_fresh_propfind_with_no_trace_of_it() {
+        let mut cache = make_test_cache();
+        cache.put_dir_cache(PathBuf::from("/"), None, None, vec![make_dav_entry("a.txt", None)]);
+        assert!(cache.get_cached_dir_readonly(&PathBuf::from("/")).unwrap()
+            .iter().any(|e| e.path == trackerignore_path()));
 
-        ensure_desktop_index_excluded(&base);
+        // A real PROPFIND result never contains it — put_dir_cache must re-add it
+        // on every call rather than depending on a stored copy surviving eviction.
+        cache.put_dir_cache(PathBuf::from("/"), Some("etag2".into()), None, vec![make_dav_entry("b.txt", None)]);
+        let root = cache.get_cached_dir_readonly(&PathBuf::from("/")).unwrap();
+        assert!(root.iter().any(|e| e.path == trackerignore_path()));
+        assert_eq!(root.iter().filter(|e| e.path == trackerignore_path()).count(), 1);
+    }
 
-        assert_eq!(std::fs::read(&marker).unwrap(), b"custom content");
+    #[test]
+    fn trackerignore_overlay_stays_hidden_once_unlinked() {
+        let mut cache = make_test_cache();
+        cache.put_dir_cache(PathBuf::from("/"), None, None, vec![make_dav_entry("a.txt", None)]);
+        assert!(cache.get_cached_dir_readonly(&PathBuf::from("/")).unwrap()
+            .iter().any(|e| e.path == trackerignore_path()));
+
+        // Mirrors what unlink() does: hide it, then a later refresh must not
+        // resurrect it for the rest of this mount's lifetime.
+        cache.trackerignore_hidden = true;
+        cache.put_dir_cache(PathBuf::from("/"), None, None, vec![make_dav_entry("a.txt", None)]);
+        let root = cache.get_cached_dir_readonly(&PathBuf::from("/")).unwrap();
+        assert!(!root.iter().any(|e| e.path == trackerignore_path()));
     }
 
     #[test]

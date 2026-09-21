@@ -1024,6 +1024,11 @@ pub(crate) struct FsCache {
     // these out so a racing PROPFIND refresh can't re-add them before the
     // server DELETE completes.
     pub(crate) deleting: HashSet<PathBuf>,
+    // Set once the user unlinks the synthetic `.trackerignore` overlay entry
+    // (see trackerignore_entry()). While set, put_dir_cache stops re-adding it
+    // to the root listing — mirrors the old real-file semantics ("stays opted
+    // out only until the next mount") without ever touching the backend.
+    trackerignore_hidden: bool,
 }
 
 impl FsCache {
@@ -1127,6 +1132,15 @@ impl FsCache {
         // Filter out files whose DELETE is still in flight: a racing PROPFIND
         // that completes before the server DELETE must not re-surface them.
         files.retain(|f| !self.deleting.contains(&f.path));
+        // Overlay the synthetic `.trackerignore` marker onto every fresh root
+        // listing (see trackerignore_entry()). Purely local — the server never
+        // sees this entry — so it survives PROPFIND refreshes for free instead
+        // of depending on a real write that a stale/evicted listing could lose.
+        if path == Path::new("/") && !self.trackerignore_hidden
+            && !files.iter().any(|f| f.path == trackerignore_path())
+        {
+            files.push(trackerignore_entry());
+        }
         self.dir_cache.insert(path, DirCacheEntry {
             files: Arc::new(files), self_entry, etag,
             at: Instant::now(), fetched_at: SystemTime::now(),
@@ -2919,6 +2933,7 @@ impl NextCloudFs {
                     pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
                     uploading: HashSet::new(),
                     deleting: HashSet::new(),
+                    trackerignore_hidden: false,
                 }));
                 load_dir_cache(&c);
                 c
@@ -3809,7 +3824,11 @@ impl NextCloudFs {
                                 } else {
                                     status_entries.push((entry_path.clone(), FileStatus::Remote));
                                 }
-                                thumb_candidates.push((entry_path, entry.modified, entry.ext.flag("has_preview"), entry.ext.int("fileid")));
+                                // The synthetic `.trackerignore` overlay entry has no
+                                // backend fileid to request a preview for.
+                                if entry_path != trackerignore_path() {
+                                    thumb_candidates.push((entry_path, entry.modified, entry.ext.flag("has_preview"), entry.ext.int("fileid")));
+                                }
                             }
                         }
 
@@ -4232,6 +4251,13 @@ impl Filesystem for NextCloudFs {
 
         let writable = flags.0 & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
 
+        // The synthetic `.trackerignore` overlay entry is read-only — there is
+        // nothing behind it to write through to.
+        if writable && path == trackerignore_path() {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         if writable && perms_to_mode(nc_permissions.as_deref(), false) & 0o200 == 0
             && nc_permissions.is_some()
         {
@@ -4397,6 +4423,16 @@ impl Filesystem for NextCloudFs {
 
         let off = offset;
         let sz = size as usize;
+
+        // The synthetic `.trackerignore` overlay entry (see trackerignore_entry()):
+        // served straight from a static buffer, zero network I/O, no staging file.
+        if path == trackerignore_path() {
+            let start = (off as usize).min(TRACKERIGNORE_CONTENT.len());
+            let end = start.saturating_add(sz).min(TRACKERIGNORE_CONTENT.len());
+            reply.data(&TRACKERIGNORE_CONTENT[start..end]);
+            return;
+        }
+
         // What the dir cache believes this file's length is. Used throughout the
         // read paths below to tell a legitimate end-of-file short reply from a
         // truncating one; see `short_reply_ok`.
@@ -5632,6 +5668,15 @@ impl Filesystem for NextCloudFs {
         let file_name = name.to_string_lossy().to_string();
         let full_path = parent_path.join(&file_name);
 
+        // The synthetic `.trackerignore` overlay entry (see trackerignore_entry()):
+        // reachable here only once the user has unlink()'d it, which is a
+        // deliberate opt back into desktop indexing for the rest of this mount —
+        // refuse recreation rather than silently reinstating it.
+        if full_path == trackerignore_path() {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
         {
             let mut ghosts = self.ghost_entries.safe_lock();
             if let Some(ghost) = ghosts.remove(&full_path) {
@@ -5860,6 +5905,29 @@ impl Filesystem for NextCloudFs {
 
         let file_name = name.to_string_lossy().to_string();
         let remote_path = parent_path.join(&file_name);
+
+        // The synthetic `.trackerignore` overlay entry (see trackerignore_entry()):
+        // there is nothing on the server to delete, so just stop put_dir_cache
+        // from re-adding it and drop it from the current root listing. No
+        // journal entry, no background DELETE — this never reaches the backend.
+        if remote_path == trackerignore_path() {
+            let mut c = self.cache.safe_lock();
+            c.trackerignore_hidden = true;
+            if let Some(dir) = c.dir_cache.get_mut(&parent_path) {
+                let files: Vec<RemoteEntry> = dir.files.iter().filter(|e| e.path != remote_path).cloned().collect();
+                dir.files = Arc::new(files);
+            }
+            drop(c);
+            if let Some(notifier) = self.notifier_slot.safe_lock().as_ref() {
+                let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
+                let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
+                if child_ino != 0 {
+                    let _ = notifier.delete(INodeNo(parent.0), INodeNo(child_ino), OsStr::new(&file_name));
+                }
+            }
+            reply.ok();
+            return;
+        }
 
         {
             let mut ghosts = self.ghost_entries.safe_lock();
@@ -6972,11 +7040,6 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;
 
-    {
-        let mount_point = options.mount_point.clone();
-        thread::spawn(move || ensure_desktop_index_excluded(&mount_point));
-    }
-
     let result = bg.guard.join().map_err(|panic_payload| {
         let msg = panic_payload
             .downcast_ref::<&str>().map(|s| s.to_string())
@@ -7138,37 +7201,51 @@ fn write_mount_marker(cache_dir: &Path, mount_point: &Path) {
     }
 }
 
-/// Drops an empty `.trackerignore` at the mount root, best-effort, if nothing
-/// is there yet. GNOME Tracker's file miner (and other desktop indexers that
-/// follow the same `.trackerignore`/`.nomedia` convention) skips a directory's
-/// content when it finds one — this is what stops a recursive index crawl from
-/// fanning out across the whole remote tree the moment the mount lands under
-/// an indexed location (an XDG special folder, `$HOME` itself, …). See the
+/// GNOME Tracker's file miner (and other desktop indexers that follow the same
+/// `.trackerignore`/`.nomedia` convention) skips a directory's content when it
+/// finds one — this is what stops a recursive index crawl from fanning out
+/// across the whole remote tree the moment the mount lands under an indexed
+/// location (an XDG special folder, `$HOME` itself, …). See the
 /// `ReaddirWorkerPermit` cap above for the other half of that fix: this marker
 /// keeps the crawl from starting at all; the cap keeps a crawl that starts
 /// anyway (a different indexer, `find`, a backup tool) from spawning an
 /// unbounded number of readdir workers.
 ///
-/// Written as a real file through the mount rather than out-of-band: it needs
-/// to be visible to Tracker's own directory walk to work, and syncing it also
-/// protects this same account's mount on any other Linux desktop it's used
-/// from. Runs once per mount (existence check makes it idempotent), and reruns
-/// on every mount — so a changed mount point, or a remount elsewhere, always
-/// gets covered without needing to track "the old path" anywhere. Never
-/// recreated once deleted within a single mount's lifetime — if the entry
-/// exists (even as something the user put there and removed and Tracker
-/// re-created empty, unlikely) this only checks presence, not content, so a
-/// user who deliberately removes it to opt back into indexing stays opted out
-/// only until the next mount.
-fn ensure_desktop_index_excluded(mount_point: &Path) {
-    let marker = mount_point.join(".trackerignore");
-    match marker.try_exists() {
-        Ok(true) => {}
-        Ok(false) => match std::fs::write(&marker, b"") {
-            Ok(()) => log::info!("wrote {} to exclude the mount from desktop file indexing", marker.display()),
-            Err(e) => log::warn!("could not write {}: {} — the mount may get crawled by a desktop indexer", marker.display(), e),
-        },
-        Err(e) => log::debug!("could not check for {}: {}", marker.display(), e),
+/// Synthesized purely at the FUSE layer — never PUT to the backend — because a
+/// real write through the mount turned out to need an actual byte written
+/// (`std::fs::write(path, b"")` never issues a `write(2)` for an empty buffer,
+/// so the upload path never even ran) and, once fixed, would still depend on
+/// the dir cache never evicting/missing the entry before the upload lands.
+/// `put_dir_cache` (the single choke point every root listing passes through,
+/// fresh or stale) splices this entry back in on every call, so it can never
+/// go missing the way a real write's local copy could. The trade-off: unlike
+/// a real file, this entry is local to this mount and does not protect a
+/// second desktop mounting the same account — only a real write on the server
+/// could do that.
+///
+/// Tracker still sees it through its own directory walk: readdir on the mount
+/// root is served by ncrs regardless of whether an entry is a real remote file
+/// or this synthetic one, so the listing looks identical from the outside.
+///
+/// "Opting out": the user can unlink() it, which sets `trackerignore_hidden`
+/// for the rest of this mount's lifetime (see `unlink`) — matching the old
+/// real-file behavior of never being recreated once deleted within a single
+/// mount, but without ever touching the network to do so.
+fn trackerignore_path() -> PathBuf {
+    PathBuf::from("/.trackerignore")
+}
+
+const TRACKERIGNORE_CONTENT: &[u8] = b"\n";
+
+fn trackerignore_entry() -> RemoteEntry {
+    RemoteEntry {
+        path: trackerignore_path(),
+        is_dir: false,
+        size: TRACKERIGNORE_CONTENT.len() as u64,
+        modified: None,
+        change_token: None,
+        content_type: Some(backend::intern("text/plain")),
+        ext: backend::EntryExtensions::default(),
     }
 }
 
