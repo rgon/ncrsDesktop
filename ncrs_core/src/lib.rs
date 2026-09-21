@@ -563,6 +563,37 @@ fn is_timeout_err(e: &str) -> bool {
     e.contains("timeout") || e.contains("Timeout") || e.contains("timed out")
 }
 
+/// Retries a single chunked-upload backend call (open/put-chunk/finish) a
+/// bounded number of times on transient failures — network blip, 5xx/408/429,
+/// or a momentary lock — with exponential backoff, mirroring the retry
+/// already used for PROPFIND/downloads/range-reads. Streamed uploads have no
+/// journal entry to fall back on (see `ChunkUploadState`'s doc comment), so
+/// without this a single blip mid-copy aborted the whole file with EIO even
+/// though the request would have succeeded moments later — this is what
+/// surfaced to users as GVFS's "Error splicing file: Input/output error" on
+/// large raw-photo copies, where more chunks means more chances to hit one.
+fn retry_chunk_write<T>(
+    op_name: &str,
+    mut f: impl FnMut() -> Result<T, backend::BackendWriteError>,
+) -> Result<T, backend::BackendWriteError> {
+    const MAX_RETRIES: u32 = 2;
+    let mut delay = Duration::from_millis(500);
+    let mut attempt = 0u32;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < MAX_RETRIES && e.is_transient() => {
+                log::warn!("{} failed (attempt {}/{}): {} — retrying in {:?}",
+                    op_name, attempt + 1, MAX_RETRIES + 1, e, delay);
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(4));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// True when a read-path error string means we could not reach the server at all
 /// (connect/read timeout or a transport-level failure) rather than an
 /// application-level rejection (401/403/404) or a server that answered. Used to
@@ -3246,8 +3277,9 @@ impl NextCloudFs {
             }
 
             if state.is_none() {
-                let session = self.conn.backend.open_chunked_upload(remote_path)
-                    .map_err(|e| e.to_string())?;
+                let session = retry_chunk_write("chunked-upload open", || {
+                    self.conn.backend.open_chunked_upload(remote_path)
+                }).map_err(|e| e.to_string())?;
                 state = Some(ChunkUploadState {
                     uploads_base: session.uploads_base,
                     next_index: 0,
@@ -3264,7 +3296,10 @@ impl NextCloudFs {
             }
 
             let session = backend::ChunkedUploadSession { uploads_base: s.uploads_base.clone() };
-            self.conn.backend.put_chunk(&session, s.next_index, chunk).map_err(|e| e.to_string())?;
+            let index = s.next_index;
+            retry_chunk_write("chunk upload", || {
+                self.conn.backend.put_chunk(&session, index, chunk.clone())
+            }).map_err(|e| e.to_string())?;
             s.next_index += 1;
             s.bytes_confirmed += webdav_ops::CHUNK_SIZE as u64;
 
@@ -3277,9 +3312,10 @@ impl NextCloudFs {
     /// bytes remain as the final chunk (there may be none, if the file's
     /// length landed exactly on a chunk boundary) and assembles the session
     /// into `remote_path`. Unlike the legacy path this runs synchronously —
-    /// flush()/close() blocks on it — and is never journaled: see
-    /// ChunkUploadState's doc comment for why a failure here is reported
-    /// rather than retried.
+    /// flush()/close() blocks on it — and is never journaled: each call is
+    /// wrapped in `retry_chunk_write` to absorb a transient blip, but see
+    /// ChunkUploadState's doc comment for why a failure that survives that
+    /// bounded retry is reported rather than resumed from disk.
     fn finish_chunk_streaming(
         &self,
         fh: FileHandle,
@@ -3316,9 +3352,13 @@ impl NextCloudFs {
             if tail_len > 0 {
                 let tail_bytes = std::fs::read(&write_path)
                     .map_err(|e| backend::BackendWriteError::Network(format!("staging read: {}", e)))?;
-                self.conn.backend.put_chunk(&session, chunk_state.next_index, tail_bytes)?;
+                retry_chunk_write("final chunk upload", || {
+                    self.conn.backend.put_chunk(&session, chunk_state.next_index, tail_bytes.clone())
+                })?;
             }
-            self.conn.backend.finish_chunked_upload(&session, &remote_path, original_etag.as_deref())
+            retry_chunk_write("chunked-upload finish", || {
+                self.conn.backend.finish_chunked_upload(&session, &remote_path, original_etag.as_deref())
+            })
         })();
 
         self.cache.safe_lock().uploading.remove(&remote_path);
@@ -3376,11 +3416,13 @@ impl NextCloudFs {
             }
             Err(e) => {
                 log::error!("streamed PUT {} failed at finish: {}", remote_path.display(), e);
-                // No journal entry exists for a streamed upload — there is
-                // nothing to retry automatically. Best-effort teardown of the
-                // session so a stalled transfer does not linger server-side;
-                // the tail file is left on disk (the purge callback reclaims
-                // it once this fh's handle is gone) for the user to retry from.
+                // Transient blips were already absorbed by retry_chunk_write; this is
+                // either a non-transient error or one that outlasted its retry budget.
+                // No journal entry exists for a streamed upload — there is nothing left
+                // to retry automatically. Best-effort teardown of the session so a
+                // stalled transfer does not linger server-side; the tail file is left on
+                // disk (the purge callback reclaims it once this fh's handle is gone)
+                // for the user to retry from.
                 self.conn.backend.abort_chunked_upload(&session);
                 let kind = match &e {
                     backend::BackendWriteError::Forbidden => SyncErrorKind::PermissionDenied,
