@@ -38,7 +38,7 @@ We avoid local thumbnail generation so that entire files don't have to be downlo
 Download and install the .deb file from the [/releases](https://github.com/rgon/ncrsDesktop/releases) page. You may simply double click the `.deb` to install it with your OS's package manager.
 
 ### First-time setup
-You may directly set it up using the GUI, following the interactive 'Authorize Device'-type login from the web browser. 
+You may directly set it up using the GUI, following the interactive 'Authorize Device'-type login from the web browser. This issues a revocable Nextcloud app password, which is saved in your OS keyring (GNOME Keyring/KWallet).
 
 The recommended configuration options are the defaults. However, you may modify them via the cogwheel icon in the application menu.
 

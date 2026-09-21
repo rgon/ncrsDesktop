@@ -123,6 +123,42 @@ pub fn fetch_server_theme(server_url: &str) -> Option<ThemeColors> {
     })
 }
 
+/// Rejects a `server` field returned by the login-flow poll response if it
+/// does not live on the same host as the server the user originally pointed
+/// the client at, or if it would downgrade an HTTPS request to plaintext.
+///
+/// The poll response's `server` field goes on to become the base URL for
+/// every future authenticated WebDAV request, carrying the freshly-issued
+/// app password (see `webdav_url`). Mirrors the host/scheme pinning
+/// `notify_push::validate_endpoint` already applies to the notify_push
+/// capability, for the same reason: nothing about a value in a server
+/// response is trustworthy just because it arrived over an authenticated
+/// connection to *some* server.
+pub fn validate_login_server(returned_server: &str, requested_server: &str) -> Result<(), String> {
+    let requested = url::Url::parse(base_server(requested_server))
+        .map_err(|e| format!("requested server URL is not a valid URL: {}", e))?;
+    let returned = url::Url::parse(base_server(returned_server))
+        .map_err(|e| format!("login flow returned an unparseable server {:?}: {}", returned_server, e))?;
+
+    if requested.scheme() == "https" && returned.scheme() != "https" {
+        return Err(format!(
+            "login flow returned server {:?} over {:?} while {:?} was requested over https — refusing to send the app password over it",
+            returned_server, returned.scheme(), requested_server
+        ));
+    }
+
+    let requested_host = requested.host_str().unwrap_or("");
+    let returned_host = returned.host_str().unwrap_or("");
+    if requested_host.is_empty() || !returned_host.eq_ignore_ascii_case(requested_host) {
+        return Err(format!(
+            "login flow returned server on host {:?}, which is not the requested server {:?} — refusing to send the app password to it",
+            returned_host, requested_host
+        ));
+    }
+
+    Ok(())
+}
+
 /// Build the WebDAV files URL from the server and login_name returned by the login flow.
 pub fn webdav_url(server: &str, login_name: &str) -> String {
     let server = base_server(server);
@@ -223,5 +259,34 @@ mod tests {
             normalize_webdav_url("https://cloud.example.com/index.php/login/v2", "alice"),
             "https://cloud.example.com/remote.php/dav/files/alice/",
         );
+    }
+
+    #[test]
+    fn login_server_same_host_accepted() {
+        assert!(validate_login_server(
+            "https://cloud.example.com",
+            "https://cloud.example.com",
+        ).is_ok());
+        // A path suffix on the returned value (canonicalisation) is fine.
+        assert!(validate_login_server(
+            "https://cloud.example.com/index.php/login/v2",
+            "https://cloud.example.com",
+        ).is_ok());
+    }
+
+    #[test]
+    fn login_server_different_host_rejected() {
+        assert!(validate_login_server(
+            "https://evil.example.net",
+            "https://cloud.example.com",
+        ).is_err());
+    }
+
+    #[test]
+    fn login_server_scheme_downgrade_rejected() {
+        assert!(validate_login_server(
+            "http://cloud.example.com",
+            "https://cloud.example.com",
+        ).is_err());
     }
 }

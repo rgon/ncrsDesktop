@@ -718,6 +718,12 @@ async fn start_login_flow(
                 Ok(Ok(Some(creds))) => {
                     log::info!("login flow succeeded for {}", creds.login_name);
 
+                    if let Err(e) = ncrs_core::login_flow::validate_login_server(&creds.server, &server) {
+                        log::error!("refusing login: {}", e);
+                        app.emit("login-error", e).ok();
+                        return;
+                    }
+
                     if let Err(e) = write_config_from_login(&creds) {
                         log::error!("failed to write config after login: {}", e);
                         app.emit("login-error", e).ok();
