@@ -5918,14 +5918,22 @@ impl Filesystem for NextCloudFs {
                 dir.files = Arc::new(files);
             }
             drop(c);
-            if let Some(notifier) = self.notifier_slot.safe_lock().as_ref() {
-                let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
-                let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
-                if child_ino != 0 {
-                    let _ = notifier.delete(INodeNo(parent.0), INodeNo(child_ino), OsStr::new(&file_name));
-                }
-            }
+            let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
             reply.ok();
+            // Off the fuser worker thread and after the reply: notify_* blocks on the
+            // kernel dentry/inode lock and this is the only FUSE request-servicing
+            // thread (n_threads=1), so calling it inline here can deadlock the whole
+            // mount against a concurrent lookup on the same directory. See the read()
+            // handler's notify_inval_inode comment for the full explanation.
+            let notifier_slot = self.notifier_slot.clone();
+            thread::spawn(move || {
+                if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
+                    let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
+                    if child_ino != 0 {
+                        let _ = notifier.delete(INodeNo(parent.0), INodeNo(child_ino), OsStr::new(&file_name));
+                    }
+                }
+            });
             return;
         }
 
@@ -5966,17 +5974,29 @@ impl Filesystem for NextCloudFs {
         self.fileids.safe_write().remove(&remote_path);
 
         self.dirty.safe_lock().insert(parent_path);
+        let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
         reply.ok();
 
         // Tell the kernel about the deletion so that other processes (e.g. Nautilus)
         // invalidate their dentry cache immediately, without waiting for the background
         // PROPFIND to complete.  Matches what proactive_refresh does for remote changes.
-        if let Some(notifier) = self.notifier_slot.safe_lock().as_ref() {
-            let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
-            let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
-            if child_ino != 0 {
-                let _ = notifier.delete(INodeNo(parent.0), INodeNo(child_ino), OsStr::new(&file_name));
-            }
+        //
+        // MUST run off this thread and after the reply: this is the only FUSE
+        // request-servicing thread (n_threads=1), and notify_inval_inode/delete block
+        // on the kernel dentry/inode lock. Calling them inline here deadlocks the
+        // whole mount as soon as another process has a lookup pending against the
+        // same directory — see the identical fix and full explanation on read().
+        {
+            let notifier_slot = self.notifier_slot.clone();
+            let file_name = file_name.clone();
+            thread::spawn(move || {
+                if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
+                    let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
+                    if child_ino != 0 {
+                        let _ = notifier.delete(INodeNo(parent.0), INodeNo(child_ino), OsStr::new(&file_name));
+                    }
+                }
+            });
         }
 
         let seq = self.journal.safe_lock().enqueue(
@@ -6098,14 +6118,23 @@ impl Filesystem for NextCloudFs {
         self.fileids.safe_write().remove(&remote_path);
 
         self.dirty.safe_lock().insert(parent_path);
+        let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
         reply.ok();
 
-        if let Some(notifier) = self.notifier_slot.safe_lock().as_ref() {
-            let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
-            let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
-            if child_ino != 0 {
-                let _ = notifier.delete(INodeNo(parent.0), INodeNo(child_ino), OsStr::new(&dir_name));
-            }
+        // MUST run off this thread and after the reply — same deadlock hazard as
+        // unlink()/read(): notify_inval_inode/delete block on the kernel dentry/inode
+        // lock, and this is the only FUSE request-servicing thread (n_threads=1).
+        {
+            let notifier_slot = self.notifier_slot.clone();
+            let dir_name = dir_name.clone();
+            thread::spawn(move || {
+                if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
+                    let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
+                    if child_ino != 0 {
+                        let _ = notifier.delete(INodeNo(parent.0), INodeNo(child_ino), OsStr::new(&dir_name));
+                    }
+                }
+            });
         }
 
         let seq = self.journal.safe_lock().enqueue(
