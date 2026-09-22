@@ -128,15 +128,8 @@
     + [x] implement 'desktop apps'?
     + [ ] Nextcloud integration with clock-in clock-out -> separate app? Same app that fetches conn info? Generate png icon with status?
 
-+ [ ] eval performant cache if needed
-	with tokio_uring! https://gist.github.com/munro/14219f9a671484a8fe820eb35d26bb80
-
-+ [ ] E2E Encryption
-+ [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
-+ [ ] cross-platform review: what do we need to change?
-
-
-+ [ ] QOL:
++ [x] implement FUSE Passthrough for cache
++ [x] QOL 1
     + [x] Auto-suffix webdav://example.com/nextcloud/remote.php/dav/files/USERNAME/
 	+ [x] View user login info/status: HPB Connection, DAV Connection. Turn orange if HPB NOK.
 	+ [x] main Settings in tauri gui
@@ -145,21 +138,26 @@
 		-- cache
 		+ [x] cache options: max size
 		+ [x] option to pre-fetch folders up to certain size or not
-                + [ ] cache algorithm: FIFO/LIFO
-		+ [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
-	+ [ ] other config:
-		+ [ ] play notification sound
 	+ [x] Setup flow:
 		+ config exists? -> load: ok|err ->
 		+ ask for login flow in browser: https://github.com/traxys/nextcloud-passwords-client
 		+ save as yaml, lock yaml file permissions
 
-+ [ ] merge login with authd login if machines use nc-idam-provided OAuth2 token
 
-+ [ ] missing test surface:
++ [ ] login keyring for authd-backed credentials: so users may log in with OAuth onto ubuntu and then ncrsDesktop will auto-login to that nextcloud account with the keyring-saved creds (without kerberos nor anything more complex), but that's a specific use case for us :)
++ [ ] cross-platform review: what do we need to change?
+
++ [ ] To review:
+    + [ ] E2E Encryption
+    + [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
+
+    + [ ] cache-merge algorithm: FIFO/LIFO
+    + [ ] ignored files regex (filter from list, filter from sync) -> keep only in cache
+	+ [ ] other config:
+		+ [ ] play notification sound
+
     + [ ] diffing algorithm? -> ask which copy we want to save/save conflicting copy separately -> choose conflict resolution strategy
     + [ ] test moving -> ensure it's a move/rename operation and not just a delete/copy
 
-+ [ ] manually review tests
 + [ ] Clean branding images/icons etc. Ask NC team
 
