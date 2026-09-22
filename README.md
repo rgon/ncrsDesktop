@@ -6,6 +6,7 @@ Designed to perform well in installations with a very large amount of shared fil
 |---|---|
 | ![Sync status and plugins](docs/screenshot1.jpg) | ![Settings](docs/screenshot2.jpg) |
 | ![NC Metadata in Nautilus](docs/screenshot3.jpg) | ![Nextcloud-generated thumbnails even for RAW files](docs/screenshot4.jpg) |
+> NOTE: personal info has been edited out from the screenshots, in real life it looks normal :)
 
 ## Feature comparison:
 | Feature                   | Nextcloud Desktop | GNOME Integration/GVfs | ncRS |
