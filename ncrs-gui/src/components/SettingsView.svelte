@@ -21,14 +21,18 @@
         fuse_passthrough: boolean;
     }
 
-    // One file-browser profile, as reported by the service (`INTEGRATIONS`).
+    // One desktop profile, as reported by the service (`INTEGRATIONS`):
+    // a toolkit (GIO, KIO) or a file browser that requires one.
     interface Integration {
         id: string;
+        kind: "toolkit" | "browser";
         name: string;
         summary: string;
         installed: boolean;
         mode: "auto" | "on" | "off";
         enabled: boolean;
+        requires: string[];
+        required_by: string[];
         adapter_package: string | null;
         adapter_client_ids: string[];
         adapter_installed: boolean;
@@ -91,6 +95,20 @@
             integrationBusy = null;
             await refreshIntegrations();
         }
+    }
+
+    // Toolkits first: they are what the browsers below depend on.
+    const integrationGroups = $derived(
+        integrations
+            ? [
+                  { title: "Desktop toolkits", items: integrations.filter((i) => i.kind === "toolkit") },
+                  { title: "File browsers", items: integrations.filter((i) => i.kind !== "toolkit") },
+              ].filter((g) => g.items.length)
+            : [],
+    );
+
+    function profileName(id: string): string {
+        return integrations?.find((i) => i.id === id)?.name ?? id;
     }
 
     async function copyInstallCommand(pkg: string) {
@@ -369,12 +387,14 @@
             <!-- ── File browsers ────────────────── -->
             {#if integrations === null || integrations?.length || integrationError}
                 <section class="sv-section">
-                    <h3 class="sv-section-title">File browsers</h3>
+                    <h3 class="sv-section-title">Desktop integration</h3>
 
                     {#if integrations === null}
                         <p class="sv-hint">Update the ncrs service to manage file browsers.</p>
                     {:else if integrations}
-                        {#each integrations as fb (fb.id)}
+                        {#each integrationGroups as group (group.title)}
+                        <h4 class="sv-fb-group">{group.title}</h4>
+                        {#each group.items as fb (fb.id)}
                             <div class="sv-toggle sv-fb">
                                 <div class="sv-fb-body">
                                     <div class="sv-fb-head">
@@ -398,6 +418,9 @@
                                             <span>{copiedPkg === fb.adapter_package ? "Copied" : "Copy"}</span>
                                         </button>
                                     {/if}
+                                    {#if fb.required_by.length}
+                                        <p class="sv-hint">Kept on by {fb.required_by.map(profileName).join(", ")}</p>
+                                    {/if}
                                     {#if fb.mode !== "auto"}
                                         <p class="sv-hint">
                                             Manual ·
@@ -414,10 +437,11 @@
                                     type="checkbox"
                                     class="sv-check"
                                     checked={fb.enabled}
-                                    disabled={integrationBusy === fb.id}
+                                    disabled={integrationBusy === fb.id || fb.required_by.length > 0}
                                     onchange={(e) => setIntegration(fb.id, (e.target as HTMLInputElement).checked ? "on" : "off")}
                                 />
                             </div>
+                        {/each}
                         {/each}
                     {/if}
                     {#if integrationError}
@@ -597,6 +621,7 @@
 /* ── File browsers ───────────────────────── */
 
 .sv-fb { align-items: flex-start; }
+.sv-fb-group { margin: 0.75rem 0 0.25rem; font-size: 0.8rem; font-weight: 600; color: var(--nc-text-2); text-transform: uppercase; letter-spacing: 0.04em; }
 .sv-fb .sv-check { margin-top: 2px; }
 
 .sv-fb-body { min-width: 0; }

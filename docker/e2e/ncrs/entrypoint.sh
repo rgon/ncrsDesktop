@@ -43,13 +43,12 @@ auto_keep_cached_files: false
 dir_cache_max_stale_mins: 1
 EOF
 
-# No file browser is installed in this image, so every desktop profile would
-# resolve to "off" (profiles default to on only for installed browsers). The
-# scenarios exercise the GIO/Tracker behaviour (O_NOATIME sniff intercept,
-# .trackerignore), so enable the Nautilus profile explicitly, exactly as a user
-# choice made via the GUI or `ncrs-ctl integration-set nautilus on` is stored.
+# This slim image has no GLib, so the GIO toolkit profile would resolve to
+# "off" (profiles default to on only for installed software). The scenarios
+# exercise its behaviour (O_NOATIME sniff intercept, .trackerignore), so enable
+# it explicitly, exactly as `ncrs-ctl integration-set gio on` stores a choice.
 cat > "$HOME/.config/ncrs/desktop-profiles.json" <<EOF
-{ "modes": { "nautilus": "on" } }
+{ "modes": { "gio": "on" } }
 EOF
 
 echo "[e2e] mounting ncrs daemon"

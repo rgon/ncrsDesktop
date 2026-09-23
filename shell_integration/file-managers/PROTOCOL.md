@@ -128,15 +128,26 @@ process starts at "now".
 | `INTEGRATION_SET <profile> on\|off\|auto` | `ok` or `error: …` |
 
 ```json
-{"id":"dolphin","name":"Dolphin (KDE)","installed":true,"mode":"auto",
- "enabled":true,"adapter_installed":false,"adapter_connected":false,
- "summary":"…","adapter_package":"ncrs-dolphin","adapter_client_ids":["dolphin-kf6","dolphin-kf5"]}
+{"id":"kio","kind":"toolkit","name":"KDE apps (KIO)","summary":"…",
+ "installed":true,"mode":"off","enabled":true,"requires":[],"required_by":["dolphin"],
+ "adapter_package":null,"adapter_client_ids":[],"adapter_installed":false,"adapter_connected":false}
+{"id":"dolphin","kind":"browser","name":"Dolphin (KDE)","summary":"…",
+ "installed":true,"mode":"auto","enabled":true,"requires":["kio"],"required_by":[],
+ "adapter_package":"ncrs-dolphin","adapter_client_ids":["dolphin-kf6","dolphin-kf5"],
+ "adapter_installed":false,"adapter_connected":false}
 ```
 
-`mode` is the stored user choice. `auto` means enabled if and only if the browser is
-installed; detection re-runs on every `INTEGRATIONS`. The profile is the only
-unit a client can toggle; its components (indexer exclusion, sniff handling,
-thumbnails, local-only files) are internal to the service.
+There are two kinds of profile. **Toolkit** profiles (`gio`, `kio`) own what a
+desktop's libraries and services do to the mount: MIME sniffing, thumbnail sizes
+and the indexer. **Browser** profiles (`nautilus`, `dolphin`, `nemo`) add a shell
+adapter and `requires` their toolkit.
+
+`mode` is the stored user choice. `auto` means enabled if and only if the
+software is installed (toolkits: their libraries; browsers: the application).
+Detection re-runs on every `INTEGRATIONS`. `enabled` is the effective state: a
+toolkit stays enabled while any enabled browser requires it (`required_by`),
+whatever its own mode. Profiles are the only unit a client can toggle; their
+components are internal to the service.
 
 ## Daemon state (GUI)
 
