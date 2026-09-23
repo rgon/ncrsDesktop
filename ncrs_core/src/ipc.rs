@@ -27,8 +27,9 @@
 ///   THUMBNAIL <abs-path>\n           → ok | error: <msg>  (fetch NC preview → XDG thumb cache)
 ///   VERSION <n>\n                     → <daemon-protocol>\t<pkg-version>  (n = extension protocol)
 ///
-/// Protocol v3 (additive) — HELLO, CLIENTS, EVENTS, WATCH. The full, normative
-/// spec for file-manager clients is shell_integration/file-managers/PROTOCOL.md.
+/// Protocol v3 (additive) — HELLO, CLIENTS, EVENTS, WATCH, INTEGRATIONS. The
+/// normative spec is shell_integration/file-managers/PROTOCOL.md; keep it in
+/// step with any change here.
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -1407,6 +1408,24 @@ mod tests {
             size,
             is_dir,
         }
+    }
+
+    #[test]
+    fn status_words_match_the_published_vocabulary() {
+        // Every adapter maps the words in status-vocabulary.txt; a status the
+        // daemon emits that is not listed there would render as nothing.
+        let vocab: HashSet<&str> = include_str!("../../shell_integration/file-managers/status-vocabulary.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        let emitted = [
+            FileStatus::Kept, FileStatus::Cached, FileStatus::Synced, FileStatus::Remote,
+            FileStatus::Downloading, FileStatus::Uploading, FileStatus::PendingSync, FileStatus::Unknown,
+        ];
+        let mut words: HashSet<&str> = emitted.iter().map(|s| s.as_str()).collect();
+        words.insert("partial"); // derived for directories by dir_status_from_children
+        assert_eq!(words, vocab);
     }
 
     // ── Protocol v3 wire format ──────────────────────────────────────────────
