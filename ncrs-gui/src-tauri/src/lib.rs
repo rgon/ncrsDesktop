@@ -440,14 +440,21 @@ fn get_conflicts(state: State<Arc<AppState>>) -> Vec<ConflictRecord> {
     state.journal.lock().unwrap().unresolved_conflicts().into_iter().cloned().collect()
 }
 
+// The daemon owns (and persists) the conflicts; this app only mirrors them over IPC, so
+// resolving must reach the daemon or the next poll brings the conflict straight back.
 #[tauri::command]
-fn resolve_conflict(state: State<Arc<AppState>>, id: u64) {
+async fn resolve_conflict(state: State<'_, Arc<AppState>>, id: u64) -> Result<(), ()> {
     state.journal.lock().unwrap().resolve_conflict(id);
+    let verb = format!("RESOLVE_CONFLICT {}", id);
+    let _ = tokio::task::spawn_blocking(move || ipc_request(&[&verb])).await;
+    Ok(())
 }
 
 #[tauri::command]
-fn clear_conflicts(state: State<Arc<AppState>>) {
+async fn clear_conflicts(state: State<'_, Arc<AppState>>) -> Result<(), ()> {
     state.journal.lock().unwrap().resolve_all_conflicts();
+    let _ = tokio::task::spawn_blocking(|| ipc_request(&["RESOLVE_ALL_CONFLICTS"])).await;
+    Ok(())
 }
 
 /// Drop every locally cached file copy (except files with a pending upload) so

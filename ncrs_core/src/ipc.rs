@@ -12,6 +12,8 @@
 ///   TRANSFERS\n                      → JSON array of TransferProgress
 ///   JOURNAL\n                        → JSON array of pending JournalEntry
 ///   CONFLICTS\n                      → JSON array of unresolved ConflictRecord
+///   RESOLVE_CONFLICT <id>\n          → "ok" (persisted, so it stays resolved)
+///   RESOLVE_ALL_CONFLICTS\n          → "ok"
 ///   CHANGES\n                        → tab-separated changed paths
 ///   FILE_CHANGES\n                    → tab-separated A:/path or D:/path entries
 ///   STORAGE\n                         → JSON {kept_bytes, cached_bytes, remote_used, remote_total}
@@ -1035,6 +1037,17 @@ fn handle_client(
             journal_entries_json(&journal.safe_lock())
         } else if trimmed == "CONFLICTS" {
             conflicts_json(&journal.safe_lock())
+        } else if let Some(id) = trimmed.strip_prefix("RESOLVE_CONFLICT ") {
+            match id.trim().parse::<u64>() {
+                Ok(id) => {
+                    journal.safe_lock().resolve_conflict(id);
+                    "ok".to_string()
+                }
+                Err(_) => "error: bad conflict id".to_string(),
+            }
+        } else if trimmed == "RESOLVE_ALL_CONFLICTS" {
+            journal.safe_lock().resolve_all_conflicts();
+            "ok".to_string()
         } else if trimmed == "STORAGE" {
             let stats = storage_stats.safe_lock().clone();
             serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())
