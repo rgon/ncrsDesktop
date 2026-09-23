@@ -269,6 +269,11 @@ pub fn put_chunk(
 /// Assembles a chunked-upload session into `path` via the collection's
 /// `.file` MOVE target, applying `if_match_etag` as an optimistic-concurrency
 /// guard exactly like a normal PUT's If-Match.
+/// `If` header making a chunked-upload MOVE conditional on the destination's etag.
+fn move_precondition(dest_url: &str, etag: &str) -> String {
+    format!("<{}> ([\"{}\"])", dest_url, etag.trim_matches('"'))
+}
+
 pub fn finish_chunked_upload(
     client: &crate::http_clients::DavClient,
     base_url: &str,
@@ -286,7 +291,9 @@ pub fn finish_chunked_upload(
         .header("Overwrite", "T");
 
     if let Some(etag) = if_match_etag {
-        req = req.header("If-Match", format!("\"{}\"", etag.trim_matches('"')));
+        // Nextcloud checks If-Match on this MOVE against the source (.file), so it 412s even
+        // with the right etag; a tagged If header targets the destination instead.
+        req = req.header("If", move_precondition(&dest_url, etag));
     }
 
     let resp = req.send().map_err(|e| WriteError::Network(format!("chunked MOVE: {}", e)))?;
@@ -405,6 +412,16 @@ fn cleanup_chunked_upload(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn chunked_move_precondition_targets_the_destination() {
+        // Verified against Nextcloud: If-Match on this MOVE is checked against the source
+        // (.file) and always 412s; only this tagged form enforces the destination's etag.
+        assert_eq!(
+            move_precondition("https://h/remote.php/dav/files/u/a b.txt", "\"abc123\""),
+            "<https://h/remote.php/dav/files/u/a b.txt> ([\"abc123\"])",
+        );
+    }
     use super::*;
     use std::path::Path;
 

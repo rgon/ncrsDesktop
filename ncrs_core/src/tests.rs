@@ -2796,3 +2796,34 @@ mod refresh_lock_tests {
         assert!(t.acquire_timeout(Duration::from_millis(50)).is_some());
     }
 }
+
+#[cfg(test)]
+mod upload_order_tests {
+    use crate::UploadOrder;
+    use std::path::Path;
+
+    #[test]
+    fn a_handle_opened_before_our_last_upload_sends_that_uploads_etag() {
+        let u = UploadOrder::default();
+        let p = Path::new("/f.txt");
+        let opened_before = u.generation();
+        u.record(p, Some("e2".into()));
+        assert_eq!(u.etag_for(p, opened_before, Some("e1".into())), Some("e2".into()),
+            "a rapid re-save must not send the etag our own previous upload replaced");
+        let opened_after = u.generation();
+        assert_eq!(u.etag_for(p, opened_after, Some("e3".into())), Some("e3".into()),
+            "a handle opened later saw the server's etag and keeps its own");
+    }
+
+    #[test]
+    fn recorded_etags_follow_renames_and_deletes() {
+        let u = UploadOrder::default();
+        let g = u.generation();
+        u.record(Path::new("/a"), Some("e".into()));
+        u.moved(Path::new("/a"), Path::new("/b"));
+        assert_eq!(u.etag_for(Path::new("/b"), g, None), Some("e".into()));
+        assert_eq!(u.etag_for(Path::new("/a"), g, None), None);
+        u.forget(Path::new("/b"));
+        assert_eq!(u.etag_for(Path::new("/b"), g, None), None);
+    }
+}

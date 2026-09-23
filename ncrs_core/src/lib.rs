@@ -9,6 +9,7 @@ pub mod fuse_notify;
 pub mod ipc;
 pub mod http_clients;
 mod iomode;
+mod path_seq;
 pub mod mutation_journal;
 pub mod nextcloud;
 pub mod notifications;
@@ -429,6 +430,57 @@ struct OpenFile {
     // A write on this handle already failed with EIO after a chunk reached the server;
     // release() aborts the chunked session instead of assembling an incomplete file.
     upload_failed: bool,
+    // Made by create() and not uploaded yet: the server has no copy until release().
+    created: bool,
+    // The path was deleted while this handle was open; release() must not re-create it.
+    unlinked: bool,
+    // UploadOrder generation when opened, for etag chaining (see UploadOrder::etag_for).
+    opened_gen: u64,
+}
+
+/// Ordering and etag bookkeeping shared by the workers that change files on the server.
+#[derive(Clone, Default)]
+struct UploadOrder {
+    seq: Arc<path_seq::PathSeq>,
+    // Etag each path got from this daemon's latest upload, with the generation it was
+    // recorded at: a handle opened before that upload must send it, not its stale etag.
+    committed: Arc<Mutex<HashMap<PathBuf, (u64, Option<String>)>>>,
+    gen: Arc<AtomicU64>,
+}
+
+impl UploadOrder {
+    fn generation(&self) -> u64 {
+        self.gen.load(Ordering::SeqCst)
+    }
+
+    fn etag_for(&self, path: &Path, opened_gen: u64, original: Option<String>) -> Option<String> {
+        match self.committed.safe_lock().get(path) {
+            Some((g, etag)) if *g > opened_gen => etag.clone(),
+            _ => original,
+        }
+    }
+
+    fn record(&self, path: &Path, etag: Option<String>) {
+        let g = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
+        self.committed.safe_lock().insert(path.to_path_buf(), (g, etag));
+    }
+
+    fn moved(&self, from: &Path, to: &Path) {
+        let mut c = self.committed.safe_lock();
+        if let Some(v) = c.remove(from) {
+            c.insert(to.to_path_buf(), v);
+        }
+    }
+
+    fn forget(&self, path: &Path) {
+        self.committed.safe_lock().remove(path);
+    }
+
+    /// Ticket for creating, replacing or removing `path` inside its parent.
+    fn ticket_entry(&self, path: &Path) -> path_seq::Ticket {
+        let parent = path.parent().unwrap_or(Path::new("/"));
+        self.seq.ticket(&[(path, path_seq::Access::Exclusive), (parent, path_seq::Access::Shared)])
+    }
 }
 
 fn plain_open_flags(kind: iomode::IoKind) -> FopenFlags {
@@ -595,7 +647,7 @@ fn is_timeout_err(e: &str) -> bool {
 /// though the request would have succeeded moments later — this is what
 /// surfaced to users as GVFS's "Error splicing file: Input/output error" on
 /// large raw-photo copies, where more chunks means more chances to hit one.
-fn retry_chunk_write<T>(
+pub(crate) fn retry_chunk_write<T>(
     op_name: &str,
     mut f: impl FnMut() -> Result<T, backend::BackendWriteError>,
 ) -> Result<T, backend::BackendWriteError> {
@@ -2697,6 +2749,7 @@ pub struct NextCloudFs {
     children_map: ipc::ChildrenMap,
     conn: Arc<ConnInfo>,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+    uploads: UploadOrder,
     io_modes: Mutex<iomode::InodeIoModes<BackingId>>,
     open_dirs: Arc<Mutex<HashMap<u64, OpenDir>>>,
     next_fh: Arc<Mutex<u64>>,
@@ -2756,17 +2809,10 @@ impl NextCloudFs {
         // Files in the journal still need their staging data for upload replay;
         // everything else is orphaned (upload completed, non-dirty open, coalesced, etc.).
         {
-            use mutation_journal::MutationOp;
             let j = journal_arc.safe_lock();
             let referenced: std::collections::HashSet<PathBuf> = j.entries()
                 .iter()
-                .filter_map(|e| {
-                    if let MutationOp::Put { staging_path, .. } = &e.op {
-                        Some(staging_path.clone())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|e| e.op.staging_path().map(Path::to_path_buf))
                 .collect();
             let mut stale_count = 0usize;
             if let Ok(dir_entries) = std::fs::read_dir(&cache_dir) {
@@ -2971,6 +3017,7 @@ impl NextCloudFs {
             children_map,
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
+            uploads: UploadOrder::default(),
             io_modes: Mutex::new(iomode::InodeIoModes::default()),
             open_dirs: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
@@ -3147,9 +3194,9 @@ impl NextCloudFs {
                 let mut protected = std::collections::HashSet::new();
                 let mut staged = std::collections::HashSet::new();
                 for e in j.entries() {
-                    if let mutation_journal::MutationOp::Put { remote_path, staging_path, .. } = &e.op {
-                        protected.insert(remote_path.clone());
-                        staged.insert(staging_path.clone());
+                    if let Some(staging_path) = e.op.staging_path() {
+                        protected.insert(e.op.path().to_path_buf());
+                        staged.insert(staging_path.to_path_buf());
                     }
                 }
                 (protected, staged)
@@ -3414,156 +3461,155 @@ impl NextCloudFs {
         }
     }
 
-    /// Finishes a chunk-streaming upload at release() time: PUTs whatever tail
-    /// bytes remain as the final chunk (there may be none, if the file's
-    /// length landed exactly on a chunk boundary) and assembles the session
-    /// into `remote_path`. Runs synchronously and is never journaled: each call is
-    /// wrapped in `retry_chunk_write` to absorb a transient blip, but see
-    /// ChunkUploadState's doc comment for why a failure that survives that
-    /// bounded retry is reported rather than resumed from disk.
-    fn finish_chunk_streaming(
+    /// Journals the end of a streamed upload and hands it to a worker, so a failed finish
+    /// is retried from the journal and release() never waits on the network.
+    fn commit_streamed(
         &self,
-        fh: FileHandle,
         remote_path: PathBuf,
-        write_path: PathBuf,
+        tail_path: PathBuf,
         original_etag: Option<String>,
-        total_written: u64,
-        chunk_state: ChunkUploadState,
+        opened_gen: u64,
+        total_len: u64,
+        cs: ChunkUploadState,
     ) -> Result<(), Errno> {
         log::info!(
             "[{}] COMMIT (streamed) {} size={} etag={:?}",
-            self.log_user, remote_path.display(), total_written, original_etag,
+            self.log_user, remote_path.display(), total_len, original_etag,
         );
-
+        if let Ok(f) = std::fs::File::open(&tail_path) {
+            if let Err(e) = f.sync_all() {
+                log::warn!("release: fsync tail {} failed: {}", tail_path.display(), e);
+            }
+        }
+        let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
         {
             let mut c = self.cache.safe_lock();
-            let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
             if let Some(dir) = c.dir_cache.get_mut(&parent) {
                 let mut files = (*dir.files).clone();
                 if let Some(e) = files.iter_mut().find(|e| e.path == remote_path) {
-                    e.size = total_written;
+                    e.size = total_len;
                 }
                 dir.files = Arc::new(files);
             }
         }
-        self.status.safe_write().insert(remote_path.clone(), FileStatus::Uploading);
+        let seq = self.journal.safe_lock().enqueue(mutation_journal::MutationOp::FinishChunked {
+            remote_path: remote_path.clone(),
+            uploads_base: cs.uploads_base.clone(),
+            next_index: cs.next_index,
+            bytes_confirmed: cs.bytes_confirmed,
+            total_len,
+            tail_path: tail_path.clone(),
+            if_match_etag: original_etag.clone(),
+        });
+        self.journal.safe_lock().supersede_uploads(&remote_path, seq);
         self.dirty.safe_lock().insert(remote_path.clone());
+        if self.conn.is_offline.load(Ordering::Relaxed) {
+            self.status.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+            return Ok(());
+        }
+        self.status.safe_write().insert(remote_path.clone(), FileStatus::Uploading);
         self.cache.safe_lock().uploading.insert(remote_path.clone());
 
-        let session = backend::ChunkedUploadSession { uploads_base: chunk_state.uploads_base.clone() };
-        let tail_len = total_written - chunk_state.bytes_confirmed;
-        let finish_result: Result<backend::PutResult, backend::BackendWriteError> = (|| {
-            if tail_len > 0 {
-                let tail_bytes = std::fs::read(&write_path)
-                    .map_err(|e| backend::BackendWriteError::Network(format!("staging read: {}", e)))?;
-                if tail_bytes.len() as u64 != tail_len {
-                    return Err(backend::BackendWriteError::Network(format!(
-                        "staging tail is {} bytes, expected {} — refusing to assemble a truncated file",
-                        tail_bytes.len(), tail_len,
-                    )));
+        let conn = self.conn.clone();
+        let cache = self.cache.clone();
+        let dirty = self.dirty.clone();
+        let elog = self.error_log.clone();
+        let journal = self.journal.clone();
+        let smap = self.status.clone();
+        let uploads = self.uploads.clone();
+        let ticket = uploads.ticket_entry(&remote_path);
+        thread::spawn(move || {
+            ticket.wait();
+            if !journal.safe_lock().claim(seq) {
+                log::debug!("streamed finish of {} skipped — superseded or replayed", remote_path.display());
+                if !journal.safe_lock().has_pending_put(&remote_path) {
+                    cache.safe_lock().uploading.remove(&remote_path);
                 }
-                retry_chunk_write("final chunk upload", || {
-                    self.conn.backend.put_chunk(&session, chunk_state.next_index, tail_bytes.clone())
-                })?;
+                return;
             }
-            retry_chunk_write("chunked-upload finish", || {
-                self.conn.backend.finish_chunked_upload(&session, &remote_path, original_etag.as_deref())
-            })
-        })();
-
-        self.cache.safe_lock().uploading.remove(&remote_path);
-
-        match finish_result {
-            Ok(result) => {
-                log::info!("PUT (streamed) {} → new etag {:?}", remote_path.display(), result.new_change_token);
-                {
-                    let mut c = self.cache.safe_lock();
-                    let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
-                    if let Some(dir) = c.dir_cache.get_mut(&parent) {
-                        let mut files = (*dir.files).clone();
-                        if let Some(entry) = files.iter_mut().find(|e| e.path == remote_path) {
-                            entry.change_token = result.new_change_token.clone();
-                            entry.size = total_written;
-                            entry.modified = Some(SystemTime::now());
+            let etag = uploads.etag_for(&remote_path, opened_gen, original_etag);
+            let _permit = conn.throttle.acquire();
+            let result = mutation_journal::finish_chunked(
+                &*conn.backend, &cs.uploads_base, cs.next_index, cs.bytes_confirmed, total_len,
+                &tail_path, &remote_path, etag.as_deref(),
+            );
+            cache.safe_lock().uploading.remove(&remote_path);
+            match result {
+                Ok(result) => {
+                    log::info!("PUT (streamed) {} → new etag {:?}", remote_path.display(), result.new_change_token);
+                    uploads.record(&remote_path, result.new_change_token.clone());
+                    {
+                        let mut c = cache.safe_lock();
+                        if let Some(dir) = c.dir_cache.get_mut(&parent) {
+                            let mut files = (*dir.files).clone();
+                            if let Some(entry) = files.iter_mut().find(|e| e.path == remote_path) {
+                                entry.change_token = result.new_change_token;
+                                entry.size = total_len;
+                                entry.modified = Some(SystemTime::now());
+                            }
+                            dir.files = Arc::new(files);
+                            dir.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
                         }
-                        dir.files = Arc::new(files);
-                        dir.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
+                    }
+                    // The tail is only the end of the file, so it can never become a kept copy.
+                    smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
+                    let _ = std::fs::remove_file(&tail_path);
+                    journal.safe_lock().remove(seq);
+                }
+                Err(backend::BackendWriteError::Conflict) => {
+                    // Every chunk is already on the server: assemble ours as a conflicted copy.
+                    let conflict_name = make_conflict_name(&remote_path);
+                    let session = backend::ChunkedUploadSession { uploads_base: cs.uploads_base.clone() };
+                    match conn.backend.finish_chunked_upload(&session, &conflict_name, None) {
+                        Ok(_) => log::info!("conflicted copy assembled as {}", conflict_name.display()),
+                        Err(e) => log::error!("failed to assemble conflicted copy {}: {}", conflict_name.display(), e),
+                    }
+                    push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
+                    smap.safe_write().remove(&remote_path);
+                    let _ = std::fs::remove_file(&tail_path);
+                    journal.safe_lock().remove(seq);
+                }
+                Err(ref e) if e.is_transient() => {
+                    if e.is_network_down() {
+                        mark_offline(&conn.is_offline, &conn.offline_since);
+                    }
+                    log::warn!("streamed PUT {} deferred — {} (queued for retry)", remote_path.display(), e);
+                    smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+                    journal.safe_lock().mark_deferred(seq, e.to_string());
+                }
+                Err(e) => {
+                    log::error!("streamed PUT {} failed at finish: {}", remote_path.display(), e);
+                    let kind = match &e {
+                        backend::BackendWriteError::Forbidden => SyncErrorKind::PermissionDenied,
+                        backend::BackendWriteError::QuotaExceeded => SyncErrorKind::QuotaExceeded,
+                        backend::BackendWriteError::Server(code, _) => SyncErrorKind::ServerError(*code),
+                        _ => SyncErrorKind::UploadFailed,
+                    };
+                    push_error(&elog, remote_path.clone(), kind, format!("Streamed upload could not complete — please retry the copy: {}", e));
+                    smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+                    if matches!(e, backend::BackendWriteError::Server(404, _)) {
+                        // The session is gone; nothing left to retry from.
+                        conn.backend.abort_chunked_upload(&backend::ChunkedUploadSession { uploads_base: cs.uploads_base.clone() });
+                        let _ = std::fs::remove_file(&tail_path);
+                        journal.safe_lock().remove(seq);
+                    } else {
+                        journal.safe_lock().mark_failed(seq, e.to_string());
                     }
                 }
-                if let Some(of) = self.open_files.safe_lock().get_mut(&fh.0) {
-                    of.dirty = false;
-                    of.original_etag = result.new_change_token.clone();
-                    of.chunk_upload = None;
-                }
-                if self.auto_keep_locally_modified_files {
-                    let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
-                    let keep_path = self.cache.safe_lock().kept_dir.join(rel);
-                    let mut kept = false;
-                    if let Some(parent) = keep_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if std::fs::copy(&write_path, &keep_path).is_ok() {
-                        self.cache.safe_lock().file_cache.insert(remote_path.clone(), FileCacheEntry {
-                            local_path: keep_path,
-                            remote_modified: Some(SystemTime::now()),
-                            etag: result.new_change_token,
-                            kept: true,
-                            size: total_written,
-                        });
-                        self.status.safe_write().insert(remote_path.clone(), FileStatus::Kept);
-                        kept = true;
-                    }
-                    if !kept {
-                        self.status.safe_write().insert(remote_path.clone(), FileStatus::Synced);
-                    }
-                } else {
-                    self.status.safe_write().insert(remote_path.clone(), FileStatus::Synced);
-                }
-                let _ = std::fs::remove_file(&write_path);
-                self.dirty.safe_lock().insert(remote_path.clone());
-                self.dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
-                Ok(())
             }
-            Err(e) => {
-                log::error!("streamed PUT {} failed at finish: {}", remote_path.display(), e);
-                // Transient blips were already absorbed by retry_chunk_write; this is
-                // either a non-transient error or one that outlasted its retry budget.
-                // No journal entry exists for a streamed upload — there is nothing left
-                // to retry automatically. Best-effort teardown of the session so a
-                // stalled transfer does not linger server-side; the tail file is left on
-                // disk (the purge callback reclaims it once this fh's handle is gone)
-                // for the user to retry from.
-                self.conn.backend.abort_chunked_upload(&session);
-                let kind = match &e {
-                    backend::BackendWriteError::Forbidden => SyncErrorKind::PermissionDenied,
-                    backend::BackendWriteError::QuotaExceeded => SyncErrorKind::QuotaExceeded,
-                    backend::BackendWriteError::Server(code, _) => SyncErrorKind::ServerError(*code),
-                    backend::BackendWriteError::Conflict => SyncErrorKind::Conflict,
-                    _ => SyncErrorKind::UploadFailed,
-                };
-                push_error(
-                    &self.error_log,
-                    remote_path.clone(),
-                    kind,
-                    format!("Streamed upload could not complete — please retry the copy: {}", e),
-                );
-                self.status.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
-                self.dirty.safe_lock().insert(remote_path.clone());
-                if let Some(of) = self.open_files.safe_lock().get_mut(&fh.0) {
-                    of.chunk_upload = None;
-                }
-                Err(Errno::EIO)
-            }
-        }
+            dirty.safe_lock().insert(remote_path.clone());
+            dirty.safe_lock().insert(parent);
+        });
+        Ok(())
     }
 
     /// Uploads a handle's staged bytes once release() has removed it. FLUSH is sent on
     /// every close() of any fd sharing the handle, so only RELEASE marks the end of a file.
     fn commit_released(&self, fh: FileHandle, of: OpenFile) -> Result<(), Errno> {
-        let OpenFile { remote_path, write_path, original_etag, chunk_upload, total_written, .. } = of;
+        let OpenFile { remote_path, write_path, original_etag, chunk_upload, total_written, opened_gen, .. } = of;
         let Some(write_path) = write_path else { return Ok(()) };
         if let Some(chunk_state) = chunk_upload {
-            return self.finish_chunk_streaming(fh, remote_path, write_path, original_etag, total_written, chunk_state);
+            return self.commit_streamed(remote_path, write_path, original_etag, opened_gen, total_written, chunk_state);
         }
         let upload_size = match std::fs::metadata(&write_path) {
             Ok(m) => m.len(),
@@ -3608,6 +3654,7 @@ impl NextCloudFs {
                 if_match_etag: original_etag.clone(),
             },
         );
+        self.journal.safe_lock().supersede_uploads(&remote_path, seq);
 
         if !self.conn.is_offline.load(Ordering::Relaxed) {
             self.status.safe_write().insert(remote_path.clone(), FileStatus::Uploading);
@@ -3633,8 +3680,19 @@ impl NextCloudFs {
             // Guard this path in the uploading set so put_dir_cache doesn't
             // evict it from a concurrent PROPFIND refresh before the PUT lands.
             self.cache.safe_lock().uploading.insert(remote_path.clone());
+            let uploads = self.uploads.clone();
+            let ticket = uploads.ticket_entry(&remote_path);
 
             thread::spawn(move || {
+                ticket.wait();
+                if !journal.safe_lock().claim(seq) {
+                    log::debug!("PUT {} skipped — superseded or replayed", remote_path.display());
+                    if !journal.safe_lock().has_pending_put(&remote_path) {
+                        cache.safe_lock().uploading.remove(&remote_path);
+                    }
+                    return;
+                }
+                let original_etag = uploads.etag_for(&remote_path, opened_gen, original_etag);
                 let _permit = conn.throttle.acquire();
                 tmap.safe_lock().insert(remote_path.clone(), TransferProgress {
                     path: remote_path.clone(),
@@ -3648,6 +3706,7 @@ impl NextCloudFs {
                         tmap.safe_lock().remove(&remote_path);
                         cache.safe_lock().uploading.remove(&remote_path);
                         log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_change_token);
+                        uploads.record(&remote_path, result.new_change_token.clone());
                         let new_size = upload_size;
                         {
                             let mut c = cache.safe_lock();
@@ -4467,7 +4526,7 @@ impl Filesystem for NextCloudFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let (path, local, etag, nc_permissions) = {
+        let (path, local, etag, nc_permissions, remote_size) = {
             let c = self.cache.safe_lock();
             let path = match c.get_path(ino.0) {
                 Some(p) => p,
@@ -4482,15 +4541,18 @@ impl Filesystem for NextCloudFs {
                 .filter(|e| e.local_path.metadata().map_or(false, |m| m.len() > 0))
                 .map(|e| e.local_path.clone());
             let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-            let (etag, nc_permissions) = c.get_cached_dir_readonly(&parent)
+            let (etag, nc_permissions, remote_size) = c.get_cached_dir_readonly(&parent)
                 .and_then(|files| files.iter().find(|e| e.path == path).map(|e| {
-                    (e.change_token.clone(), e.ext.str("permissions").map(str::to_string))
+                    (e.change_token.clone(), e.ext.str("permissions").map(str::to_string), e.size)
                 }))
-                .unwrap_or((None, None));
-            (path, local, etag, nc_permissions)
+                .unwrap_or((None, None, 0));
+            (path, local, etag, nc_permissions, remote_size)
         };
 
         let writable = flags.0 & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
+        // FUSE_ATOMIC_O_TRUNC is negotiated, so a truncating open arrives here instead of
+        // as a separate setattr and must start from an empty staging file.
+        let truncating = writable && flags.0 & libc::O_TRUNC != 0;
 
         // The synthetic `.trackerignore` overlay entry is read-only — there is
         // nothing behind it to write through to.
@@ -4513,15 +4575,37 @@ impl Filesystem for NextCloudFs {
             fh
         };
 
+        // Pin the cached-copy freshness for this handle's lifetime (see OpenFile).
+        // file_cache_matches_remote() returns false when the file is not cached,
+        // and true when offline (no remote etag to compare) so offline reads of a
+        // kept copy are never forced into an unsatisfiable re-download.
+        let cache_fresh = self.cache.safe_lock().file_cache_matches_remote(&path);
+
+        // Whether the staging file starts out holding the file's current content.
+        let mut seeded = false;
         let write_path = if writable {
             let cache_dir = self.cache.safe_lock().cache_dir.clone();
             let wp = cache_dir.join(format!("write_{}", fh));
-            if let Some(ref local) = local {
-                if let Err(e) = std::fs::copy(local, &wp) {
-                    log::error!("open: failed to seed staging file {} from {}: {}", wp.display(), local.display(), e);
-                    reply.error(Errno::EIO);
-                    return;
-                }
+            // Stage the current content before any write: a write that does not start at
+            // 0 (O_APPEND, an in-place edit) would otherwise upload a zero-filled prefix.
+            let staged = if truncating {
+                std::fs::File::create(&wp).map(|_| ()).map_err(|e| e.to_string())
+            } else if let Some(local) = local.as_ref().filter(|_| cache_fresh) {
+                seeded = true;
+                std::fs::copy(local, &wp).map(|_| ()).map_err(|e| e.to_string())
+            } else if remote_size > 0 {
+                seeded = true;
+                std::fs::File::create(&wp)
+                    .map_err(|e| e.to_string())
+                    .and_then(|dest| open_file_timeout(&self.conn, path.clone(), dest, Some(self.transfer_map.clone())))
+            } else {
+                Ok(())
+            };
+            if let Err(e) = staged {
+                log::error!("open: cannot stage current content of {} for writing: {}", path.display(), e);
+                let _ = std::fs::remove_file(&wp);
+                reply.error(Errno::EIO);
+                return;
             }
             Some(wp)
         } else {
@@ -4566,11 +4650,6 @@ impl Filesystem for NextCloudFs {
         // as a bonus the kernel stops inflating the probe read via read-ahead, so
         // it always arrives within the MIME_DETECT_MAX_READ guard at its true size.
         let mime_detect = mime_detect_ct.is_some();
-        // Pin the cached-copy freshness for this handle's lifetime (see OpenFile).
-        // file_cache_matches_remote() returns false when the file is not cached,
-        // and true when offline (no remote etag to compare) so offline reads of a
-        // kept copy are never forced into an unsatisfiable re-download.
-        let cache_fresh = self.cache.safe_lock().file_cache_matches_remote(&path);
 
         // Kernel FUSE_PASSTHROUGH: only offered for a read-only open already
         // backed by a complete, fresh local cache copy — never for a handle
@@ -4623,18 +4702,23 @@ impl Filesystem for NextCloudFs {
                 local: local.clone(),
                 buf: None,
                 write_path,
-                dirty: false,
+                // A truncating open changes the file even if nothing is written after it.
+                dirty: truncating,
                 original_etag: etag,
                 mime_detect_ct,
                 cache_fresh,
                 next_expected_off: 0,
                 read_ahead_window: READ_AHEAD_INITIAL,
                 total_written: 0,
-                stream_eligible: local.is_none(),
+                // Only an empty staging file can stream from offset 0.
+                stream_eligible: !seeded,
                 chunk_upload: None,
                 ino: ino.0,
                 io_kind: grant.kind(),
                 upload_failed: false,
+                created: false,
+                unlinked: false,
+                opened_gen: self.uploads.generation(),
             },
         );
         // io_modes keeps the BackingId alive until the inode's last passthrough
@@ -5313,9 +5397,15 @@ impl Filesystem for NextCloudFs {
         self.io_modes.safe_lock().release(of.ino, of.io_kind);
         reply.ok();
 
-        if of.upload_failed {
-            // A write already returned EIO after chunks reached the server; assembling
-            // them would publish an incomplete file. Tear the session down instead.
+        if of.upload_failed || of.unlinked {
+            // A write already returned EIO after chunks reached the server (assembling them
+            // would publish an incomplete file), or the file was deleted while open
+            // (committing would re-create it). Tear any session down instead.
+            if of.unlinked {
+                if let Some(ref wp) = of.write_path {
+                    let _ = std::fs::remove_file(wp);
+                }
+            }
             self.cache.safe_lock().uploading.remove(&of.remote_path);
             if let Some(cs) = of.chunk_upload {
                 log::warn!(
@@ -5379,6 +5469,9 @@ impl Filesystem for NextCloudFs {
         // per entry on large directories; `ls` keeps using plain readdir. Best
         // effort — silently ignored if the running kernel lacks support.
         let _ = config.add_capabilities(InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO);
+        // Deliver O_TRUNC to open() rather than as a follow-up setattr, so open() knows
+        // not to stage (download) content that is about to be discarded.
+        let _ = config.add_capabilities(InitFlags::FUSE_ATOMIC_O_TRUNC);
         // Negotiate FUSE_PASSTHROUGH support unconditionally — cheap and
         // harmless if unused. Whether any given open() actually hands the
         // kernel a backing fd is decided per-open against passthrough_enabled/
@@ -5763,6 +5856,9 @@ impl Filesystem for NextCloudFs {
                                     ino,
                                     io_kind,
                                     upload_failed: false,
+                                    created: false,
+                                    unlinked: false,
+                                    opened_gen: self.uploads.generation(),
                                 });
                                 log::info!("ghost create: {} (inotify trigger)", full_path.display());
                                 reply.created(&TTL, &attr, Generation(0), FileHandle(fh), plain_open_flags(io_kind));
@@ -5845,6 +5941,9 @@ impl Filesystem for NextCloudFs {
                 ino,
                 io_kind,
                 upload_failed: false,
+                created: true,
+                unlinked: false,
+                opened_gen: self.uploads.generation(),
             },
         );
 
@@ -5920,6 +6019,8 @@ impl Filesystem for NextCloudFs {
                 files.push(new_entry);
                 dir.files = Arc::new(files);
             }
+            // Listing the new folder before its MKCOL reaches the server must not 404.
+            c.put_dir_cache(remote_path.clone(), None, None, Vec::new());
             ino
         };
         self.dirty.safe_lock().insert(parent_path);
@@ -5933,7 +6034,9 @@ impl Filesystem for NextCloudFs {
             let conn = self.conn.clone();
             let journal = self.journal.clone();
             let elog = self.error_log.clone();
+            let ticket = self.uploads.ticket_entry(&remote_path);
             thread::spawn(move || {
+                ticket.wait();
                 let _permit = conn.throttle.acquire();
                 match conn.backend.mkdir(&remote_path) {
                     Ok(()) => {
@@ -6064,6 +6167,13 @@ impl Filesystem for NextCloudFs {
             });
         }
 
+        // A handle still open on the deleted file must not re-create it when it is released.
+        for of in self.open_files.safe_lock().values_mut() {
+            if of.remote_path == remote_path {
+                of.unlinked = true;
+            }
+        }
+
         let seq = self.journal.safe_lock().enqueue(
             mutation_journal::MutationOp::Unlink { path: remote_path.clone() },
         );
@@ -6073,7 +6183,11 @@ impl Filesystem for NextCloudFs {
             let journal = self.journal.clone();
             let elog = self.error_log.clone();
             let cache = self.cache.clone();
+            let uploads = self.uploads.clone();
+            let ticket = uploads.ticket_entry(&remote_path);
             thread::spawn(move || {
+                ticket.wait();
+                uploads.forget(&remote_path);
                 // Hold the DELETE until the file's own upload has drained. LibreOffice
                 // (and similar apps) create a lock file, then delete it a moment later;
                 // its PUT may still be in flight, and Nextcloud's transactional locking
@@ -6211,7 +6325,10 @@ impl Filesystem for NextCloudFs {
             let journal = self.journal.clone();
             let cache = self.cache.clone();
             let elog = self.error_log.clone();
+            // Waits for every upload inside the folder (they hold it Shared).
+            let ticket = self.uploads.ticket_entry(&remote_path);
             thread::spawn(move || {
+                ticket.wait();
                 let _permit = conn.throttle.acquire();
                 match conn.backend.delete(&remote_path) {
                     Ok(()) => {
@@ -6392,6 +6509,31 @@ impl Filesystem for NextCloudFs {
         }
         reply.ok();
 
+        // Handles still open under the source now commit to the destination. One made by
+        // create() means the server has no copy of the source yet, so there is nothing to MOVE.
+        let mut uncommitted_source = false;
+        {
+            let mut files = self.open_files.safe_lock();
+            for of in files.values_mut() {
+                if let Ok(suffix) = of.remote_path.strip_prefix(&from) {
+                    if suffix.as_os_str().is_empty() {
+                        uncommitted_source |= of.created && !of.unlinked;
+                        of.remote_path = to.clone();
+                    } else {
+                        of.remote_path = to.join(suffix);
+                    }
+                }
+            }
+        }
+        if uncommitted_source && !self.journal.safe_lock().has_pending_put(&from) {
+            log::info!("rename {} → {}: source not uploaded yet — retargeted, no MOVE needed", from.display(), to.display());
+            let mut c = self.cache.safe_lock();
+            if c.uploading.remove(&from) {
+                c.uploading.insert(to.clone());
+            }
+            return;
+        }
+
         let seq = self.journal.safe_lock().enqueue(
             mutation_journal::MutationOp::Rename { from: from.clone(), to: to.clone() },
         );
@@ -6401,7 +6543,17 @@ impl Filesystem for NextCloudFs {
             let journal = self.journal.clone();
             let elog = self.error_log.clone();
             let cache = self.cache.clone();
+            let uploads = self.uploads.clone();
+            let root = Path::new("/");
+            let ticket = uploads.seq.ticket(&[
+                (from.as_path(), path_seq::Access::Exclusive),
+                (to.as_path(), path_seq::Access::Exclusive),
+                (from.parent().unwrap_or(root), path_seq::Access::Shared),
+                (to.parent().unwrap_or(root), path_seq::Access::Shared),
+            ]);
             thread::spawn(move || {
+                // Runs after every earlier change to either path, e.g. the source's upload.
+                ticket.wait();
                 // If the source was just created via create() + flush(), the PUT runs
                 // asynchronously and the file may not yet exist on the server when this
                 // MOVE fires.  Wait until BOTH the in-flight upload guard is cleared AND
@@ -6434,6 +6586,7 @@ impl Filesystem for NextCloudFs {
                 match conn.backend.rename(&from, &to) {
                     Ok(()) => {
                         log::info!("MOVE {} → {}", from.display(), to.display());
+                        uploads.moved(&from, &to);
                         journal.safe_lock().remove(seq);
                     }
                     Err(backend::BackendWriteError::Server(404, _)) => {
