@@ -876,7 +876,7 @@ impl OfflineStatus {
 /// `sz <= 16384` guard rejected it and every such file was fully downloaded
 /// (~300 ms each) just to answer a MIME query — the regression this fixes.
 ///
-/// `read()` intercepts when `off == 0 && sz <= MIME_DETECT_MAX_READ` (32768).
+/// `read()` intercepts when `off == 0 && sz <= GLIB_SNIFF_MAX_READ` (32768).
 /// That covers the read-ahead-inflated magic read while staying safely below
 /// the smallest copy buffer (GIO's 65536), so copies still fall through to the
 /// real network-fetch path.  (In practice copy tools do not even set
@@ -895,7 +895,6 @@ impl OfflineStatus {
 /// MIME-detection probe (see [`mime_magic_bytes`]).  GLib asks for 16384 bytes,
 /// but kernel read-ahead inflates the initial read up to one 8-page window
 /// (32768 bytes) regardless of file size; copy tools use ≥65536-byte buffers.
-const MIME_DETECT_MAX_READ: usize = desktop::toolkit::gio::GLIB_SNIFF_MAX_READ;
 
 pub fn mime_magic_bytes(content_type: &str) -> &'static [u8] {
     let ct = content_type.split(';').next().unwrap_or(content_type).trim();
@@ -4694,7 +4693,7 @@ impl Filesystem for NextCloudFs {
         // user is about to open). FOPEN_DIRECT_IO keeps this handle's reads out
         // of the page cache entirely, so the short reply cannot poison it — and
         // as a bonus the kernel stops inflating the probe read via read-ahead, so
-        // it always arrives within the MIME_DETECT_MAX_READ guard at its true size.
+        // it always arrives within the GLIB_SNIFF_MAX_READ guard at its true size.
         let mime_detect = mime_detect_ct.is_some();
 
         // Kernel FUSE_PASSTHROUGH: only offered for a read-only open already
@@ -4865,7 +4864,7 @@ impl Filesystem for NextCloudFs {
                 // PROPFIND dir cache. Zero network I/O; see mime_magic_bytes() for details.
                 //
                 // Guard: GLib's 16384-byte magic-detection read is inflated by
-                // kernel read-ahead up to MIME_DETECT_MAX_READ (32768) for the
+                // kernel read-ahead up to GLIB_SNIFF_MAX_READ (32768) for the
                 // initial read of a file, while copy tools use ≥65536-byte
                 // buffers. Intercepting reads up to that bound keeps copies
                 // correct. See mime_magic_bytes() for the full rationale.
@@ -4876,7 +4875,7 @@ impl Filesystem for NextCloudFs {
                         reply.data(&magic[..end]);
                         return;
                     }
-                    // Copy-sized read (sz > MIME_DETECT_MAX_READ) on a handle that was opened while the
+                    // Copy-sized read (sz > GLIB_SNIFF_MAX_READ) on a handle that was opened while the
                     // file was NOT in the local cache (mime_detect_ct being set proves this).
                     // If we are offline, we have no real content to serve — fail now rather
                     // than letting the file_cache return a stale/poisoned entry or letting

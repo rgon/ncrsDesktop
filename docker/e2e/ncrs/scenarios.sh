@@ -180,7 +180,7 @@ echo "→ 11. MIME magic-byte interception (content-type sniffing must not downl
 # GLib 2.80 sniffs the content type of a file with an unknown/ambiguous
 # extension by opening it O_NOATIME and reading the first ~16 KiB. On a remote
 # mount ncrs must answer that probe with a few synthetic magic bytes instead of
-# downloading the file (see mime_magic_bytes() / MIME_DETECT_MAX_READ in
+# downloading the file (see mime_magic_bytes() / GLIB_SNIFF_MAX_READ in
 # ncrs_core/src/lib.rs). ncrs opens the intercepted handle FOPEN_DIRECT_IO, which
 # both keeps the tiny reply out of the page cache (a buffered short read at
 # offset 0 would otherwise be cached as EOF and truncate every later read of the
