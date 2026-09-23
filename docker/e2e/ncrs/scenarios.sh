@@ -690,6 +690,90 @@ else
     sleep 3   # let the monitor settle online before the suite ends
 fi
 
+echo "→ 22. SERVER EDIT of a KEPT file — the refresh that evicts it must not freeze the mount"
+# Regression for the v0.1.73 freeze: a read-triggered refresh that found a locally
+# cached (kept) file changed on the server evicted it while holding the cache lock,
+# then re-locked that lock to persist the file cache. The refresh thread deadlocked
+# on itself and every later getattr/lookup blocked forever. The other scenarios never
+# reached it because nothing is kept (auto_keep_cached_files: false), so the eviction
+# found no file-cache entry. A sibling is added alongside the edit so the dir ETag
+# moves and the refresh gets past its unchanged-ETag short-circuit.
+# Every mount access here is SIGKILL-bounded: a hang must fail the suite, not stall it.
+SOCK="$(ls "${XDG_RUNTIME_DIR:-/nonexistent}/ncrs.sock" /tmp/ncrs-"$(id -u)"/ncrs.sock 2>/dev/null | head -1)"
+ipc() { printf '%s\n' "$1" | timeout 10 nc -U -N "$SOCK" 2>/dev/null; }
+bounded() { timeout -s KILL "$@"; }   # exit 137 = the call was still blocked in the kernel
+mount_hung() {
+    no "$1 — mount frozen (FUSE request never answered)"
+    DPID="$(pgrep -x ncrs | head -1)"
+    for t in /proc/"$DPID"/task/*; do
+        echo "    $(cat "$t/comm" 2>/dev/null): $(head -4 "$t/stack" 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+    done
+    pkill -9 -x ncrs   # release the blocked requests so teardown cannot hang too
+    echo
+    echo "e2e results: ${PASS} passed, ${FAIL} failed"
+    exit 1
+}
+mkdir "$MOUNT/relock"
+for _ in $(seq 1 30); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}relock/")" = "207" ] && break
+    sleep 1
+done
+RK="kept-baseline $(date +%s%N)"
+printf '%s' "$RK" > "$MOUNT/relock/kept.txt"
+wait_dav_sha relock/kept.txt "$(printf '%s' "$RK" | sha)" 60 >/dev/null || no "setup: kept.txt never reached the backend"
+[ -S "$SOCK" ] && [ "$(ipc "KEEP $MOUNT/relock/kept.txt")" = "ok" ] || no "setup: IPC KEEP was not accepted (socket: ${SOCK:-none})"
+kept=""
+for _ in $(seq 1 60); do
+    if [ "$(ipc "STATUS $MOUNT/relock/kept.txt")" = "kept" ] \
+        && [ -n "$(find "$HOME/.cache/ncrs" -path '*/kept/relock/kept.txt' -type f 2>/dev/null)" ]; then
+        kept=1; break
+    fi
+    sleep 1
+done
+[ -n "$kept" ] && ok "setup: file pinned locally (file-cache entry + kept copy on disk)" \
+    || no "setup: KEEP never produced a kept local copy"
+sleep 11                                          # age the listing past the 10s dir TTL
+bounded 20 ls "$MOUNT/relock" >/dev/null 2>&1     # synchronous re-list: this is old_snap
+[ $? -eq 137 ] && mount_hung "re-list before the server edit"
+RKN="server-edited $(date +%s%N) $(head -c 2048 /dev/urandom | base64 | tr -d '\n')"
+printf '%s' "$RKN" > /tmp/relock.new
+curl -s -u "$U:$P" -T /tmp/relock.new "${URL}relock/kept.txt" -o /dev/null
+printf 'sibling' > /tmp/relock.sib
+curl -s -u "$U:$P" -T /tmp/relock.sib "${URL}relock/sibling.txt" -o /dev/null
+sleep 3                                           # past the just-listed suppression, inside the TTL
+evicted=""
+for _ in $(seq 1 15); do
+    bounded 20 ls "$MOUNT/relock" >/dev/null 2>&1  # each read schedules the background refresh
+    [ $? -eq 137 ] && mount_hung "listing while the refresh ran"
+    if grep -q "file_cache: evicted stale /relock/kept.txt" "$NCRS_LOG" 2>/dev/null; then evicted=1; break; fi
+    sleep 1
+done
+if [ -n "$evicted" ]; then
+    ok "refresh evicted the kept file's stale copy (the formerly deadlocking path ran)"
+else
+    no "refresh never evicted the kept file — scenario did not reach the regression path"
+fi
+sleep 2
+bounded 20 stat "$MOUNT/relock/kept.txt" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 137 ] && mount_hung "getattr after the eviction"
+bounded 20 ls "$MOUNT/new_after_relock_probe" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 137 ] && mount_hung "lookup after the eviction"
+ok "getattr and lookup still answered after the eviction (no cache-lock deadlock)"
+got=""
+for _ in $(seq 1 45); do
+    got="$(bounded 20 sha256sum "$MOUNT/relock/kept.txt" 2>/dev/null | awk '{print $1}')"
+    [ "$got" = "$(sha < /tmp/relock.new)" ] && break
+    sleep 1
+done
+[ "$got" = "$(sha < /tmp/relock.new)" ] && ok "evicted kept file re-reads as the new server content" \
+    || no "kept file did not re-read as the server edit (got ${got:0:12})"
+stuck=0
+for w in /sys/fs/fuse/connections/*/waiting; do
+    [ -r "$w" ] && [ "$(cat "$w")" != 0 ] && stuck=$((stuck + $(cat "$w")))
+done
+[ "$stuck" = 0 ] && ok "no FUSE requests left waiting on the daemon" \
+    || no "$stuck FUSE request(s) still waiting on the daemon at suite end"
+
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
