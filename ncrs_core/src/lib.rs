@@ -196,8 +196,21 @@ impl Throttle {
         Throttle { state: Mutex::new(0), cv: Condvar::new(), max }
     }
 
+    /// For callers on the FUSE dispatch thread, which must never wait unbounded for a slot.
+    pub fn acquire_timeout(&self, timeout: Duration) -> Option<ThrottleGuard<'_>> {
+        let count = self.state.safe_lock();
+        let (mut count, _) = self.cv
+            .wait_timeout_while(count, timeout, |c| *c >= self.max)
+            .unwrap_or_else(|e| e.into_inner());
+        if *count >= self.max {
+            return None;
+        }
+        *count += 1;
+        Some(ThrottleGuard { throttle: self })
+    }
+
     pub fn acquire(&self) -> ThrottleGuard<'_> {
-        let mut count = self.state.lock().unwrap();
+        let mut count = self.state.safe_lock();
         if *count >= self.max {
             let t = Instant::now();
             while *count >= self.max {
@@ -215,7 +228,7 @@ impl Throttle {
 
 impl Drop for ThrottleGuard<'_> {
     fn drop(&mut self) {
-        let mut count = self.throttle.state.lock().unwrap();
+        let mut count = self.throttle.state.safe_lock();
         *count -= 1;
         self.throttle.cv.notify_one();
     }
@@ -2045,9 +2058,10 @@ fn list_dir_cached_or_fresh(
         }
     };
     if let Some(old_etag) = expired_etag {
-        let probe = {
-            let _permit = conn.throttle.acquire();
-            conn.backend.dir_change_token(&path, PROPFIND_TIMEOUT)
+        // Reached from lookup/getattr/readdir on the FUSE dispatch thread.
+        let probe = match conn.throttle.acquire_timeout(PROPFIND_TIMEOUT) {
+            Some(_permit) => conn.backend.dir_change_token(&path, PROPFIND_TIMEOUT),
+            None => Err(backend::BackendReadError::Timeout),
         };
         let mut c = cache.safe_lock();
         match probe {
@@ -4949,8 +4963,6 @@ impl Filesystem for NextCloudFs {
                                 && total_bytes as u64 >= file_total_size
                                 && cache.safe_lock().file_cache.get(&path).is_none()
                             {
-                                let ss = mtx.lock().unwrap();
-                                let data = &ss.data[..file_total_size as usize];
                                 let (target_dir, kept) = {
                                     let c = cache.safe_lock();
                                     if auto_keep_cached {
@@ -4964,7 +4976,13 @@ impl Filesystem for NextCloudFs {
                                 if let Some(parent) = local_path.parent() {
                                     let _ = std::fs::create_dir_all(parent);
                                 }
-                                if std::fs::write(&local_path, data).is_ok() {
+                                // Stream lock held only for the write: read() takes open_files then
+                                // this lock, so it must never be held while taking cache/open_files.
+                                let written = {
+                                    let ss = mtx.lock().unwrap();
+                                    std::fs::write(&local_path, &ss.data[..file_total_size as usize]).is_ok()
+                                };
+                                if written {
                                     let mut c = cache.safe_lock();
                                     let mod_time = c.remote_modified_for(&path);
                                     let etag = c.remote_etag_for(&path);
@@ -5692,8 +5710,9 @@ impl Filesystem for NextCloudFs {
         }
 
         {
-            let mut ghosts = self.ghost_entries.safe_lock();
-            if let Some(ghost) = ghosts.remove(&full_path) {
+            // Released before taking `cache`: refreshes lock `cache` then `ghost_entries`.
+            let ghost = self.ghost_entries.safe_lock().remove(&full_path);
+            if let Some(ghost) = ghost {
                 if ghost.created_at.elapsed() < GHOST_TTL {
                     if let GhostKind::HiddenAdd = ghost.kind {
                         let mut c = self.cache.safe_lock();
@@ -5840,8 +5859,9 @@ impl Filesystem for NextCloudFs {
         let remote_path = parent_path.join(&dir_name);
 
         {
-            let mut ghosts = self.ghost_entries.safe_lock();
-            if let Some(ghost) = ghosts.remove(&remote_path) {
+            // Released before taking `cache`: refreshes lock `cache` then `ghost_entries`.
+            let ghost = self.ghost_entries.safe_lock().remove(&remote_path);
+            if let Some(ghost) = ghost {
                 if ghost.created_at.elapsed() < GHOST_TTL {
                     if let GhostKind::HiddenAdd = ghost.kind {
                         let ino = self.cache.safe_lock().allocate_inode(remote_path.clone());

@@ -56,7 +56,8 @@ struct Cli {
 }
 
 fn main() {
-    env_logger::init();
+    // The GUI spawns the daemon without RUST_LOG; bare env_logger::init() would then log nothing.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = Cli::parse();
 
     if cli.print_default_config {

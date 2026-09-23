@@ -578,128 +578,12 @@ fn refresh_one_dir(
 
     match result {
         Ok((etag, self_entry, fresh_files)) => {
-            let diff = compute_dir_diff(&old_snap, &fresh_files);
-            static RENAME_PAIR_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-            if !diff.removed.is_empty() {
-                log::info!("proactive_refresh: {} removed from {}: {:?}", diff.removed.len(), dir_path.display(), diff.removed);
-            }
-            if !diff.added.is_empty() {
-                log::info!("proactive_refresh: {} added to {}: {:?}", diff.added.len(), dir_path.display(), diff.added);
-            }
-            if !diff.modified.is_empty() {
-                log::info!("proactive_refresh: {} file(s) modified in {}: {:?}", diff.modified.len(), dir_path.display(), diff.modified);
-            }
+            drop(_permit);
+            let AppliedListing { diff, parent_ino, delete_targets, modified_inodes, added_is_dir } =
+                apply_listing(&cache, &ghost_entries, &dir_path, &old_snap, etag, self_entry, fresh_files);
 
             let listing_changed = !diff.added.is_empty() || !diff.removed.is_empty() || !diff.renames.is_empty();
             let had_changes = listing_changed || !diff.modified.is_empty();
-
-            let mut c = cache.safe_lock();
-            let parent_ino = c.get_inode(&dir_path).unwrap_or(1);
-
-            let mut file_cache_changed = false;
-            for (old_path, new_path, is_dir) in &diff.renames {
-                if !is_dir {
-                    if let Some(entry) = c.file_cache.remove(old_path) {
-                        c.file_cache.insert(new_path.clone(), entry);
-                        file_cache_changed = true;
-                        log::info!("file_cache: moved {} → {}", old_path.display(), new_path.display());
-                    }
-                }
-            }
-
-            // A file whose content changed on the server (new etag → flagged
-            // `modified`) makes our locally cached copy stale. Evict it — both the
-            // map entry and the on-disk file — so the next read re-downloads via
-            // ensure_file_cached instead of the read fast-path serving the old bytes
-            // at the NEW (dir-cache) size. That size/content mismatch is what makes a
-            // ZIP-based format (odt/xlsx/…) opened right after a server-side edit look
-            // corrupt. Renames are handled above; only genuine content changes land here.
-            for p in &diff.modified {
-                if let Some(entry) = c.file_cache.remove(p) {
-                    match std::fs::remove_file(&entry.local_path) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => log::warn!("file_cache: failed to remove stale {}: {}", entry.local_path.display(), e),
-                    }
-                    file_cache_changed = true;
-                    log::info!("file_cache: evicted stale {} (modified on server)", p.display());
-                }
-            }
-
-            {
-                let old_entries = c.get_cached_dir_readonly(&dir_path);
-                let mut ghosts = ghost_entries.safe_lock();
-
-                for p in &diff.removed {
-                    if let Some(old_entry) = old_entries.as_ref()
-                        .and_then(|entries| entries.iter().find(|e| &e.path == p))
-                    {
-                        let ino = c.get_inode(p).unwrap_or(1);
-                        let attr = crate::make_file_attr(ino, old_entry);
-                        ghosts.insert(p.clone(), GhostEntry {
-                            kind: GhostKind::VisibleDelete { attr },
-                            created_at: Instant::now(),
-                            rename_pair_id: None,
-                        });
-                        log::info!("ghost: VisibleDelete for {} (ino={})", p.display(), ino);
-                    }
-                }
-
-                for (old_path, new_path, _) in &diff.renames {
-                    let pair_id = RENAME_PAIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    if let Some(old_entry) = old_entries.as_ref()
-                        .and_then(|entries| entries.iter().find(|e| &e.path == old_path))
-                    {
-                        let ino = c.get_inode(old_path).unwrap_or(1);
-                        let attr = crate::make_file_attr(ino, old_entry);
-                        ghosts.insert(old_path.clone(), GhostEntry {
-                            kind: GhostKind::VisibleDelete { attr },
-                            created_at: Instant::now(),
-                            rename_pair_id: Some(pair_id),
-                        });
-                        ghosts.insert(new_path.clone(), GhostEntry {
-                            kind: GhostKind::HiddenAdd,
-                            created_at: Instant::now(),
-                            rename_pair_id: Some(pair_id),
-                        });
-                        log::info!("ghost: rename pair {} ↔ {} (pair_id={})", old_path.display(), new_path.display(), pair_id);
-                    }
-                }
-            }
-
-            let delete_targets: Vec<(u64, String)> = diff.removed.iter().filter_map(|p| {
-                let child_ino = c.get_inode(p).unwrap_or(0);
-                p.file_name().map(|n| (child_ino, n.to_string_lossy().into_owned()))
-            }).collect();
-            let modified_inodes: Vec<u64> = diff.modified.iter()
-                .filter_map(|p| c.get_inode(p))
-                .collect();
-
-            let added_is_dir: HashMap<PathBuf, bool> = fresh_files.iter()
-                .filter(|f| diff.added.contains(&f.path))
-                .map(|f| (f.path.clone(), f.is_dir))
-                .collect();
-
-            c.put_dir_cache(dir_path.clone(), etag, self_entry, fresh_files);
-
-            {
-                let mut ghosts = ghost_entries.safe_lock();
-                for p in &diff.added {
-                    ghosts.insert(p.clone(), GhostEntry {
-                        kind: GhostKind::HiddenAdd,
-                        created_at: Instant::now(),
-                        rename_pair_id: None,
-                    });
-                    log::info!("ghost: HiddenAdd for {}", p.display());
-                }
-            }
-
-            if file_cache_changed {
-                crate::save_file_cache(&cache);
-            }
-
-            drop(c);
 
             if !diff.added.is_empty() || !diff.removed.is_empty() || !diff.modified.is_empty() || !diff.renames.is_empty() {
                 let mut q = file_change_queue.safe_lock();
@@ -746,6 +630,148 @@ fn refresh_one_dir(
             log::warn!("proactive_refresh: {} failed: {}", dir_path.display(), e);
         }
     }
+}
+
+pub(crate) struct AppliedListing {
+    pub diff: DirDiff,
+    pub parent_ino: u64,
+    pub delete_targets: Vec<(u64, String)>,
+    pub modified_inodes: Vec<u64>,
+    pub added_is_dir: HashMap<PathBuf, bool>,
+}
+
+/// Merges a fresh listing of `dir_path` into the cache and ghost map.
+/// Lock order is `cache` then `ghost_entries`; `cache` is released before `save_file_cache` re-locks it.
+pub(crate) fn apply_listing(
+    cache: &Mutex<crate::FsCache>,
+    ghost_entries: &Mutex<HashMap<PathBuf, GhostEntry>>,
+    dir_path: &Path,
+    old_snap: &OldDirSnapshot,
+    etag: Option<String>,
+    self_entry: Option<crate::backend::RemoteEntry>,
+    fresh_files: Vec<crate::backend::RemoteEntry>,
+) -> AppliedListing {
+    let diff = compute_dir_diff(old_snap, &fresh_files);
+    static RENAME_PAIR_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    if !diff.removed.is_empty() {
+        log::info!("proactive_refresh: {} removed from {}: {:?}", diff.removed.len(), dir_path.display(), diff.removed);
+    }
+    if !diff.added.is_empty() {
+        log::info!("proactive_refresh: {} added to {}: {:?}", diff.added.len(), dir_path.display(), diff.added);
+    }
+    if !diff.modified.is_empty() {
+        log::info!("proactive_refresh: {} file(s) modified in {}: {:?}", diff.modified.len(), dir_path.display(), diff.modified);
+    }
+
+    let mut c = cache.safe_lock();
+    let parent_ino = c.get_inode(dir_path).unwrap_or(1);
+
+    let mut file_cache_changed = false;
+    for (old_path, new_path, is_dir) in &diff.renames {
+        if !is_dir {
+            if let Some(entry) = c.file_cache.remove(old_path) {
+                c.file_cache.insert(new_path.clone(), entry);
+                file_cache_changed = true;
+                log::info!("file_cache: moved {} → {}", old_path.display(), new_path.display());
+            }
+        }
+    }
+
+    // A file whose content changed on the server (new etag → flagged
+    // `modified`) makes our locally cached copy stale. Evict it — both the
+    // map entry and the on-disk file — so the next read re-downloads via
+    // ensure_file_cached instead of the read fast-path serving the old bytes
+    // at the NEW (dir-cache) size. That size/content mismatch is what makes a
+    // ZIP-based format (odt/xlsx/…) opened right after a server-side edit look
+    // corrupt. Renames are handled above; only genuine content changes land here.
+    for p in &diff.modified {
+        if let Some(entry) = c.file_cache.remove(p) {
+            match std::fs::remove_file(&entry.local_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!("file_cache: failed to remove stale {}: {}", entry.local_path.display(), e),
+            }
+            file_cache_changed = true;
+            log::info!("file_cache: evicted stale {} (modified on server)", p.display());
+        }
+    }
+
+    {
+        let old_entries = c.get_cached_dir_readonly(dir_path);
+        let mut ghosts = ghost_entries.safe_lock();
+
+        for p in &diff.removed {
+            if let Some(old_entry) = old_entries.as_ref()
+                .and_then(|entries| entries.iter().find(|e| &e.path == p))
+            {
+                let ino = c.get_inode(p).unwrap_or(1);
+                let attr = crate::make_file_attr(ino, old_entry);
+                ghosts.insert(p.clone(), GhostEntry {
+                    kind: GhostKind::VisibleDelete { attr },
+                    created_at: Instant::now(),
+                    rename_pair_id: None,
+                });
+                log::info!("ghost: VisibleDelete for {} (ino={})", p.display(), ino);
+            }
+        }
+
+        for (old_path, new_path, _) in &diff.renames {
+            let pair_id = RENAME_PAIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if let Some(old_entry) = old_entries.as_ref()
+                .and_then(|entries| entries.iter().find(|e| &e.path == old_path))
+            {
+                let ino = c.get_inode(old_path).unwrap_or(1);
+                let attr = crate::make_file_attr(ino, old_entry);
+                ghosts.insert(old_path.clone(), GhostEntry {
+                    kind: GhostKind::VisibleDelete { attr },
+                    created_at: Instant::now(),
+                    rename_pair_id: Some(pair_id),
+                });
+                ghosts.insert(new_path.clone(), GhostEntry {
+                    kind: GhostKind::HiddenAdd,
+                    created_at: Instant::now(),
+                    rename_pair_id: Some(pair_id),
+                });
+                log::info!("ghost: rename pair {} ↔ {} (pair_id={})", old_path.display(), new_path.display(), pair_id);
+            }
+        }
+    }
+
+    let delete_targets: Vec<(u64, String)> = diff.removed.iter().filter_map(|p| {
+        let child_ino = c.get_inode(p).unwrap_or(0);
+        p.file_name().map(|n| (child_ino, n.to_string_lossy().into_owned()))
+    }).collect();
+    let modified_inodes: Vec<u64> = diff.modified.iter()
+        .filter_map(|p| c.get_inode(p))
+        .collect();
+
+    let added_is_dir: HashMap<PathBuf, bool> = fresh_files.iter()
+        .filter(|f| diff.added.contains(&f.path))
+        .map(|f| (f.path.clone(), f.is_dir))
+        .collect();
+
+    c.put_dir_cache(dir_path.to_path_buf(), etag, self_entry, fresh_files);
+
+    {
+        let mut ghosts = ghost_entries.safe_lock();
+        for p in &diff.added {
+            ghosts.insert(p.clone(), GhostEntry {
+                kind: GhostKind::HiddenAdd,
+                created_at: Instant::now(),
+                rename_pair_id: None,
+            });
+            log::info!("ghost: HiddenAdd for {}", p.display());
+        }
+    }
+
+    drop(c);
+
+    if file_cache_changed {
+        crate::save_file_cache(cache);
+    }
+
+    AppliedListing { diff, parent_ino, delete_targets, modified_inodes, added_is_dir }
 }
 
 fn proactive_refresh(

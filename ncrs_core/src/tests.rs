@@ -2713,3 +2713,86 @@ mod http3_available_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod refresh_lock_tests {
+    use crate::backend::{EntryExtensions, RemoteEntry};
+    use crate::notify_push::{apply_listing, OldDirSnapshot};
+    use crate::{FileCacheEntry, GhostEntry, Throttle};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    fn entry(path: &str, etag: &str, fileid: u64) -> RemoteEntry {
+        let mut ext = EntryExtensions::default();
+        ext.set_int("fileid", fileid);
+        RemoteEntry {
+            path: PathBuf::from(path),
+            is_dir: false,
+            size: 3,
+            modified: None,
+            change_token: Some(etag.into()),
+            content_type: None,
+            ext,
+        }
+    }
+
+    fn cached(local_path: PathBuf) -> FileCacheEntry {
+        FileCacheEntry { local_path, remote_modified: None, etag: Some("e".into()), kept: false, size: 3 }
+    }
+
+    // Regression: a refresh that moved or evicted a cached file re-locked `cache`
+    // (via save_file_cache) while still holding it, freezing every FUSE getattr.
+    #[test]
+    fn refresh_that_moves_and_evicts_cached_files_releases_the_cache_lock() {
+        let dir = std::env::temp_dir().join(format!("ncrs-refresh-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let modified_copy = dir.join("a.txt");
+        let renamed_copy = dir.join("b.txt");
+        std::fs::write(&modified_copy, b"old").unwrap();
+        std::fs::write(&renamed_copy, b"old").unwrap();
+
+        let old = vec![entry("/d/a.txt", "a1", 1), entry("/d/b.txt", "b1", 2)];
+        let fresh = vec![entry("/d/a.txt", "a2", 1), entry("/d/c.txt", "b1", 2)];
+
+        let mut c = super::make_test_cache();
+        c.cache_dir = dir.clone();
+        c.file_cache.insert(PathBuf::from("/d/a.txt"), cached(modified_copy.clone()));
+        c.file_cache.insert(PathBuf::from("/d/b.txt"), cached(renamed_copy.clone()));
+        c.put_dir_cache(PathBuf::from("/d"), Some("d1".into()), None, old.clone());
+        let snap = OldDirSnapshot::of(&old);
+        let cache = Arc::new(Mutex::new(c));
+        let ghosts: Arc<Mutex<HashMap<PathBuf, GhostEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        let (tx, rx) = mpsc::channel();
+        {
+            let (cache, ghosts) = (cache.clone(), ghosts.clone());
+            std::thread::spawn(move || {
+                let applied = apply_listing(&cache, &ghosts, Path::new("/d"), &snap, Some("d2".into()), None, fresh);
+                let _ = tx.send((applied.diff.modified.len(), applied.diff.renames.len()));
+            });
+        }
+        let (modified, renamed) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("apply_listing did not return: cache lock re-entered while held");
+        assert_eq!((modified, renamed), (1, 1));
+
+        let c = cache.try_lock().expect("cache lock still held after apply_listing");
+        assert!(!c.file_cache.contains_key(Path::new("/d/a.txt")));
+        assert!(c.file_cache.contains_key(Path::new("/d/c.txt")));
+        drop(c);
+        assert!(!modified_copy.exists(), "stale copy of a modified file must be removed");
+        assert!(dir.join("file_cache.json").exists(), "file cache must be persisted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn throttle_acquire_timeout_gives_up_when_saturated() {
+        let t = Throttle::new(1);
+        let held = t.acquire();
+        assert!(t.acquire_timeout(Duration::from_millis(50)).is_none());
+        drop(held);
+        assert!(t.acquire_timeout(Duration::from_millis(50)).is_some());
+    }
+}
