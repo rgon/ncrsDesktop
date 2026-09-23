@@ -724,6 +724,80 @@ for spec in mw6:6:multi mw25:25:multi cp25:25:cp; do
     fi
 done
 
+echo "→ 24. APPEND to a file with no local copy — the existing content must be kept"
+# Opening an uncached file for writing without O_TRUNC left the staging file empty, so an
+# append (its writes land at the old size) uploaded a zero-filled prefix.
+AB="append-base $(date +%s%N)"
+printf '%s' "$AB" > "$MOUNT/append.txt"
+if wait_dav_sha append.txt "$(printf '%s' "$AB" | sha)" 60; then
+    printf '%s' "-tail" >> "$MOUNT/append.txt"
+    if wait_dav_sha append.txt "$(printf '%s-tail' "$AB" | sha)" 60; then
+        ok "append to an uncached file kept its existing content on the server"
+    else
+        no "append to an uncached file lost its existing content (server: $(curl -s -u "$U:$P" "${URL}append.txt" | od -An -c | head -1))"
+    fi
+else
+    no "setup: append.txt never reached the backend"
+fi
+
+echo "→ 25. RENAME while still open — the upload follows the new name"
+# GLib's save writes a temp file and renames it before its last close. The upload happens
+# at that close, so it must land under the new name, and the MOVE of a temp that was never
+# uploaded must not 404 (the close comes after the old 30 s MOVE wait expired).
+exec 8>"$MOUNT/rn_tmp.txt"
+printf 'renamed-while-open' >&8
+mv "$MOUNT/rn_tmp.txt" "$MOUNT/rn_final.txt"
+sleep 35
+exec 8>&-
+if wait_dav_sha rn_final.txt "$(printf 'renamed-while-open' | sha)" 60; then
+    ok "file renamed while open was uploaded under its new name"
+else
+    no "file renamed while open is missing under its new name (HTTP $(dav_code rn_final.txt))"
+fi
+sleep 2
+[ "$(dav_code rn_tmp.txt)" = "404" ] && ok "no temp name left behind on the server" \
+    || no "the temp name was re-created on the server (HTTP $(dav_code rn_tmp.txt))"
+
+echo "→ 26. RAPID RE-SAVES of one file — the last save wins, no conflicted copies"
+# Every save commits its own upload; they must reach the server in save order, and a save
+# opened before the previous upload finished must chain its etag instead of 412-ing.
+mkdir "$MOUNT/resave"
+printf 'v0' > "$MOUNT/resave/doc.txt"
+wait_dav_sha resave/doc.txt "$(printf 'v0' | sha)" 60 >/dev/null || no "setup: resave/doc.txt never reached the backend"
+for i in 1 2 3 4 5 6; do
+    head -c 3000000 /dev/urandom > "/tmp/resave_$i"
+    cp "/tmp/resave_$i" "$MOUNT/resave/doc.txt"
+done
+if wait_dav_sha resave/doc.txt "$(sha < /tmp/resave_6)" 90; then
+    ok "six back-to-back saves: the server holds the last one"
+else
+    got=$(dav_sha resave/doc.txt); which="an older save or partial file"
+    for i in 1 2 3 4 5; do [ "$got" = "$(sha < "/tmp/resave_$i")" ] && which="save #$i"; done
+    no "six back-to-back saves: the server ended with ${which}, not the last save"
+fi
+sleep 3
+conflicts=$(curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 1' "${URL}resave/" | grep -o 'conflicted' | wc -l)
+[ "$conflicts" = 0 ] && ok "no conflicted copies from back-to-back saves" \
+    || no "$conflicts conflicted cop(ies) created by back-to-back saves"
+
+echo "→ 27. NEW FOLDER listed and filled right away — no 'not found', children land inside"
+# mkdir replied before its MKCOL reached the server and cached no listing, so listing the
+# folder straight away PROPFINDed a folder the server did not have yet.
+nf_fail=0
+for i in 1 2 3 4 5 6 7 8; do
+    d="newfolder_$i"
+    mkdir "$MOUNT/$d" && ls "$MOUNT/$d" >/dev/null 2>&1 && printf 'child %s' "$i" > "$MOUNT/$d/c.txt" \
+        || nf_fail=$((nf_fail + 1))
+done
+landed=0
+for i in 1 2 3 4 5 6 7 8; do
+    wait_dav_sha "newfolder_$i/c.txt" "$(printf 'child %s' "$i" | sha)" 60 && landed=$((landed + 1))
+done
+[ "$nf_fail" = 0 ] && ok "8 new folders listed and written immediately without errors" \
+    || no "$nf_fail of 8 new folders failed to list or accept a file right after mkdir"
+[ "$landed" = 8 ] && ok "all 8 files uploaded into their just-created folders" \
+    || no "only $landed of 8 files reached their just-created folders"
+
 echo "→ 22. SERVER EDIT of a KEPT file — the refresh that evicts it must not freeze the mount"
 # Regression for the v0.1.73 freeze: a read-triggered refresh that found a locally
 # cached (kept) file changed on the server evicted it while holding the cache lock,
