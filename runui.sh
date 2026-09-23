@@ -5,7 +5,7 @@
 
 DEST="$HOME/.local/share/nautilus-python/extensions"
 mkdir -p "$DEST"
-cp shell_integration/nautilus/syncstate.py "$DEST/"
+cp shell_integration/file-managers/nautilus/syncstate.py "$DEST/"
 nautilus -q 2>/dev/null || true
 
 # GNOME Shell search provider

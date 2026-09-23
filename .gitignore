@@ -1,5 +1,5 @@
 /target
 /dist
 shell_integration/gnome-search/__pycache__/
-shell_integration/nautilus/__pycache__/
+shell_integration/file-managers/nautilus/__pycache__/
 docker/e2e/ncrs/ncrs
