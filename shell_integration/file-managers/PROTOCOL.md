@@ -17,8 +17,13 @@ other, and nothing here requires the GUI.
 - Paths are absolute local paths under the mount point. A path outside the
   mount gets `unknown`, an empty reply or `error: path not under mount`.
 - Errors start with `error: `. An unrecognised verb replies `unknown`.
+- Paths are sent raw: no escaping is defined, so a path containing `\t`,
+  `\x1e` or `\n` cannot be represented (such names are not supported).
 - Up to 64 concurrent connections. Adapters that load into many processes
-  (KDE file dialogs) must connect lazily, only once they see a URL under the mount.
+  (KDE file dialogs) must connect lazily. The mount point is only known from
+  `HELLO`, so "lazily" means on the first *local-file* lookup, with a cheap
+  failure (a missing socket is one stat) and a backoff. Streaming connections
+  (`WATCH`) should open only once a path under the mount has been seen.
 
 ## Handshake
 
@@ -35,6 +40,11 @@ A protocol mismatch is logged on both sides, and the connection keeps working
 for every verb both sides know.
 
 `VERSION <n>` → `<proto>\t<package-version>` is the v2 handshake, kept as an alias.
+It carries no mount point, so v3-only adapters (Dolphin) do not support v2 daemons.
+
+`HELLO` is per connection and optional. A `WATCH`-only connection does not
+need it, but it then does not appear in `CLIENTS`: say `HELLO` on the query
+connection so the adapter shows as connected.
 
 ## Status vocabulary
 
@@ -65,6 +75,8 @@ The machine-readable list is `status-vocabulary.txt`:
 | `THUMBNAIL <path>` | `ok` or `error: …` (fetch the server preview into the freedesktop cache) |
 
 `sharing` is `""`, `Shared by you`, `Shared with you` or `Shared`.
+
+The mount root has no parent listing: use `DETAIL <mount>` for its own status.
 
 ## Actions
 
