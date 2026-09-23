@@ -8,6 +8,7 @@ pub mod filename_validation;
 pub mod fuse_notify;
 pub mod ipc;
 pub mod http_clients;
+mod iomode;
 pub mod mutation_journal;
 pub mod nextcloud;
 pub mod notifications;
@@ -408,12 +409,17 @@ struct OpenFile {
     // seektable, then the playback position) missed the single per-handle buffer
     // about five times and pulled ~281 MB — 2.2x the file — before it could start.
     read_ahead_window: usize,
-    // Present only when this handle was granted kernel FUSE_PASSTHROUGH at
-    // open() — reads/writes for it bypass ncrs entirely from then on. Held here
-    // purely so it drops (and tells the kernel to tear down the backing
-    // registration) when the handle is removed from open_files in release().
-    #[allow(dead_code)]
-    backing_id: Option<BackingId>,
+    // Inode and kernel I/O mode this handle was opened with, returned to
+    // io_modes in release(). A Passthrough handle's reads bypass ncrs entirely.
+    ino: u64,
+    io_kind: iomode::IoKind,
+}
+
+fn plain_open_flags(kind: iomode::IoKind) -> FopenFlags {
+    match kind {
+        iomode::IoKind::DirectIo => FopenFlags::FOPEN_DIRECT_IO,
+        _ => FopenFlags::empty(),
+    }
 }
 
 /// Appends `data` to a chunk-streaming tail staging file, creating it if this
@@ -2674,6 +2680,7 @@ pub struct NextCloudFs {
     children_map: ipc::ChildrenMap,
     conn: Arc<ConnInfo>,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+    io_modes: Mutex<iomode::InodeIoModes<BackingId>>,
     open_dirs: Arc<Mutex<HashMap<u64, OpenDir>>>,
     next_fh: Arc<Mutex<u64>>,
     error_log: ErrorLog,
@@ -2947,6 +2954,7 @@ impl NextCloudFs {
             children_map,
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
+            io_modes: Mutex::new(iomode::InodeIoModes::default()),
             open_dirs: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
             error_log: Arc::new(Mutex::new(std::collections::VecDeque::new())),
@@ -4336,36 +4344,45 @@ impl Filesystem for NextCloudFs {
         // backed by a complete, fresh local cache copy — never for a handle
         // that may be served from the in-flight streaming buffer (of.buf) or
         // the write staging path, both of which require ncrs to stay on the
-        // data path (see OpenFile::backing_id and the read()/write() handlers).
-        // is_mime_detect implies local.is_none(), so it can never reach here.
-        let backing_id: Option<BackingId> = if !writable
-            && local.is_some()
-            && cache_fresh
-            && self.conn.passthrough_enabled.load(Ordering::Relaxed)
-            && self.conn.passthrough_capable.load(Ordering::Relaxed)
-        {
-            let lp = local.clone().unwrap();
-            match std::fs::File::open(&lp).and_then(|f| reply.open_backing(f)) {
-                Ok(id) => {
-                    log::debug!("FUSE passthrough granted for {}", lp.display());
-                    Some(id)
-                }
-                Err(e) => {
-                    // Sticky for the rest of this session — a missing
-                    // CAP_SYS_ADMIN or a pre-6.9 kernel will not fix itself
-                    // mid-run, so don't retry (and re-log) on every open().
-                    if self.conn.passthrough_capable.swap(false, Ordering::Relaxed) {
-                        log::info!(
-                            "FUSE passthrough unavailable ({}) — falling back to buffered reads for the rest of this session",
-                            e
-                        );
-                    }
-                    None
+        // data path (see the read()/write() handlers). io_modes then decides
+        // whether this open may actually use it (see iomode.rs).
+        let grant = if mime_detect {
+            iomode::IoGrant::DirectIo
+        } else {
+            let passthrough = if !writable
+                && cache_fresh
+                && self.conn.passthrough_enabled.load(Ordering::Relaxed)
+                && self.conn.passthrough_capable.load(Ordering::Relaxed)
+            {
+                let reply = &reply;
+                local.as_ref().and_then(|lp| {
+                    let file = iomode::FileId::of(&std::fs::metadata(lp).ok()?);
+                    Some((file, move || std::fs::File::open(lp).and_then(|f| reply.open_backing(f))))
+                })
+            } else {
+                None
+            };
+            let (grant, err) = self.io_modes.safe_lock().acquire(ino.0, passthrough);
+            if let Some(e) = err {
+                // Sticky for the rest of this session — a missing
+                // CAP_SYS_ADMIN or a pre-6.9 kernel will not fix itself
+                // mid-run, so don't retry (and re-log) on every open().
+                if self.conn.passthrough_capable.swap(false, Ordering::Relaxed) {
+                    log::info!(
+                        "FUSE passthrough unavailable ({}) — falling back to buffered reads for the rest of this session",
+                        e
+                    );
                 }
             }
-        } else {
-            None
+            grant
         };
+        match grant.kind() {
+            iomode::IoKind::Passthrough => log::debug!("FUSE passthrough granted for {}", path.display()),
+            iomode::IoKind::DirectIo if !mime_detect => {
+                log::debug!("open {}: inode already in passthrough mode — using direct I/O", path.display())
+            }
+            _ => {}
+        }
 
         self.open_files.safe_lock().insert(
             fh,
@@ -4383,23 +4400,17 @@ impl Filesystem for NextCloudFs {
                 total_written: 0,
                 stream_eligible: local.is_none(),
                 chunk_upload: None,
-                backing_id,
+                ino: ino.0,
+                io_kind: grant.kind(),
             },
         );
-        let fopen_flags = if mime_detect {
-            FopenFlags::FOPEN_DIRECT_IO
-        } else {
-            FopenFlags::empty()
-        };
-        // The BackingId must stay alive through and after this reply (the
-        // crate's own doc warns dropping it right after replying can cause
-        // the kernel to return EIO) — it now lives in the open_files entry
-        // just inserted above, so borrow it back from there rather than the
-        // now-moved local, and let it drop naturally in release().
-        let files = self.open_files.safe_lock();
-        match files.get(&fh).and_then(|of| of.backing_id.as_ref()) {
-            Some(id) => reply.opened_passthrough(FileHandle(fh), fopen_flags, id),
-            None => reply.opened(FileHandle(fh), fopen_flags),
+        // io_modes keeps the BackingId alive until the inode's last passthrough
+        // handle is released (the crate warns dropping it right after replying
+        // can make the kernel return EIO).
+        match grant {
+            iomode::IoGrant::Passthrough(id) => reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &id),
+            iomode::IoGrant::Cached => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            iomode::IoGrant::DirectIo => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
         }
     }
 
@@ -5075,7 +5086,9 @@ impl Filesystem for NextCloudFs {
             } else {
                 None
             };
-            files.remove(&fh.0);
+            if let Some(of) = files.remove(&fh.0) {
+                self.io_modes.safe_lock().release(of.ino, of.io_kind);
+            }
             abandoned
         };
         if let Some(cs) = abandoned_session {
@@ -5691,6 +5704,7 @@ impl Filesystem for NextCloudFs {
                                 let attr = make_file_attr(ino, entry);
                                 drop(c);
                                 let fh = { let mut n = self.next_fh.safe_lock(); let fh = *n; *n += 1; fh };
+                                let io_kind = self.io_modes.safe_lock().acquire_plain(ino);
                                 self.open_files.safe_lock().insert(fh, OpenFile {
                                     remote_path: PathBuf::new(),
                                     local: None, buf: None, write_path: None,
@@ -5702,10 +5716,11 @@ impl Filesystem for NextCloudFs {
                                     total_written: 0,
                                     stream_eligible: false,
                                     chunk_upload: None,
-                                    backing_id: None,
+                                    ino,
+                                    io_kind,
                                 });
                                 log::info!("ghost create: {} (inotify trigger)", full_path.display());
-                                reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
+                                reply.created(&TTL, &attr, Generation(0), FileHandle(fh), plain_open_flags(io_kind));
                                 return;
                             }
                         }
@@ -5765,6 +5780,7 @@ impl Filesystem for NextCloudFs {
             c.uploading.insert(remote_path.clone());
         }
 
+        let io_kind = self.io_modes.safe_lock().acquire_plain(ino);
         self.open_files.safe_lock().insert(
             fh,
             OpenFile {
@@ -5781,12 +5797,13 @@ impl Filesystem for NextCloudFs {
                 total_written: 0,
                 stream_eligible: true,
                 chunk_upload: None,
-                backing_id: None,
+                ino,
+                io_kind,
             },
         );
 
         let attr = make_file_attr(ino, &new_entry);
-        reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
+        reply.created(&TTL, &attr, Generation(0), FileHandle(fh), plain_open_flags(io_kind));
     }
 
     fn mkdir(
