@@ -76,7 +76,35 @@ pub fn put_file(
         req = req.header("If-Match", format!("\"{}\"", etag.trim_matches('"')));
     }
 
-    let resp = req.send().map_err(|e| WriteError::Network(e.to_string()))?;
+    put_result(req.send().map_err(|e| WriteError::Network(e.to_string()))?)
+}
+
+/// One streamed PUT of a whole staging file, for servers without chunked uploads.
+fn put_file_streamed(
+    client: &crate::http_clients::DavClient,
+    base_url: &str,
+    creds: &crate::auth::Credentials,
+    path: &Path,
+    staging_path: &Path,
+    file_size: usize,
+    if_match_etag: Option<&str>,
+) -> Result<PutResult, WriteError> {
+    let file = std::fs::File::open(staging_path)
+        .map_err(|e| WriteError::Network(format!("staging open: {}", e)))?;
+    // The whole file rides one request, so the budget scales with its size (>= 512 KiB/s).
+    let timeout = WRITE_TIMEOUT + std::time::Duration::from_secs(file_size as u64 / (512 * 1024));
+    let url = dav_url(base_url, creds.username(), path);
+    let mut req = creds.apply(client
+        .put(&url)
+        .timeout(timeout))
+        .body(reqwest::blocking::Body::sized(file, file_size as u64));
+    if let Some(etag) = if_match_etag {
+        req = req.header("If-Match", format!("\"{}\"", etag.trim_matches('"')));
+    }
+    put_result(req.send().map_err(|e| WriteError::Network(e.to_string()))?)
+}
+
+fn put_result(resp: reqwest::blocking::Response) -> Result<PutResult, WriteError> {
     let status = resp.status().as_u16();
 
     match status {
@@ -331,7 +359,15 @@ pub fn put_file_from_path(
         return put_file(client, base_url, creds, path, body, if_match_etag);
     }
 
-    let uploads_base = open_chunked_session(client, base_url, creds)?;
+    let uploads_base = match open_chunked_session(client, base_url, creds) {
+        Ok(u) => u,
+        // A plain WebDAV server without Nextcloud's chunked uploads rejects the session.
+        Err(WriteError::Server(404 | 501, _)) => {
+            log::info!("chunked upload unavailable — sending {} as a single PUT", path.display());
+            return put_file_streamed(client, base_url, creds, path, staging_path, file_size, if_match_etag);
+        }
+        Err(e) => return Err(e),
+    };
     let total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
     let mut file = std::fs::File::open(staging_path)
         .map_err(|e| WriteError::Network(format!("staging open: {}", e)))?;

@@ -690,6 +690,40 @@ else
     sleep 3   # let the monitor settle online before the suite ends
 fi
 
+echo "→ 23. MID-WRITE FLUSHES — closing an inherited fd must not commit a half-written file"
+# Every close() of an fd referring to an open file sends FUSE FLUSH, including a child that
+# inherited the writer's fd and exits (shell groups; helpers a file manager forks mid-copy).
+# v0.1.74 treated each FLUSH as the end of the file: it uploaded the partial snapshot and
+# deleted the staging file, so the server kept a truncated or scrambled copy while every
+# writer reported success. Only RELEASE (the last close) may commit. The 25 MiB cases also
+# cover a server without chunked uploads (rclone): the first chunk session fails with no
+# bytes sent, so the handle must fall back to a whole-file upload instead of EIO.
+mw_write() {  # <src> <dest>: one dd child per MiB, each exiting mid-write; 1 if any child failed
+    local src=$1 dest=$2 i rc=0 n=$(( $(stat -c %s "$1") / 1048576 ))
+    { for i in $(seq 0 $((n - 1))); do
+          dd if="$src" bs=1M skip="$i" count=1 status=none || rc=1
+      done; } > "$dest" || rc=1
+    return "$rc"
+}
+for spec in mw6:6:multi mw25:25:multi cp25:25:cp; do
+    IFS=: read -r name mib mode <<<"$spec"
+    src="/tmp/$name.src"
+    head -c $((mib * 1048576)) /dev/urandom > "$src"
+    want="$(sha < "$src")"
+    if [ "$mode" = multi ]; then mw_write "$src" "$MOUNT/$name.bin"; else cp "$src" "$MOUNT/$name.bin"; fi
+    wrc=$?
+    if wait_dav_sha "$name.bin" "$want" 90; then
+        if [ "$wrc" -eq 0 ]; then
+            ok "$name ($mode, ${mib} MiB): server copy byte-identical, every writer succeeded"
+        else
+            no "$name ($mode, ${mib} MiB): server copy intact but a writer failed (rc=$wrc)"
+        fi
+    else
+        got=$(curl -s -u "$U:$P" "${URL}$name.bin" | wc -c)
+        no "$name ($mode, ${mib} MiB): server copy is not what was written (writers rc=$wrc, server ${got} of $((mib * 1048576)) bytes)"
+    fi
+done
+
 echo "→ 22. SERVER EDIT of a KEPT file — the refresh that evicts it must not freeze the mount"
 # Regression for the v0.1.73 freeze: a read-triggered refresh that found a locally
 # cached (kept) file changed on the server evicted it while holding the cache lock,
