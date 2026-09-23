@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.74](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.73...ncrs-v0.1.74) (2026-09-23)
+
+
+### Bug Fixes
+
+* **fuse:** release the cache lock before save_file_cache in directory refresh to stop a getattr-freezing self-deadlock ([6ad5187](https://github.com/rgon/ncrsDesktop/commit/6ad51878959d55f8325873be15a416336f4dc617))
+
 ## [0.1.73](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.72...ncrs-v0.1.73) (2026-09-23)
 
 
