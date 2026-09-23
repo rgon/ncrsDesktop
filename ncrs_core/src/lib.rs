@@ -6034,6 +6034,7 @@ impl Filesystem for NextCloudFs {
             let conn = self.conn.clone();
             let journal = self.journal.clone();
             let elog = self.error_log.clone();
+            let cache = self.cache.clone();
             let ticket = self.uploads.ticket_entry(&remote_path);
             thread::spawn(move || {
                 ticket.wait();
@@ -6042,6 +6043,12 @@ impl Filesystem for NextCloudFs {
                     Ok(()) => {
                         log::info!("MKCOL {}", remote_path.display());
                         journal.safe_lock().remove(seq);
+                        // The server has the folder now: stop answering from the placeholder
+                        // listing unless something was already created in it locally.
+                        let mut c = cache.safe_lock();
+                        if c.dir_cache.get(&remote_path).is_some_and(|d| d.etag.is_none() && d.files.is_empty()) {
+                            c.dir_cache.remove(&remote_path);
+                        }
                     }
                     Err(e) => {
                         log::error!("MKCOL {} failed (journaled): {}", remote_path.display(), e);
