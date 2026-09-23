@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.73](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.72...ncrs-v0.1.73) (2026-09-23)
+
+
+### Bug Fixes
+
+* **fuse:** share one passthrough backing per inode and fall back to direct I/O on io-mode conflicts ([72ac7b2](https://github.com/rgon/ncrsDesktop/commit/72ac7b2f5610e62e3975ebf1f1c3fc37eec17f81))
+
 ## [0.1.72](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.71...ncrs-v0.1.72) (2026-09-21)
 
 
