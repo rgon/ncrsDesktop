@@ -56,13 +56,10 @@ kcoreaddons_add_plugin(ncrsoverlayplugin
     INSTALL_NAMESPACE "kf${QT_MAJOR_VERSION}/overlayicon")
 target_link_libraries(ncrsoverlayplugin PRIVATE ncrsclient_static ${KF}::CoreAddons ${KIO_OVERLAY_LIB})
 
-# ServiceMenu: KF6 reads kio/servicemenus; KF5 still reads kservices5.
-if(QT_MAJOR_VERSION EQUAL 6)
-    set(NCRS_SERVICEMENU_DIR ${KDE_INSTALL_DATADIR}/kio/servicemenus)
-else()
-    set(NCRS_SERVICEMENU_DIR ${KDE_INSTALL_DATADIR}/kservices5/ServiceMenus)
-endif()
-install(FILES servicemenu/ncrs.desktop DESTINATION ${NCRS_SERVICEMENU_DIR})
+# ServiceMenu: kio/servicemenus is read by KF6 and by KF5 >= 5.85, so the KF5
+# and KF6 builds install the same file to the same path and one package can
+# carry both without a duplicate menu entry.
+install(FILES servicemenu/ncrs.desktop DESTINATION ${KDE_INSTALL_DATADIR}/kio/servicemenus)
 
 if(BUILD_TESTING)
     add_subdirectory(tests)

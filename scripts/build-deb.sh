@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Builds release binaries and assembles the .deb packages:
-#   ncrs            the service, CLI tools and (unless --skip-gui) the GUI
-#   ncrs-nautilus   the Nautilus shell adapter (arch: all; depends on ncrs)
-# The Dolphin adapter (ncrs-dolphin) is built by scripts/build-deb-dolphin.sh.
+# Builds release binaries and assembles the ncrs .deb: the service, CLI tools,
+# the GUI (unless --skip-gui) and the file-browser adapters (Nautilus
+# extension, Dolphin plugin).
+#
+# The Dolphin plugin is C++ built against Qt/KF, so it is staged beforehand by
+# scripts/build-dolphin-plugin.sh (once per KF major) and copied in from
+# dist/dolphin/* or --dolphin-stage.
 #
 # Usage: ./scripts/build-deb.sh [OPTIONS]
 #   --version VERSION   Package version (default: workspace version in Cargo.toml)
@@ -10,6 +13,9 @@
 #   --out-dir DIR       Output directory for the .deb (default: dist)
 #   --skip-gui          Do not build/package the GUI tray app
 #   --skip-build        Assemble only; expect binaries already in target/release
+#   --dolphin-stage DIR Staged Dolphin plugin tree to include (repeatable;
+#                       default: every dist/dolphin/*/ that exists)
+#   --require-dolphin   Fail instead of warning when no Dolphin plugin is staged
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,6 +27,8 @@ ARCH=""
 OUT_DIR="dist"
 SKIP_GUI=false
 SKIP_BUILD=false
+DOLPHIN_STAGES=()
+REQUIRE_DOLPHIN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -29,6 +37,8 @@ while [[ $# -gt 0 ]]; do
         --out-dir)    OUT_DIR="$2"; shift 2 ;;
         --skip-gui)   SKIP_GUI=true; shift ;;
         --skip-build) SKIP_BUILD=true; shift ;;
+        --dolphin-stage)   DOLPHIN_STAGES+=("$2"); shift 2 ;;
+        --require-dolphin) REQUIRE_DOLPHIN=true; shift ;;
         -h|--help)    awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
         *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
     esac
@@ -88,6 +98,7 @@ install -Dm755 target/release/ncrs-open                                  "$PKG_D
 install -Dm755 target/release/ncrs-ctl                                   "$PKG_DIR/usr/bin/ncrs-ctl"
 install -Dm644 packaging/ncrs.service                                    "$PKG_DIR/usr/lib/systemd/user/ncrs.service"
 install -Dm644 packaging/ncrs-open.desktop                               "$PKG_DIR/usr/share/applications/ncrs-open.desktop"
+install -Dm644 shell_integration/file-managers/nautilus/syncstate.py      "$PKG_DIR/usr/share/nautilus-python/extensions/ncrs-syncstate.py"
 install -Dm755 shell_integration/gnome-search/ncrs-search-provider       "$PKG_DIR/usr/bin/ncrs-search-provider"
 install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.SearchProvider.ini \
                                                                          "$PKG_DIR/usr/share/gnome-shell/search-providers/es.rgon.ncrs.SearchProvider.ini"
@@ -119,12 +130,27 @@ if ! $SKIP_GUI; then
     install -Dm644 ncrs-gui/src-tauri/icons/icon.png                     "$PKG_DIR/usr/share/icons/hicolor/512x512/apps/ncrs.png"
 fi
 
+# ── Dolphin plugin (KF5 and/or KF6 builds, staged by build-dolphin-plugin.sh) ─
+if [[ ${#DOLPHIN_STAGES[@]} -eq 0 ]]; then
+    for d in dist/dolphin/*/; do [[ -d "$d" ]] && DOLPHIN_STAGES+=("$d"); done
+fi
+for stage in ${DOLPHIN_STAGES[@]+"${DOLPHIN_STAGES[@]}"}; do
+    [[ -d "$stage" ]] || { echo "error: --dolphin-stage $stage is not a directory" >&2; exit 1; }
+    cp -a "$stage/." "$PKG_DIR/"
+done
+if [[ -z "$(find "$PKG_DIR" -path '*/overlayicon/ncrsoverlayplugin.so' -print -quit)" ]]; then
+    $REQUIRE_DOLPHIN && { echo "error: no Dolphin plugin staged (run scripts/build-dolphin-plugin.sh)" >&2; exit 1; }
+    echo "  warning: no Dolphin plugin staged; the package will have no Dolphin emblems"
+else
+    echo "  Dolphin plugin: $(find "$PKG_DIR" -path '*/overlayicon/ncrsoverlayplugin.so' -printf '%P ')"
+fi
+
 # ── Write DEBIAN/control ──────────────────────────────────────────────────────
 # ncrs links libssl at build time; ncrs-gui dlopens libayatana-appindicator3
 # for the tray icon (invisible to ldd/shlibdeps) and panics without it.
-# File-manager adapters are separate packages (ncrs-nautilus, ncrs-dolphin) so
-# no desktop's bindings are forced onto another's users.
-DEPENDS="fuse3, libssl3t64 | libssl3, libimage-exiftool-perl, python3-gi, gir1.2-gdkpixbuf-2.0"
+# The Dolphin plugin's Qt/KF libraries are deliberately not listed: only
+# Dolphin loads it, and Dolphin brings them, so GNOME users are not handed KDE.
+DEPENDS="fuse3, python3-nautilus | gir1.2-nautilus-3.0, libssl3t64 | libssl3, libimage-exiftool-perl, python3-gi, gir1.2-gdkpixbuf-2.0"
 if ! $SKIP_GUI; then
     DEPENDS="$DEPENDS, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37, libayatana-appindicator3-1 | libappindicator3-1"
 fi
@@ -136,16 +162,15 @@ Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: Gonzalo Ruiz <gonza@logo.cl>
 Depends: ${DEPENDS}
-Recommends: libcap2-bin, ncrs-nautilus
-Suggests: ncrs-dolphin
+Recommends: libcap2-bin
 Section: net
 Priority: optional
 Description: Nextcloud FUSE virtual filesystem client
  ncrs mounts your Nextcloud as a local FUSE filesystem with offline
  caching, real-time sync, conflict detection and a GNOME Shell search
  provider. File-browser integration (indexer exclusion, thumbnails,
- type detection) is applied per installed browser by the service; sync
- emblems and menus come from the ncrs-nautilus / ncrs-dolphin adapters.
+ type detection) is applied per installed browser by the service, with
+ sync emblems and menus in Nautilus and Dolphin.
  .
  libcap2-bin (setcap) is used at install time to grant the ncrs binary
  CAP_SYS_ADMIN, which enables zero-copy kernel read passthrough for
@@ -165,38 +190,8 @@ done
 mkdir -p "$OUT_DIR"
 DEB_PATH="$OUT_DIR/ncrs_${VERSION}_${ARCH}.deb"
 dpkg-deb --build --root-owner-group "$PKG_DIR" "$DEB_PATH"
-
-# ── ncrs-nautilus (the Nautilus shell adapter) ────────────────────────────────
-# Older ncrs packages shipped the extension themselves, hence Replaces/Breaks
-# so an upgrade hands the file over instead of failing on the overlap. Pinned to
-# this build's own version (both packages are always built together) rather than
-# a literal, so it stays right whichever release the split first ships in.
-NAUT_DIR="$OUT_DIR/ncrs-nautilus_${VERSION}_all"
-rm -rf "$NAUT_DIR"
-install -Dm644 shell_integration/file-managers/nautilus/syncstate.py      "$NAUT_DIR/usr/share/nautilus-python/extensions/ncrs-syncstate.py"
-install -Dm644 packaging/copyright                                       "$NAUT_DIR/usr/share/doc/ncrs-nautilus/copyright"
-install -Dm755 packaging/ncrs-nautilus/postinst                          "$NAUT_DIR/DEBIAN/postinst"
-cat > "$NAUT_DIR/DEBIAN/control" <<EOF
-Package: ncrs-nautilus
-Version: ${VERSION}
-Architecture: all
-Maintainer: Gonzalo Ruiz <gonza@logo.cl>
-Depends: ncrs (>= ${VERSION}), python3-nautilus | gir1.2-nautilus-3.0, python3-gi
-Replaces: ncrs (<< ${VERSION})
-Breaks: ncrs (<< ${VERSION})
-Section: net
-Priority: optional
-Description: Nautilus integration for the ncrs Nextcloud filesystem
- Sync-status emblems, sharing/permission columns, Keep / Free up space /
- Open in web actions and Nextcloud search in Files (Nautilus), talking to
- the ncrs service over its local socket.
-EOF
-NAUT_DEB="$OUT_DIR/ncrs-nautilus_${VERSION}_all.deb"
-dpkg-deb --build --root-owner-group "$NAUT_DIR" "$NAUT_DEB"
-
 echo ""
 echo "✓ Built: $DEB_PATH"
-echo "✓ Built: $NAUT_DEB"
-echo "  Install with: sudo apt install ./$DEB_PATH ./$NAUT_DEB"
+echo "  Install with: sudo apt install ./$DEB_PATH"
 echo "  The GUI tray app autostarts at login (/etc/xdg/autostart/ncrs-gui.desktop)."
 echo "  Headless (no-GUI) alternative: systemctl --user enable --now ncrs.service"

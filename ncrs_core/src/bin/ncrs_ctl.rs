@@ -141,7 +141,7 @@ fn run(cli: Cli) -> Result<(), String> {
                         .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
                         .unwrap_or_default()
                 };
-                let adapter = if p.get("adapter_package").is_some_and(|v| !v.is_null()) {
+                let adapter = if p.get("adapter_client_ids").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty()) {
                     format!(
                         " adapter={}{}",
                         if b("adapter_installed") { "installed" } else { "missing" },

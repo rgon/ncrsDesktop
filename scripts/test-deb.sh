@@ -4,28 +4,28 @@
 #
 # Usage: ./scripts/test-deb.sh [OPTIONS]
 #   --deb PATH        .deb to test (default: newest dist/ncrs_*.deb)
-#   --nautilus-deb P  ncrs-nautilus .deb (default: newest dist/ncrs-nautilus_*.deb)
 #   --container       Also run the clean-install test (needs docker or podman)
 #   --image IMAGE     Container image for the install test (default: ubuntu:24.04)
 #   --skip-gui        The .deb was built with --skip-gui; skip GUI assertions
+#   --skip-dolphin    The .deb was built without a staged Dolphin plugin
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 DEB=""
-NAUT_DEB=""
 CONTAINER=false
 IMAGE="ubuntu:24.04"
 SKIP_GUI=false
+SKIP_DOLPHIN=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --deb)       DEB="$2"; shift 2 ;;
-        --nautilus-deb) NAUT_DEB="$2"; shift 2 ;;
         --container) CONTAINER=true; shift ;;
         --image)     IMAGE="$2"; shift 2 ;;
         --skip-gui)  SKIP_GUI=true; shift ;;
+        --skip-dolphin) SKIP_DOLPHIN=true; shift ;;
         -h|--help)   awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
         *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
     esac
@@ -35,10 +35,6 @@ if [[ -z "$DEB" ]]; then
     DEB="$(ls -t dist/ncrs_*.deb 2>/dev/null | head -1 || true)"
 fi
 [[ -n "$DEB" && -f "$DEB" ]] || { echo "No .deb found (build one with scripts/build-deb.sh, or pass --deb)" >&2; exit 1; }
-if [[ -z "$NAUT_DEB" ]]; then
-    NAUT_DEB="$(ls -t dist/ncrs-nautilus_*.deb 2>/dev/null | head -1 || true)"
-fi
-[[ -n "$NAUT_DEB" && -f "$NAUT_DEB" ]] || { echo "No ncrs-nautilus .deb found (scripts/build-deb.sh builds it, or pass --nautilus-deb)" >&2; exit 1; }
 
 FAILURES=0
 pass() { echo "  ✓ $1"; }
@@ -52,14 +48,7 @@ echo "→ Control metadata"
 CONTROL="$(dpkg-deb -f "$DEB")"
 check "Package is ncrs"            grep -q '^Package: ncrs$' <<<"$CONTROL"
 check "Depends on fuse3"           grep -q '^Depends: .*fuse3' <<<"$CONTROL"
-# File-manager adapters are separate packages; the core must not drag in
-# any one desktop's bindings.
-if grep -q 'python3-nautilus' <<<"$CONTROL"; then
-    fail "core package does not depend on python3-nautilus"
-else
-    pass "core package does not depend on python3-nautilus"
-fi
-check "Recommends ncrs-nautilus"   grep -q '^Recommends: .*ncrs-nautilus' <<<"$CONTROL"
+check "Depends on nautilus ext"    grep -q 'python3-nautilus' <<<"$CONTROL"
 if ! $SKIP_GUI; then
     check "Depends on webkit2gtk"  grep -q 'libwebkit2gtk' <<<"$CONTROL"
 fi
@@ -89,6 +78,7 @@ REQUIRED=(
     ./usr/share/applications/es.rgon.ncrs.desktop
     ./usr/share/dbus-1/services/es.rgon.ncrs.SearchProvider.service
     ./usr/share/gnome-shell/search-providers/es.rgon.ncrs.SearchProvider.ini
+    ./usr/share/nautilus-python/extensions/ncrs-syncstate.py
     ./usr/share/doc/ncrs/config.yaml.example
 )
 if ! $SKIP_GUI; then
@@ -103,9 +93,24 @@ if ! $SKIP_GUI; then
         ./usr/share/icons/hicolor/512x512/apps/ncrs.png
     )
 fi
+if ! $SKIP_DOLPHIN; then
+    REQUIRED+=(./usr/share/kio/servicemenus/ncrs.desktop)
+fi
 for f in "${REQUIRED[@]}"; do
     check "$f" grep -qx "$f" <<<"$CONTENTS"
 done
+
+# One package carries the Dolphin plugin for both Plasma 5 and Plasma 6. Its
+# Qt/KF libraries must stay out of Depends, or GNOME installs would pull in KDE.
+if ! $SKIP_DOLPHIN; then
+    check "Dolphin plugin (KF6)" grep -q '/qt6/plugins/kf6/overlayicon/ncrsoverlayplugin\.so$' <<<"$CONTENTS"
+    check "Dolphin plugin (KF5)" grep -q '/qt5/plugins/kf5/overlayicon/ncrsoverlayplugin\.so$' <<<"$CONTENTS"
+fi
+if grep -qiE '^Depends: .*lib(kf[56]|qt[56])' <<<"$CONTROL"; then
+    fail "Depends lists no Qt/KF libraries"
+else
+    pass "Depends lists no Qt/KF libraries"
+fi
 
 # A GUI binary built without tauri's custom-protocol feature embeds no
 # frontend and tries to load the vite dev server (devUrl) at runtime —
@@ -124,29 +129,6 @@ if ! $SKIP_GUI; then
     rm -f "$GUI_BIN"
 fi
 
-if grep -q 'nautilus-python' <<<"$CONTENTS"; then
-    fail "core package ships no Nautilus extension (moved to ncrs-nautilus)"
-else
-    pass "core package ships no Nautilus extension (moved to ncrs-nautilus)"
-fi
-
-# ── ncrs-nautilus ─────────────────────────────────────────────────────────────
-echo "→ ncrs-nautilus ($NAUT_DEB)"
-NCONTROL="$(dpkg-deb -f "$NAUT_DEB")"
-check "Package is ncrs-nautilus"        grep -q '^Package: ncrs-nautilus$' <<<"$NCONTROL"
-check "Architecture all"                grep -q '^Architecture: all$' <<<"$NCONTROL"
-check "Depends on ncrs"                 grep -q '^Depends: ncrs (>= ' <<<"$NCONTROL"
-check "Depends on python3-nautilus"     grep -q '^Depends: .*python3-nautilus' <<<"$NCONTROL"
-check "Replaces pre-split ncrs"         grep -q '^Replaces: ncrs (<< ' <<<"$NCONTROL"
-check "Breaks pre-split ncrs"           grep -q '^Breaks: ncrs (<< ' <<<"$NCONTROL"
-NCONTENTS="$(dpkg-deb -c "$NAUT_DEB" | awk '{print $NF}')"
-check "ships the extension"             grep -qx './usr/share/nautilus-python/extensions/ncrs-syncstate.py' <<<"$NCONTENTS"
-if dpkg-deb --ctrl-tarfile "$NAUT_DEB" | tar -xO ./postinst 2>/dev/null | grep -q 'nautilus -q'; then
-    pass "postinst reloads running Nautilus instances"
-else
-    fail "postinst reloads running Nautilus instances"
-fi
-
 # ── Desktop entry validation ──────────────────────────────────────────────────
 # Validate the .desktop files actually inside the .deb under test, not the
 # repo checkout's copies (which may differ from the packaged artifact).
@@ -156,10 +138,11 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
     trap 'rm -rf "$EXTRACT_DIR"' EXIT
     dpkg-deb --fsys-tarfile "$DEB" | tar -x -C "$EXTRACT_DIR" --wildcards '*.desktop'
     found_desktop=false
+    # KIO ServiceMenus are KDE Type=Service files, not freedesktop entries.
     while IFS= read -r d; do
         found_desktop=true
         check "desktop-file-validate ${d#"$EXTRACT_DIR"}" desktop-file-validate "$d"
-    done < <(find "$EXTRACT_DIR" -name '*.desktop' | sort)
+    done < <(find "$EXTRACT_DIR" -name '*.desktop' -not -path '*/kio/servicemenus/*' | sort)
     $found_desktop || fail "no .desktop files found in the package"
 else
     echo "  (desktop-file-validate not installed; skipping)"
@@ -179,7 +162,6 @@ if $CONTAINER; then
         fail "container test requested but neither podman nor docker found"
     else
         DEB_ABS="$(readlink -f "$DEB")"
-        NAUT_ABS="$(readlink -f "$NAUT_DEB")"
         GUI_CHECKS=""
         if ! $SKIP_GUI; then
             GUI_CHECKS='
@@ -194,15 +176,16 @@ if $CONTAINER; then
         # representative of a real (unsandboxed) user login session —
         # --privileged removes that confinement for this throwaway
         # container so the smoke test can actually run the installed binary.
-        "$RUNTIME" run --rm --privileged -v "$DEB_ABS:/pkg.deb:ro" -v "$NAUT_ABS:/pkg-nautilus.deb:ro" "$IMAGE" bash -ec "
+        "$RUNTIME" run --rm --privileged -v "$DEB_ABS:/pkg.deb:ro" "$IMAGE" bash -ec "
             # Minimized cloud images exclude /usr/share/doc — undo so we can
             # assert the provisioning example config actually installs.
             rm -f /etc/dpkg/dpkg.cfg.d/excludes
             apt-get update -qq >/dev/null
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /pkg.deb /pkg-nautilus.deb >/dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /pkg.deb >/dev/null
             echo 'installed OK'
-            test -f /usr/share/nautilus-python/extensions/ncrs-syncstate.py || { echo 'FAIL: nautilus extension missing'; exit 1; }
             test -x /usr/bin/ncrs-ctl || { echo 'FAIL: ncrs-ctl missing'; exit 1; }
+            test -f /usr/share/nautilus-python/extensions/ncrs-syncstate.py || { echo 'FAIL: nautilus extension missing'; exit 1; }
+            ! dpkg -l 'libkf5*' 'libkf6*' 2>/dev/null | grep -q '^ii' || { echo 'FAIL: installing ncrs pulled in KDE Frameworks'; exit 1; }
             test -f /usr/share/doc/ncrs/config.yaml.example || { echo 'FAIL: example config missing'; exit 1; }
             ! ls /etc/systemd/user/default.target.wants/ncrs.service >/dev/null 2>&1 || { echo 'FAIL: ncrs.service globally enabled'; exit 1; }
             /usr/bin/ncrs --print-default-config | grep -q 'ncRS Desktop configuration' || { echo 'FAIL: ncrs --print-default-config'; exit 1; }

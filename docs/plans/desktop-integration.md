@@ -17,6 +17,13 @@ pending measurement). Based on `master` @ `a190f75`. Line references point at th
 - Phase 0 (measurement on a KDE session) was not run. The Qt sniff probe, KIO `.part`
   handling and folder-view metadata are documented as open in GOTCHAS.md §4 rather
   than implemented blind.
+- **One `.deb`, not per-adapter packages.** `ncrs` ships the Nautilus extension and
+  the Dolphin plugin for both KF5 and KF6 (they install to different Qt plugin
+  dirs). The plugin's Qt/KF libraries stay out of `Depends`, since only Dolphin
+  loads it and Dolphin brings them. CI builds KF5 on the jammy runner and KF6 in
+  `debian:trixie`. The ServiceMenu goes to `kio/servicemenus` for both, which
+  KF5 >= 5.85 also reads. With no separate package there is no "install the
+  adapter" hint in the GUI.
 
 ## Goal
 
@@ -36,8 +43,9 @@ module plus its shell adapter, with no new special cases in the FUSE layer.
    A headless or systemd install gets full integration.
    (On master the GUI already spawns or attaches to a separate `ncrs` daemon:
    `ncrs-gui/src-tauri/src/lib.rs:1385-1420`.)
-3. **Packages:** `ncrs-nautilus` and `ncrs-dolphin` depend on `ncrs`, never on
-   `ncrs-gui`.
+3. **Packages:** the adapters never depend on `ncrs-gui`. (Planned as separate
+   `ncrs-nautilus` / `ncrs-dolphin` packages; shipped inside the one `ncrs` .deb,
+   see Deviations.)
 4. **The GUI packs integrations per browser profile.** The user sees one
    enable/disable toggle per browser (Nautilus, Dolphin, …) and never the individual
    components (GIO sniff, Tracker ignore, …).

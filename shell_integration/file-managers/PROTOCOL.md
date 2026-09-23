@@ -130,10 +130,10 @@ process starts at "now".
 ```json
 {"id":"kio","kind":"toolkit","name":"KDE apps (KIO)","summary":"…",
  "installed":true,"mode":"off","enabled":true,"requires":[],"required_by":["dolphin"],
- "adapter_package":null,"adapter_client_ids":[],"adapter_installed":false,"adapter_connected":false}
+ "adapter_client_ids":[],"adapter_installed":false,"adapter_connected":false}
 {"id":"dolphin","kind":"browser","name":"Dolphin (KDE)","summary":"…",
  "installed":true,"mode":"auto","enabled":true,"requires":["kio"],"required_by":[],
- "adapter_package":"ncrs-dolphin","adapter_client_ids":["dolphin-kf6","dolphin-kf5"],
+ "adapter_client_ids":["dolphin-kf6","dolphin-kf5"],
  "adapter_installed":false,"adapter_connected":false}
 ```
 

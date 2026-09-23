@@ -716,7 +716,6 @@ pub struct Integration {
     /// Enabled browsers keeping this toolkit on regardless of its own mode.
     #[serde(default)]
     pub required_by: Vec<String>,
-    pub adapter_package: Option<String>,
     #[serde(default)]
     pub adapter_client_ids: Vec<String>,
     pub adapter_installed: bool,

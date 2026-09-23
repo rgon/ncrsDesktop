@@ -210,7 +210,6 @@ pub struct ProfileStatus {
     pub requires: &'static [&'static str],
     /// Enabled profiles that keep this one on.
     pub required_by: Vec<&'static str>,
-    pub adapter_package: Option<&'static str>,
     pub adapter_client_ids: &'static [&'static str],
     pub adapter_installed: bool,
     pub adapter_connected: bool,
@@ -377,7 +376,6 @@ impl Manager {
                 enabled: self.enabled_locked(&st, p),
                 requires: p.requires,
                 required_by: self.required_by(&st, p),
-                adapter_package: p.adapter.package,
                 adapter_client_ids: p.adapter.client_ids,
                 adapter_installed: p.adapter.is_installed(&self.env),
                 adapter_connected: p.adapter.client_ids.iter().any(|id| is_connected(id)),

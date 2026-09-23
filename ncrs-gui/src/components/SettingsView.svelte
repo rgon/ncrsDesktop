@@ -33,7 +33,6 @@
         enabled: boolean;
         requires: string[];
         required_by: string[];
-        adapter_package: string | null;
         adapter_client_ids: string[];
         adapter_installed: boolean;
         adapter_connected: boolean;
@@ -54,7 +53,6 @@
     let integrations = $state<Integration[] | null | undefined>(undefined);
     let integrationBusy = $state<string | null>(null);
     let integrationError = $state("");
-    let copiedPkg = $state<string | null>(null);
 
     // Displayed as MB / GB; stored as bytes
     let readAheadMb = $state(64);
@@ -109,16 +107,6 @@
 
     function profileName(id: string): string {
         return integrations?.find((i) => i.id === id)?.name ?? id;
-    }
-
-    async function copyInstallCommand(pkg: string) {
-        try {
-            await navigator.clipboard.writeText(`sudo apt install ${pkg}`);
-            copiedPkg = pkg;
-            setTimeout(() => { if (copiedPkg === pkg) copiedPkg = null; }, 2000);
-        } catch {
-            copiedPkg = null;
-        }
     }
 
     async function refreshPassthroughStatus() {
@@ -401,23 +389,13 @@
                                         <label class="sv-toggle-label" for="fb-{fb.id}">{fb.name}</label>
                                         {#if !fb.installed}
                                             <span class="sv-badge">Not installed</span>
-                                        {:else if fb.adapter_package && !fb.adapter_installed}
-                                            <span class="sv-badge sv-badge-warn">Emblems need {fb.adapter_package}</span>
+                                        {:else if fb.adapter_client_ids.length && !fb.adapter_installed}
+                                            <span class="sv-badge sv-badge-warn">Emblems not installed</span>
                                         {:else if fb.adapter_connected}
                                             <span class="sv-badge sv-badge-ok">Connected</span>
                                         {/if}
                                     </div>
                                     <p class="sv-hint">{fb.summary}</p>
-                                    {#if fb.installed && fb.adapter_package && !fb.adapter_installed}
-                                        <button
-                                            class="sv-fb-cmd"
-                                            title="Copy to clipboard"
-                                            onclick={() => copyInstallCommand(fb.adapter_package!)}
-                                        >
-                                            <code>sudo apt install {fb.adapter_package}</code>
-                                            <span>{copiedPkg === fb.adapter_package ? "Copied" : "Copy"}</span>
-                                        </button>
-                                    {/if}
                                     {#if fb.required_by.length}
                                         <p class="sv-hint">Kept on by {fb.required_by.map(profileName).join(", ")}</p>
                                     {/if}
@@ -650,22 +628,6 @@
     color: var(--nc-success);
     background: color-mix(in srgb, var(--nc-success) 12%, transparent);
 }
-
-.sv-fb-cmd {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 4px;
-    padding: 2px 6px;
-    font-size: 10px;
-    color: var(--nc-text-2);
-    background: color-mix(in srgb, var(--nc-text-3) 8%, transparent);
-    border: 1px solid var(--nc-border);
-    border-radius: 4px;
-    cursor: pointer;
-}
-.sv-fb-cmd code { font-family: monospace; user-select: all; }
-.sv-fb-cmd span { color: var(--nc-accent); }
 
 .sv-link {
     font-size: inherit;
