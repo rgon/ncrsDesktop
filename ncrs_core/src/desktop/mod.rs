@@ -23,6 +23,7 @@
 pub mod detect;
 pub mod indexer;
 pub mod profiles;
+pub mod sniff;
 pub mod store;
 pub mod thumbguard;
 pub mod toolkit;
@@ -64,9 +65,9 @@ pub struct ThumbnailSizes {
 pub struct DesktopPolicy {
     /// Overlay a synthetic `/.trackerignore` onto the mount root (Tracker).
     pub tracker_ignore: bool,
-    /// Answer GLib's `O_NOATIME` magic-byte probes from cached metadata and
-    /// expose `user.xdg.mime.type`, so MIME detection never downloads a file.
-    pub glib_sniff: bool,
+    /// File-type probes answered from cached metadata so MIME detection never
+    /// downloads a file (see [`sniff`]).
+    pub sniff_probes: Vec<sniff::SniffProbe>,
     /// Name prefixes of toolkit atomic-write temps: hidden from listings and,
     /// if configured, purged from the server when found orphaned.
     pub hidden_temp_prefixes: Vec<&'static str>,
@@ -83,7 +84,7 @@ impl DesktopPolicy {
     pub fn empty() -> Self {
         DesktopPolicy {
             tracker_ignore: false,
-            glib_sniff: false,
+            sniff_probes: Vec::new(),
             hidden_temp_prefixes: Vec::new(),
             thumbnails: ThumbnailSizes::default(),
             thumbnailer_guard: Vec::new(),
@@ -106,6 +107,22 @@ impl DesktopPolicy {
     /// start one, so behaviour is unchanged unless profiles say otherwise.
     pub fn legacy_default() -> Self {
         DesktopPolicy::from_components([ComponentId::Gio, ComponentId::Tracker])
+    }
+
+    pub fn add_sniff_probe(&mut self, probe: sniff::SniffProbe) {
+        if !self.sniff_probes.contains(&probe) {
+            self.sniff_probes.push(probe);
+        }
+    }
+
+    /// The probe a read-only open of an uncached file with these flags is, if any.
+    pub fn sniff_probe_for_open(&self, flags: i32) -> Option<&sniff::SniffProbe> {
+        self.sniff_probes.iter().find(|p| p.matches_open(flags))
+    }
+
+    /// Whether `name` is a MIME-type xattr some active probe's toolkit reads.
+    pub fn serves_mime_xattr(&self, name: &[u8]) -> bool {
+        self.sniff_probes.iter().any(|p| p.xattr.is_some_and(|x| x.as_bytes() == name))
     }
 
     pub fn add_thumbnailer(&mut self, m: thumbguard::ThumbnailerMatch) {
@@ -502,7 +519,7 @@ mod tests {
         let m = manager(&f);
         assert_eq!(enabled(&m), vec!["gio", "kio", "dolphin"]);
         let p = m.current_policy();
-        assert!(p.glib_sniff && p.thumbnails.large);
+        assert!(!p.sniff_probes.is_empty() && p.thumbnails.large);
     }
 
     #[test]
@@ -540,12 +557,12 @@ mod tests {
         assert!(gio.enabled, "Nautilus and Nemo still need it");
         assert_eq!(gio.mode, Mode::Off);
         assert_eq!(gio.required_by, vec!["nautilus", "nemo"]);
-        assert!(m.current_policy().glib_sniff);
+        assert!(!m.current_policy().sniff_probes.is_empty());
         m.set("nautilus", Mode::Off).unwrap();
-        assert!(m.current_policy().glib_sniff, "Nemo alone still needs it");
+        assert!(!m.current_policy().sniff_probes.is_empty(), "Nemo alone still needs it");
         m.set("nemo", Mode::Off).unwrap();
         let p = m.current_policy();
-        assert!(!p.glib_sniff && !p.tracker_ignore);
+        assert!(p.sniff_probes.is_empty() && !p.tracker_ignore);
     }
 
     #[test]
@@ -557,7 +574,9 @@ mod tests {
     #[test]
     fn legacy_default_matches_pre_profile_behaviour() {
         let p = DesktopPolicy::legacy_default();
-        assert!(p.tracker_ignore && p.glib_sniff);
+        assert!(p.tracker_ignore);
+        assert!(p.sniff_probe_for_open(libc::O_NOATIME).is_some());
+        assert!(p.serves_mime_xattr(b"user.xdg.mime.type"));
         assert!(p.is_hidden_temp(".goutputstream-ABC123"));
         assert!(p.is_hidden_temp(".xdp-foo"));
         assert!(!p.is_hidden_temp("report.odt"));
@@ -568,7 +587,7 @@ mod tests {
     fn kio_adds_large_thumbnails() {
         let p = DesktopPolicy::from_components([ComponentId::Kio]);
         assert!(p.thumbnails.normal && p.thumbnails.large);
-        assert!(!p.glib_sniff);
+        assert!(p.sniff_probes.is_empty(), "KIO declares no probe until Qt's is measured");
         assert!(p.thumbnailer_guard.contains(&thumbguard::ThumbnailerMatch::CmdlineContains("/kio/thumbnail.so")));
     }
 }

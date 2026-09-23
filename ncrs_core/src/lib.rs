@@ -412,6 +412,9 @@ struct OpenFile {
     // MIME magic-byte detection signature.  read() at offset 0 returns magic bytes
     // derived from this content type without touching the network.
     mime_detect_ct: Option<String>,
+    // Largest offset-0 read answered with magic bytes, from the matching
+    // desktop::sniff::SniffProbe (0 when mime_detect_ct is None).
+    mime_detect_max_read: usize,
     // Offset the next read would start at to continue sequentially, i.e. the end
     // of the previous read on this handle. Updated on every read, whatever served
     // it, so a run of buffer hits still counts as sequential.
@@ -892,7 +895,7 @@ impl OfflineStatus {
 /// MIME-detection probe (see [`mime_magic_bytes`]).  GLib asks for 16384 bytes,
 /// but kernel read-ahead inflates the initial read up to one 8-page window
 /// (32768 bytes) regardless of file size; copy tools use ≥65536-byte buffers.
-const MIME_DETECT_MAX_READ: usize = 32768;
+const MIME_DETECT_MAX_READ: usize = desktop::toolkit::gio::GLIB_SNIFF_MAX_READ;
 
 pub fn mime_magic_bytes(content_type: &str) -> &'static [u8] {
     let ct = content_type.split(';').next().unwrap_or(content_type).trim();
@@ -4471,9 +4474,10 @@ impl Filesystem for NextCloudFs {
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-        // `user.xdg.mime.type` is GLib's fast path; served while the GIO
-        // component is active (see desktop::toolkit::gio).
-        if name.as_encoded_bytes() != b"user.xdg.mime.type" || !desktop::policy().glib_sniff {
+        // The MIME-type xattr a toolkit checks before sniffing (GLib:
+        // `user.xdg.mime.type`), served while that toolkit's probe is declared
+        // by an enabled profile (desktop::sniff).
+        if !desktop::policy().serves_mime_xattr(name.as_encoded_bytes()) {
             reply.error(Errno::ENODATA);
             return;
         }
@@ -4519,11 +4523,20 @@ impl Filesystem for NextCloudFs {
             Some(e) => e,
             None => { if size == 0 { reply.size(0); } else { reply.data(b""); } return; }
         };
-        let has_ct = desktop::policy().glib_sniff && entries.iter()
+        let has_ct = entries.iter()
             .find(|e| e.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == file_name)
             .map(|e| e.content_type.is_some())
             .unwrap_or(false);
-        let list: &[u8] = if has_ct { b"user.xdg.mime.type\0" } else { b"" };
+        let mut list: Vec<u8> = Vec::new();
+        if has_ct {
+            for name in desktop::policy().sniff_probes.iter().filter_map(|p| p.xattr) {
+                if !list.split(|b| *b == 0).any(|n| n == name.as_bytes()) {
+                    list.extend_from_slice(name.as_bytes());
+                    list.push(0);
+                }
+            }
+        }
+        let list = list.as_slice();
         if size == 0 {
             reply.size(list.len() as u32);
         } else if size as usize >= list.len() {
@@ -4649,10 +4662,13 @@ impl Filesystem for NextCloudFs {
         // during the PROPFIND, and mark the handle so read() can respond with synthetic
         // magic bytes instead. O_NOFOLLOW and O_CLOEXEC are both stripped by the kernel
         // before the request reaches FUSE, so O_NOATIME is the only reliable signal.
-        let is_mime_detect = !writable && local.is_none()
-            && (flags.0 & libc::O_NOATIME != 0)
-            && desktop::policy().glib_sniff;
-        let mime_detect_ct = if is_mime_detect {
+        // Which probes count is declared per toolkit profile (desktop::sniff).
+        let probe_max_read = if !writable && local.is_none() {
+            desktop::policy().sniff_probe_for_open(flags.0).map(|p| p.max_read)
+        } else {
+            None
+        };
+        let mime_detect_ct = if probe_max_read.is_some() {
             let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
             let ct = self.cache.safe_lock()
                 .get_cached_dir_readonly(&parent)
@@ -4736,6 +4752,7 @@ impl Filesystem for NextCloudFs {
                 dirty: truncating,
                 original_etag: etag,
                 mime_detect_ct,
+                mime_detect_max_read: probe_max_read.unwrap_or(0),
                 cache_fresh,
                 next_expected_off: 0,
                 read_ahead_window: READ_AHEAD_INITIAL,
@@ -4853,7 +4870,7 @@ impl Filesystem for NextCloudFs {
                 // buffers. Intercepting reads up to that bound keeps copies
                 // correct. See mime_magic_bytes() for the full rationale.
                 if let Some(ref ct) = of.mime_detect_ct {
-                    if off == 0 && sz <= MIME_DETECT_MAX_READ {
+                    if off == 0 && sz <= of.mime_detect_max_read {
                         let magic = mime_magic_bytes(ct);
                         let end = magic.len().min(sz);
                         reply.data(&magic[..end]);
@@ -5877,6 +5894,7 @@ impl Filesystem for NextCloudFs {
                                     local: None, buf: None, write_path: None,
                                     dirty: false, original_etag: None,
                                     mime_detect_ct: None,
+                                    mime_detect_max_read: 0,
                                     cache_fresh: true,
                                     next_expected_off: 0,
                                     read_ahead_window: READ_AHEAD_INITIAL,
@@ -5962,6 +5980,7 @@ impl Filesystem for NextCloudFs {
                 dirty: false,
                 original_etag: None,
                 mime_detect_ct: None,
+                mime_detect_max_read: 0,
                 cache_fresh: true,
                 next_expected_off: 0,
                 read_ahead_window: READ_AHEAD_INITIAL,
