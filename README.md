@@ -102,7 +102,9 @@ sudo apt-get install python3-nautilus
 ```
 This starts the Tauri tray app; the daemon mounts WebDAV at your configured `mount_point` automatically. 
 
-It will also install the shell integrations etc: `./shell_integration/nautilus/install.sh` to show sync-state emblems (cloud = remote-only, tick = local) on files in the mount.
+It will also install the shell integrations etc: `./shell_integration/file-managers/nautilus/install.sh` to show sync-state emblems (cloud = remote-only, tick = local) on files in the mount.
+
+File-browser support is modular: the service detects which browsers are installed (Nautilus, Dolphin, Nemo) and applies each one's profile (indexer exclusion, thumbnails, type detection). Profiles can be toggled from the GUI's *File browsers* settings or with `ncrs-ctl integrations` / `ncrs-ctl integration-set <id> on|off|auto`. Adapters talk to the service over the protocol in [`shell_integration/file-managers/PROTOCOL.md`](shell_integration/file-managers/PROTOCOL.md); the Dolphin adapter lives in `shell_integration/file-managers/dolphin/`.
 
 Downloaded files are cached in `~/.cache/ncrs/`.
 
@@ -122,7 +124,7 @@ nautilus -q
 Unit + integration tests (no server needed — integration tests skip gracefully):
 ```sh
 cargo test
-python3 -m unittest shell_integration.nautilus.test_syncstate -v
+python3 -m unittest discover -s shell_integration/file-managers/nautilus -v
 ```
 
 End-to-end tests against a real WebDAV server (requires Docker):

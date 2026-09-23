@@ -57,6 +57,15 @@ SOCKET_TIMEOUT = 2.0  # seconds
 # old extension, or vice-versa) is reported instead of silently misbehaving.
 PROTOCOL_VERSION = 3
 
+# Client id announced with HELLO; the service reports this profile's adapter
+# as connected while a client with this id is connected.
+CLIENT_ID = "nautilus"
+
+# Mount point as reported by the daemon's HELLO reply. Preferred over the one
+# parsed from config.yaml, which can differ from what the service mounted
+# (e.g. a --mount-point override).
+_DAEMON_MOUNT: str | None = None
+
 _POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="ncrs-nautilus")
 
 # Bind the InfoProvider result enums once so the per-file hot path does not
@@ -472,10 +481,20 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         GLib.timeout_add_seconds(2, self._poll_changes)
 
     def _check_daemon_version(self) -> None:
-        """Announce our protocol version and warn if the daemon's differs."""
+        """Say HELLO (protocol v3), falling back to the v2 VERSION handshake for
+        an older daemon, warn on a mismatch, and adopt the daemon's mount point."""
         try:
-            resp = _send_command(f"VERSION {PROTOCOL_VERSION}")
-            daemon_proto = resp.split("\t")[0] if resp else ""
+            resp = _send_command(f"HELLO {CLIENT_ID} {PROTOCOL_VERSION}")
+            if resp.startswith("OK\t"):
+                fields = resp.split("\t")
+                daemon_proto = fields[1] if len(fields) > 1 else ""
+                if len(fields) > 3 and fields[3]:
+                    self._adopt_mount(fields[3].rstrip("/") or "/")
+            else:
+                if resp == "unknown":
+                    # A v2 daemon does not know HELLO but does know VERSION.
+                    resp = _send_command(f"VERSION {PROTOCOL_VERSION}")
+                daemon_proto = resp.split("\t")[0] if resp else ""
             if not resp or resp.startswith("error") or daemon_proto in ("", "unknown"):
                 print(
                     f"[ncrs-nautilus] warning: the ncRS daemon did not report a protocol "
@@ -488,7 +507,7 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 daemon_v = int(daemon_proto)
             except ValueError:
                 print(
-                    f"[ncrs-nautilus] warning: unexpected VERSION reply from daemon: {resp!r}",
+                    f"[ncrs-nautilus] warning: unexpected handshake reply from daemon: {resp!r}",
                     file=sys.stderr,
                 )
                 return
@@ -506,6 +525,13 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 )
         except Exception:
             _log_error("_check_daemon_version")
+
+    def _adopt_mount(self, mount: str) -> None:
+        global _DAEMON_MOUNT
+        _DAEMON_MOUNT = mount
+        if mount != self._mount:
+            self._mount = mount
+            self._mount_prefix = mount + "/"
 
     def _poll_changes(self) -> bool:
         if self._poll_skip > 0:
@@ -771,7 +797,11 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
 class NcrsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
     def __init__(self):
         super().__init__()
-        self._mount = _load_mount_point()
+        self._config_mount = _load_mount_point()
+
+    @property
+    def _mount(self) -> str | None:
+        return _DAEMON_MOUNT or self._config_mount
 
     def get_file_items(self, *args):
         try:

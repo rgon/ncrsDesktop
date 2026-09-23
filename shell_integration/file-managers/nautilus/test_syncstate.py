@@ -1,8 +1,8 @@
 """
 Unit tests for the ncRS Nautilus extension helper functions.
 
-Run with:  python3 -m pytest shell_integration/nautilus/test_syncstate.py -v
-       or: python3 -m unittest shell_integration/nautilus/test_syncstate.py
+Run with:  python3 -m pytest shell_integration/file-managers/nautilus/test_syncstate.py -v
+       or: python3 -m unittest discover -s shell_integration/file-managers/nautilus
 """
 
 import os
@@ -662,29 +662,74 @@ class TestDaemonVersionCheck(unittest.TestCase):
             prov._check_daemon_version()
         return sent, buf.getvalue()
 
-    def test_announces_own_protocol_version(self):
-        sent, _ = self._run_check(f"{syncstate.PROTOCOL_VERSION}\t0.1.10")
-        self.assertEqual(sent, [f"VERSION {syncstate.PROTOCOL_VERSION}"])
+    def _hello_ok(self, proto=None, mount="/mnt/ncrs"):
+        proto = syncstate.PROTOCOL_VERSION if proto is None else proto
+        return f"OK\t{proto}\t0.1.73\t{mount}\tdetaildir,events"
+
+    def _run_scripted(self, replies):
+        """Like _run_check, but each command gets its own reply."""
+        sent = []
+        syncstate._send_command = lambda cmd: (sent.append(cmd), replies.get(cmd.split()[0], "unknown"))[1]
+        prov = syncstate.NcrsInfoProvider.__new__(syncstate.NcrsInfoProvider)
+        prov._mount = "/from/config"
+        prov._mount_prefix = "/from/config/"
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            prov._check_daemon_version()
+        return prov, sent, buf.getvalue()
+
+    def tearDown(self):
+        syncstate._send_command = self._orig_send
+        syncstate._DAEMON_MOUNT = None
+
+    def test_says_hello_with_client_id_and_protocol(self):
+        _, sent, _ = self._run_scripted({"HELLO": self._hello_ok()})
+        self.assertEqual(sent, [f"HELLO nautilus {syncstate.PROTOCOL_VERSION}"])
 
     def test_matching_version_no_warning(self):
-        _, err = self._run_check(f"{syncstate.PROTOCOL_VERSION}\t0.1.10")
+        _, _, err = self._run_scripted({"HELLO": self._hello_ok()})
         self.assertNotIn("warning", err.lower())
         self.assertIn(f"protocol v{syncstate.PROTOCOL_VERSION}", err)
 
+    def test_hello_mount_point_wins_over_config(self):
+        prov, _, _ = self._run_scripted({"HELLO": self._hello_ok(mount="/home/u/Cloud")})
+        self.assertEqual(prov._mount, "/home/u/Cloud")
+        self.assertEqual(prov._mount_prefix, "/home/u/Cloud/")
+        menu = syncstate.NcrsMenuProvider.__new__(syncstate.NcrsMenuProvider)
+        menu._config_mount = "/from/config"
+        self.assertEqual(menu._mount, "/home/u/Cloud")
+
     def test_mismatched_version_warns(self):
-        _, err = self._run_check(f"{syncstate.PROTOCOL_VERSION + 1}\t9.9.9")
+        _, _, err = self._run_scripted({"HELLO": self._hello_ok(proto=syncstate.PROTOCOL_VERSION + 1)})
         self.assertIn("warning", err.lower())
         self.assertIn("does not match", err)
 
+    def test_v2_daemon_falls_back_to_version(self):
+        prov, sent, err = self._run_scripted({"VERSION": "2\t0.1.72"})
+        self.assertEqual(sent, [f"HELLO nautilus {syncstate.PROTOCOL_VERSION}", f"VERSION {syncstate.PROTOCOL_VERSION}"])
+        self.assertIn("does not match", err)
+        self.assertEqual(prov._mount, "/from/config")
+
     def test_old_daemon_without_version_command_warns(self):
-        # Pre-VERSION daemons reply "unknown" to an unrecognised command.
-        _, err = self._run_check("unknown")
+        # Pre-VERSION daemons reply "unknown" to every handshake.
+        _, _, err = self._run_scripted({})
         self.assertIn("warning", err.lower())
         self.assertIn("older build", err)
 
     def test_connection_error_warns(self):
         _, err = self._run_check("error: connection failed")
         self.assertIn("warning", err.lower())
+
+    def test_every_published_status_is_handled(self):
+        # Each word in the shared vocabulary either has an emblem or is one of
+        # the statuses that deliberately show none.
+        vocab_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "status-vocabulary.txt")
+        with open(vocab_path, encoding="utf-8") as f:
+            vocab = {l.strip() for l in f if l.strip() and not l.startswith("#")}
+        no_emblem = {"synced", "remote", "unknown"}
+        self.assertEqual(vocab - set(syncstate._SYNC_EMBLEMS) - no_emblem, set())
 
 
 class TestTargetedChangeRefresh(unittest.TestCase):
