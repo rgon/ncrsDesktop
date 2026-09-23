@@ -2,6 +2,7 @@ pub mod asset_url;
 pub mod auth;
 pub mod backend;
 pub mod config;
+pub mod desktop;
 pub mod login_flow;
 pub mod edit_locally;
 pub mod filename_validation;
@@ -1212,7 +1213,9 @@ impl FsCache {
         // listing (see trackerignore_entry()). Purely local — the server never
         // sees this entry — so it survives PROPFIND refreshes for free instead
         // of depending on a real write that a stale/evicted listing could lose.
+        // Only while a profile with the Tracker component is enabled.
         if path == Path::new("/") && !self.trackerignore_hidden
+            && desktop::policy().tracker_ignore
             && !files.iter().any(|f| f.path == trackerignore_path())
         {
             files.push(trackerignore_entry());
@@ -1553,8 +1556,10 @@ const SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 /// Cap on total deferral, so a busy tree still gets persisted.
 const SAVE_MAX_DEFER: Duration = Duration::from_secs(60);
 
+/// A toolkit atomic-write temp (GIO's `.goutputstream-*` / `.xdp-*` today),
+/// per the active desktop profiles — see `desktop::toolkit::gio`.
 fn is_gio_temp_file(name: &str) -> bool {
-    name.starts_with(".goutputstream-") || name.starts_with(".xdp-")
+    desktop::policy().is_hidden_temp(name)
 }
 
 fn unix_millis() -> u64 {
@@ -4466,7 +4471,9 @@ impl Filesystem for NextCloudFs {
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-        if name.as_encoded_bytes() != b"user.xdg.mime.type" {
+        // `user.xdg.mime.type` is GLib's fast path; served while the GIO
+        // component is active (see desktop::toolkit::gio).
+        if name.as_encoded_bytes() != b"user.xdg.mime.type" || !desktop::policy().glib_sniff {
             reply.error(Errno::ENODATA);
             return;
         }
@@ -4512,7 +4519,7 @@ impl Filesystem for NextCloudFs {
             Some(e) => e,
             None => { if size == 0 { reply.size(0); } else { reply.data(b""); } return; }
         };
-        let has_ct = entries.iter()
+        let has_ct = desktop::policy().glib_sniff && entries.iter()
             .find(|e| e.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == file_name)
             .map(|e| e.content_type.is_some())
             .unwrap_or(false);
@@ -4622,7 +4629,8 @@ impl Filesystem for NextCloudFs {
         // magic bytes instead. O_NOFOLLOW and O_CLOEXEC are both stripped by the kernel
         // before the request reaches FUSE, so O_NOATIME is the only reliable signal.
         let is_mime_detect = !writable && local.is_none()
-            && (flags.0 & libc::O_NOATIME != 0);
+            && (flags.0 & libc::O_NOATIME != 0)
+            && desktop::policy().glib_sniff;
         let mime_detect_ct = if is_mime_detect {
             let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
             let ct = self.cache.safe_lock()
@@ -6890,7 +6898,11 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let file_change_queue = filesystem.file_change_queue();
     let storage_stats: ipc::SharedStorageStats = Arc::new(Mutex::new(ipc::StorageStats::default()));
     let offline_flag = filesystem.is_offline_flag();
-    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.children_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), Some(purge_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone(), offline_status.clone(), filesystem.passthrough_enabled_flag(), filesystem.passthrough_capable_flag());
+    // Desktop / file-browser profiles: resolve which browsers are installed
+    // (or explicitly toggled) and apply their components.
+    let desktop_manager = Arc::new(desktop::Manager::for_service(options.mount_point.clone()));
+    desktop_manager.spawn_refresher();
+    ipc::start_server(options.mount_point.clone(), filesystem.status_map(), filesystem.shared_set(), filesystem.fileid_map(), filesystem.detail_map(), filesystem.children_map(), filesystem.dirty_set(), ipc_creds, base_url, Some(keep_cb), Some(evict_cb), Some(prefetch_cb), Some(thumbnail_cb), Some(purge_cb), filesystem.error_log(), filesystem.transfer_map(), filesystem.journal(), file_change_queue.clone(), storage_stats.clone(), paused_flag.clone(), offline_status.clone(), filesystem.passthrough_enabled_flag(), filesystem.passthrough_capable_flag(), Some(desktop_manager.clone()));
 
     let backend = filesystem.conn.backend.clone();
     let notifier_slot = filesystem.notifier_slot();
