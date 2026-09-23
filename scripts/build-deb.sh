@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Builds release binaries and assembles a .deb package.
+# Builds release binaries and assembles the .deb packages:
+#   ncrs            the service, CLI tools and (unless --skip-gui) the GUI
+#   ncrs-nautilus   the Nautilus shell adapter (arch: all; depends on ncrs)
+# The Dolphin adapter (ncrs-dolphin) is built by scripts/build-deb-dolphin.sh.
 #
 # Usage: ./scripts/build-deb.sh [OPTIONS]
 #   --version VERSION   Package version (default: workspace version in Cargo.toml)
@@ -68,7 +71,7 @@ fi
 # With --skip-build the staged binaries must already exist; fail fast instead
 # of dying mid-assembly (or silently shipping a GUI-less package).
 if $SKIP_BUILD; then
-    for bin in ncrs ncrs-open; do
+    for bin in ncrs ncrs-open ncrs-ctl; do
         [[ -x "target/release/$bin" ]] || { echo "error: --skip-build set but target/release/$bin is missing" >&2; exit 1; }
     done
     if ! $SKIP_GUI && [[ ! -x target/release/ncrs-gui ]]; then
@@ -82,9 +85,9 @@ echo "→ Assembling package tree..."
 rm -rf "$PKG_DIR"
 install -Dm755 target/release/ncrs                                       "$PKG_DIR/usr/bin/ncrs"
 install -Dm755 target/release/ncrs-open                                  "$PKG_DIR/usr/bin/ncrs-open"
+install -Dm755 target/release/ncrs-ctl                                   "$PKG_DIR/usr/bin/ncrs-ctl"
 install -Dm644 packaging/ncrs.service                                    "$PKG_DIR/usr/lib/systemd/user/ncrs.service"
 install -Dm644 packaging/ncrs-open.desktop                               "$PKG_DIR/usr/share/applications/ncrs-open.desktop"
-install -Dm644 shell_integration/nautilus/syncstate.py                   "$PKG_DIR/usr/share/nautilus-python/extensions/ncrs-syncstate.py"
 install -Dm755 shell_integration/gnome-search/ncrs-search-provider       "$PKG_DIR/usr/bin/ncrs-search-provider"
 install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.SearchProvider.ini \
                                                                          "$PKG_DIR/usr/share/gnome-shell/search-providers/es.rgon.ncrs.SearchProvider.ini"
@@ -119,7 +122,9 @@ fi
 # ── Write DEBIAN/control ──────────────────────────────────────────────────────
 # ncrs links libssl at build time; ncrs-gui dlopens libayatana-appindicator3
 # for the tray icon (invisible to ldd/shlibdeps) and panics without it.
-DEPENDS="fuse3, python3-nautilus | gir1.2-nautilus-3.0, libssl3t64 | libssl3, libimage-exiftool-perl, python3-gi, gir1.2-gdkpixbuf-2.0"
+# File-manager adapters are separate packages (ncrs-nautilus, ncrs-dolphin) so
+# no desktop's bindings are forced onto another's users.
+DEPENDS="fuse3, libssl3t64 | libssl3, libimage-exiftool-perl, python3-gi, gir1.2-gdkpixbuf-2.0"
 if ! $SKIP_GUI; then
     DEPENDS="$DEPENDS, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37, libayatana-appindicator3-1 | libappindicator3-1"
 fi
@@ -131,13 +136,16 @@ Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: Gonzalo Ruiz <gonza@logo.cl>
 Depends: ${DEPENDS}
-Recommends: libcap2-bin
+Recommends: libcap2-bin, ncrs-nautilus
+Suggests: ncrs-dolphin
 Section: net
 Priority: optional
 Description: Nextcloud FUSE virtual filesystem client
  ncrs mounts your Nextcloud as a local FUSE filesystem with offline
- caching, real-time sync, conflict detection, and GNOME/Nautilus
- integration including a GNOME Shell search provider.
+ caching, real-time sync, conflict detection and a GNOME Shell search
+ provider. File-browser integration (indexer exclusion, thumbnails,
+ type detection) is applied per installed browser by the service; sync
+ emblems and menus come from the ncrs-nautilus / ncrs-dolphin adapters.
  .
  libcap2-bin (setcap) is used at install time to grant the ncrs binary
  CAP_SYS_ADMIN, which enables zero-copy kernel read passthrough for
@@ -157,8 +165,36 @@ done
 mkdir -p "$OUT_DIR"
 DEB_PATH="$OUT_DIR/ncrs_${VERSION}_${ARCH}.deb"
 dpkg-deb --build --root-owner-group "$PKG_DIR" "$DEB_PATH"
+
+# ── ncrs-nautilus (the Nautilus shell adapter) ────────────────────────────────
+# Up to 0.1.72 the extension shipped inside ncrs itself, hence Replaces/Breaks
+# so an upgrade hands the file over instead of failing on the overlap.
+NAUT_DIR="$OUT_DIR/ncrs-nautilus_${VERSION}_all"
+rm -rf "$NAUT_DIR"
+install -Dm644 shell_integration/file-managers/nautilus/syncstate.py      "$NAUT_DIR/usr/share/nautilus-python/extensions/ncrs-syncstate.py"
+install -Dm644 packaging/copyright                                       "$NAUT_DIR/usr/share/doc/ncrs-nautilus/copyright"
+install -Dm755 packaging/ncrs-nautilus/postinst                          "$NAUT_DIR/DEBIAN/postinst"
+cat > "$NAUT_DIR/DEBIAN/control" <<EOF
+Package: ncrs-nautilus
+Version: ${VERSION}
+Architecture: all
+Maintainer: Gonzalo Ruiz <gonza@logo.cl>
+Depends: ncrs (>= ${VERSION}), python3-nautilus | gir1.2-nautilus-3.0, python3-gi
+Replaces: ncrs (<< 0.1.73)
+Breaks: ncrs (<< 0.1.73)
+Section: net
+Priority: optional
+Description: Nautilus integration for the ncrs Nextcloud filesystem
+ Sync-status emblems, sharing/permission columns, Keep / Free up space /
+ Open in web actions and Nextcloud search in Files (Nautilus), talking to
+ the ncrs service over its local socket.
+EOF
+NAUT_DEB="$OUT_DIR/ncrs-nautilus_${VERSION}_all.deb"
+dpkg-deb --build --root-owner-group "$NAUT_DIR" "$NAUT_DEB"
+
 echo ""
 echo "✓ Built: $DEB_PATH"
-echo "  Install with: sudo apt install ./$DEB_PATH"
+echo "✓ Built: $NAUT_DEB"
+echo "  Install with: sudo apt install ./$DEB_PATH ./$NAUT_DEB"
 echo "  The GUI tray app autostarts at login (/etc/xdg/autostart/ncrs-gui.desktop)."
 echo "  Headless (no-GUI) alternative: systemctl --user enable --now ncrs.service"
