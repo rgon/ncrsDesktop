@@ -2942,7 +2942,7 @@ dependencies = [
 
 [[package]]
 name = "nc_gnome_integration"
-version = "0.1.72"
+version = "0.1.73"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2957,7 +2957,7 @@ dependencies = [
 
 [[package]]
 name = "nc_passwords"
-version = "0.1.72"
+version = "0.1.73"
 dependencies = [
  "log",
  "ncrs_plugin",
@@ -2970,7 +2970,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs-gui"
-version = "0.1.72"
+version = "0.1.73"
 dependencies = [
  "dirs",
  "libc",
@@ -2995,7 +2995,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs_core"
-version = "0.1.72"
+version = "0.1.73"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs_plugin"
-version = "0.1.72"
+version = "0.1.73"
 dependencies = [
  "serde",
  "serde_json",
