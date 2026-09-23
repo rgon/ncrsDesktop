@@ -2002,12 +2002,12 @@ password: "pass"
         // Smallest copy-tool buffer (GIO g_file_copy); cp uses 131072.
         const SMALLEST_COPY_BUFFER: usize = 65536;
 
-        assert!(MIME_DETECT_MAX_READ >= READAHEAD_CEILING,
+        assert!(crate::desktop::toolkit::gio::GLIB_SNIFF_MAX_READ >= READAHEAD_CEILING,
             "intercept must cover read-ahead-inflated magic reads ({} < {})",
-            MIME_DETECT_MAX_READ, READAHEAD_CEILING);
-        assert!(MIME_DETECT_MAX_READ < SMALLEST_COPY_BUFFER,
+            crate::desktop::toolkit::gio::GLIB_SNIFF_MAX_READ, READAHEAD_CEILING);
+        assert!(crate::desktop::toolkit::gio::GLIB_SNIFF_MAX_READ < SMALLEST_COPY_BUFFER,
             "intercept must not swallow copy reads ({} >= {})",
-            MIME_DETECT_MAX_READ, SMALLEST_COPY_BUFFER);
+            crate::desktop::toolkit::gio::GLIB_SNIFF_MAX_READ, SMALLEST_COPY_BUFFER);
     }
 
     #[test]
