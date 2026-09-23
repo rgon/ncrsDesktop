@@ -135,14 +135,31 @@ fn run(cli: Cli) -> Result<(), String> {
             for p in v.as_array().into_iter().flatten() {
                 let s = |k: &str| p.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let b = |k: &str| p.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+                let list = |k: &str| {
+                    p.get(k)
+                        .and_then(|x| x.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
+                        .unwrap_or_default()
+                };
+                let adapter = if p.get("adapter_package").is_some_and(|v| !v.is_null()) {
+                    format!(
+                        " adapter={}{}",
+                        if b("adapter_installed") { "installed" } else { "missing" },
+                        if b("adapter_connected") { ",connected" } else { "" }
+                    )
+                } else {
+                    String::new()
+                };
+                let required_by = list("required_by");
                 println!(
-                    "{:<10} {:<4} mode={:<4} installed={:<5} adapter={}{}",
+                    "{:<8} {:<9} {:<4} mode={:<4} installed={:<5}{}{}",
+                    s("kind"),
                     s("id"),
                     if b("enabled") { "on" } else { "off" },
                     s("mode"),
                     b("installed"),
-                    if b("adapter_installed") { "installed" } else { "missing" },
-                    if b("adapter_connected") { ",connected" } else { "" },
+                    adapter,
+                    if required_by.is_empty() { String::new() } else { format!(" required-by={}", required_by) },
                 );
             }
         }

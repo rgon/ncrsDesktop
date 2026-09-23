@@ -7,22 +7,22 @@
 //! answers them locally, and *how* it does so depends on the browser.
 //!
 //! Rather than scattering per-browser special cases through the FUSE layer,
-//! "support X" is expressed as a [`browser::BrowserProfile`]: a named bundle of
-//! reusable [`Component`]s (a toolkit such as GIO or KIO, an indexer such as
-//! Tracker or Baloo) plus a descriptor of its shell adapter. The [`Manager`]
-//! resolves which profiles are enabled (by default: the browsers that are
-//! installed), activates the union of their components (ref-counted — a
-//! component stays on while any enabled profile needs it), and publishes one
-//! immutable [`DesktopPolicy`] that the FUSE hot paths read lock-free-ish via
+//! "support X" is expressed as a [`profiles::Profile`]: a *toolkit* profile
+//! (GIO, KIO) bundles reusable [`Component`]s — sniffing, thumbnails, the
+//! desktop's indexer — and a *browser* profile (Nautilus, Dolphin, …) adds its
+//! shell adapter and requires its toolkit. The [`Manager`] resolves which
+//! profiles are enabled (by default: what is installed; a toolkit is also kept
+//! on while an enabled browser requires it), activates their components, and
+//! publishes one immutable [`DesktopPolicy`] that the FUSE hot paths read via
 //! [`policy()`].
 //!
 //! The service owns all of this. The GUI and `ncrs-ctl` only list and toggle
 //! whole profiles over IPC (`INTEGRATIONS`, `INTEGRATION_SET`); components are
 //! never exposed individually.
 
-pub mod browser;
 pub mod detect;
 pub mod indexer;
+pub mod profiles;
 pub mod store;
 pub mod toolkit;
 
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::{MutexExt, RwLockExt};
-use browser::BrowserProfile;
+use profiles::{Profile, ProfileKind};
 use detect::DetectEnv;
 use store::{Mode, Store};
 
@@ -169,11 +169,16 @@ fn publish(p: DesktopPolicy) {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ProfileStatus {
     pub id: &'static str,
+    pub kind: ProfileKind,
     pub name: &'static str,
     pub summary: &'static str,
     pub installed: bool,
     pub mode: Mode,
+    /// Effective state: own mode resolved, or kept on by `required_by`.
     pub enabled: bool,
+    pub requires: &'static [&'static str],
+    /// Enabled profiles that keep this one on.
+    pub required_by: Vec<&'static str>,
     pub adapter_package: Option<&'static str>,
     pub adapter_client_ids: &'static [&'static str],
     pub adapter_installed: bool,
@@ -194,7 +199,7 @@ pub struct Manager {
     mount_point: PathBuf,
     env: DetectEnv,
     store_path: Option<PathBuf>,
-    profiles: &'static [BrowserProfile],
+    profiles: &'static [Profile],
     state: Mutex<State>,
     /// Publish into the process-wide policy slot (off in unit tests, which
     /// inspect [`Manager::current_policy`] instead).
@@ -204,14 +209,14 @@ pub struct Manager {
 impl Manager {
     /// The service's manager: real environment, state persisted next to config.yaml.
     pub fn for_service(mount_point: PathBuf) -> Self {
-        Self::new(mount_point, DetectEnv::from_env(), Some(store::default_path()), browser::PROFILES, true)
+        Self::new(mount_point, DetectEnv::from_env(), Some(store::default_path()), profiles::PROFILES, true)
     }
 
     pub fn new(
         mount_point: PathBuf,
         env: DetectEnv,
         store_path: Option<PathBuf>,
-        profiles: &'static [BrowserProfile],
+        profiles: &'static [Profile],
         publish_global: bool,
     ) -> Self {
         let store = store_path.as_deref().map(Store::load).unwrap_or_default();
@@ -242,12 +247,26 @@ impl Manager {
         }
     }
 
-    fn enabled_locked(&self, st: &State, p: &BrowserProfile) -> bool {
+    /// The profile's own resolution: the user's choice, else installed-ness.
+    fn own_enabled(&self, st: &State, p: &Profile) -> bool {
         match st.store.mode(p.id) {
             Mode::On => true,
             Mode::Off => false,
             Mode::Auto => st.installed.get(p.id).copied().unwrap_or(false),
         }
+    }
+
+    /// Enabled browsers that require `p` (keeping it on regardless of its own mode).
+    fn required_by(&self, st: &State, p: &Profile) -> Vec<&'static str> {
+        self.profiles
+            .iter()
+            .filter(|q| q.requires.contains(&p.id) && self.own_enabled(st, q))
+            .map(|q| q.id)
+            .collect()
+    }
+
+    fn enabled_locked(&self, st: &State, p: &Profile) -> bool {
+        self.own_enabled(st, p) || !self.required_by(st, p).is_empty()
     }
 
     fn wanted_components(&self, st: &State) -> BTreeSet<ComponentId> {
@@ -319,11 +338,14 @@ impl Manager {
             .iter()
             .map(|p| ProfileStatus {
                 id: p.id,
+                kind: p.kind,
                 name: p.name,
                 summary: p.summary,
                 installed: st.installed.get(p.id).copied().unwrap_or(false),
                 mode: st.store.mode(p.id),
                 enabled: self.enabled_locked(&st, p),
+                requires: p.requires,
+                required_by: self.required_by(&st, p),
                 adapter_package: p.adapter.package,
                 adapter_client_ids: p.adapter.client_ids,
                 adapter_installed: p.adapter.is_installed(&self.env),
@@ -367,39 +389,47 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use browser::{AdapterDescriptor, Detect};
+    use profiles::{AdapterDescriptor, Detect};
 
-    static TEST_PROFILES: &[BrowserProfile] = &[
-        BrowserProfile {
-            id: "nautilus",
-            name: "Files",
+    const fn toolkit(id: &'static str, lib: &'static [&'static str], components: &'static [ComponentId]) -> Profile {
+        Profile {
+            id,
+            kind: ProfileKind::Toolkit,
+            name: id,
             summary: "",
-            detect: Detect { binaries: &["nautilus"], desktop_files: &[] },
-            components: &[ComponentId::Gio, ComponentId::Tracker],
+            detect: Detect { binaries: &[], desktop_files: &[], libraries: lib },
+            components,
+            requires: &[],
             adapter: AdapterDescriptor::NONE,
-        },
-        BrowserProfile {
-            id: "nemo",
-            name: "Nemo",
+        }
+    }
+
+    const fn browser(id: &'static str, bin: &'static [&'static str], desktop: &'static [&'static str], requires: &'static [&'static str]) -> Profile {
+        Profile {
+            id,
+            kind: ProfileKind::Browser,
+            name: id,
             summary: "",
-            detect: Detect { binaries: &["nemo"], desktop_files: &[] },
-            components: &[ComponentId::Gio, ComponentId::Tracker],
+            detect: Detect { binaries: bin, desktop_files: desktop, libraries: &[] },
+            components: &[],
+            requires,
             adapter: AdapterDescriptor::NONE,
-        },
-        BrowserProfile {
-            id: "dolphin",
-            name: "Dolphin",
-            summary: "",
-            detect: Detect { binaries: &[], desktop_files: &["org.kde.dolphin.desktop"] },
-            components: &[ComponentId::Kio],
-            adapter: AdapterDescriptor::NONE,
-        },
+        }
+    }
+
+    static TEST_PROFILES: &[Profile] = &[
+        toolkit("gio", &["libgio-2.0.so.0"], &[ComponentId::Gio, ComponentId::Tracker]),
+        toolkit("kio", &["libKF6KIOCore.so.6"], &[ComponentId::Kio]),
+        browser("nautilus", &["nautilus"], &[], &["gio"]),
+        browser("nemo", &["nemo"], &[], &["gio"]),
+        browser("dolphin", &[], &["org.kde.dolphin.desktop"], &["kio"]),
     ];
 
     struct Fixture {
         _dir: tempfile::TempDir,
         bin: PathBuf,
         apps: PathBuf,
+        lib: PathBuf,
         env: DetectEnv,
         store: PathBuf,
     }
@@ -409,11 +439,13 @@ mod tests {
         let bin = dir.path().join("bin");
         let share = dir.path().join("share");
         let apps = share.join("applications");
+        let lib = dir.path().join("lib");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&apps).unwrap();
-        let env = DetectEnv { bin_dirs: vec![bin.clone()], data_dirs: vec![share], lib_dirs: vec![] };
+        std::fs::create_dir_all(lib.join("x86_64-linux-gnu")).unwrap();
+        let env = DetectEnv { bin_dirs: vec![bin.clone()], data_dirs: vec![share], lib_dirs: vec![lib.clone()] };
         let store = dir.path().join("desktop-profiles.json");
-        Fixture { _dir: dir, bin, apps, env, store }
+        Fixture { _dir: dir, bin, apps, lib, env, store }
     }
 
     fn install_bin(f: &Fixture, name: &str) {
@@ -421,6 +453,10 @@ mod tests {
         let p = f.bin.join(name);
         std::fs::write(&p, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn install_lib(f: &Fixture, name: &str) {
+        std::fs::write(f.lib.join("x86_64-linux-gnu").join(name), b"").unwrap();
     }
 
     fn manager(f: &Fixture) -> Manager {
@@ -436,12 +472,26 @@ mod tests {
         let f = fixture();
         install_bin(&f, "nautilus");
         let m = manager(&f);
-        assert_eq!(enabled(&m), vec!["nautilus"]);
-        // Installing Dolphin later flips its default without a restart.
+        // Nautilus pulls its toolkit in even though libgio is not "installed" here.
+        assert_eq!(enabled(&m), vec!["gio", "nautilus"]);
+        // Installing Dolphin later flips its default (and its toolkit) without a restart.
         std::fs::write(f.apps.join("org.kde.dolphin.desktop"), "[Desktop Entry]\n").unwrap();
-        assert_eq!(enabled(&m), vec!["nautilus", "dolphin"]);
+        assert_eq!(enabled(&m), vec!["gio", "kio", "nautilus", "dolphin"]);
         std::fs::remove_file(f.bin.join("nautilus")).unwrap();
-        assert_eq!(enabled(&m), vec!["dolphin"]);
+        assert_eq!(enabled(&m), vec!["kio", "dolphin"]);
+    }
+
+    #[test]
+    fn toolkit_profile_is_detected_independently_of_browsers() {
+        // A KDE desktop with GTK apps: GLib is installed, Nautilus is not. The
+        // GIO workarounds must still apply for those apps.
+        let f = fixture();
+        install_lib(&f, "libgio-2.0.so.0");
+        std::fs::write(f.apps.join("org.kde.dolphin.desktop"), "[Desktop Entry]\n").unwrap();
+        let m = manager(&f);
+        assert_eq!(enabled(&m), vec!["gio", "kio", "dolphin"]);
+        let p = m.current_policy();
+        assert!(p.glib_sniff && p.thumbnails.large);
     }
 
     #[test]
@@ -458,27 +508,30 @@ mod tests {
         let m = manager(&f);
         m.set("nautilus", Mode::Off).unwrap();
         m.set("dolphin", Mode::On).unwrap();
-        assert_eq!(enabled(&m), vec!["dolphin"]);
+        assert_eq!(enabled(&m), vec!["kio", "dolphin"]);
         // A fresh manager (service restart) reads the stored choices back.
         let m2 = manager(&f);
-        assert_eq!(enabled(&m2), vec!["dolphin"]);
+        assert_eq!(enabled(&m2), vec!["kio", "dolphin"]);
         // Reset to auto: back to detection.
         m2.set("nautilus", Mode::Auto).unwrap();
         m2.set("dolphin", Mode::Auto).unwrap();
-        assert_eq!(enabled(&m2), vec!["nautilus"]);
+        assert_eq!(enabled(&m2), vec!["gio", "nautilus"]);
     }
 
     #[test]
-    fn shared_components_are_ref_counted() {
+    fn a_required_toolkit_stays_on_and_reports_why() {
         let f = fixture();
         install_bin(&f, "nautilus");
         install_bin(&f, "nemo");
         let m = manager(&f);
-        m.refresh();
+        m.set("gio", Mode::Off).unwrap();
+        let gio = m.list(&|_| false).into_iter().find(|p| p.id == "gio").unwrap();
+        assert!(gio.enabled, "Nautilus and Nemo still need it");
+        assert_eq!(gio.mode, Mode::Off);
+        assert_eq!(gio.required_by, vec!["nautilus", "nemo"]);
+        assert!(m.current_policy().glib_sniff);
         m.set("nautilus", Mode::Off).unwrap();
-        // Nemo still needs GIO + Tracker.
-        let p = m.current_policy();
-        assert!(p.glib_sniff && p.tracker_ignore);
+        assert!(m.current_policy().glib_sniff, "Nemo alone still needs it");
         m.set("nemo", Mode::Off).unwrap();
         let p = m.current_policy();
         assert!(!p.glib_sniff && !p.tracker_ignore);

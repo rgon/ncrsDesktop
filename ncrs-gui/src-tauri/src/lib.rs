@@ -701,12 +701,21 @@ fn get_passthrough_status() -> Option<String> {
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct Integration {
     pub id: String,
+    /// "toolkit" (GIO, KIO) | "browser" (Nautilus, Dolphin, …)
+    #[serde(default)]
+    pub kind: String,
     pub name: String,
     pub summary: String,
     pub installed: bool,
     /// "auto" | "on" | "off"
     pub mode: String,
     pub enabled: bool,
+    /// Toolkit profiles this browser keeps enabled.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Enabled browsers keeping this toolkit on regardless of its own mode.
+    #[serde(default)]
+    pub required_by: Vec<String>,
     pub adapter_package: Option<String>,
     #[serde(default)]
     pub adapter_client_ids: Vec<String>,
