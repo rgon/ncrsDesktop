@@ -1459,6 +1459,9 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
             log::info!("notification polling starting for {}", ncrs_core::notifications::base_url(&poll_url));
             spawn(async move {
                 let base = ncrs_core::notifications::base_url(&poll_url);
+                // Ids already on screen; None until the first fetch sets the
+                // baseline, so startup doesn't pop every unread notification.
+                let mut seen: Option<std::collections::HashSet<u64>> = None;
                 loop {
                     if *notif_shutdown.borrow() { break; }
                     let b = base.clone();
@@ -1473,6 +1476,12 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
                         Ok(Ok(notifs)) => {
                             log::info!("notifications fetched: {} item(s)", notifs.len());
                             *poll_state.auth_error.lock().unwrap() = None;
+                            // Pop new ones from here, not the webview: closing the
+                            // window destroys it, and the tray process polls alone.
+                            if let Some(seen) = &seen {
+                                notify_new_notifications(&poll_app, &notifs, seen);
+                            }
+                            seen = Some(notifs.iter().map(|n| n.notification_id).collect());
                             *poll_state.notifications.lock().unwrap() = notifs.clone();
                             poll_app.emit("notifications-updated", notifs).ok();
                         }
@@ -1509,6 +1518,29 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
     }
 
     Ok(())
+}
+
+/// Raise a desktop notification for each Nextcloud notification not in `seen`,
+/// collapsing a burst into a single summary.
+fn notify_new_notifications(app: &AppHandle, notifs: &[NcNotification], seen: &std::collections::HashSet<u64>) {
+    let fresh: Vec<&NcNotification> = notifs.iter().filter(|n| !seen.contains(&n.notification_id)).collect();
+    if fresh.len() > 3 {
+        app.notification()
+            .builder()
+            .title("Nextcloud")
+            .body(format!("{} new notifications", fresh.len()))
+            .show()
+            .ok();
+        return;
+    }
+    for n in fresh {
+        app.notification()
+            .builder()
+            .title(&n.subject)
+            .body(&n.message)
+            .show()
+            .ok();
+    }
 }
 
 /// Outcome of a single [`run_subscription`] attempt.
