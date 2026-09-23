@@ -151,3 +151,29 @@ reports reachability without ever demoting.
 `ncrs_core/examples/h3probe.rs` probes a server end-to-end (`--v3` for real
 HTTP/3, sleeps to cross idle boundaries) and prints the negotiated version —
 use it before blaming the server or the network.
+
+## 4. Every file browser brings its own download storms (desktop profiles)
+
+A remote mount looks local to the desktop, so indexers, MIME sniffers and
+thumbnailers read file contents freely, and on ncrs each read is a download.
+These behaviours differ per browser/toolkit, so they are handled per
+*desktop profile* (`ncrs_core/src/desktop/`), never as ad-hoc special cases in
+the FUSE layer. A profile is enabled by default iff its browser is installed,
+and components shared by several profiles stay active while any of them is
+enabled.
+
+| Behaviour | GIO (Nautilus, Nemo) | KIO (Dolphin) |
+|---|---|---|
+| Indexer | Tracker: synthetic `/.trackerignore` | Baloo: mount added to `exclude folders` (via `balooctl6`, fallback `baloofilerc`); only the entry ncrs added is ever removed |
+| MIME sniffing | `O_NOATIME` head reads answered from PROPFIND content-type (§2), plus `user.xdg.mime.type` | **Unmeasured.** Qt's `QMimeDatabase` does not use `O_NOATIME`, so the GLib intercept never fires |
+| Thumbnails | freedesktop `normal` pre-filled from server previews | `normal` + `large` (one 256 px fetch, scaled down for `normal`) |
+| Atomic-write temps | `.goutputstream-*`, `.xdp-*` hidden and optionally purged | **Unmeasured:** KIO `*.part` copies (not hidden: a user's own `.part` file would be deleted) |
+| Folder view settings | — | **Unmeasured:** `user.kde.fm.viewproperties` xattr has no `setxattr` handler, so Dolphin may fall back to writing `.directory` files that get uploaded |
+
+The unmeasured cells need a strace / FUSE-debug session of Dolphin, Baloo and
+the KIO thumbnailer against a *test* mount (never the live one) before any
+intercept is written. A wrong sniff signal serves fake bytes to real readers
+(see the `cp` false positives in §2).
+
+Disabling every GIO-based profile also disables the GLib sniff intercept for
+GTK apps in general (e.g. a GTK file chooser on a KDE desktop).

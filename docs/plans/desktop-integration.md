@@ -1,6 +1,22 @@
 # Plan: modular file-browser / desktop integration (Dolphin first)
 
-Status: planned. Based on `master` @ `a190f75`. Line references point at that commit.
+Status: implemented on branch `docs/desktop-integration-plan` (Phases 1–7, KDE items
+pending measurement). Based on `master` @ `a190f75`. Line references point at that commit.
+
+### Deviations from the plan as implemented
+
+- Profile choices and applied side effects live in the service-owned
+  `~/.config/ncrs/desktop-profiles.json`, not `config.yaml`: the GUI rewrites
+  config.yaml wholesale and would clobber them.
+- The Baloo exclusion is removed when the Dolphin profile is disabled, not on every
+  unmount. Otherwise Baloo could start crawling in the window between mount and
+  re-adding it.
+- Legacy `CHANGES`/`FILE_CHANGES` cursors are keyed by client **pid**, not by pid plus
+  client-id, because Nautilus says hello on only one of its pool-thread
+  connections. Cursors are created only for clients that poll.
+- Phase 0 (measurement on a KDE session) was not run. The Qt sniff probe, KIO `.part`
+  handling and folder-view metadata are documented as open in GOTCHAS.md §4 rather
+  than implemented blind.
 
 ## Goal
 
