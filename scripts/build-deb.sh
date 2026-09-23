@@ -167,8 +167,10 @@ DEB_PATH="$OUT_DIR/ncrs_${VERSION}_${ARCH}.deb"
 dpkg-deb --build --root-owner-group "$PKG_DIR" "$DEB_PATH"
 
 # ── ncrs-nautilus (the Nautilus shell adapter) ────────────────────────────────
-# Up to 0.1.72 the extension shipped inside ncrs itself, hence Replaces/Breaks
-# so an upgrade hands the file over instead of failing on the overlap.
+# Older ncrs packages shipped the extension themselves, hence Replaces/Breaks
+# so an upgrade hands the file over instead of failing on the overlap. Pinned to
+# this build's own version (both packages are always built together) rather than
+# a literal, so it stays right whichever release the split first ships in.
 NAUT_DIR="$OUT_DIR/ncrs-nautilus_${VERSION}_all"
 rm -rf "$NAUT_DIR"
 install -Dm644 shell_integration/file-managers/nautilus/syncstate.py      "$NAUT_DIR/usr/share/nautilus-python/extensions/ncrs-syncstate.py"
@@ -180,8 +182,8 @@ Version: ${VERSION}
 Architecture: all
 Maintainer: Gonzalo Ruiz <gonza@logo.cl>
 Depends: ncrs (>= ${VERSION}), python3-nautilus | gir1.2-nautilus-3.0, python3-gi
-Replaces: ncrs (<< 0.1.73)
-Breaks: ncrs (<< 0.1.73)
+Replaces: ncrs (<< ${VERSION})
+Breaks: ncrs (<< ${VERSION})
 Section: net
 Priority: optional
 Description: Nautilus integration for the ncrs Nextcloud filesystem
