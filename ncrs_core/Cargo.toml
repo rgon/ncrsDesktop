@@ -40,5 +40,9 @@ seccompiler = "0.5.0"
 name = "ncrs-open"
 path = "src/bin/ncrs_open.rs"
 
+[[bin]]
+name = "ncrs-ctl"
+path = "src/bin/ncrs_ctl.rs"
+
 [dev-dependencies]
 tempfile = "3"
