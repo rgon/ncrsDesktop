@@ -16,16 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// How a toolkit's thumbnailer processes are recognised.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ThumbnailerMatch {
-    /// A thumbnailer program, by executable name (also matched against the
-    /// kernel's 15-byte `comm`, which is what a script interpreter shows).
-    Program(String),
-    /// A generic host process whose command line names the thumbnailer
-    /// (e.g. KIO's `kioworker …/kio/thumbnail.so thumbnail …`).
-    CmdlineContains(&'static str),
-}
+use super::process::{self, ProcessMatch};
 
 /// Programs named by the `Exec=` lines of freedesktop `.thumbnailer` files
 /// under `<data dir>/thumbnailers/`.
@@ -55,92 +46,44 @@ pub fn thumbnailer_programs(data_dirs: &[PathBuf]) -> Vec<String> {
     out
 }
 
-/// If `pid` (a FUSE request's caller, possibly a thread id) is a thumbnailer
-/// per `matchers`, a short description of it for the log.
-pub fn thumbnailer_process(pid: u32, matchers: &[ThumbnailerMatch]) -> Option<String> {
-    classify(Path::new("/proc"), pid, matchers)
-}
-
-fn classify(proc_root: &Path, pid: u32, matchers: &[ThumbnailerMatch]) -> Option<String> {
-    if pid == 0 || matchers.is_empty() {
-        return None;
-    }
-    let dir = proc_root.join(pid.to_string());
-    let exe = std::fs::read_link(dir.join("exe"))
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
-    let comm = std::fs::read_to_string(dir.join("comm")).ok().map(|c| c.trim_end().to_string());
-    let mut cmdline: Option<String> = None;
-    for m in matchers {
-        match m {
-            ThumbnailerMatch::Program(name) => {
-                let comm_name: String = name.chars().take(15).collect();
-                if exe.as_deref() == Some(name.as_str()) || comm.as_deref() == Some(comm_name.as_str()) {
-                    return Some(name.clone());
-                }
-            }
-            ThumbnailerMatch::CmdlineContains(needle) => {
-                let cl = cmdline.get_or_insert_with(|| {
-                    std::fs::read(dir.join("cmdline"))
-                        .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
-                        .unwrap_or_default()
-                });
-                if cl.contains(needle) {
-                    return Some(format!("{} ({})", comm.as_deref().unwrap_or("?"), needle));
-                }
-            }
-        }
-    }
-    None
+/// If `pid` (a FUSE request's caller) is a thumbnailer per `matchers`, a
+/// short description of it for the log.
+pub fn thumbnailer_process(pid: u32, matchers: &[ProcessMatch]) -> Option<String> {
+    process::first_match(pid, matchers).map(ProcessMatch::describe)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fake_proc(root: &Path, pid: u32, exe: &str, comm: &str, cmdline: &[&str]) {
-        let d = root.join(pid.to_string());
-        std::fs::create_dir_all(&d).unwrap();
-        std::os::unix::fs::symlink(exe, d.join("exe")).unwrap();
-        std::fs::write(d.join("comm"), format!("{}\n", comm)).unwrap();
-        std::fs::write(d.join("cmdline"), cmdline.join("\0")).unwrap();
-    }
+    use crate::desktop::process::eval;
+    use crate::desktop::process::tests::fake_proc;
 
     #[test]
     fn recognises_programs_by_exe_or_truncated_comm() {
         let dir = tempfile::tempdir().unwrap();
-        fake_proc(dir.path(), 10, "/usr/bin/gdk-pixbuf-thumbnailer", "gdk-pixbuf-thum", &[]);
+        fake_proc(dir.path(), 10, "/usr/bin/gdk-pixbuf-thumbnailer", "gdk-pixbuf-thum", &[], &[]);
         // A Python thumbnailer: exe is the interpreter, comm is the script name.
-        fake_proc(dir.path(), 11, "/usr/bin/python3.12", "totem-video-thu", &[]);
-        fake_proc(dir.path(), 12, "/usr/bin/nautilus", "nautilus", &[]);
-        let m = vec![
-            ThumbnailerMatch::Program("gdk-pixbuf-thumbnailer".into()),
-            ThumbnailerMatch::Program("totem-video-thumbnailer".into()),
-        ];
-        assert_eq!(classify(dir.path(), 10, &m).as_deref(), Some("gdk-pixbuf-thumbnailer"));
-        assert_eq!(classify(dir.path(), 11, &m).as_deref(), Some("totem-video-thumbnailer"));
-        assert_eq!(classify(dir.path(), 12, &m), None, "the file manager itself reads normally");
+        fake_proc(dir.path(), 11, "/usr/bin/python3.12", "totem-video-thu", &[], &[]);
+        fake_proc(dir.path(), 12, "/usr/bin/nautilus", "nautilus", &[], &[]);
+        let gdk = ProcessMatch::Program("gdk-pixbuf-thumbnailer".into());
+        let totem = ProcessMatch::Program("totem-video-thumbnailer".into());
+        assert!(eval(dir.path(), 10, &gdk));
+        assert!(eval(dir.path(), 11, &totem));
+        assert!(!eval(dir.path(), 12, &gdk) && !eval(dir.path(), 12, &totem), "the file manager itself reads normally");
     }
 
     #[test]
     fn recognises_kio_thumbnail_worker_but_not_other_workers() {
         let dir = tempfile::tempdir().unwrap();
-        fake_proc(dir.path(), 20, "/usr/lib/x86_64-linux-gnu/libexec/kf6/kioworker", "kioworker",
-            &["/usr/lib/x86_64-linux-gnu/libexec/kf6/kioworker", "/usr/lib/x86_64-linux-gnu/qt6/plugins/kf6/kio/thumbnail.so", "thumbnail", "local:/run/user/1000/dolphinXYZ.1.kioworker.socket"]);
+        let worker = "/usr/lib/x86_64-linux-gnu/libexec/kf6/kioworker";
+        fake_proc(dir.path(), 20, worker, "kioworker",
+            &[worker, "/usr/lib/x86_64-linux-gnu/qt6/plugins/kf6/kio/thumbnail.so", "thumbnail", "local:/run/user/1000/dolphinXYZ.1.kioworker.socket"], &[]);
         // The same binary copying a file must not be refused.
-        fake_proc(dir.path(), 21, "/usr/lib/x86_64-linux-gnu/libexec/kf6/kioworker", "kioworker",
-            &["/usr/lib/x86_64-linux-gnu/libexec/kf6/kioworker", "/usr/lib/x86_64-linux-gnu/qt6/plugins/kf6/kio/file.so", "file", "local:/run/user/1000/x.socket"]);
-        let m = vec![ThumbnailerMatch::CmdlineContains("/kio/thumbnail.so")];
-        assert!(classify(dir.path(), 20, &m).is_some());
-        assert_eq!(classify(dir.path(), 21, &m), None);
-    }
-
-    #[test]
-    fn unknown_or_vanished_process_is_not_a_thumbnailer() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = vec![ThumbnailerMatch::Program("x".into())];
-        assert_eq!(classify(dir.path(), 999, &m), None);
-        assert_eq!(classify(dir.path(), 0, &m), None);
+        fake_proc(dir.path(), 21, worker, "kioworker",
+            &[worker, "/usr/lib/x86_64-linux-gnu/qt6/plugins/kf6/kio/file.so", "file", "local:/run/user/1000/x.socket"], &[]);
+        let m = ProcessMatch::CmdlineContains("/kio/thumbnail.so");
+        assert!(eval(dir.path(), 20, &m));
+        assert!(!eval(dir.path(), 21, &m));
     }
 
     #[test]

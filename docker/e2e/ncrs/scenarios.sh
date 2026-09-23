@@ -198,14 +198,25 @@ cp /tmp/weird.bin "$MOUNT/weird.ncrstest"
 if wait_dav_sha weird.ncrstest "$WW" 90; then
     ls "$MOUNT" >/dev/null 2>&1; sleep 2   # drop any local staging copy
 
+    # The probe is only answered for processes that have GLib's gio loaded
+    # (desktop::sniff); a GLib app is simulated by preloading libgio into dd.
+    GIO_LIB="$(ls /usr/lib/*/libgio-2.0.so.0 2>/dev/null | head -1)"
+
     # O_NOATIME probe with GLib's exact 16384-byte read: intercepted → synthetic
     # magic bytes (≠ real content); not intercepted → real downloaded bytes.
-    SNIFF_HEX="$(dd if="$MOUNT/weird.ncrstest" iflag=noatime bs=16384 count=1 2>/dev/null | head -c16 | od_hex)"
-    if [ -n "$SNIFF_HEX" ] && [ "$SNIFF_HEX" != "$REAL_HEX" ]; then
-        ok "O_NOATIME content-type probe intercepted (no download for MIME detection)"
+    SNIFF_HEX="$(LD_PRELOAD="$GIO_LIB" dd if="$MOUNT/weird.ncrstest" iflag=noatime bs=16384 count=1 2>/dev/null | head -c16 | od_hex)"
+    if [ -n "$GIO_LIB" ] && [ -n "$SNIFF_HEX" ] && [ "$SNIFF_HEX" != "$REAL_HEX" ]; then
+        ok "O_NOATIME content-type probe from a GLib process intercepted (no download for MIME detection)"
     else
-        no "O_NOATIME probe returned real content — file downloaded for MIME detection (regression)"
+        no "GLib O_NOATIME probe returned real content — file downloaded for MIME detection (regression; gio=${GIO_LIB:-missing})"
     fi
+
+    # A non-GLib tool sharing the O_NOATIME signature (cp, rsync, backups)
+    # must get the real bytes, never synthetic ones. (After the probe: a real
+    # read may cache the file, and cached files are never intercepted.)
+    PLAINTOOL_HEX="$(dd if="$MOUNT/weird.ncrstest" iflag=noatime,fullblock bs=16384 count=1 2>/dev/null | head -c16 | od_hex)"
+    [ "$PLAINTOOL_HEX" = "$REAL_HEX" ] && ok "O_NOATIME read from a non-GLib process returns real content" \
+        || no "non-GLib O_NOATIME read got synthetic bytes (got ${PLAINTOOL_HEX:-empty})"
 
     # A plain (no-O_NOATIME) read right after the probe must still return true
     # bytes: the intercept must not leak into ordinary reads, and (regression

@@ -22,6 +22,7 @@
 
 pub mod detect;
 pub mod indexer;
+pub mod process;
 pub mod profiles;
 pub mod sniff;
 pub mod store;
@@ -74,7 +75,7 @@ pub struct DesktopPolicy {
     pub thumbnails: ThumbnailSizes,
     /// Processes refused when they open an uncached file, so the server
     /// preview is the only thumbnail source (see [`thumbguard`]).
-    pub thumbnailer_guard: Vec<thumbguard::ThumbnailerMatch>,
+    pub thumbnailer_guard: Vec<process::ProcessMatch>,
     /// Components this policy was built from (diagnostics).
     pub components: BTreeSet<ComponentId>,
 }
@@ -115,9 +116,11 @@ impl DesktopPolicy {
         }
     }
 
-    /// The probe a read-only open of an uncached file with these flags is, if any.
-    pub fn sniff_probe_for_open(&self, flags: i32) -> Option<&sniff::SniffProbe> {
-        self.sniff_probes.iter().find(|p| p.matches_open(flags))
+    /// The probe a read-only open of an uncached file with these flags, by
+    /// process `pid`, is — if any. Both the read signature and the probe's
+    /// process condition must hold.
+    pub fn sniff_probe_for_open(&self, flags: i32, pid: u32) -> Option<&sniff::SniffProbe> {
+        self.sniff_probes.iter().find(|p| p.matches_open(flags) && p.matches_process(pid))
     }
 
     /// Whether `name` is a MIME-type xattr some active probe's toolkit reads.
@@ -125,7 +128,7 @@ impl DesktopPolicy {
         self.sniff_probes.iter().any(|p| p.xattr.is_some_and(|x| x.as_bytes() == name))
     }
 
-    pub fn add_thumbnailer(&mut self, m: thumbguard::ThumbnailerMatch) {
+    pub fn add_thumbnailer(&mut self, m: process::ProcessMatch) {
         if !self.thumbnailer_guard.contains(&m) {
             self.thumbnailer_guard.push(m);
         }
@@ -575,7 +578,10 @@ mod tests {
     fn legacy_default_matches_pre_profile_behaviour() {
         let p = DesktopPolicy::legacy_default();
         assert!(p.tracker_ignore);
-        assert!(p.sniff_probe_for_open(libc::O_NOATIME).is_some());
+        // Our own test process has GLib? No — so even O_NOATIME is not a probe from us.
+        let probe = &p.sniff_probes[0];
+        assert!(probe.matches_open(libc::O_NOATIME));
+        assert!(p.sniff_probe_for_open(libc::O_NOATIME, std::process::id()).is_none());
         assert!(p.serves_mime_xattr(b"user.xdg.mime.type"));
         assert!(p.is_hidden_temp(".goutputstream-ABC123"));
         assert!(p.is_hidden_temp(".xdp-foo"));
@@ -588,6 +594,6 @@ mod tests {
         let p = DesktopPolicy::from_components([ComponentId::Kio]);
         assert!(p.thumbnails.normal && p.thumbnails.large);
         assert!(p.sniff_probes.is_empty(), "KIO declares no probe until Qt's is measured");
-        assert!(p.thumbnailer_guard.contains(&thumbguard::ThumbnailerMatch::CmdlineContains("/kio/thumbnail.so")));
+        assert!(p.thumbnailer_guard.contains(&process::ProcessMatch::CmdlineContains("/kio/thumbnail.so")));
     }
 }

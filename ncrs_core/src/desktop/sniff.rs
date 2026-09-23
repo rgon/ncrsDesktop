@@ -12,6 +12,18 @@
 //! This is separate from thumbnailing (`thumbguard`): the probe comes from the
 //! file manager or any app itself, before a thumbnailer is ever chosen, and it
 //! must be *answered*, not refused.
+//!
+//! A probe is recognised by two conditions that must both hold:
+//! - its **read signature** (open flag + small first read at offset 0) says
+//!   *what kind of read* it is — the same process also does real reads, so the
+//!   process alone can never decide;
+//! - its **process condition** (e.g. "has libgio loaded") says *who may send
+//!   it*, so an unrelated tool that happens to share the signature (`cp`,
+//!   `rsync` and backup tools also open with `O_NOATIME`) always gets real bytes.
+//!
+//! Every enabled toolkit contributes its own probe; they are checked together.
+
+use super::process::{self, ProcessMatch};
 
 /// How the probe's answer is produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,17 +47,36 @@ pub struct SniffProbe {
     /// Extended attribute the toolkit checks before sniffing; served with the
     /// content-type so most files never reach the probe at all.
     pub xattr: Option<&'static str>,
+    /// Processes allowed to send this probe (`None` = any).
+    pub process: Option<ProcessMatch>,
 }
 
 impl SniffProbe {
     pub fn matches_open(&self, flags: i32) -> bool {
         flags & self.open_flag != 0
     }
+
+    pub fn matches_process(&self, pid: u32) -> bool {
+        self.process.as_ref().map_or(true, |m| process::matches(pid, m))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::desktop::process::{eval, tests::fake_proc, ProcessMatch};
     use crate::desktop::toolkit::gio::GLIB_SNIFF_PROBE;
+
+    #[test]
+    fn glib_probe_is_only_accepted_from_glib_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_proc(dir.path(), 1, "/usr/bin/nautilus", "nautilus", &[], &["libgio-2.0.so.0"]);
+        fake_proc(dir.path(), 2, "/usr/bin/rsync", "rsync", &[], &["libc.so.6"]);
+        let Some(ProcessMatch::LinksLibrary(lib)) = GLIB_SNIFF_PROBE.process.clone() else {
+            panic!("the GLib probe must be scoped to GLib processes");
+        };
+        assert!(eval(dir.path(), 1, &ProcessMatch::LinksLibrary(lib)));
+        assert!(!eval(dir.path(), 2, &ProcessMatch::LinksLibrary(lib)));
+    }
 
     #[test]
     fn glib_probe_is_recognised_by_o_noatime_only() {

@@ -167,7 +167,7 @@ Three different reads, three different answers. None of them replaces another:
 | Behaviour | GIO toolkit | KIO toolkit |
 |---|---|---|
 | Indexer | Tracker: synthetic `/.trackerignore` | Baloo: mount added to `exclude folders` (via `balooctl6`, fallback `baloofilerc`); only the entry ncrs added is ever removed |
-| File-type probe (`desktop::sniff`) — *answered* | declared `SniffProbe`: `O_NOATIME` open, first read ≤ 32 KiB answered with magic bytes from the PROPFIND content-type (§2); `user.xdg.mime.type` xattr | **Unmeasured**: no probe declared. Qt's `QMimeDatabase` does not use `O_NOATIME` |
+| File-type probe (`desktop::sniff`) — *answered* | declared `SniffProbe`: `O_NOATIME` open **from a process with libgio loaded**, first read ≤ 32 KiB answered with magic bytes from the PROPFIND content-type (§2); `user.xdg.mime.type` xattr. Non-GLib tools that share the flag (cp, rsync, backups) always get real bytes | **Unmeasured**: no probe declared. Qt's `QMimeDatabase` does not use `O_NOATIME`; once its read signature is known it becomes a probe scoped to processes with `libKF6KIOCore`/`libQt6Core` loaded |
 | Thumbnailer (`desktop::thumbguard`) — *refused* | every program in a `.thumbnailer` `Exec=` line is refused on uncached files; the server preview is fetched instead | the thumbnail worker (`kioworker …/kio/thumbnail.so`) is refused the same way (match unverified on a real session) |
 | Thumbnail cache — *pre-filled* | freedesktop `normal` from server previews | `normal` + `large` (one 256 px fetch, scaled down for `normal`) |
 | Atomic-write temps | `.goutputstream-*`, `.xdp-*` hidden and optionally purged | **Unmeasured:** KIO `*.part` copies (not hidden: a user's own `.part` file would be deleted) |
@@ -180,4 +180,7 @@ intercept is written. A wrong sniff signal serves fake bytes to real readers
 
 The file-type probe comes from the file manager or any app itself, before a
 thumbnailer is chosen, so it must be answered, never refused. Refusing it
-would break type detection.
+would break type detection. It is recognised by the read signature *and* a
+process condition, both required. The same process also does real reads, so
+the process alone cannot decide, and unrelated tools share the signature, so
+the signature alone is not enough.
