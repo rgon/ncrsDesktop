@@ -13,10 +13,25 @@
 //!   `.thumbnailer` file is refused on uncached files (see `thumbguard`).
 
 use crate::desktop::detect::DetectEnv;
+use crate::desktop::sniff::{SniffAnswer, SniffProbe};
 use crate::desktop::thumbguard::{thumbnailer_programs, ThumbnailerMatch};
 use crate::desktop::{Component, ComponentId, DesktopPolicy};
 
 pub struct Gio;
+
+/// GLib asks for 16 KiB at offset 0; kernel read-ahead can inflate that first
+/// read to 32 KiB, while copy tools use ≥ 64 KiB buffers (GOTCHAS.md §2).
+pub const GLIB_SNIFF_MAX_READ: usize = 32768;
+
+/// GLib 2.80+ opens with `O_NOATIME | O_NOFOLLOW` to sniff; the kernel strips
+/// `O_NOFOLLOW` before FUSE, so `O_NOATIME` is the signal.
+pub const GLIB_SNIFF_PROBE: SniffProbe = SniffProbe {
+    toolkit: "gio",
+    open_flag: libc::O_NOATIME,
+    max_read: GLIB_SNIFF_MAX_READ,
+    answer: SniffAnswer::MagicFromContentType,
+    xattr: Some("user.xdg.mime.type"),
+};
 
 impl Component for Gio {
     fn id(&self) -> ComponentId {
@@ -24,7 +39,7 @@ impl Component for Gio {
     }
 
     fn contribute(&self, p: &mut DesktopPolicy) {
-        p.glib_sniff = true;
+        p.add_sniff_probe(GLIB_SNIFF_PROBE);
         for prefix in [".goutputstream-", ".xdp-"] {
             if !p.hidden_temp_prefixes.contains(&prefix) {
                 p.hidden_temp_prefixes.push(prefix);

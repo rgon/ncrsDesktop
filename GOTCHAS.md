@@ -158,15 +158,18 @@ A remote mount looks local to the desktop, so indexers, MIME sniffers and
 thumbnailers read file contents freely, and on ncrs each read is a download.
 These behaviours differ per browser/toolkit, so they are handled per
 *desktop profile* (`ncrs_core/src/desktop/`), never as ad-hoc special cases in
-the FUSE layer. A profile is enabled by default iff its browser is installed,
-and components shared by several profiles stay active while any of them is
-enabled.
+the FUSE layer. Toolkit profiles (GIO, KIO) own these behaviours and are
+enabled by default iff their libraries are installed; browser profiles
+(Nautilus, Dolphin, Nemo) add the emblem adapter and keep their toolkit on.
 
-| Behaviour | GIO (Nautilus, Nemo) | KIO (Dolphin) |
+Three different reads, three different answers. None of them replaces another:
+
+| Behaviour | GIO toolkit | KIO toolkit |
 |---|---|---|
 | Indexer | Tracker: synthetic `/.trackerignore` | Baloo: mount added to `exclude folders` (via `balooctl6`, fallback `baloofilerc`); only the entry ncrs added is ever removed |
-| MIME sniffing | `O_NOATIME` head reads answered from PROPFIND content-type (§2), plus `user.xdg.mime.type` | **Unmeasured.** Qt's `QMimeDatabase` does not use `O_NOATIME`, so the GLib intercept never fires |
-| Thumbnails | freedesktop `normal` pre-filled from server previews | `normal` + `large` (one 256 px fetch, scaled down for `normal`) |
+| File-type probe (`desktop::sniff`) — *answered* | declared `SniffProbe`: `O_NOATIME` open, first read ≤ 32 KiB answered with magic bytes from the PROPFIND content-type (§2); `user.xdg.mime.type` xattr | **Unmeasured**: no probe declared. Qt's `QMimeDatabase` does not use `O_NOATIME` |
+| Thumbnailer (`desktop::thumbguard`) — *refused* | every program in a `.thumbnailer` `Exec=` line is refused on uncached files; the server preview is fetched instead | the thumbnail worker (`kioworker …/kio/thumbnail.so`) is refused the same way (match unverified on a real session) |
+| Thumbnail cache — *pre-filled* | freedesktop `normal` from server previews | `normal` + `large` (one 256 px fetch, scaled down for `normal`) |
 | Atomic-write temps | `.goutputstream-*`, `.xdp-*` hidden and optionally purged | **Unmeasured:** KIO `*.part` copies (not hidden: a user's own `.part` file would be deleted) |
 | Folder view settings | — | **Unmeasured:** `user.kde.fm.viewproperties` xattr has no `setxattr` handler, so Dolphin may fall back to writing `.directory` files that get uploaded |
 
@@ -175,5 +178,6 @@ the KIO thumbnailer against a *test* mount (never the live one) before any
 intercept is written. A wrong sniff signal serves fake bytes to real readers
 (see the `cp` false positives in §2).
 
-Disabling every GIO-based profile also disables the GLib sniff intercept for
-GTK apps in general (e.g. a GTK file chooser on a KDE desktop).
+The file-type probe comes from the file manager or any app itself, before a
+thumbnailer is chosen, so it must be answered, never refused. Refusing it
+would break type detection.
