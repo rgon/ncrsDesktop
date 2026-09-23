@@ -4664,7 +4664,7 @@ impl Filesystem for NextCloudFs {
         // before the request reaches FUSE, so O_NOATIME is the only reliable signal.
         // Which probes count is declared per toolkit profile (desktop::sniff).
         let probe_max_read = if !writable && local.is_none() {
-            desktop::policy().sniff_probe_for_open(flags.0).map(|p| p.max_read)
+            desktop::policy().sniff_probe_for_open(flags.0, req.pid()).map(|p| p.max_read)
         } else {
             None
         };

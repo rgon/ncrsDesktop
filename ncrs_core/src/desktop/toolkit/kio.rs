@@ -8,11 +8,14 @@
 //!   plugin in-process) is refused on uncached files (see `thumbguard`).
 //!
 //! Not handled yet, pending measurement on a real KDE session (plan Phase 0):
-//! Qt's `QMimeDatabase` content sniffing (it does not use `O_NOATIME`, so the
-//! GLib intercept never fires), per-folder view properties
+//! Qt's `QMimeDatabase` content sniffing. Once its read signature is known it
+//! becomes a `SniffProbe` here scoped with
+//! `ProcessMatch::LinksLibrary("libKF6KIOCore.so")` (or `libQt6Core.so`); without
+//! a distinctive signature no process condition can tell a probe from a real
+//! read. Also pending: per-folder view properties
 //! (`user.kde.fm.viewproperties` xattr / `.directory`), and KIO `.part` copies.
 
-use crate::desktop::thumbguard::ThumbnailerMatch;
+use crate::desktop::process::ProcessMatch;
 use crate::desktop::{Component, ComponentId, DesktopPolicy};
 
 pub struct Kio;
@@ -26,6 +29,6 @@ impl Component for Kio {
         p.thumbnails.normal = true;
         p.thumbnails.large = true;
         // KF6 kioworker and KF5 kioslave5 both name the plugin path.
-        p.add_thumbnailer(ThumbnailerMatch::CmdlineContains("/kio/thumbnail.so"));
+        p.add_thumbnailer(ProcessMatch::CmdlineContains("/kio/thumbnail.so"));
     }
 }

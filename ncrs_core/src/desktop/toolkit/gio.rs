@@ -14,7 +14,8 @@
 
 use crate::desktop::detect::DetectEnv;
 use crate::desktop::sniff::{SniffAnswer, SniffProbe};
-use crate::desktop::thumbguard::{thumbnailer_programs, ThumbnailerMatch};
+use crate::desktop::process::ProcessMatch;
+use crate::desktop::thumbguard::thumbnailer_programs;
 use crate::desktop::{Component, ComponentId, DesktopPolicy};
 
 pub struct Gio;
@@ -24,13 +25,16 @@ pub struct Gio;
 pub const GLIB_SNIFF_MAX_READ: usize = 32768;
 
 /// GLib 2.80+ opens with `O_NOATIME | O_NOFOLLOW` to sniff; the kernel strips
-/// `O_NOFOLLOW` before FUSE, so `O_NOATIME` is the signal.
+/// `O_NOFOLLOW` before FUSE, so `O_NOATIME` is the signature. Only accepted
+/// from processes with GLib's gio loaded: non-GLib tools that also open with
+/// `O_NOATIME` (cp, rsync, backups) must never receive synthetic bytes.
 pub const GLIB_SNIFF_PROBE: SniffProbe = SniffProbe {
     toolkit: "gio",
     open_flag: libc::O_NOATIME,
     max_read: GLIB_SNIFF_MAX_READ,
     answer: SniffAnswer::MagicFromContentType,
     xattr: Some("user.xdg.mime.type"),
+    process: Some(ProcessMatch::LinksLibrary("libgio-2.0.so")),
 };
 
 impl Component for Gio {
@@ -47,7 +51,7 @@ impl Component for Gio {
         }
         p.thumbnails.normal = true;
         for prog in thumbnailer_programs(&DetectEnv::from_env().data_dirs) {
-            p.add_thumbnailer(ThumbnailerMatch::Program(prog));
+            p.add_thumbnailer(ProcessMatch::Program(prog));
         }
     }
 }
