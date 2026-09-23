@@ -1,0 +1,12 @@
+# Sync status words the ncrs daemon puts on the wire (STATUS, DETAIL, DETAILDIR).
+# One per line. Every file-manager adapter must map each of these (to an emblem
+# or to "none"); the Rust, Python and C++ test suites all read this file.
+kept
+cached
+synced
+remote
+downloading
+uploading
+pending
+partial
+unknown
