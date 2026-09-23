@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.76](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.75...ncrs-v0.1.76) (2026-09-23)
+
+
+### Features
+
+* **gui:** pop a desktop notification for each new Nextcloud notification, even with the window closed ([6684754](https://github.com/rgon/ncrsDesktop/commit/668475467da24abcb86df2286de5075249bd1994))
+
+
+### Bug Fixes
+
+* **gui:** resolve conflicts in the daemon over IPC so cleared warnings stay cleared ([6c776d2](https://github.com/rgon/ncrsDesktop/commit/6c776d207c8207978a73142e76778edae61b2388))
+
 ## [0.1.75](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.74...ncrs-v0.1.75) (2026-09-23)
 
 
