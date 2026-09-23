@@ -55,7 +55,7 @@ SOCKET_TIMEOUT = 2.0  # seconds
 # IPC protocol version. Must match PROTOCOL_VERSION in ncrs_core/src/ipc.rs.
 # Announced to the daemon on connect so a half-updated install (new daemon +
 # old extension, or vice-versa) is reported instead of silently misbehaving.
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 _POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="ncrs-nautilus")
 

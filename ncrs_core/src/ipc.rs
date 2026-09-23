@@ -26,6 +26,9 @@
 ///   PAUSE\n / RESUME\n                → ok (suspend/resume background sync)
 ///   THUMBNAIL <abs-path>\n           → ok | error: <msg>  (fetch NC preview → XDG thumb cache)
 ///   VERSION <n>\n                     → <daemon-protocol>\t<pkg-version>  (n = extension protocol)
+///
+/// Protocol v3 (additive) — HELLO, CLIENTS, EVENTS, WATCH. The full, normative
+/// spec for file-manager clients is shell_integration/file-managers/PROTOCOL.md.
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -68,7 +71,14 @@ fn note_dir_status_fallback(context: &str, dir: &Path) {
 /// its own copy of this on connect via `VERSION`; a mismatch is logged so a
 /// half-updated install (new daemon + old extension, or vice-versa) is obvious.
 /// Keep in sync with `PROTOCOL_VERSION` in shell_integration/nautilus/syncstate.py.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// Capabilities advertised in the `HELLO` reply.
+pub const CAPABILITIES: &str = "detaildir,events,watch,search,thumbnail,weburl,keep,evict,integrations";
+
+/// Most records one `EVENTS` reply or `WATCH` line carries; the client asks
+/// again with the returned `next` to page through the rest.
+const EVENTS_PAGE: usize = 1000;
 
 const QUERY_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ').add(b'#').add(b'%').add(b'&').add(b'+').add(b'=').add(b'?');
@@ -116,6 +126,132 @@ pub struct FileChange {
 }
 
 pub type FileChangeQueue = Arc<Mutex<Vec<FileChange>>>;
+
+fn abs_path(mount_point: &Path, remote: &Path) -> PathBuf {
+    mount_point.join(remote.strip_prefix("/").unwrap_or(remote))
+}
+
+/// Wire form of one structural change, shared by `FILE_CHANGES` and `EVENTS`.
+fn encode_file_change(c: &FileChange, mount_point: &Path) -> String {
+    let abs = abs_path(mount_point, &c.path);
+    match &c.kind {
+        FileChangeKind::Added => format!("A:{}", abs.display()),
+        FileChangeKind::Removed => format!("D:{}", abs.display()),
+        FileChangeKind::Modified => format!("M:{}", abs.display()),
+        FileChangeKind::DirAdded => format!("DA:{}", abs.display()),
+        FileChangeKind::DirRemoved => format!("DD:{}", abs.display()),
+        FileChangeKind::Renamed { from } => {
+            format!("R:{}\x1e{}", abs_path(mount_point, from).display(), abs.display())
+        }
+    }
+}
+
+fn encode_record(rec: &crate::change_log::ChangeRecord, mount_point: &Path) -> String {
+    match rec {
+        crate::change_log::ChangeRecord::Status(p) => format!("S:{}", abs_path(mount_point, p).display()),
+        crate::change_log::ChangeRecord::File(c) => encode_file_change(c, mount_point),
+    }
+}
+
+/// `<next>\t<rec>\t<rec>…`, or `<next>\tRESYNC` when the reader fell off the ring.
+fn encode_events(res: &crate::change_log::ReadResult, mount_point: &Path) -> String {
+    let mut out = res.next.to_string();
+    if res.resync {
+        out.push_str("\tRESYNC");
+        return out;
+    }
+    for rec in &res.records {
+        out.push('\t');
+        out.push_str(&encode_record(rec, mount_point));
+    }
+    out
+}
+
+/// A connected client that identified itself with `HELLO`.
+#[derive(Clone, serde::Serialize)]
+pub struct ClientInfo {
+    pub id: String,
+    pub proto: u32,
+    pub pid: u32,
+    #[serde(skip)]
+    pub connected_at: std::time::Instant,
+    pub connected_secs: u64,
+}
+
+#[derive(Default)]
+pub struct ClientRegistry {
+    next_conn: AtomicU64,
+    clients: Mutex<std::collections::HashMap<u64, ClientInfo>>,
+}
+
+impl ClientRegistry {
+    fn new_conn_id(&self) -> u64 {
+        self.next_conn.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn register(&self, conn: u64, info: ClientInfo) {
+        self.clients.safe_lock().insert(conn, info);
+    }
+
+    fn remove(&self, conn: u64) {
+        self.clients.safe_lock().remove(&conn);
+    }
+
+    /// Snapshot of connected clients, oldest first.
+    pub fn list(&self) -> Vec<ClientInfo> {
+        let mut v: Vec<ClientInfo> = self
+            .clients
+            .safe_lock()
+            .values()
+            .cloned()
+            .map(|mut c| {
+                c.connected_secs = c.connected_at.elapsed().as_secs();
+                c
+            })
+            .collect();
+        v.sort_by(|a, b| b.connected_secs.cmp(&a.connected_secs));
+        v
+    }
+
+    /// Whether any client with this id is connected.
+    pub fn is_connected(&self, id: &str) -> bool {
+        self.clients.safe_lock().values().any(|c| c.id == id)
+    }
+}
+
+/// State shared by every connection that the protocol-v3 verbs need.
+#[derive(Clone)]
+pub struct V3Context {
+    pub change_log: Arc<crate::change_log::ChangeLog>,
+    pub clients: Arc<ClientRegistry>,
+}
+
+/// Peer process id of a Unix-socket connection (0 if unavailable).
+fn peer_pid(stream: &std::os::unix::net::UnixStream) -> u32 {
+    use std::os::unix::io::AsRawFd;
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `cred`, a properly
+    // sized and aligned ucred owned by this frame.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 { cred.pid.max(0) as u32 } else { 0 }
+}
+
+/// A client id is echoed into logs and JSON; keep it short and printable.
+fn sanitize_client_id(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        .take(64)
+        .collect()
+}
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StorageStats {
@@ -640,6 +776,22 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
         journal.clone(),
     );
 
+    // Broadcast change log: the pump is the only drainer of the producer
+    // buffers, and every client reads through its own cursor.
+    let v3 = V3Context {
+        change_log: Arc::new(crate::change_log::ChangeLog::new(crate::change_log::DEFAULT_CAPACITY)),
+        clients: Arc::new(ClientRegistry::default()),
+    };
+    {
+        let log = v3.change_log.clone();
+        let dirty = dirty_set.clone();
+        let fcq = file_change_queue.clone();
+        std::thread::spawn(move || loop {
+            log.pump(&dirty, &fcq);
+            std::thread::sleep(Duration::from_millis(250));
+        });
+    }
+
     let active = Arc::new(AtomicUsize::new(0));
 
     std::thread::spawn(move || {
@@ -681,9 +833,10 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let pt_enabled = passthrough_enabled.clone();
             let pt_capable = passthrough_capable.clone();
             let active = active.clone();
+            let v3c = v3.clone();
             active.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, pu, elog, tmap, jrnl, fcq, sstats, pause_flag, offline_flag, sp, pt_enabled, pt_capable);
+                handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, pu, elog, tmap, jrnl, fcq, sstats, pause_flag, offline_flag, sp, pt_enabled, pt_capable, v3c);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -754,15 +907,87 @@ fn handle_client(
     state_push: Arc<StatePush>,
     passthrough_enabled: Arc<AtomicBool>,
     passthrough_capable: Arc<AtomicBool>,
+    v3: V3Context,
 ) {
     let mut write_half = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
     };
+    let conn = ConnState::new(&stream, v3);
     let mut reader = BufReader::new(stream);
+    handle_client_loop(&mut reader, &mut write_half, &conn, mount_point, status_map, shared_set, fileid_map, detail_map, children_map, dirty_set, creds, base_url, keep_cb, evict_cb, prefetch_cb, thumbnail_cb, purge_cb, error_log, transfer_map, journal, file_change_queue, storage_stats, paused, offline, state_push, passthrough_enabled, passthrough_capable);
+}
 
+/// Per-connection bookkeeping for the v3 verbs; undone on drop.
+struct ConnState {
+    v3: V3Context,
+    conn_id: u64,
+    pid: u32,
+    key: Mutex<crate::change_log::CursorKey>,
+    live_reader: AtomicBool,
+}
+
+impl ConnState {
+    fn new(stream: &std::os::unix::net::UnixStream, v3: V3Context) -> Self {
+        let pid = peer_pid(stream);
+        let key = crate::change_log::CursorKey { pid, client: String::new() };
+        v3.change_log.attach(&key);
+        ConnState { conn_id: v3.clients.new_conn_id(), v3, pid, key: Mutex::new(key), live_reader: AtomicBool::new(false) }
+    }
+
+    fn key(&self) -> crate::change_log::CursorKey {
+        self.key.safe_lock().clone()
+    }
+
+    fn mark_live_reader(&self) {
+        if !self.live_reader.swap(true, Ordering::Relaxed) {
+            self.v3.change_log.add_live_reader();
+        }
+    }
+}
+
+impl Drop for ConnState {
+    fn drop(&mut self) {
+        self.v3.change_log.detach(&self.key());
+        self.v3.clients.remove(self.conn_id);
+        if self.live_reader.load(Ordering::Relaxed) {
+            self.v3.change_log.remove_live_reader();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_client_loop(
+    reader: &mut BufReader<std::os::unix::net::UnixStream>,
+    write_half: &mut std::os::unix::net::UnixStream,
+    conn: &ConnState,
+    mount_point: PathBuf,
+    status_map: StatusMap,
+    shared_set: SharedSet,
+    fileid_map: FileIdMap,
+    detail_map: FileDetailMap,
+    children_map: ChildrenMap,
+    dirty_set: DirtySet,
+    creds: crate::auth::Credentials,
+    base_url: String,
+    keep_cb: Option<KeepCallback>,
+    evict_cb: Option<EvictCallback>,
+    prefetch_cb: Option<PrefetchCallback>,
+    thumbnail_cb: Option<ThumbnailCallback>,
+    purge_cb: Option<PurgeCallback>,
+    error_log: crate::ErrorLog,
+    transfer_map: crate::TransferMap,
+    journal: crate::mutation_journal::SharedJournal,
+    file_change_queue: FileChangeQueue,
+    storage_stats: SharedStorageStats,
+    paused: Arc<AtomicBool>,
+    offline: crate::OfflineStatus,
+    state_push: Arc<StatePush>,
+    passthrough_enabled: Arc<AtomicBool>,
+    passthrough_capable: Arc<AtomicBool>,
+) {
     loop {
-        let line = match read_line_bounded(&mut reader, MAX_IPC_LINE_LEN) {
+        let line = match read_line_bounded(reader, MAX_IPC_LINE_LEN) {
             Ok(Some(l)) => l,
             Ok(None) => break,
             Err(e) => {
@@ -775,6 +1000,38 @@ fn handle_client(
         // SUBSCRIBE hands this connection to the push loop: acknowledge, send the
         // current snapshot, then a SNAP line whenever state changes (with a PING
         // keepalive so a dead peer is noticed). It never returns to reading verbs.
+        // WATCH hands this connection to the change stream: `WATCHING\t<seq>`,
+        // then `EV\t<next>\t<records>` whenever the log moves (same record
+        // syntax as EVENTS), plus `PING` keepalives. Never returns to verbs.
+        if trimmed == "WATCH" || trimmed.starts_with("WATCH ") {
+            let log = &conn.v3.change_log;
+            conn.mark_live_reader();
+            log.pump(&dirty_set, &file_change_queue);
+            let mut since = trimmed
+                .strip_prefix("WATCH ")
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or_else(|| log.head());
+            if writeln!(write_half, "WATCHING\t{}", since).is_err() {
+                return;
+            }
+            loop {
+                let res = log.read_since(since, EVENTS_PAGE);
+                if res.resync || !res.records.is_empty() {
+                    since = res.next;
+                    if writeln!(write_half, "EV\t{}", encode_events(&res, &mount_point)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                since = res.next;
+                if log.wait_past(since, Duration::from_secs(20)) <= since
+                    && writeln!(write_half, "PING").is_err()
+                {
+                    return;
+                }
+            }
+        }
+
         if trimmed == "SUBSCRIBE" {
             if writeln!(write_half, "SUBSCRIBED").is_err() {
                 return;
@@ -903,60 +1160,69 @@ fn handle_client(
                 None => "error: path not under mount".to_string(),
             }
         } else if trimmed == "CHANGES" {
+            // Legacy per-process cursor over the broadcast log (see change_log).
             const MAX_CHANGES: usize = 500;
-            let mut set = dirty_set.safe_lock();
-            let total = set.len();
-            let paths: Vec<PathBuf> = if total <= MAX_CHANGES {
-                set.drain().collect()
-            } else {
-                let batch: Vec<PathBuf> = set.iter().take(MAX_CHANGES).cloned().collect();
-                for p in &batch {
-                    set.remove(p);
-                }
-                batch
-            };
-            drop(set);
+            conn.v3.change_log.pump(&dirty_set, &file_change_queue);
+            let paths = conn.v3.change_log.take_status(&conn.key(), MAX_CHANGES);
             if !paths.is_empty() {
-                log::info!("IPC CHANGES → {} dirty paths (of {} total)", paths.len(), total);
+                log::info!("IPC CHANGES → {} dirty paths (pid {})", paths.len(), conn.pid);
             }
-            if paths.is_empty() {
-                String::new()
-            } else {
-                paths.iter()
-                    .map(|p| {
-                        let rel = p.strip_prefix("/").unwrap_or(p);
-                        mount_point.join(rel).to_string_lossy().into_owned()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\t")
-            }
+            paths.iter()
+                .map(|p| abs_path(&mount_point, p).to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("\t")
         } else if trimmed == "FILE_CHANGES" {
-            let changes: Vec<FileChange> = {
-                let mut q = file_change_queue.safe_lock();
-                q.drain(..).collect()
-            };
-            if changes.is_empty() {
-                String::new()
-            } else {
-                changes.iter()
-                    .map(|c| {
-                        let rel = c.path.strip_prefix("/").unwrap_or(&c.path);
-                        let abs = mount_point.join(rel);
-                        match &c.kind {
-                            FileChangeKind::Added => format!("A:{}", abs.display()),
-                            FileChangeKind::Removed => format!("D:{}", abs.display()),
-                            FileChangeKind::Modified => format!("M:{}", abs.display()),
-                            FileChangeKind::DirAdded => format!("DA:{}", abs.display()),
-                            FileChangeKind::DirRemoved => format!("DD:{}", abs.display()),
-                            FileChangeKind::Renamed { from } => {
-                                let from_rel = from.strip_prefix("/").unwrap_or(from);
-                                format!("R:{}\x1e{}", mount_point.join(from_rel).display(), abs.display())
-                            }
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\t")
+            conn.v3.change_log.pump(&dirty_set, &file_change_queue);
+            conn.v3.change_log.take_file_changes(&conn.key())
+                .iter()
+                .map(|c| encode_file_change(c, &mount_point))
+                .collect::<Vec<_>>()
+                .join("\t")
+        } else if trimmed == "EVENTS" || trimmed.starts_with("EVENTS ") {
+            // Client-held cursor. Bare `EVENTS` just returns the current head
+            // so a new client can start from "now".
+            let log = &conn.v3.change_log;
+            conn.mark_live_reader();
+            log.pump(&dirty_set, &file_change_queue);
+            match trimmed.strip_prefix("EVENTS ").map(|s| s.trim().parse::<u64>()) {
+                None => log.head().to_string(),
+                Some(Ok(since)) => encode_events(&log.read_since(since, EVENTS_PAGE), &mount_point),
+                Some(Err(_)) => "error: EVENTS takes a sequence number".to_string(),
             }
+        } else if let Some(rest) = trimmed.strip_prefix("HELLO ") {
+            // `HELLO <client-id> <proto>` → `OK\t<proto>\t<pkg>\t<mount>\t<caps>`.
+            let mut parts = rest.split_whitespace();
+            let id = sanitize_client_id(parts.next().unwrap_or(""));
+            let proto = parts.next().and_then(|p| p.parse::<u32>().ok());
+            match (id.is_empty(), proto) {
+                (false, Some(proto)) => {
+                    if proto != PROTOCOL_VERSION {
+                        log::warn!(
+                            "IPC client {} speaks protocol v{}, daemon speaks v{} — update both to the same ncRS release",
+                            id, proto, PROTOCOL_VERSION
+                        );
+                    } else {
+                        log::info!("IPC client connected: {} (protocol v{}, pid {})", id, proto, conn.pid);
+                    }
+                    let new_key = crate::change_log::CursorKey { pid: conn.pid, client: id.clone() };
+                    {
+                        let mut k = conn.key.safe_lock();
+                        conn.v3.change_log.rekey(&k, &new_key);
+                        *k = new_key;
+                    }
+                    conn.v3.clients.register(conn.conn_id, ClientInfo {
+                        id,
+                        proto,
+                        pid: conn.pid,
+                        connected_at: std::time::Instant::now(),
+                        connected_secs: 0,
+                    });
+                    format!("OK\t{}\t{}\t{}\t{}", PROTOCOL_VERSION, env!("CARGO_PKG_VERSION"), mount_point.display(), CAPABILITIES)
+                }
+                _ => "error: usage: HELLO <client-id> <protocol>".to_string(),
+            }
+        } else if trimmed == "CLIENTS" {
+            serde_json::to_string(&conn.v3.clients.list()).unwrap_or_else(|_| "[]".to_string())
         } else if let Some(path_str) = trimmed.strip_prefix("KEEP ") {
             match (strip_mount(Path::new(path_str), &mount_point), &keep_cb) {
                 (Some(remote), Some(cb)) => {
@@ -1100,22 +1366,23 @@ fn handle_client(
             // version so the extension can warn on its side too.
             match ver_str.trim().parse::<u32>() {
                 Ok(v) if v == PROTOCOL_VERSION => {
-                    log::info!("Nautilus extension connected (protocol v{})", v);
+                    log::info!("shell extension connected (protocol v{})", v);
                 }
                 Ok(v) => {
                     log::warn!(
-                        "Nautilus extension protocol v{} does not match daemon protocol v{} — \
-                         update ncRS so the daemon and Nautilus extension are the same release",
+                        "shell extension protocol v{} does not match daemon protocol v{} — \
+                         update ncRS so the daemon and extension are the same release",
                         v, PROTOCOL_VERSION
                     );
                 }
                 Err(_) => {
-                    log::warn!("Nautilus extension sent malformed VERSION: {:?}", ver_str.trim());
+                    log::warn!("shell extension sent malformed VERSION: {:?}", ver_str.trim());
                 }
             }
             format!("{}\t{}", PROTOCOL_VERSION, env!("CARGO_PKG_VERSION"))
         } else if let Some(msg) = trimmed.strip_prefix("LOG ") {
-            log::info!("[nautilus] {}", msg);
+            let who = conn.key().client;
+            log::info!("[{}] {}", if who.is_empty() { "extension" } else { who.as_str() }, msg);
             "ok".to_string()
         } else {
             "unknown".to_string()
@@ -1140,6 +1407,66 @@ mod tests {
             size,
             is_dir,
         }
+    }
+
+    // ── Protocol v3 wire format ──────────────────────────────────────────────
+
+    #[test]
+    fn events_reply_encodes_every_record_kind() {
+        use crate::change_log::{ChangeLog, ChangeRecord};
+        let log = ChangeLog::new(16);
+        log.add_live_reader();
+        log.append([
+            ChangeRecord::Status(PathBuf::from("/a/b.txt")),
+            ChangeRecord::File(FileChange { kind: FileChangeKind::DirAdded, path: PathBuf::from("/d") }),
+            ChangeRecord::File(FileChange {
+                kind: FileChangeKind::Renamed { from: PathBuf::from("/old") },
+                path: PathBuf::from("/new"),
+            }),
+        ]);
+        let reply = encode_events(&log.read_since(0, 100), Path::new("/home/u/NC"));
+        assert_eq!(
+            reply,
+            "3\tS:/home/u/NC/a/b.txt\tDA:/home/u/NC/d\tR:/home/u/NC/old\x1e/home/u/NC/new"
+        );
+    }
+
+    #[test]
+    fn events_reply_signals_resync() {
+        let res = crate::change_log::ReadResult { next: 42, records: vec![], resync: true };
+        assert_eq!(encode_events(&res, Path::new("/m")), "42\tRESYNC");
+    }
+
+    #[test]
+    fn client_ids_are_sanitized() {
+        assert_eq!(sanitize_client_id("dolphin-kf6/0.1"), "dolphin-kf6/0.1");
+        assert_eq!(sanitize_client_id("evil\tid\x1e"), "evilid");
+        assert_eq!(sanitize_client_id(&"x".repeat(200)).len(), 64);
+    }
+
+    #[test]
+    fn client_registry_tracks_connections() {
+        let reg = ClientRegistry::default();
+        let c = reg.new_conn_id();
+        reg.register(c, ClientInfo {
+            id: "nautilus".into(),
+            proto: PROTOCOL_VERSION,
+            pid: 1,
+            connected_at: std::time::Instant::now(),
+            connected_secs: 0,
+        });
+        assert!(reg.is_connected("nautilus"));
+        assert!(!reg.is_connected("dolphin"));
+        let json = serde_json::to_string(&reg.list()).unwrap();
+        assert!(json.contains("\"id\":\"nautilus\""));
+        reg.remove(c);
+        assert!(!reg.is_connected("nautilus"));
+    }
+
+    #[test]
+    fn peer_pid_is_our_own_for_a_socketpair() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(peer_pid(&a), std::process::id());
     }
 
     // ── Daemon state word ────────────────────────────────────────────────────
