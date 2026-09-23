@@ -40,7 +40,7 @@ jobs:
             target/release/ncrs-ctl
             target/release/ncrs-gui
             dist/
-          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
 
       - name: Cache Cargo registry and git sources
         if: steps.binary-cache.outputs.cache-hit != 'true'
@@ -66,7 +66,12 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             python3-nautilus \
-            mold
+            mold \
+            cmake \
+            extra-cmake-modules \
+            qtbase5-dev \
+            libkf5kio-dev \
+            libkf5coreaddons-dev
 
       - name: Set up sccache
         if: steps.binary-cache.outputs.cache-hit != 'true'
@@ -107,9 +112,25 @@ jobs:
           RUSTC_WRAPPER: sccache
         run: cargo test --release -p ncrs_core
 
+      # The one .deb carries the Dolphin plugin for Plasma 5 and Plasma 6. KF5
+      # builds on this runner; jammy has no KF6, so that build runs in trixie.
+      - name: Build Dolphin plugin (KF5)
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-dolphin-plugin.sh --kf5 --test
+
+      - name: Build Dolphin plugin (KF6)
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm -v "$PWD":/src -w /src debian:trixie bash -ec "
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends cmake make g++ extra-cmake-modules \
+              qt6-base-dev libkf6kio-dev libkf6coreaddons-dev >/dev/null
+            bash scripts/build-dolphin-plugin.sh --test
+            chown -R $(id -u):$(id -g) dist"
+
       - name: Build .deb
         if: steps.binary-cache.outputs.cache-hit != 'true'
-        run: bash scripts/build-deb.sh --skip-build
+        run: bash scripts/build-deb.sh --skip-build --require-dolphin
 
   e2e:
     name: e2e (data-loss)
@@ -131,7 +152,7 @@ jobs:
             target/release/ncrs-ctl
             target/release/ncrs-gui
             dist/
-          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
 
       - name: Stage .deb for Docker build context
         run: cp dist/ncrs_*.deb docker/e2e/ncrs/ncrs.deb
@@ -218,7 +239,7 @@ jobs:
             target/release/ncrs-ctl
             target/release/ncrs-gui
             dist/
-          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
 
       - name: Fix binary permissions
         run: chmod +x target/release/ncrs target/release/ncrs-open target/release/ncrs-gui

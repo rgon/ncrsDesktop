@@ -40,8 +40,6 @@ impl Detect {
 
 /// The out-of-process shell adapter (emblems, context menu) for a browser.
 pub struct AdapterDescriptor {
-    /// Distribution package that ships it, if one exists yet.
-    pub package: Option<&'static str>,
     /// `HELLO` client-ids the adapter announces.
     pub client_ids: &'static [&'static str],
     /// Files whose presence means the adapter is installed (see
@@ -50,7 +48,7 @@ pub struct AdapterDescriptor {
 }
 
 impl AdapterDescriptor {
-    pub const NONE: AdapterDescriptor = AdapterDescriptor { package: None, client_ids: &[], installed_paths: &[] };
+    pub const NONE: AdapterDescriptor = AdapterDescriptor { client_ids: &[], installed_paths: &[] };
 
     pub fn is_installed(&self, env: &DetectEnv) -> bool {
         self.installed_paths.iter().any(|p| env.path_exists(p))
@@ -107,7 +105,6 @@ pub static PROFILES: &[Profile] = &[
         components: &[],
         requires: &["gio"],
         adapter: AdapterDescriptor {
-            package: Some("ncrs-nautilus"),
             client_ids: &["nautilus"],
             installed_paths: &[
                 "/usr/share/nautilus-python/extensions/ncrs-syncstate.py",
@@ -128,7 +125,6 @@ pub static PROFILES: &[Profile] = &[
         components: &[],
         requires: &["kio"],
         adapter: AdapterDescriptor {
-            package: Some("ncrs-dolphin"),
             client_ids: &["dolphin-kf6", "dolphin-kf5"],
             installed_paths: &[
                 "@lib/qt6/plugins/kf6/overlayicon/ncrsoverlayplugin.so",

@@ -85,10 +85,11 @@ This installs:
 | File | KF6 | KF5 |
 |---|---|---|
 | plugin | `/usr/lib/<triplet>/qt6/plugins/kf6/overlayicon/ncrsoverlayplugin.so` | `/usr/lib/<triplet>/qt5/plugins/kf5/overlayicon/ncrsoverlayplugin.so` |
-| ServiceMenu | `/usr/share/kio/servicemenus/ncrs.desktop` | `/usr/share/kservices5/ServiceMenus/ncrs.desktop` |
+| ServiceMenu | `/usr/share/kio/servicemenus/ncrs.desktop` | same (read by KF5 >= 5.85) |
 
-Or build a package: `scripts/build-deb-dolphin.sh` (add `--kf5` for Plasma 5)
-writes `dist/ncrs-dolphin_<version>_<arch>.deb`.
+The `ncrs` .deb ships both plugins. To package it locally, stage them first:
+`scripts/build-dolphin-plugin.sh` (add `--kf5` for Plasma 5) installs into
+`dist/dolphin/kf6` (or `kf5`), which `scripts/build-deb.sh` picks up.
 
 ## Debug
 
