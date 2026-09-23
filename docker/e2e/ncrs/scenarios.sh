@@ -225,6 +225,34 @@ else
     no "large unknown-ext file never reached backend (setup failed)"
 fi
 
+echo "→ 11b. Thumbnailer guard (the server is the only thumbnail source)"
+# A desktop thumbnailer opening an uncached file would download all of it to
+# render a preview. ncrs refuses such opens (no network I/O) and fetches the
+# server preview instead (desktop::thumbguard). The entrypoint registered
+# /usr/local/bin/ncrs-fake-thumbnailer as a GIO thumbnailer.
+{ printf 'NCRS-THUMB-DATA-'; head -c 4080 /dev/urandom; } > /tmp/pic.jpg
+PIC_HEX="$(head -c16 /tmp/pic.jpg | od_hex)"
+curl -s -u "$U:$P" -X MKCOL "${URL}thumbdir" -o /dev/null
+curl -s -u "$U:$P" -T /tmp/pic.jpg "${URL}thumbdir/pic.jpg" -o /dev/null
+ls "$MOUNT/thumbdir" >/dev/null 2>&1
+if [ -f "$MOUNT/thumbdir/pic.jpg" ]; then
+    if /usr/local/bin/ncrs-fake-thumbnailer -c16 "$MOUNT/thumbdir/pic.jpg" >/dev/null 2>&1; then
+        no "thumbnailer read an uncached file (it would download it to render a preview)"
+    else
+        ok "thumbnailer refused on an uncached file (no download for a preview)"
+    fi
+    grep -q "THUMBGUARD refused /thumbdir/pic.jpg" "${NCRS_LOG:-/tmp/ncrs.log}" \
+        && ok "refusal logged and handed to the server-preview fetch" \
+        || no "no THUMBGUARD log line for the refused thumbnailer"
+    # The guard is scoped to thumbnailer processes: an ordinary read of the
+    # same file right after gets the real bytes.
+    [ "$(head -c16 "$MOUNT/thumbdir/pic.jpg" 2>/dev/null | od_hex)" = "$PIC_HEX" ] \
+        && ok "ordinary read of the same file returns real content" \
+        || no "ordinary read was refused or wrong after the thumbnailer guard"
+else
+    no "backend-created thumbdir/pic.jpg never appeared on the mount (setup failed)"
+fi
+
 echo "→ 12. SERVER DOWN — new edit persists locally and syncs on recovery"
 # The whole point of the local cache: a save must succeed and stay readable even
 # when the server is unreachable, then upload itself once the server is back.

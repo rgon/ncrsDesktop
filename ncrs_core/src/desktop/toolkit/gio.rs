@@ -8,8 +8,12 @@
 //! - Atomic writes: GIO saves through `.goutputstream-*` / `.xdp-*` temps
 //!   renamed into place; any that reach the server are orphans, hidden from
 //!   listings and optionally purged.
-//! - Thumbnails: the freedesktop `normal` cache, keyed by GLib's file URI.
+//! - Thumbnails: the freedesktop `normal` cache, keyed by GLib's file URI, is
+//!   pre-filled from server previews; every program registered in a
+//!   `.thumbnailer` file is refused on uncached files (see `thumbguard`).
 
+use crate::desktop::detect::DetectEnv;
+use crate::desktop::thumbguard::{thumbnailer_programs, ThumbnailerMatch};
 use crate::desktop::{Component, ComponentId, DesktopPolicy};
 
 pub struct Gio;
@@ -27,5 +31,8 @@ impl Component for Gio {
             }
         }
         p.thumbnails.normal = true;
+        for prog in thumbnailer_programs(&DetectEnv::from_env().data_dirs) {
+            p.add_thumbnailer(ThumbnailerMatch::Program(prog));
+        }
     }
 }
