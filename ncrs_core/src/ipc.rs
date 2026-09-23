@@ -225,6 +225,8 @@ impl ClientRegistry {
 pub struct V3Context {
     pub change_log: Arc<crate::change_log::ChangeLog>,
     pub clients: Arc<ClientRegistry>,
+    /// Desktop / file-browser profiles (absent in callers that never start one).
+    pub desktop: Option<Arc<crate::desktop::Manager>>,
 }
 
 /// Peer process id of a Unix-socket connection (0 if unavailable).
@@ -740,7 +742,7 @@ fn spawn_state_monitor(
 /// Start the IPC socket server in a background thread.
 ///
 /// `mount_point` is the local FUSE mount directory; paths outside it return Unknown.
-pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, children_map: ChildrenMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, purge_cb: Option<PurgeCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>, offline: crate::OfflineStatus, passthrough_enabled: Arc<AtomicBool>, passthrough_capable: Arc<AtomicBool>) {
+pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: SharedSet, fileid_map: FileIdMap, detail_map: FileDetailMap, children_map: ChildrenMap, dirty_set: DirtySet, creds: crate::auth::Credentials, base_url: String, keep_cb: Option<KeepCallback>, evict_cb: Option<EvictCallback>, prefetch_cb: Option<PrefetchCallback>, thumbnail_cb: Option<ThumbnailCallback>, purge_cb: Option<PurgeCallback>, error_log: crate::ErrorLog, transfer_map: crate::TransferMap, journal: crate::mutation_journal::SharedJournal, file_change_queue: FileChangeQueue, storage_stats: SharedStorageStats, paused: Arc<AtomicBool>, offline: crate::OfflineStatus, passthrough_enabled: Arc<AtomicBool>, passthrough_capable: Arc<AtomicBool>, desktop: Option<Arc<crate::desktop::Manager>>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
 
@@ -782,6 +784,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
     let v3 = V3Context {
         change_log: Arc::new(crate::change_log::ChangeLog::new(crate::change_log::DEFAULT_CAPACITY)),
         clients: Arc::new(ClientRegistry::default()),
+        desktop,
     };
     {
         let log = v3.change_log.clone();
@@ -1221,6 +1224,27 @@ fn handle_client_loop(
                     format!("OK\t{}\t{}\t{}\t{}", PROTOCOL_VERSION, env!("CARGO_PKG_VERSION"), mount_point.display(), CAPABILITIES)
                 }
                 _ => "error: usage: HELLO <client-id> <protocol>".to_string(),
+            }
+        } else if trimmed == "INTEGRATIONS" {
+            // One record per browser profile; detection re-runs first.
+            match &conn.v3.desktop {
+                Some(m) => {
+                    let clients = conn.v3.clients.clone();
+                    let list = m.list(&|id| clients.is_connected(id));
+                    serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+                }
+                None => "[]".to_string(),
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("INTEGRATION_SET ") {
+            let mut parts = rest.split_whitespace();
+            match (&conn.v3.desktop, parts.next(), parts.next().map(str::parse::<crate::desktop::store::Mode>)) {
+                (None, _, _) => "error: not supported".to_string(),
+                (Some(m), Some(id), Some(Ok(mode))) => match m.set(id, mode) {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("error: {}", e),
+                },
+                (_, _, Some(Err(e))) => format!("error: {}", e),
+                _ => "error: usage: INTEGRATION_SET <profile> on|off|auto".to_string(),
             }
         } else if trimmed == "CLIENTS" {
             serde_json::to_string(&conn.v3.clients.list()).unwrap_or_else(|_| "[]".to_string())
