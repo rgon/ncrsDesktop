@@ -37,6 +37,7 @@ jobs:
           path: |
             target/release/ncrs
             target/release/ncrs-open
+            target/release/ncrs-ctl
             target/release/ncrs-gui
             dist/
           key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
@@ -127,6 +128,7 @@ jobs:
           path: |
             target/release/ncrs
             target/release/ncrs-open
+            target/release/ncrs-ctl
             target/release/ncrs-gui
             dist/
           key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
@@ -213,6 +215,7 @@ jobs:
           path: |
             target/release/ncrs
             target/release/ncrs-open
+            target/release/ncrs-ctl
             target/release/ncrs-gui
             dist/
           key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml') }}
