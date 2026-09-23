@@ -1,0 +1,9 @@
+{
+    "KPlugin": {
+        "Id": "ncrsoverlayplugin",
+        "Name": "Nextcloud (ncrs) sync status",
+        "Description": "Shows ncrs sync-status and sharing emblems on files under the Nextcloud mount",
+        "License": "GPL-3.0-or-later",
+        "Website": "https://github.com/rgon/ncrsDesktop"
+    }
+}

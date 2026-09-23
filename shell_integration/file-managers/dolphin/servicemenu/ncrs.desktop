@@ -1,0 +1,27 @@
+# ncrs actions for Dolphin's context menu. Installed to
+# /usr/share/kio/servicemenus/ (KF6) or /usr/share/kservices5/ServiceMenus/ (KF5).
+# ServiceMenus cannot filter by path, so the entries show for every local file;
+# ncrs-ctl rejects paths outside the mount with an error.
+[Desktop Entry]
+Type=Service
+MimeType=all/all;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Protocols=file
+X-KDE-Submenu=Nextcloud (ncrs)
+Icon=folder-cloud
+Actions=keep;evict;web
+
+[Desktop Action keep]
+Name=Always Keep on This Device
+Icon=emblem-checked
+Exec=ncrs-ctl keep %F
+
+[Desktop Action evict]
+Name=Free Up Space
+Icon=edit-clear
+Exec=ncrs-ctl evict %F
+
+[Desktop Action web]
+Name=Open in Nextcloud Web
+Icon=internet-web-browser
+Exec=ncrs-ctl weburl --open %f
