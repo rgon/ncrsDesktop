@@ -243,13 +243,22 @@ echo "→ 11b. Thumbnailer guard (the server is the only thumbnail source)"
 # /usr/local/bin/ncrs-fake-thumbnailer as a GIO thumbnailer.
 { printf 'NCRS-THUMB-DATA-'; head -c 4080 /dev/urandom; } > /tmp/pic.jpg
 PIC_HEX="$(head -c16 /tmp/pic.jpg | od_hex)"
-curl -s -u "$U:$P" -X MKCOL "${URL}thumbdir" -o /dev/null
-curl -s -u "$U:$P" -T /tmp/pic.jpg "${URL}thumbdir/pic.jpg" -o /dev/null
-# Wait for the backend-created file to be listed. List only, never read: a
-# read could cache it, and cached files are deliberately not guarded.
-seen=""
+# Same setup as scenario 18: make the folder through the mount, then put the
+# file straight onto the backend so it was never written (or cached) locally,
+# and let read-triggered revalidation surface it.
+mkdir "$MOUNT/thumbdir"
 for _ in $(seq 1 60); do
-    ls "$MOUNT/thumbdir" 2>/dev/null | grep -qx 'pic.jpg' && { seen=1; break; }
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}thumbdir/")" = "207" ] && break
+    sleep 1
+done
+ls "$MOUNT/thumbdir" >/dev/null 2>&1
+curl -s -u "$U:$P" -T /tmp/pic.jpg "${URL}thumbdir/pic.jpg" -o /dev/null
+# List and stat only, never read: a read could cache it, and cached files are
+# deliberately not guarded. A newly discovered entry is listed before lookups
+# resolve it (ghosted first, as in scenario 18), so wait for the stat too.
+seen=""
+for _ in $(seq 1 90); do
+    ls "$MOUNT/thumbdir" 2>/dev/null | grep -qx 'pic.jpg' && [ -e "$MOUNT/thumbdir/pic.jpg" ] && { seen=1; break; }
     sleep 1
 done
 if [ -n "$seen" ]; then
