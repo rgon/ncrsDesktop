@@ -702,6 +702,8 @@ echo "→ 22. SERVER EDIT of a KEPT file — the refresh that evicts it must not
 SOCK="$(ls "${XDG_RUNTIME_DIR:-/nonexistent}/ncrs.sock" /tmp/ncrs-"$(id -u)"/ncrs.sock 2>/dev/null | head -1)"
 ipc() { printf '%s\n' "$1" | timeout 10 nc -U -N "$SOCK" 2>/dev/null; }
 bounded() { timeout -s KILL "$@"; }   # exit 137 = the call was still blocked in the kernel
+# Scenario 20 restarts the daemon into its own log, so search every daemon log.
+daemon_logs() { cat "$NCRS_LOG" /tmp/ncrs_restart19.log 2>/dev/null; }
 mount_hung() {
     no "$1 — mount frozen (FUSE request never answered)"
     DPID="$(pgrep -x ncrs | head -1)"
@@ -745,13 +747,14 @@ evicted=""
 for _ in $(seq 1 15); do
     bounded 20 ls "$MOUNT/relock" >/dev/null 2>&1  # each read schedules the background refresh
     [ $? -eq 137 ] && mount_hung "listing while the refresh ran"
-    if grep -q "file_cache: evicted stale /relock/kept.txt" "$NCRS_LOG" 2>/dev/null; then evicted=1; break; fi
+    if daemon_logs | grep -q "file_cache: evicted stale /relock/kept.txt"; then evicted=1; break; fi
     sleep 1
 done
 if [ -n "$evicted" ]; then
     ok "refresh evicted the kept file's stale copy (the formerly deadlocking path ran)"
 else
     no "refresh never evicted the kept file — scenario did not reach the regression path"
+    daemon_logs | grep "relock" | grep -v "READDIR\|LIST_CACHED" | tail -15 | sed 's/^/    /'
 fi
 sleep 2
 bounded 20 stat "$MOUNT/relock/kept.txt" >/dev/null 2>&1; rc=$?
