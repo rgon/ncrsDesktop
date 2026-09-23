@@ -43,6 +43,15 @@ auto_keep_cached_files: false
 dir_cache_max_stale_mins: 1
 EOF
 
+# No file browser is installed in this image, so every desktop profile would
+# resolve to "off" (profiles default to on only for installed browsers). The
+# scenarios exercise the GIO/Tracker behaviour (O_NOATIME sniff intercept,
+# .trackerignore), so enable the Nautilus profile explicitly, exactly as a user
+# choice made via the GUI or `ncrs-ctl integration-set nautilus on` is stored.
+cat > "$HOME/.config/ncrs/desktop-profiles.json" <<EOF
+{ "modes": { "nautilus": "on" } }
+EOF
+
 echo "[e2e] mounting ncrs daemon"
 RUST_LOG="${RUST_LOG:-info}" ncrs --config "$HOME/.config/ncrs/config.yaml" >"$LOG" 2>&1 &
 DAEMON=$!
