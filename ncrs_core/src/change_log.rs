@@ -14,9 +14,9 @@
 //! through its own cursor. The producers are untouched.
 //!
 //! - Legacy `CHANGES`/`FILE_CHANGES` keep a cursor per client *process* (keyed
-//!   by the peer pid), so the Nautilus extension — which polls from whichever
-//!   pool thread is free, each with its own connection — still sees every
-//!   change exactly once.
+//!   by the peer pid, regardless of which connection said `HELLO`), so the
+//!   Nautilus extension — which polls from whichever pool thread is free, each
+//!   with its own connection — still sees every change exactly once.
 //! - `EVENTS <since>` / `WATCH` let the client hold the cursor itself; falling
 //!   off the ring is reported as `RESYNC` instead of silently losing events.
 
@@ -50,12 +50,12 @@ pub struct ReadResult {
     pub resync: bool,
 }
 
-/// Who a legacy (`CHANGES`/`FILE_CHANGES`) cursor belongs to.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Who a legacy (`CHANGES`/`FILE_CHANGES`) cursor belongs to: the client
+/// process. Deliberately not the `HELLO` client-id — a multi-threaded client
+/// may say hello on only one of its connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CursorKey {
     pub pid: u32,
-    /// `HELLO` client-id, or empty for a client that never said hello.
-    pub client: String,
 }
 
 struct LegacyCursor {
@@ -197,7 +197,7 @@ impl ChangeLog {
         let mut r = self.inner.safe_lock();
         let head = r.head();
         r.cursors
-            .entry(key.clone())
+            .entry(*key)
             .or_insert(LegacyCursor { status: head, file: head, refs: 0 })
             .refs += 1;
     }
@@ -211,31 +211,6 @@ impl ChangeLog {
                 r.cursors.remove(key);
             }
         }
-    }
-
-    /// Move a connection from one cursor key to another (after `HELLO`),
-    /// carrying the position over so nothing is replayed or lost.
-    pub fn rekey(&self, from: &CursorKey, to: &CursorKey) {
-        if from == to {
-            return;
-        }
-        let mut r = self.inner.safe_lock();
-        let head = r.head();
-        let (status, file) = match r.cursors.get_mut(from) {
-            Some(c) => {
-                c.refs = c.refs.saturating_sub(1);
-                let pos = (c.status, c.file);
-                if c.refs == 0 {
-                    r.cursors.remove(from);
-                }
-                pos
-            }
-            None => (head, head),
-        };
-        r.cursors
-            .entry(to.clone())
-            .or_insert(LegacyCursor { status, file, refs: 0 })
-            .refs += 1;
     }
 
     /// Legacy `CHANGES`: up to `max` distinct status paths past this client's cursor.
@@ -299,7 +274,7 @@ mod tests {
     use std::sync::Arc;
 
     fn key(pid: u32) -> CursorKey {
-        CursorKey { pid, client: String::new() }
+        CursorKey { pid }
     }
 
     fn status(p: &str) -> ChangeRecord {
@@ -395,18 +370,6 @@ mod tests {
         log.append([status("/a"), status("/b")]);
         assert_eq!(log.head(), 2);
         assert_eq!(log.inner.safe_lock().entries.len(), 0);
-    }
-
-    #[test]
-    fn rekey_carries_position() {
-        let log = ChangeLog::new(16);
-        let anon = key(3);
-        let named = CursorKey { pid: 3, client: "nautilus".into() };
-        log.attach(&anon);
-        log.append([status("/a")]);
-        log.rekey(&anon, &named);
-        assert_eq!(log.take_status(&named, 10), vec![PathBuf::from("/a")]);
-        assert!(log.take_status(&anon, 10).is_empty());
     }
 
     #[test]

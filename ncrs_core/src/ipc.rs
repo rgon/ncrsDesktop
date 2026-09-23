@@ -71,7 +71,7 @@ fn note_dir_status_fallback(context: &str, dir: &Path) {
 /// (a new command, a changed reply format). The Nautilus extension announces
 /// its own copy of this on connect via `VERSION`; a mismatch is logged so a
 /// half-updated install (new daemon + old extension, or vice-versa) is obvious.
-/// Keep in sync with `PROTOCOL_VERSION` in shell_integration/nautilus/syncstate.py.
+/// Keep in sync with `PROTOCOL_VERSION` in shell_integration/file-managers/nautilus/syncstate.py.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Capabilities advertised in the `HELLO` reply.
@@ -927,20 +927,39 @@ struct ConnState {
     v3: V3Context,
     conn_id: u64,
     pid: u32,
-    key: Mutex<crate::change_log::CursorKey>,
+    key: crate::change_log::CursorKey,
+    /// `HELLO` client-id, empty until the client says hello.
+    client_id: Mutex<String>,
+    /// Holds a legacy cursor (only clients that poll CHANGES/FILE_CHANGES or
+    /// announce with VERSION do, so a GUI connection pins no history).
+    attached: AtomicBool,
     live_reader: AtomicBool,
 }
 
 impl ConnState {
     fn new(stream: &std::os::unix::net::UnixStream, v3: V3Context) -> Self {
         let pid = peer_pid(stream);
-        let key = crate::change_log::CursorKey { pid, client: String::new() };
-        v3.change_log.attach(&key);
-        ConnState { conn_id: v3.clients.new_conn_id(), v3, pid, key: Mutex::new(key), live_reader: AtomicBool::new(false) }
+        let key = crate::change_log::CursorKey { pid };
+        ConnState {
+            conn_id: v3.clients.new_conn_id(),
+            v3,
+            pid,
+            key,
+            client_id: Mutex::new(String::new()),
+            attached: AtomicBool::new(false),
+            live_reader: AtomicBool::new(false),
+        }
+    }
+
+    /// Join (or create, at the current head) this process's legacy cursor.
+    fn ensure_attached(&self) {
+        if !self.attached.swap(true, Ordering::Relaxed) {
+            self.v3.change_log.attach(&self.key);
+        }
     }
 
     fn key(&self) -> crate::change_log::CursorKey {
-        self.key.safe_lock().clone()
+        self.key
     }
 
     fn mark_live_reader(&self) {
@@ -952,7 +971,9 @@ impl ConnState {
 
 impl Drop for ConnState {
     fn drop(&mut self) {
-        self.v3.change_log.detach(&self.key());
+        if self.attached.load(Ordering::Relaxed) {
+            self.v3.change_log.detach(&self.key);
+        }
         self.v3.clients.remove(self.conn_id);
         if self.live_reader.load(Ordering::Relaxed) {
             self.v3.change_log.remove_live_reader();
@@ -1166,6 +1187,7 @@ fn handle_client_loop(
         } else if trimmed == "CHANGES" {
             // Legacy per-process cursor over the broadcast log (see change_log).
             const MAX_CHANGES: usize = 500;
+            conn.ensure_attached();
             conn.v3.change_log.pump(&dirty_set, &file_change_queue);
             let paths = conn.v3.change_log.take_status(&conn.key(), MAX_CHANGES);
             if !paths.is_empty() {
@@ -1176,6 +1198,7 @@ fn handle_client_loop(
                 .collect::<Vec<_>>()
                 .join("\t")
         } else if trimmed == "FILE_CHANGES" {
+            conn.ensure_attached();
             conn.v3.change_log.pump(&dirty_set, &file_change_queue);
             conn.v3.change_log.take_file_changes(&conn.key())
                 .iter()
@@ -1208,12 +1231,7 @@ fn handle_client_loop(
                     } else {
                         log::info!("IPC client connected: {} (protocol v{}, pid {})", id, proto, conn.pid);
                     }
-                    let new_key = crate::change_log::CursorKey { pid: conn.pid, client: id.clone() };
-                    {
-                        let mut k = conn.key.safe_lock();
-                        conn.v3.change_log.rekey(&k, &new_key);
-                        *k = new_key;
-                    }
+                    *conn.client_id.safe_lock() = id.clone();
                     conn.v3.clients.register(conn.conn_id, ClientInfo {
                         id,
                         proto,
@@ -1385,6 +1403,9 @@ fn handle_client_loop(
                 None => "error: not supported".to_string(),
             }
         } else if let Some(ver_str) = trimmed.strip_prefix("VERSION ") {
+            // A v2 extension announces itself on connect and then polls: start
+            // its change cursor here so nothing between connect and first poll is lost.
+            conn.ensure_attached();
             // The extension announces its protocol version on connect. Print it
             // and warn if it does not match the daemon so a half-updated install
             // is visible in the logs. Reply with our own protocol + package
@@ -1406,7 +1427,7 @@ fn handle_client_loop(
             }
             format!("{}\t{}", PROTOCOL_VERSION, env!("CARGO_PKG_VERSION"))
         } else if let Some(msg) = trimmed.strip_prefix("LOG ") {
-            let who = conn.key().client;
+            let who = conn.client_id.safe_lock().clone();
             log::info!("[{}] {}", if who.is_empty() { "extension" } else { who.as_str() }, msg);
             "ok".to_string()
         } else {
