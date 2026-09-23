@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.75](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.74...ncrs-v0.1.75) (2026-09-23)
+
+
+### Bug Fixes
+
+* **fuse:** commit uploads on release, not flush, so a mid-write close no longer truncates or scrambles files ([66fe140](https://github.com/rgon/ncrsDesktop/commit/66fe140e7039609d77e6ed8de780db5a4ba48365))
+* **fuse:** drop a new folder's placeholder listing once its MKCOL lands, so later listings come from the server ([6fd5ede](https://github.com/rgon/ncrsDesktop/commit/6fd5edeff8258dae32691f7b11e8add255cd0b91))
+* **fuse:** order server changes per path, retarget renamed open files, stage appends and journal streamed finishes ([b698627](https://github.com/rgon/ncrsDesktop/commit/b698627c83eccf211791c4770ee9abe534a53aa1))
+
 ## [0.1.74](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.73...ncrs-v0.1.74) (2026-09-23)
 
 
