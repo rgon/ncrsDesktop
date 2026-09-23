@@ -27,7 +27,44 @@ const FILE_PATH_ENCODE: &AsciiSet = &CONTROLS
     .add(b'|')
     .add(b'}');
 
-const PREVIEW_SIZE: u32 = 128;
+/// freedesktop thumbnail sizes ncrs can pre-fill. Which ones are wanted comes
+/// from the active desktop profiles (`desktop::DesktopPolicy::thumbnails`):
+/// GLib only reads `normal`; KIO also reads `large` at bigger zoom/HiDPI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThumbSize {
+    Normal,
+    Large,
+}
+
+impl ThumbSize {
+    fn dir(self) -> &'static str {
+        match self {
+            ThumbSize::Normal => "normal",
+            ThumbSize::Large => "large",
+        }
+    }
+
+    fn px(self) -> u32 {
+        match self {
+            ThumbSize::Normal => 128,
+            ThumbSize::Large => 256,
+        }
+    }
+}
+
+fn wanted_sizes() -> Vec<ThumbSize> {
+    let t = crate::desktop::policy().thumbnails;
+    let mut v = Vec::new();
+    // `normal` is also the fallback when no profile asks for anything: the
+    // IPC THUMBNAIL path and the thumbnailer script look there.
+    if t.normal || !t.large {
+        v.push(ThumbSize::Normal);
+    }
+    if t.large {
+        v.push(ThumbSize::Large);
+    }
+    v
+}
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 // Server-cached previews (has_preview=true) are pre-generated JPEGs served as static
@@ -171,16 +208,20 @@ pub fn file_uri(mount_point: &Path, remote_path: &Path) -> String {
     format!("file://{}", encoded)
 }
 
-fn xdg_thumb_dir() -> PathBuf {
+fn xdg_thumb_dir(size: ThumbSize) -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("thumbnails")
-        .join("normal")
+        .join(size.dir())
+}
+
+fn xdg_thumb_path_sized(file_uri: &str, size: ThumbSize) -> PathBuf {
+    let hash = format!("{:x}", md5::compute(file_uri));
+    xdg_thumb_dir(size).join(format!("{}.png", hash))
 }
 
 fn xdg_thumb_path(file_uri: &str) -> PathBuf {
-    let hash = format!("{:x}", md5::compute(file_uri));
-    xdg_thumb_dir().join(format!("{}.png", hash))
+    xdg_thumb_path_sized(file_uri, ThumbSize::Normal)
 }
 
 /// Remove any XDG fail-cache entries for `file_uri` so Nautilus retries
@@ -217,11 +258,12 @@ fn fetch_preview_bytes(
     creds: &crate::auth::Credentials,
     remote_path: &Path,
     fileid: u64,
+    px: u32,
 ) -> Result<Vec<u8>, String> {
     let _permit = FetchPermit::acquire();
     let t0 = std::time::Instant::now();
     let url = format!("{}/core/preview", base);
-    let size = PREVIEW_SIZE.to_string();
+    let size = px.to_string();
     let fid_str = fileid.to_string();
     let resp = creds.apply(
         client.get(&url)
@@ -253,6 +295,21 @@ fn ensure_png(data: Vec<u8>) -> Result<Vec<u8>, String> {
         return Ok(out);
     }
     Err(format!("unexpected preview format (first bytes: {:02x?})", &data[..data.len().min(4)]))
+}
+
+/// PNG for a `px` box. A preview already within the box is passed through
+/// `ensure_png` untouched; a larger one (fetched once for `large`) is scaled
+/// down for `normal`, so both sizes cost a single server request.
+fn png_for_size(raw: &[u8], fetched_px: u32, px: u32) -> Result<Vec<u8>, String> {
+    if px >= fetched_px {
+        return ensure_png(raw.to_vec());
+    }
+    let img = image::load_from_memory(raw).map_err(|e| format!("preview decode: {}", e))?;
+    let img = if img.width().max(img.height()) > px { img.thumbnail(px, px) } else { img };
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| format!("png encode: {}", e))?;
+    Ok(out)
 }
 
 // ── XDG thumbnail PNG writer ──────────────────────────────────────────────────
@@ -302,10 +359,13 @@ pub fn prefetch_thumbnail(
     fileid: Option<u64>,
 ) {
     let uri = file_uri(mount_point, remote_path);
-    let thumb = xdg_thumb_path(&uri);
-    if thumb.exists() {
+    let missing: Vec<ThumbSize> = wanted_sizes()
+        .into_iter()
+        .filter(|s| !xdg_thumb_path_sized(&uri, *s).exists())
+        .collect();
+    let Some(fetch_px) = missing.iter().map(|s| s.px()).max() else {
         return;
-    }
+    };
 
     let Some(fileid) = fileid else {
         log::debug!("thumbnail {}: no fileid, skipping", remote_path.display());
@@ -318,7 +378,7 @@ pub fn prefetch_thumbnail(
     }
 
     let t_total = std::time::Instant::now();
-    let raw = match fetch_preview_bytes(client, base, creds, remote_path, fileid) {
+    let raw = match fetch_preview_bytes(client, base, creds, remote_path, fileid, fetch_px) {
         Ok(d) => d,
         Err(e) => {
             mark_negative(fileid);
@@ -328,43 +388,44 @@ pub fn prefetch_thumbnail(
     };
     let t_after_fetch = t_total.elapsed().as_millis();
 
-    let png = match ensure_png(raw) {
-        Ok(d) => d,
-        Err(e) => {
-            log::debug!("thumbnail {}: {}", remote_path.display(), e);
-            return;
-        }
-    };
-    let t_after_convert = t_total.elapsed().as_millis();
-
     let mtime_s = mtime
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|| "0".into());
 
-    let data = match inject_png_text_chunks(&png, &[("Thumb::URI", &uri), ("Thumb::MTime", &mtime_s)]) {
-        Some(d) => d,
-        None => {
-            log::debug!("thumbnail {}: inject_png_text_chunks failed (corrupt PNG?)", remote_path.display());
+    for size in &missing {
+        let png = match png_for_size(&raw, fetch_px, size.px()) {
+            Ok(d) => d,
+            Err(e) => {
+                log::debug!("thumbnail {}: {}", remote_path.display(), e);
+                return;
+            }
+        };
+        let data = match inject_png_text_chunks(&png, &[("Thumb::URI", &uri), ("Thumb::MTime", &mtime_s)]) {
+            Some(d) => d,
+            None => {
+                log::debug!("thumbnail {}: inject_png_text_chunks failed (corrupt PNG?)", remote_path.display());
+                return;
+            }
+        };
+        let thumb = xdg_thumb_path_sized(&uri, *size);
+        if let Some(parent) = thumb.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Write to a sibling .tmp then rename so concurrent writers can't corrupt
+        // a partially-written PNG that Nautilus has already opened and cached.
+        let tmp = thumb.with_extension("png.tmp");
+        if let Err(e) = std::fs::write(&tmp, &data) {
+            log::debug!("write thumbnail {}: {}", thumb.display(), e);
             return;
         }
-    };
-
-    if let Some(parent) = thumb.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::rename(&tmp, &thumb) {
+            log::debug!("rename thumbnail {}: {}", thumb.display(), e);
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
     }
-    // Write to a sibling .tmp then rename so concurrent writers can't corrupt
-    // a partially-written PNG that Nautilus has already opened and cached.
-    let tmp = thumb.with_extension("png.tmp");
-    if let Err(e) = std::fs::write(&tmp, &data) {
-        log::debug!("write thumbnail {}: {}", thumb.display(), e);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &thumb) {
-        log::debug!("rename thumbnail {}: {}", thumb.display(), e);
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
+    let t_after_convert = t_total.elapsed().as_millis();
     // Remove any stale fail-cache entries so Nautilus picks up the thumbnail
     // instead of indefinitely skipping the file because of a past failure.
     evict_fail_cache(&uri);
@@ -492,6 +553,29 @@ mod tests {
         let remote = Path::new("/docs/report.pdf");
         let uri = file_uri(mount, remote);
         assert_eq!(uri, "file:///home/user/ncrs/docs/report.pdf");
+    }
+
+    #[test]
+    fn png_for_size_passes_small_previews_through_and_scales_large_ones() {
+        let img = image::DynamicImage::new_rgb8(256, 192);
+        let mut jpeg = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg).unwrap();
+        let normal = png_for_size(&jpeg, 256, 128).unwrap();
+        let back = image::load_from_memory(&normal).unwrap();
+        assert_eq!((back.width(), back.height()), (128, 96));
+        let large = png_for_size(&jpeg, 256, 256).unwrap();
+        assert_eq!(&large[..8], &PNG_SIG);
+        assert_eq!(image::load_from_memory(&large).unwrap().width(), 256);
+    }
+
+    #[test]
+    fn large_thumbnails_live_next_to_normal_ones() {
+        let uri = "file:///m/a.jpg";
+        let n = xdg_thumb_path_sized(uri, ThumbSize::Normal);
+        let l = xdg_thumb_path_sized(uri, ThumbSize::Large);
+        assert!(n.ends_with(format!("thumbnails/normal/{}", n.file_name().unwrap().to_str().unwrap())));
+        assert_eq!(n.file_name(), l.file_name());
+        assert!(l.parent().unwrap().ends_with("thumbnails/large"));
     }
 
     #[test]
