@@ -234,8 +234,14 @@ echo "→ 11b. Thumbnailer guard (the server is the only thumbnail source)"
 PIC_HEX="$(head -c16 /tmp/pic.jpg | od_hex)"
 curl -s -u "$U:$P" -X MKCOL "${URL}thumbdir" -o /dev/null
 curl -s -u "$U:$P" -T /tmp/pic.jpg "${URL}thumbdir/pic.jpg" -o /dev/null
-ls "$MOUNT/thumbdir" >/dev/null 2>&1
-if [ -f "$MOUNT/thumbdir/pic.jpg" ]; then
+# Wait for the backend-created file to be listed. List only, never read: a
+# read could cache it, and cached files are deliberately not guarded.
+seen=""
+for _ in $(seq 1 60); do
+    ls "$MOUNT/thumbdir" 2>/dev/null | grep -qx 'pic.jpg' && { seen=1; break; }
+    sleep 1
+done
+if [ -n "$seen" ]; then
     if /usr/local/bin/ncrs-fake-thumbnailer -c16 "$MOUNT/thumbdir/pic.jpg" >/dev/null 2>&1; then
         no "thumbnailer read an uncached file (it would download it to render a preview)"
     else
