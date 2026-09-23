@@ -6,6 +6,7 @@ pub mod login_flow;
 pub mod edit_locally;
 pub mod filename_validation;
 pub mod fuse_notify;
+pub mod change_log;
 pub mod ipc;
 pub mod http_clients;
 mod iomode;
