@@ -21,6 +21,20 @@
         fuse_passthrough: boolean;
     }
 
+    // One file-browser profile, as reported by the service (`INTEGRATIONS`).
+    interface Integration {
+        id: string;
+        name: string;
+        summary: string;
+        installed: boolean;
+        mode: "auto" | "on" | "off";
+        enabled: boolean;
+        adapter_package: string | null;
+        adapter_client_ids: string[];
+        adapter_installed: boolean;
+        adapter_connected: boolean;
+    }
+
     let { forced = false }: { forced?: boolean } = $props();
 
     let settings = $state<ConfigSettings | null>(null);
@@ -32,6 +46,11 @@
     let purgeMsg = $state("");
     let passthroughStatus = $state<string | null>(null);
     let passthroughBusy = $state(false);
+    // null = daemon too old for INTEGRATIONS; undefined = not loaded / unreachable.
+    let integrations = $state<Integration[] | null | undefined>(undefined);
+    let integrationBusy = $state<string | null>(null);
+    let integrationError = $state("");
+    let copiedPkg = $state<string | null>(null);
 
     // Displayed as MB / GB; stored as bytes
     let readAheadMb = $state(64);
@@ -47,7 +66,42 @@
         readAheadMb = Math.round(cfg.read_ahead_bytes / (1024 * 1024));
         cacheMaxGb = Math.round(cfg.cache_max_size_bytes / (1024 * 1024 * 1024));
         refreshPassthroughStatus();
+        refreshIntegrations();
     });
+
+    async function refreshIntegrations() {
+        try {
+            integrations = await invoke<Integration[] | null>("list_integrations");
+        } catch (err: unknown) {
+            integrations = undefined;
+            integrationError = String(err);
+        }
+    }
+
+    // The service owns every file-browser side effect; we only send the mode.
+    // Like passthrough, this applies live rather than on "Save".
+    async function setIntegration(id: string, mode: Integration["mode"]) {
+        integrationBusy = id;
+        integrationError = "";
+        try {
+            await invoke("set_integration", { id, mode });
+        } catch (err: unknown) {
+            integrationError = String(err);
+        } finally {
+            integrationBusy = null;
+            await refreshIntegrations();
+        }
+    }
+
+    async function copyInstallCommand(pkg: string) {
+        try {
+            await navigator.clipboard.writeText(`sudo apt install ${pkg}`);
+            copiedPkg = pkg;
+            setTimeout(() => { if (copiedPkg === pkg) copiedPkg = null; }, 2000);
+        } catch {
+            copiedPkg = null;
+        }
+    }
 
     async function refreshPassthroughStatus() {
         try {
@@ -312,6 +366,66 @@
                 </div>
             </section>
 
+            <!-- ── File browsers ────────────────── -->
+            {#if integrations === null || integrations?.length || integrationError}
+                <section class="sv-section">
+                    <h3 class="sv-section-title">File browsers</h3>
+
+                    {#if integrations === null}
+                        <p class="sv-hint">Update the ncrs service to manage file browsers.</p>
+                    {:else if integrations}
+                        {#each integrations as fb (fb.id)}
+                            <div class="sv-toggle sv-fb">
+                                <div class="sv-fb-body">
+                                    <div class="sv-fb-head">
+                                        <label class="sv-toggle-label" for="fb-{fb.id}">{fb.name}</label>
+                                        {#if !fb.installed}
+                                            <span class="sv-badge">Not installed</span>
+                                        {:else if fb.adapter_package && !fb.adapter_installed}
+                                            <span class="sv-badge sv-badge-warn">Emblems need {fb.adapter_package}</span>
+                                        {:else if fb.adapter_connected}
+                                            <span class="sv-badge sv-badge-ok">Connected</span>
+                                        {/if}
+                                    </div>
+                                    <p class="sv-hint">{fb.summary}</p>
+                                    {#if fb.installed && fb.adapter_package && !fb.adapter_installed}
+                                        <button
+                                            class="sv-fb-cmd"
+                                            title="Copy to clipboard"
+                                            onclick={() => copyInstallCommand(fb.adapter_package!)}
+                                        >
+                                            <code>sudo apt install {fb.adapter_package}</code>
+                                            <span>{copiedPkg === fb.adapter_package ? "Copied" : "Copy"}</span>
+                                        </button>
+                                    {/if}
+                                    {#if fb.mode !== "auto"}
+                                        <p class="sv-hint">
+                                            Manual ·
+                                            <button
+                                                class="sv-link"
+                                                disabled={integrationBusy === fb.id}
+                                                onclick={() => setIntegration(fb.id, "auto")}
+                                            >Reset to automatic</button>
+                                        </p>
+                                    {/if}
+                                </div>
+                                <input
+                                    id="fb-{fb.id}"
+                                    type="checkbox"
+                                    class="sv-check"
+                                    checked={fb.enabled}
+                                    disabled={integrationBusy === fb.id}
+                                    onchange={(e) => setIntegration(fb.id, (e.target as HTMLInputElement).checked ? "on" : "off")}
+                                />
+                            </div>
+                        {/each}
+                    {/if}
+                    {#if integrationError}
+                        <p class="sv-error">{integrationError}</p>
+                    {/if}
+                </section>
+            {/if}
+
             <!-- ── Integration ──────────────────── -->
             <section class="sv-section">
                 <h3 class="sv-section-title">Integration</h3>
@@ -479,6 +593,65 @@
     outline: 2px solid var(--nc-accent);
     outline-offset: 2px;
 }
+
+/* ── File browsers ───────────────────────── */
+
+.sv-fb { align-items: flex-start; }
+.sv-fb .sv-check { margin-top: 2px; }
+
+.sv-fb-body { min-width: 0; }
+
+.sv-fb-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.sv-badge {
+    font-size: 9px;
+    font-weight: 600;
+    line-height: 1.5;
+    padding: 0 6px;
+    border-radius: 999px;
+    color: var(--nc-text-3);
+    background: color-mix(in srgb, var(--nc-text-3) 12%, transparent);
+}
+.sv-badge-warn {
+    color: var(--nc-warning);
+    background: color-mix(in srgb, var(--nc-warning) 12%, transparent);
+}
+.sv-badge-ok {
+    color: var(--nc-success);
+    background: color-mix(in srgb, var(--nc-success) 12%, transparent);
+}
+
+.sv-fb-cmd {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 4px;
+    padding: 2px 6px;
+    font-size: 10px;
+    color: var(--nc-text-2);
+    background: color-mix(in srgb, var(--nc-text-3) 8%, transparent);
+    border: 1px solid var(--nc-border);
+    border-radius: 4px;
+    cursor: pointer;
+}
+.sv-fb-cmd code { font-family: monospace; user-select: all; }
+.sv-fb-cmd span { color: var(--nc-accent); }
+
+.sv-link {
+    font-size: inherit;
+    color: var(--nc-accent);
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+}
+.sv-link:hover { text-decoration: underline; }
+.sv-link:disabled { opacity: 0.5; cursor: default; }
 
 /* ── Footer ──────────────────────────────── */
 

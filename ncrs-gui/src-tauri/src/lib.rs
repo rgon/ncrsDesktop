@@ -695,6 +695,78 @@ fn get_passthrough_status() -> Option<String> {
     ipc_request(&["PASSTHROUGH_STATUS"]).and_then(|r| r.into_iter().next())
 }
 
+/// One file-browser profile as reported by the service's `INTEGRATIONS` verb.
+/// The service owns detection and every side effect; the GUI only lists
+/// profiles and flips their mode.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+pub struct Integration {
+    pub id: String,
+    pub name: String,
+    pub summary: String,
+    pub installed: bool,
+    /// "auto" | "on" | "off"
+    pub mode: String,
+    pub enabled: bool,
+    pub adapter_package: Option<String>,
+    #[serde(default)]
+    pub adapter_client_ids: Vec<String>,
+    pub adapter_installed: bool,
+    pub adapter_connected: bool,
+}
+
+/// List file-browser profiles. `Ok(None)` when the daemon predates the
+/// `INTEGRATIONS` verb (it replies `unknown`), so the UI can ask for an update
+/// instead of showing an error.
+#[tauri::command]
+async fn list_integrations() -> Result<Option<Vec<Integration>>, String> {
+    tokio::task::spawn_blocking(|| match ipc_request(&["INTEGRATIONS"]) {
+        Some(replies) => {
+            let r = replies.first().map(String::as_str).unwrap_or("");
+            if r == "unknown" {
+                Ok(None)
+            } else if let Some(e) = r.strip_prefix("error:") {
+                Err(e.trim().to_string())
+            } else {
+                serde_json::from_str(r).map(Some).map_err(|e| format!("unexpected reply: {}", e))
+            }
+        }
+        None => Err("daemon not reachable".to_string()),
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set a profile's mode: "on"/"off" override detection, "auto" follows it.
+#[tauri::command]
+async fn set_integration(id: String, mode: String) -> Result<(), String> {
+    if !matches!(mode.as_str(), "on" | "off" | "auto") {
+        return Err(format!("invalid mode: {}", mode));
+    }
+    // The verb is whitespace-delimited; an id with spaces would be misparsed.
+    if id.is_empty() || id.contains(char::is_whitespace) {
+        return Err(format!("invalid profile id: {:?}", id));
+    }
+    tokio::task::spawn_blocking(move || {
+        match ipc_request(&[&format!("INTEGRATION_SET {} {}", id, mode)]) {
+            Some(replies) => {
+                let r = replies.first().map(String::as_str).unwrap_or("");
+                if r == "ok" {
+                    Ok(())
+                } else if r == "unknown" {
+                    Err("Update the ncrs service to manage file browsers".to_string())
+                } else if let Some(e) = r.strip_prefix("error:") {
+                    Err(e.trim().to_string())
+                } else {
+                    Err(format!("unexpected reply: {}", r))
+                }
+            }
+            None => Err("daemon not reachable".to_string()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -1173,6 +1245,8 @@ pub fn run() {
             save_config_values,
             set_passthrough_enabled,
             get_passthrough_status,
+            list_integrations,
+            set_integration,
             get_app_version,
             nc_passwords::commands::nc_passwords_connect,
             nc_passwords::commands::nc_passwords_disconnect,
