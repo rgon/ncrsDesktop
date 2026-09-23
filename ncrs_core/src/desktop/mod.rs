@@ -24,6 +24,7 @@ pub mod detect;
 pub mod indexer;
 pub mod profiles;
 pub mod store;
+pub mod thumbguard;
 pub mod toolkit;
 
 use std::collections::{BTreeSet, HashMap};
@@ -70,6 +71,9 @@ pub struct DesktopPolicy {
     /// if configured, purged from the server when found orphaned.
     pub hidden_temp_prefixes: Vec<&'static str>,
     pub thumbnails: ThumbnailSizes,
+    /// Processes refused when they open an uncached file, so the server
+    /// preview is the only thumbnail source (see [`thumbguard`]).
+    pub thumbnailer_guard: Vec<thumbguard::ThumbnailerMatch>,
     /// Components this policy was built from (diagnostics).
     pub components: BTreeSet<ComponentId>,
 }
@@ -82,6 +86,7 @@ impl DesktopPolicy {
             glib_sniff: false,
             hidden_temp_prefixes: Vec::new(),
             thumbnails: ThumbnailSizes::default(),
+            thumbnailer_guard: Vec::new(),
             components: BTreeSet::new(),
         }
     }
@@ -101,6 +106,12 @@ impl DesktopPolicy {
     /// start one, so behaviour is unchanged unless profiles say otherwise.
     pub fn legacy_default() -> Self {
         DesktopPolicy::from_components([ComponentId::Gio, ComponentId::Tracker])
+    }
+
+    pub fn add_thumbnailer(&mut self, m: thumbguard::ThumbnailerMatch) {
+        if !self.thumbnailer_guard.contains(&m) {
+            self.thumbnailer_guard.push(m);
+        }
     }
 
     pub fn is_hidden_temp(&self, name: &str) -> bool {
@@ -558,5 +569,6 @@ mod tests {
         let p = DesktopPolicy::from_components([ComponentId::Kio]);
         assert!(p.thumbnails.normal && p.thumbnails.large);
         assert!(!p.glib_sniff);
+        assert!(p.thumbnailer_guard.contains(&thumbguard::ThumbnailerMatch::CmdlineContains("/kio/thumbnail.so")));
     }
 }

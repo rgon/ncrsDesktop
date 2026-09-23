@@ -4533,7 +4533,7 @@ impl Filesystem for NextCloudFs {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let (path, local, etag, nc_permissions, remote_size) = {
             let c = self.cache.safe_lock();
             let path = match c.get_path(ino.0) {
@@ -4574,6 +4574,27 @@ impl Filesystem for NextCloudFs {
         {
             reply.error(Errno::EACCES);
             return;
+        }
+
+        // A desktop thumbnailer opening an uncached file would download all of
+        // it just to render a preview the server already renders. Refuse it —
+        // no network I/O — and fill the thumbnail cache from the server
+        // preview instead (desktop::thumbguard). Cached files cost nothing to
+        // read, so thumbnailers may still use those.
+        if !writable && local.is_none() {
+            let policy = desktop::policy();
+            if let Some(who) = desktop::thumbguard::thumbnailer_process(req.pid(), &policy.thumbnailer_guard) {
+                log::info!("THUMBGUARD refused {} to {}; fetching the server preview", path.display(), who);
+                let fetch = self.thumbnail_callback();
+                let remote = path.clone();
+                // Off the FUSE worker: the prefetch stats and touches the file
+                // through this same mount.
+                thread::spawn(move || {
+                    fetch(remote);
+                });
+                reply.error(Errno::EACCES);
+                return;
+            }
         }
 
         let fh = {

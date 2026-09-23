@@ -51,6 +51,18 @@ cat > "$HOME/.config/ncrs/desktop-profiles.json" <<EOF
 { "modes": { "gio": "on" } }
 EOF
 
+# Register a stand-in freedesktop thumbnailer (a copy of head(1)) the way a
+# real one is installed, so the GIO profile's thumbnailer guard knows it.
+# Scenario 11b checks that it is refused on uncached files. Registered before
+# the daemon starts, since that is when the profile policy is built.
+cp "$(command -v head)" /usr/local/bin/ncrs-fake-thumbnailer
+mkdir -p /usr/share/thumbnailers
+cat > /usr/share/thumbnailers/ncrs-fake.thumbnailer <<EOF
+[Thumbnailer Entry]
+Exec=/usr/local/bin/ncrs-fake-thumbnailer -s %s %u %o
+MimeType=image/jpeg;
+EOF
+
 echo "[e2e] mounting ncrs daemon"
 RUST_LOG="${RUST_LOG:-info}" ncrs --config "$HOME/.config/ncrs/config.yaml" >"$LOG" 2>&1 &
 DAEMON=$!
