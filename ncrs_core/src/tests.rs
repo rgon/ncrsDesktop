@@ -4960,6 +4960,90 @@ mod upload_order_tests {
         }
 
         #[test]
+        fn an_unlink_between_the_snapshot_and_the_registration_marks_the_handle_local() {
+            // CRIT-1's interleaving: open() takes its snapshot, then unlink
+            // records its tombstone and scans `open_files` while the handle is
+            // not there yet; the registration must find the tombstone.
+            let (_, meta, tmp, ino) = open_setup(vec![], true);
+            let snap = meta.cache.safe_lock().tombstones.snapshot();
+            {
+                let mut c = meta.cache.safe_lock();
+                c.dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(vec![]);
+                c.tombstones.record(ino);
+            }
+            mark_unlinked(&meta.open_files, Path::new("/d/a.txt"), Some(ino));
+            assert!(meta.open_files.safe_lock().is_empty(), "nothing registered for the scan to find");
+            let (r, _rx) = reply();
+            let _ = open_register(&meta, OpenReq { unlink_snap: Some(snap), ..rq(ino, "/d/a.txt", libc::O_WRONLY, None) }, listed(0), 11, false, Some(tmp.path().join("w11")), false, None, &r);
+            assert_eq!(meta.open_files.safe_lock()[&11].unlinked, Unlinked::Local);
+            release_bookkeeping(&meta, 11);
+            // An open whose snapshot came after the unlink is the re-created file.
+            let snap = meta.cache.safe_lock().tombstones.snapshot();
+            let (r, _rx) = reply();
+            let _ = open_register(&meta, OpenReq { unlink_snap: Some(snap), ..rq(ino, "/d/a.txt", libc::O_WRONLY, None) }, listed(0), 12, false, Some(tmp.path().join("w12")), false, None, &r);
+            assert_eq!(meta.open_files.safe_lock()[&12].unlinked, Unlinked::No);
+            release_bookkeeping(&meta, 12);
+            assert_all_given_back(&meta, ino);
+        }
+
+        #[test]
+        fn a_rename_over_a_file_marks_its_open_handles_unlinked_and_retargets_the_source() {
+            let (_, meta, tmp, a_ino) = open_setup(vec![], true);
+            let b_ino = {
+                let mut c = meta.cache.safe_lock();
+                let mut b = entry_in("/d", "b.txt");
+                b.size = 3;
+                let mut files = (*c.dir_cache[Path::new("/d")].files).clone();
+                files.push(b);
+                c.dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(files);
+                c.allocate_inode(PathBuf::from("/d/b.txt"))
+            };
+            let (r, _rx) = reply();
+            let _ = open_register(&meta, rq(a_ino, "/d/a.txt", libc::O_WRONLY, None), listed(0), 21, false, Some(tmp.path().join("w21")), false, None, &r);
+            let _ = open_register(&meta, rq(b_ino, "/d/b.txt", libc::O_WRONLY, None), listed(0), 22, false, Some(tmp.path().join("w22")), false, None, &r);
+            let snap = meta.cache.safe_lock().tombstones.snapshot();
+            rename_in_cache(&mut meta.cache.safe_lock(), &meta.open_files, Path::new("/d/a.txt"), Path::new("/d/b.txt"), Path::new("/d"), Path::new("/d"));
+            {
+                let files = meta.open_files.safe_lock();
+                assert_eq!(files[&22].unlinked, Unlinked::Local, "the replaced file's writes would land over the renamed one");
+                assert_eq!(files[&21].unlinked, Unlinked::No);
+                assert_eq!(files[&21].remote_path, PathBuf::from("/d/b.txt"));
+            }
+            let mut c = meta.cache.safe_lock();
+            assert!(c.tombstones.removed_since(b_ino, &snap), "an open of the replaced file still in flight must see it");
+            assert!(!c.tombstones.removed_since(a_ino, &snap));
+            assert_eq!(c.get_inode(Path::new("/d/b.txt")), Some(a_ino));
+            let names: Vec<_> = c.dir_cache[Path::new("/d")].files.iter().map(|e| e.path.clone()).collect();
+            assert_eq!(names, vec![PathBuf::from("/d/b.txt")]);
+            drop(c);
+            drop(snap);
+            release_bookkeeping(&meta, 21);
+            release_bookkeeping(&meta, 22);
+        }
+
+        #[test]
+        fn rename_refuses_exchange_and_unknown_flags_and_honors_noreplace() {
+            use fuser::RenameFlags as F;
+            let never = || -> bool { panic!("not asked") };
+            assert!(rename_flags_refusal(F::empty(), never).is_none());
+            assert_eq!(rename_flags_refusal(F::RENAME_EXCHANGE, never).map(|e| e.code()), Some(libc::EINVAL));
+            assert_eq!(rename_flags_refusal(F::RENAME_EXCHANGE | F::RENAME_NOREPLACE, never).map(|e| e.code()), Some(libc::EINVAL));
+            assert_eq!(rename_flags_refusal(F::RENAME_WHITEOUT, never).map(|e| e.code()), Some(libc::EINVAL));
+            assert_eq!(rename_flags_refusal(F::from_bits_retain(1 << 20), never).map(|e| e.code()), Some(libc::EINVAL));
+            assert_eq!(rename_flags_refusal(F::RENAME_NOREPLACE, || true).map(|e| e.code()), Some(libc::EEXIST));
+            assert!(rename_flags_refusal(F::RENAME_NOREPLACE, || false).is_none());
+            // What "exists" means: the resident listing, else the inode map.
+            let (_, meta, _tmp, _) = open_setup(vec![], true);
+            let mut c = meta.cache.safe_lock();
+            assert!(rename_target_exists(&c, Path::new("/d/a.txt")));
+            assert!(!rename_target_exists(&c, Path::new("/d/new.txt")));
+            c.allocate_inode(PathBuf::from("/e/x.txt"));
+            assert!(rename_target_exists(&c, Path::new("/e/x.txt")), "no listing: the inode map");
+            c.allocate_inode(PathBuf::from("/d/stale.txt"));
+            assert!(!rename_target_exists(&c, Path::new("/d/stale.txt")), "the listing wins over a stale inode");
+        }
+
+        #[test]
         fn a_purge_keeps_the_staging_of_a_handle_released_while_it_ran() {
             let (_, meta, tmp, _) = open_setup(vec![], true);
             let old = std::time::SystemTime::now() - Duration::from_secs(60);
