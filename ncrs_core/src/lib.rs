@@ -3403,6 +3403,38 @@ impl ConnInfo {
     }
 }
 
+/// Fetches the server preview of one file into the freedesktop thumbnail
+/// cache; true when a thumbnail is there afterwards.
+fn make_thumbnail_callback(
+    conn: Arc<ConnInfo>,
+    fileids: ipc::FileIdMap,
+    thumb_inflight: Arc<Mutex<HashSet<PathBuf>>>,
+) -> ipc::ThumbnailCallback {
+    Arc::new(move |remote_path: PathBuf| {
+        let already_inflight = !thumb_inflight.safe_lock().insert(remote_path.clone());
+        if !already_inflight {
+            let fileid = fileids.safe_read().get(&remote_path).copied();
+            let mount_path = conn.mount_point.join(
+                remote_path.strip_prefix("/").unwrap_or(&remote_path)
+            );
+            let mtime = std::fs::metadata(&mount_path).ok()
+                .and_then(|m| m.modified().ok());
+            crate::preview::prefetch_thumbnail(
+                &conn.clients.get(),
+                &conn.base_url,
+                &conn.creds,
+                &conn.mount_point,
+                &remote_path,
+                mtime,
+                fileid,
+            );
+            thumb_inflight.safe_lock().remove(&remote_path);
+        }
+        let uri = crate::preview::file_uri(&conn.mount_point, &remote_path);
+        crate::preview::xdg_thumbnail_path(&uri).exists()
+    })
+}
+
 /// Clears an in-progress flag on drop, so a panicking worker cannot latch it.
 struct ReleaseOnDrop(Arc<AtomicBool>);
 impl Drop for ReleaseOnDrop {
@@ -3455,6 +3487,12 @@ struct MetaCtx {
     // Open handles that may hold unsent writes. Zero (the common case) lets a
     // getattr skip the `open_files` lock entirely (see `overlay_local_size`).
     open_writers: Arc<AtomicUsize>,
+    // What open() needs when it finishes on a worker.
+    next_fh: Arc<Mutex<u64>>,
+    io_modes: Arc<Mutex<iomode::InodeIoModes<BackingId>>>,
+    uploads: UploadOrder,
+    transfer_map: TransferMap,
+    thumbnail: ipc::ThumbnailCallback,
     // How long a request that has to list its parent may take in all, from
     // submission: CHILD_RESOLVE_DEADLINE (shorter in tests).
     resolve_within: Duration,
@@ -3473,6 +3511,11 @@ impl MetaCtx {
             status: Arc::new(RwLock::new(HashMap::new())),
             open_files: Arc::new(Mutex::new(HashMap::new())),
             open_writers: Arc::new(AtomicUsize::new(0)),
+            next_fh: Arc::new(Mutex::new(1)),
+            io_modes: Arc::new(Mutex::new(iomode::InodeIoModes::default())),
+            uploads: UploadOrder::default(),
+            transfer_map: Arc::new(Mutex::new(HashMap::new())),
+            thumbnail: Arc::new(|_| false),
             resolve_within,
         }
     }
@@ -3627,6 +3670,309 @@ fn with_child<R, T, P, A>(
     }
 }
 
+// ── open() ───────────────────────────────────────────────────────────────────
+//
+// open() runs in up to three places. The dispatch thread does whatever is
+// local and quick; resolving an evicted parent listing and classifying the
+// caller from /proc/<pid>/{maps,cmdline} go to `bg::META`; downloading or
+// copying the current content into a staging file goes to `bg::READ` (it can
+// take the full DOWNLOAD_TIMEOUT, and must not hold a META worker that long).
+// Passthrough is only ever granted to a read-only open of a fresh local copy,
+// which never leaves the dispatch thread.
+
+/// What open() takes from the file's entry in its parent listing.
+#[derive(Default)]
+struct OpenEntry {
+    etag: Option<String>,
+    perms: Option<String>,
+    size: u64,
+    content_type: Option<Arc<str>>,
+}
+
+impl OpenEntry {
+    fn of(e: &RemoteEntry) -> Self {
+        OpenEntry {
+            etag: e.change_token.clone(),
+            perms: e.ext.str("permissions").map(str::to_string),
+            size: e.size,
+            content_type: e.content_type.clone(),
+        }
+    }
+}
+
+/// One open() request, carried to whichever thread finishes it.
+struct OpenReq {
+    ino: u64,
+    flags: i32,
+    pid: u32,
+    writable: bool,
+    truncating: bool,
+    path: PathBuf,
+    local: Option<PathBuf>,
+}
+
+fn next_fh(ctx: &MetaCtx) -> u64 {
+    let mut n = ctx.next_fh.safe_lock();
+    let fh = *n;
+    *n += 1;
+    fh
+}
+
+/// Everything open() decides once it knows the entry. `on_worker` is true on a
+/// META worker, where the process classifiers may read any /proc file.
+fn open_continue(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, reply: ReplyOpen, on_worker: bool) {
+    if rq.writable && entry.perms.is_some() && perms_to_mode(entry.perms.as_deref(), false) & 0o200 == 0 {
+        reply.error(Errno::EACCES);
+        return;
+    }
+
+    // Who is opening an uncached file for reading decides two things: a
+    // thumbnailer is refused (below), and a toolkit's MIME probe gets magic
+    // bytes instead of a download. Some of those checks read
+    // /proc/<pid>/{maps,cmdline}, which can hang the dispatch thread (see
+    // `desktop::process::lock_free`); undecided here, they run on a worker.
+    let mut probe_max_read = None;
+    if !rq.writable && rq.local.is_none() {
+        let policy = desktop::policy();
+        let verdict = if on_worker {
+            Some((
+                desktop::thumbguard::thumbnailer_process(rq.pid, &policy.thumbnailer_guard),
+                policy.sniff_probe_for_open(rq.flags, rq.pid).map(|p| p.max_read),
+            ))
+        } else {
+            match desktop::thumbguard::try_thumbnailer_process(rq.pid, &policy.thumbnailer_guard) {
+                Some(Some(who)) => Some((Some(who), None)),
+                Some(None) => policy.try_sniff_probe_for_open(rq.flags, rq.pid).map(|p| (None, p.map(|p| p.max_read))),
+                None => None,
+            }
+        };
+        let Some((thumbnailer, probe)) = verdict else {
+            let worker_ctx = ctx.clone();
+            let queued = bg::META.submit_owning((reply, rq, entry), move |(reply, rq, entry)| {
+                open_continue(&worker_ctx, rq, entry, reply, true);
+            });
+            if let Err((_, (reply, _, _))) = queued {
+                reply.error(Errno::EAGAIN);
+            }
+            return;
+        };
+        // A desktop thumbnailer opening an uncached file would download all of
+        // it just to render a preview the server already renders. Refuse it —
+        // no network I/O — and fill the thumbnail cache from the server
+        // preview instead (desktop::thumbguard). Cached files cost nothing to
+        // read, so thumbnailers may still use those.
+        if let Some(who) = thumbnailer {
+            log::info!("THUMBGUARD refused {} to {}; fetching the server preview", rq.path.display(), who);
+            let fetch = ctx.thumbnail.clone();
+            let remote = rq.path.clone();
+            // Off the FUSE worker: the prefetch stats and touches the file
+            // through this same mount. A dropped job costs one thumbnail.
+            let _ = bg::THUMB.submit(move || {
+                fetch(remote);
+            });
+            reply.error(Errno::EACCES);
+            return;
+        }
+        probe_max_read = probe;
+    }
+
+    let fh = next_fh(ctx);
+
+    // Pin the cached-copy freshness for this handle's lifetime (see OpenFile).
+    // file_cache_matches_remote() returns false when the file is not cached,
+    // and true when offline (no remote etag to compare) so offline reads of a
+    // kept copy are never forced into an unsatisfiable re-download.
+    let cache_fresh = ctx.cache.safe_lock().file_cache_matches_remote(&rq.path);
+
+    if !rq.writable {
+        open_finish(ctx, rq, entry, fh, cache_fresh, None, false, probe_max_read, reply);
+        return;
+    }
+
+    let wp = ctx.cache.safe_lock().cache_dir.join(format!("write_{}", fh));
+    // Stage the current content before any write: a write that does not start at
+    // 0 (O_APPEND, an in-place edit) would otherwise upload a zero-filled prefix.
+    let seed: Option<Option<PathBuf>> = if rq.truncating {
+        None
+    } else if let Some(local) = rq.local.clone().filter(|_| cache_fresh) {
+        Some(Some(local))
+    } else if entry.size > 0 {
+        Some(None)
+    } else {
+        None
+    };
+    let Some(seed_from) = seed else {
+        // Nothing to seed: a truncating open starts from an empty file, and an
+        // empty remote file needs none (write() creates it on first use).
+        if rq.truncating {
+            if let Err(e) = std::fs::File::create(&wp) {
+                log::error!("open: cannot create staging file {}: {}", wp.display(), e);
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+        open_finish(ctx, rq, entry, fh, cache_fresh, Some(wp), false, None, reply);
+        return;
+    };
+    // Downloading can take DOWNLOAD_TIMEOUT and copying a large kept file is
+    // disk-bound: either way, not on the dispatch thread.
+    let worker_ctx = ctx.clone();
+    let queued = bg::READ.submit_owning((reply, rq, entry, wp), move |(reply, rq, entry, wp)| {
+        let staged = match seed_from {
+            Some(local) => std::fs::copy(&local, &wp).map(|_| ()).map_err(|e| e.to_string()),
+            None => std::fs::File::create(&wp)
+                .map_err(|e| e.to_string())
+                .and_then(|dest| open_file_timeout(&worker_ctx.conn, rq.path.clone(), dest, Some(worker_ctx.transfer_map.clone()))),
+        };
+        if let Err(e) = staged {
+            log::error!("open: cannot stage current content of {} for writing: {}", rq.path.display(), e);
+            let _ = std::fs::remove_file(&wp);
+            reply.error(Errno::EIO);
+            return;
+        }
+        open_finish(&worker_ctx, rq, entry, fh, cache_fresh, Some(wp), true, None, reply);
+    });
+    if let Err((_, (reply, _, _, _))) = queued {
+        reply.error(Errno::EAGAIN);
+    }
+}
+
+/// Registers the handle and answers the kernel.
+#[allow(clippy::too_many_arguments)]
+fn open_finish(
+    ctx: &MetaCtx,
+    rq: OpenReq,
+    entry: OpenEntry,
+    fh: u64,
+    cache_fresh: bool,
+    write_path: Option<PathBuf>,
+    seeded: bool,
+    probe_max_read: Option<usize>,
+    reply: ReplyOpen,
+) {
+    // Intercept GLib 2.80+ magic-byte detection opens. See the doc-comment on
+    // mime_magic_bytes() for the full explanation. Summary: GLib opens files with
+    // O_NOATIME when it cannot determine the MIME type from the extension alone.
+    // On a remote FUSE mount that would trigger a WebDAV download (~280 ms) per
+    // file. We detect the flag, look up the content-type that was already fetched
+    // during the PROPFIND, and mark the handle so read() can respond with synthetic
+    // magic bytes instead. O_NOFOLLOW and O_CLOEXEC are both stripped by the kernel
+    // before the request reaches FUSE, so O_NOATIME is the only reliable signal.
+    // Which probes count is declared per toolkit profile (desktop::sniff).
+    //
+    // Fall back to octet-stream when the server did not supply a content-type
+    // so that every O_NOATIME open is intercepted — no file is ever downloaded
+    // solely to satisfy GLib's magic-byte check.
+    let mime_detect_ct = probe_max_read.map(|_| {
+        entry.content_type.as_deref().unwrap_or("application/octet-stream").to_string()
+    });
+
+    // A MIME-detect handle answers GLib's probe with a few synthetic magic
+    // bytes — far fewer than the (read-ahead-inflated) size the kernel asked
+    // for. A buffered short read at offset 0 is recorded by the kernel as an
+    // EOF for that page, poisoning the inode's page cache: every later
+    // *buffered* read of the same file then returns only those few bytes,
+    // truncating real content (a data-loss bug, since GLib sniffs a file the
+    // user is about to open). FOPEN_DIRECT_IO keeps this handle's reads out
+    // of the page cache entirely, so the short reply cannot poison it — and
+    // as a bonus the kernel stops inflating the probe read via read-ahead, so
+    // it always arrives within the GLIB_SNIFF_MAX_READ guard at its true size.
+    let mime_detect = mime_detect_ct.is_some();
+
+    // Kernel FUSE_PASSTHROUGH: only offered for a read-only open already
+    // backed by a complete, fresh local cache copy — never for a handle
+    // that may be served from the in-flight streaming buffer (of.buf) or
+    // the write staging path, both of which require ncrs to stay on the
+    // data path (see the read()/write() handlers). io_modes then decides
+    // whether this open may actually use it (see iomode.rs). Such an open
+    // never leaves the dispatch thread (see open_continue).
+    let grant = if mime_detect {
+        iomode::IoGrant::DirectIo
+    } else {
+        let passthrough = if !rq.writable
+            && cache_fresh
+            && ctx.conn.passthrough_enabled.load(Ordering::Relaxed)
+            && ctx.conn.passthrough_capable.load(Ordering::Relaxed)
+        {
+            let reply = &reply;
+            rq.local.as_ref().and_then(|lp| {
+                let file = iomode::FileId::of(&std::fs::metadata(lp).ok()?);
+                Some((file, move || std::fs::File::open(lp).and_then(|f| reply.open_backing(f))))
+            })
+        } else {
+            None
+        };
+        let (grant, err) = ctx.io_modes.safe_lock().acquire(rq.ino, passthrough);
+        if let Some(e) = err {
+            // Sticky for the rest of this session — a missing
+            // CAP_SYS_ADMIN or a pre-6.9 kernel will not fix itself
+            // mid-run, so don't retry (and re-log) on every open().
+            if ctx.conn.passthrough_capable.swap(false, Ordering::Relaxed) {
+                log::info!(
+                    "FUSE passthrough unavailable ({}) — falling back to buffered reads for the rest of this session",
+                    e
+                );
+            }
+        }
+        grant
+    };
+    match grant.kind() {
+        iomode::IoKind::Passthrough => log::debug!("FUSE passthrough granted for {}", rq.path.display()),
+        iomode::IoKind::DirectIo if !mime_detect => {
+            log::debug!("open {}: inode already in passthrough mode — using direct I/O", rq.path.display())
+        }
+        _ => {}
+    }
+
+    insert_open_file(
+        ctx,
+        fh,
+        OpenFile {
+            remote_path: rq.path,
+            local: rq.local,
+            buf: None,
+            write_path,
+            // A truncating open changes the file even if nothing is written after it.
+            dirty: rq.truncating,
+            original_etag: entry.etag,
+            mime_detect_ct,
+            mime_detect_max_read: probe_max_read.unwrap_or(0),
+            cache_fresh,
+            next_expected_off: 0,
+            read_ahead_window: READ_AHEAD_INITIAL,
+            total_written: 0,
+            // Only an empty staging file can stream from offset 0.
+            stream_eligible: !seeded,
+            chunk_upload: None,
+            ino: rq.ino,
+            io_kind: grant.kind(),
+            upload_failed: false,
+            created: false,
+            unlinked: false,
+            opened_gen: ctx.uploads.generation(),
+            writer: false,
+        },
+    );
+    // io_modes keeps the BackingId alive until the inode's last passthrough
+    // handle is released (the crate warns dropping it right after replying
+    // can make the kernel return EIO).
+    match grant {
+        iomode::IoGrant::Passthrough(id) => reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &id),
+        iomode::IoGrant::Cached => reply.opened(FileHandle(fh), FopenFlags::empty()),
+        iomode::IoGrant::DirectIo => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
+    }
+}
+
+/// Registers an open handle. A writable one is counted so `getattr` knows to
+/// overlay the size of its unsent writes (`overlay_local_size`).
+fn insert_open_file(ctx: &MetaCtx, fh: u64, mut of: OpenFile) {
+    of.writer = of.write_path.is_some();
+    if of.writer {
+        ctx.open_writers.fetch_add(1, Ordering::Relaxed);
+    }
+    ctx.open_files.safe_lock().insert(fh, of);
+}
+
 /// What `lookup` hands the kernel and the IPC maps for one found entry.
 struct LookupHit {
     target: PathBuf,
@@ -3696,7 +4042,7 @@ pub struct NextCloudFs {
     conn: Arc<ConnInfo>,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     uploads: UploadOrder,
-    io_modes: Mutex<iomode::InodeIoModes<BackingId>>,
+    io_modes: Arc<Mutex<iomode::InodeIoModes<BackingId>>>,
     open_dirs: Arc<Mutex<HashMap<u64, OpenDir>>>,
     next_fh: Arc<Mutex<u64>>,
     error_log: ErrorLog,
@@ -3969,6 +4315,11 @@ impl NextCloudFs {
             c
         };
         let open_files: Arc<Mutex<HashMap<u64, OpenFile>>> = Arc::new(Mutex::new(HashMap::new()));
+        let next_fh = Arc::new(Mutex::new(1));
+        let io_modes = Arc::new(Mutex::new(iomode::InodeIoModes::default()));
+        let uploads = UploadOrder::default();
+        let transfer_map: TransferMap = Arc::new(Mutex::new(HashMap::new()));
+        let thumb_inflight = Arc::new(Mutex::new(HashSet::new()));
         let meta = MetaCtx {
             conn: conn.clone(),
             cache: cache.clone(),
@@ -3979,6 +4330,11 @@ impl NextCloudFs {
             status: status.clone(),
             open_files: open_files.clone(),
             open_writers: Arc::new(AtomicUsize::new(0)),
+            next_fh: next_fh.clone(),
+            io_modes: io_modes.clone(),
+            uploads: uploads.clone(),
+            transfer_map: transfer_map.clone(),
+            thumbnail: make_thumbnail_callback(conn.clone(), fileids.clone(), thumb_inflight.clone()),
             resolve_within: CHILD_RESOLVE_DEADLINE,
         };
         Ok(NextCloudFs {
@@ -3992,12 +4348,12 @@ impl NextCloudFs {
             children_map,
             conn,
             open_files,
-            uploads: UploadOrder::default(),
-            io_modes: Mutex::new(iomode::InodeIoModes::default()),
+            uploads,
+            io_modes,
             open_dirs: Arc::new(Mutex::new(HashMap::new())),
-            next_fh: Arc::new(Mutex::new(1)),
+            next_fh,
             error_log: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-            transfer_map: Arc::new(Mutex::new(HashMap::new())),
+            transfer_map,
             journal: journal_arc,
             notifier_slot: Arc::new(Mutex::new(None)),
             ghost_entries: Arc::new(Mutex::new(HashMap::new())),
@@ -4010,7 +4366,7 @@ impl NextCloudFs {
             read_ahead_bytes: options.read_ahead_bytes,
             cache_streamed_reads: options.cache_streamed_reads,
             exclude_folders,
-            thumb_inflight: Arc::new(Mutex::new(HashSet::new())),
+            thumb_inflight,
             cleanup_stale_gio_temps: options.cleanup_stale_gio_temps,
         })
     }
@@ -4251,32 +4607,7 @@ impl NextCloudFs {
     }
 
     pub fn thumbnail_callback(&self) -> ipc::ThumbnailCallback {
-        let conn = self.conn.clone();
-        let fileids = self.fileids.clone();
-        let thumb_inflight = self.thumb_inflight.clone();
-        Arc::new(move |remote_path: PathBuf| {
-            let already_inflight = !thumb_inflight.safe_lock().insert(remote_path.clone());
-            if !already_inflight {
-                let fileid = fileids.safe_read().get(&remote_path).copied();
-                let mount_path = conn.mount_point.join(
-                    remote_path.strip_prefix("/").unwrap_or(&remote_path)
-                );
-                let mtime = std::fs::metadata(&mount_path).ok()
-                    .and_then(|m| m.modified().ok());
-                crate::preview::prefetch_thumbnail(
-                    &conn.clients.get(),
-                    &conn.base_url,
-                    &conn.creds,
-                    &conn.mount_point,
-                    &remote_path,
-                    mtime,
-                    fileid,
-                );
-                thumb_inflight.safe_lock().remove(&remote_path);
-            }
-            let uri = crate::preview::file_uri(&conn.mount_point, &remote_path);
-            crate::preview::xdg_thumbnail_path(&uri).exists()
-        })
+        make_thumbnail_callback(self.conn.clone(), self.fileids.clone(), self.thumb_inflight.clone())
     }
 }
 
@@ -4773,14 +5104,8 @@ impl NextCloudFs {
         with_child(&self.meta, pid, path, reply, pick, inline_miss, answer)
     }
 
-    /// Registers an open handle. A writable one is counted so `getattr` knows
-    /// to overlay the size of its unsent writes (`overlay_local_size`).
-    fn insert_open_file(&self, fh: u64, mut of: OpenFile) {
-        of.writer = of.write_path.is_some();
-        if of.writer {
-            self.meta.open_writers.fetch_add(1, Ordering::Relaxed);
-        }
-        self.open_files.safe_lock().insert(fh, of);
+    fn insert_open_file(&self, fh: u64, of: OpenFile) {
+        insert_open_file(&self.meta, fh, of);
     }
 
     fn readdir_common(&self, pid: u32, ino: INodeNo, fh: u64, offset: u64, reply: DirReply) {
@@ -5444,8 +5769,12 @@ impl Filesystem for NextCloudFs {
     }
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let (path, local, etag, nc_permissions, remote_size) = {
-            let c = self.cache.safe_lock();
+        let writable = flags.0 & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
+        // FUSE_ATOMIC_O_TRUNC is negotiated, so a truncating open arrives here instead of
+        // as a separate setattr and must start from an empty staging file.
+        let truncating = writable && flags.0 & libc::O_TRUNC != 0;
+        let (path, local, listed) = {
+            let mut c = self.cache.safe_lock();
             let path = match c.get_path(ino.0) {
                 Some(p) => p,
                 None => {
@@ -5458,19 +5787,14 @@ impl Filesystem for NextCloudFs {
                 .get(&path)
                 .filter(|e| e.local_path.metadata().map_or(false, |m| m.len() > 0))
                 .map(|e| e.local_path.clone());
-            let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-            let (etag, nc_permissions, remote_size) = c.get_cached_dir_readonly(&parent)
-                .and_then(|files| files.iter().find(|e| e.path == path).map(|e| {
-                    (e.change_token.clone(), e.ext.str("permissions").map(str::to_string), e.size)
-                }))
-                .unwrap_or((None, None, 0));
-            (path, local, etag, nc_permissions, remote_size)
+            // None: the parent listing is not resident.
+            let listed = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+                (Some(dir), Some(name)) => c.find_child(dir, name)
+                    .map(|(files, pos)| pos.map(|i| OpenEntry::of(&files[i])).unwrap_or_default()),
+                _ => Some(OpenEntry::default()),
+            };
+            (path, local, listed)
         };
-
-        let writable = flags.0 & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
-        // FUSE_ATOMIC_O_TRUNC is negotiated, so a truncating open arrives here instead of
-        // as a separate setattr and must start from an empty staging file.
-        let truncating = writable && flags.0 & libc::O_TRUNC != 0;
 
         // The synthetic `.trackerignore` overlay entry is read-only — there is
         // nothing behind it to write through to.
@@ -5479,200 +5803,39 @@ impl Filesystem for NextCloudFs {
             return;
         }
 
-        if writable && perms_to_mode(nc_permissions.as_deref(), false) & 0o200 == 0
-            && nc_permissions.is_some()
-        {
-            reply.error(Errno::EACCES);
-            return;
-        }
-
-        // A desktop thumbnailer opening an uncached file would download all of
-        // it just to render a preview the server already renders. Refuse it —
-        // no network I/O — and fill the thumbnail cache from the server
-        // preview instead (desktop::thumbguard). Cached files cost nothing to
-        // read, so thumbnailers may still use those.
-        if !writable && local.is_none() {
-            let policy = desktop::policy();
-            if let Some(who) = desktop::thumbguard::thumbnailer_process(req.pid(), &policy.thumbnailer_guard) {
-                log::info!("THUMBGUARD refused {} to {}; fetching the server preview", path.display(), who);
-                let fetch = self.thumbnail_callback();
-                let remote = path.clone();
-                // Off the FUSE worker: the prefetch stats and touches the file
-                // through this same mount. A dropped job costs one thumbnail.
-                let _ = bg::THUMB.submit(move || {
-                    fetch(remote);
-                });
-                reply.error(Errno::EACCES);
-                return;
+        let rq = OpenReq { ino: ino.0, flags: flags.0, pid: req.pid(), writable, truncating, path, local };
+        match listed {
+            Some(entry) => open_continue(&self.meta, rq, entry, reply, false),
+            // The parent listing was evicted. A writable open stages the file's
+            // current content, so it has to know the file's size and etag:
+            // assuming "empty" (what this did) left the staging file unseeded,
+            // and an O_APPEND or in-place write then uploaded a zero-filled
+            // prefix over the real content — with no etag for If-Match to catch
+            // it. Resolve the parent first, off the dispatch thread.
+            None if writable => {
+                self.with_child(
+                    rq.pid,
+                    &rq.path.clone(),
+                    (reply, rq),
+                    |_, _, e| OpenEntry::of(e),
+                    |_| None,
+                    |ctx, _, (reply, rq), r| match r {
+                        Resolved::Found(entry) => open_continue(ctx, rq, entry, reply, false),
+                        // Not on the server: nothing to seed from.
+                        Resolved::Absent => open_continue(ctx, rq, OpenEntry::default(), reply, false),
+                        // A truncating open discards the content anyway.
+                        Resolved::Unknown(_) if rq.truncating => open_continue(ctx, rq, OpenEntry::default(), reply, false),
+                        // Anything else would be the zero-filled upload again.
+                        Resolved::Unknown(e) => {
+                            log::warn!("open: {} for writing — its parent listing is unavailable, refusing rather than staging it empty", rq.path.display());
+                            reply.error(unknown_child_errno(e.as_deref()));
+                        }
+                    },
+                );
             }
-        }
-
-        let fh = {
-            let mut n = self.next_fh.safe_lock();
-            let fh = *n;
-            *n += 1;
-            fh
-        };
-
-        // Pin the cached-copy freshness for this handle's lifetime (see OpenFile).
-        // file_cache_matches_remote() returns false when the file is not cached,
-        // and true when offline (no remote etag to compare) so offline reads of a
-        // kept copy are never forced into an unsatisfiable re-download.
-        let cache_fresh = self.cache.safe_lock().file_cache_matches_remote(&path);
-
-        // Whether the staging file starts out holding the file's current content.
-        let mut seeded = false;
-        let write_path = if writable {
-            let cache_dir = self.cache.safe_lock().cache_dir.clone();
-            let wp = cache_dir.join(format!("write_{}", fh));
-            // Stage the current content before any write: a write that does not start at
-            // 0 (O_APPEND, an in-place edit) would otherwise upload a zero-filled prefix.
-            let staged = if truncating {
-                std::fs::File::create(&wp).map(|_| ()).map_err(|e| e.to_string())
-            } else if let Some(local) = local.as_ref().filter(|_| cache_fresh) {
-                seeded = true;
-                std::fs::copy(local, &wp).map(|_| ()).map_err(|e| e.to_string())
-            } else if remote_size > 0 {
-                seeded = true;
-                std::fs::File::create(&wp)
-                    .map_err(|e| e.to_string())
-                    .and_then(|dest| open_file_timeout(&self.conn, path.clone(), dest, Some(self.transfer_map.clone())))
-            } else {
-                Ok(())
-            };
-            if let Err(e) = staged {
-                log::error!("open: cannot stage current content of {} for writing: {}", path.display(), e);
-                let _ = std::fs::remove_file(&wp);
-                reply.error(Errno::EIO);
-                return;
-            }
-            Some(wp)
-        } else {
-            None
-        };
-
-        // Intercept GLib 2.80+ magic-byte detection opens. See the doc-comment on
-        // mime_magic_bytes() for the full explanation. Summary: GLib opens files with
-        // O_NOATIME when it cannot determine the MIME type from the extension alone.
-        // On a remote FUSE mount that would trigger a WebDAV download (~280 ms) per
-        // file. We detect the flag, look up the content-type that was already fetched
-        // during the PROPFIND, and mark the handle so read() can respond with synthetic
-        // magic bytes instead. O_NOFOLLOW and O_CLOEXEC are both stripped by the kernel
-        // before the request reaches FUSE, so O_NOATIME is the only reliable signal.
-        // Which probes count is declared per toolkit profile (desktop::sniff).
-        let probe_max_read = if !writable && local.is_none() {
-            desktop::policy().sniff_probe_for_open(flags.0, req.pid()).map(|p| p.max_read)
-        } else {
-            None
-        };
-        let mime_detect_ct = if probe_max_read.is_some() {
-            let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-            let ct = self.cache.safe_lock()
-                .get_cached_dir_readonly(&parent)
-                .and_then(|entries| {
-                    entries.iter().find(|e| e.path == path)
-                        .and_then(|e| e.content_type.clone())
-                });
-            // Fall back to octet-stream when the server did not supply a content-type
-            // so that every O_NOATIME open is intercepted — no file is ever downloaded
-            // solely to satisfy GLib's magic-byte check.
-            Some(ct.map(|c| c.to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_string()))
-        } else {
-            None
-        };
-
-        // A MIME-detect handle answers GLib's probe with a few synthetic magic
-        // bytes — far fewer than the (read-ahead-inflated) size the kernel asked
-        // for. A buffered short read at offset 0 is recorded by the kernel as an
-        // EOF for that page, poisoning the inode's page cache: every later
-        // *buffered* read of the same file then returns only those few bytes,
-        // truncating real content (a data-loss bug, since GLib sniffs a file the
-        // user is about to open). FOPEN_DIRECT_IO keeps this handle's reads out
-        // of the page cache entirely, so the short reply cannot poison it — and
-        // as a bonus the kernel stops inflating the probe read via read-ahead, so
-        // it always arrives within the GLIB_SNIFF_MAX_READ guard at its true size.
-        let mime_detect = mime_detect_ct.is_some();
-
-        // Kernel FUSE_PASSTHROUGH: only offered for a read-only open already
-        // backed by a complete, fresh local cache copy — never for a handle
-        // that may be served from the in-flight streaming buffer (of.buf) or
-        // the write staging path, both of which require ncrs to stay on the
-        // data path (see the read()/write() handlers). io_modes then decides
-        // whether this open may actually use it (see iomode.rs).
-        let grant = if mime_detect {
-            iomode::IoGrant::DirectIo
-        } else {
-            let passthrough = if !writable
-                && cache_fresh
-                && self.conn.passthrough_enabled.load(Ordering::Relaxed)
-                && self.conn.passthrough_capable.load(Ordering::Relaxed)
-            {
-                let reply = &reply;
-                local.as_ref().and_then(|lp| {
-                    let file = iomode::FileId::of(&std::fs::metadata(lp).ok()?);
-                    Some((file, move || std::fs::File::open(lp).and_then(|f| reply.open_backing(f))))
-                })
-            } else {
-                None
-            };
-            let (grant, err) = self.io_modes.safe_lock().acquire(ino.0, passthrough);
-            if let Some(e) = err {
-                // Sticky for the rest of this session — a missing
-                // CAP_SYS_ADMIN or a pre-6.9 kernel will not fix itself
-                // mid-run, so don't retry (and re-log) on every open().
-                if self.conn.passthrough_capable.swap(false, Ordering::Relaxed) {
-                    log::info!(
-                        "FUSE passthrough unavailable ({}) — falling back to buffered reads for the rest of this session",
-                        e
-                    );
-                }
-            }
-            grant
-        };
-        match grant.kind() {
-            iomode::IoKind::Passthrough => log::debug!("FUSE passthrough granted for {}", path.display()),
-            iomode::IoKind::DirectIo if !mime_detect => {
-                log::debug!("open {}: inode already in passthrough mode — using direct I/O", path.display())
-            }
-            _ => {}
-        }
-
-        self.insert_open_file(
-            fh,
-            OpenFile {
-                remote_path: path,
-                local: local.clone(),
-                buf: None,
-                write_path,
-                // A truncating open changes the file even if nothing is written after it.
-                dirty: truncating,
-                original_etag: etag,
-                mime_detect_ct,
-                mime_detect_max_read: probe_max_read.unwrap_or(0),
-                cache_fresh,
-                next_expected_off: 0,
-                read_ahead_window: READ_AHEAD_INITIAL,
-                total_written: 0,
-                // Only an empty staging file can stream from offset 0.
-                stream_eligible: !seeded,
-                chunk_upload: None,
-                ino: ino.0,
-                io_kind: grant.kind(),
-                upload_failed: false,
-                created: false,
-                unlinked: false,
-                opened_gen: self.uploads.generation(),
-                writer: false,
-            },
-        );
-        // io_modes keeps the BackingId alive until the inode's last passthrough
-        // handle is released (the crate warns dropping it right after replying
-        // can make the kernel return EIO).
-        match grant {
-            iomode::IoGrant::Passthrough(id) => reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &id),
-            iomode::IoGrant::Cached => reply.opened(FileHandle(fh), FopenFlags::empty()),
-            iomode::IoGrant::DirectIo => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
+            // A read-only open takes only hints from the listing (the sniffing
+            // content type falls back to octet-stream), as before.
+            None => open_continue(&self.meta, rq, OpenEntry::default(), reply, false),
         }
     }
 

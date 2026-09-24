@@ -49,17 +49,33 @@ fn cache() -> &'static Mutex<HashMap<(u32, ProcessMatch), (bool, Instant)>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Whether process `pid` satisfies `m` (cached).
+fn cached(pid: u32, m: &ProcessMatch) -> Option<bool> {
+    let (hit, at) = cache().safe_lock().get(&(pid, m.clone())).copied()?;
+    (at.elapsed() < CACHE_TTL).then_some(hit)
+}
+
+/// Whether deciding `m` only reads `/proc` files that never take the target's
+/// `mmap_lock`: the `exe` link (RCU) and `comm` (task lock). `maps` and
+/// `cmdline` do take it, and a process with a thread page-faulting on a file
+/// mmapped from this mount holds it while that fault waits for a FUSE read. If
+/// the FUSE dispatch thread then reads such a file for another of that
+/// process's threads, it queues behind a writer that queued behind the fault,
+/// and the fault's read is never dispatched: an unkillable hang (review
+/// addendum, 2026-09-24).
+fn lock_free(m: &ProcessMatch) -> bool {
+    matches!(m, ProcessMatch::Program(_))
+}
+
+/// Whether process `pid` satisfies `m` (cached). May read `/proc/<pid>/maps`
+/// or `cmdline`: never call it on the FUSE dispatch thread — use `try_matches`.
 pub fn matches(pid: u32, m: &ProcessMatch) -> bool {
     if pid == 0 {
         return false;
     }
-    let key = (pid, m.clone());
-    if let Some((hit, at)) = cache().safe_lock().get(&key).copied() {
-        if at.elapsed() < CACHE_TTL {
-            return hit;
-        }
+    if let Some(hit) = cached(pid, m) {
+        return hit;
     }
+    let key = (pid, m.clone());
     let hit = eval(Path::new("/proc"), pid, m);
     let mut c = cache().safe_lock();
     if c.len() >= CACHE_MAX {
@@ -72,9 +88,33 @@ pub fn matches(pid: u32, m: &ProcessMatch) -> bool {
     hit
 }
 
+/// `matches` for the FUSE dispatch thread: the answer when it is cached or
+/// decidable without the target's `mmap_lock`, else `None` — the caller then
+/// asks again from a pool worker with `matches`. Same verdicts either way.
+pub fn try_matches(pid: u32, m: &ProcessMatch) -> Option<bool> {
+    if pid == 0 {
+        return Some(false);
+    }
+    if let Some(hit) = cached(pid, m) {
+        return Some(hit);
+    }
+    lock_free(m).then(|| matches(pid, m))
+}
+
 /// The first of `ms` that `pid` satisfies.
 pub fn first_match(pid: u32, ms: &[ProcessMatch]) -> Option<&ProcessMatch> {
     ms.iter().find(|m| matches(pid, m))
+}
+
+/// `first_match` via `try_matches`: `None` when a matcher before the first
+/// match could not be decided here.
+pub fn try_first_match(pid: u32, ms: &[ProcessMatch]) -> Option<Option<&ProcessMatch>> {
+    for m in ms {
+        if try_matches(pid, m)? {
+            return Some(Some(m));
+        }
+    }
+    Some(None)
 }
 
 /// Uncached evaluation against a `/proc`-shaped directory. An unreadable or
@@ -145,6 +185,24 @@ pub(crate) mod tests {
             assert!(!eval(dir.path(), 42, &m));
         }
         assert!(!matches(0, &ProcessMatch::LinksLibrary("libc")));
+    }
+
+    #[test]
+    fn try_matches_never_reads_maps_or_cmdline_but_agrees_once_cached() {
+        let me = std::process::id();
+        let lib = ProcessMatch::LinksLibrary("libncrs-try-matches-probe");
+        let cmd = ProcessMatch::CmdlineContains("ncrs-try-matches-probe");
+        assert_eq!(try_matches(me, &lib), None, "an uncached maps read is left to a pool worker");
+        assert_eq!(try_matches(me, &cmd), None, "so is an uncached cmdline read");
+        assert!(!matches(me, &lib));
+        assert_eq!(try_matches(me, &lib), Some(false), "a cached verdict is answered at once");
+        assert_eq!(try_matches(0, &lib), Some(false));
+        // Program matchers read `exe` and `comm` only, so they are decided inline.
+        assert!(try_matches(me, &ProcessMatch::Program("definitely-not-this-test".into())).is_some());
+        let ms = [ProcessMatch::Program("definitely-not-this-test".into()), cmd.clone()];
+        assert_eq!(try_first_match(me, &ms), None, "an undecided matcher before any match leaves it undecided");
+        assert!(first_match(me, &ms).is_none());
+        assert_eq!(try_first_match(me, &ms), Some(None));
     }
 
     #[test]

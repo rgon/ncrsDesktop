@@ -59,6 +59,11 @@ impl SniffProbe {
     pub fn matches_process(&self, pid: u32) -> bool {
         self.process.as_ref().map_or(true, |m| process::matches(pid, m))
     }
+
+    /// `matches_process` for the FUSE dispatch thread (`process::try_matches`).
+    pub fn try_matches_process(&self, pid: u32) -> Option<bool> {
+        self.process.as_ref().map_or(Some(true), |m| process::try_matches(pid, m))
+    }
 }
 
 #[cfg(test)]
