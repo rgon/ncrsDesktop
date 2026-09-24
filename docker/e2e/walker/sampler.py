@@ -238,6 +238,14 @@ def summarize(results, facts_path):
         crit += [("no-freeze: " + n, ok, v) for n, ok, v in nofreeze["criteria"]]
     elif os.environ.get("SCENARIO") == "nofreeze":
         crit.append(("no-freeze: nofreeze.json written", False, None))
+    uploadfreeze = None
+    uf_path = os.path.join(results, "uploadfreeze.json")
+    if os.path.exists(uf_path):
+        with open(uf_path) as f:
+            uploadfreeze = json.load(f)
+        crit += [("upload-freeze: " + n, ok, v) for n, ok, v in uploadfreeze["criteria"]]
+    elif os.environ.get("SCENARIO") == "uploadfreeze":
+        crit.append(("upload-freeze: uploadfreeze.json written", False, None))
     passed = all(ok for _, ok, _ in crit)
     walk = facts.get("walk") or {}
     elapsed = walk.get("elapsed_s") or 0
@@ -264,6 +272,7 @@ def summarize(results, facts_path):
         "walk": facts.get("walk"),
         "log_counts": facts.get("log_counts"),
         "nofreeze": nofreeze,
+        "uploadfreeze": uploadfreeze,
     }
     with open(os.path.join(results, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
@@ -300,6 +309,11 @@ def summarize(results, facts_path):
               % (nofreeze["probes"], nofreeze["probe_p50_ms"], nofreeze["probe_p99_ms"], nofreeze["probe_max_ms"],
                  nofreeze["probe_errors"], nofreeze["slow_stats"], nofreeze["slow_stat_max_s"],
                  json.dumps(nofreeze["slow_stat_outcomes"])))
+    if uploadfreeze:
+        print("  upload-freeze       : %s MB copied in %ss; probes n=%s p50=%sms p99=%sms max=%sms errors=%s; server hash %s"
+              % (uploadfreeze["upload_mb"], uploadfreeze["copy_s"], uploadfreeze["probes"], uploadfreeze["probe_p50_ms"],
+                 uploadfreeze["probe_p99_ms"], uploadfreeze["probe_max_ms"], uploadfreeze["probe_errors"],
+                 "match" if uploadfreeze["server_sha256"] == uploadfreeze["want_sha256"] else "MISMATCH"))
     print("  -- criteria")
     for n, ok, v in crit:
         print("    [%s] %s  (value: %s)" % ("PASS" if ok else "FAIL", n, v))

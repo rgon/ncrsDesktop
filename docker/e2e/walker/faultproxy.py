@@ -32,6 +32,15 @@ Env:
                     being forwarded (a listing the server takes forever on; the
                     "no-freeze" scenario stats into one while probing a hot file)
   SLOW_MS           hold for SLOW_PATH_SUBSTR matches (default 20000)
+  CHUNKING          1 = answer Nextcloud chunked uploads (v2) itself: MKCOL of
+                    /remote.php/dav/uploads/<user>/<id>, a PUT per chunk, MOVE of
+                    <id>/.file (assembled and PUT upstream), DELETE <id>. rclone
+                    has no such endpoint, so without this every streamed upload
+                    falls back to whole-file staging (default 0)
+  PUT_BPS           throttle every PUT body (chunk or whole file) to this many
+                    bytes/s (default 0 = unthrottled)
+  PUT_LATENCY_MS    extra delay before answering each PUT (default 0); with
+                    PUT_BPS, what the "upload-freeze" scenario uploads through
   FAULT_ARMED       1 (default) = faults active from the start; 0 = no faults
                     until POST /__arm (run_walker.sh arms after the mount is up,
                     so FAULT_ROOT=1 tests a *running* daemon, not mount-time)
@@ -70,6 +79,12 @@ SLOW_PATH_SUBSTR = os.environ.get("SLOW_PATH_SUBSTR", "")
 SLOW_MS = float(os.environ.get("SLOW_MS", "20000") or 0)
 ROOT_PREFIX = os.environ.get("ROOT_PREFIX", "/remote.php/dav/files/testuser")
 QUIET = os.environ.get("QUIET", "0") == "1"
+CHUNKING = os.environ.get("CHUNKING", "0") == "1"
+PUT_BPS = float(os.environ.get("PUT_BPS", "0") or 0)
+PUT_LATENCY_MS = float(os.environ.get("PUT_LATENCY_MS", "0") or 0)
+UPLOADS_PREFIX = "/remote.php/dav/uploads/"
+UPLOADS = {}  # session collection path -> {chunk name: bytes}
+UPLOADS_LOCK = threading.Lock()
 ARMED = {"on": os.environ.get("FAULT_ARMED", "1") == "1", "at": time.time()}
 
 HOP_BY_HOP = {
@@ -261,6 +276,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         inflight = STATS.begin(method)
+        if CHUNKING and path.startswith(UPLOADS_PREFIX):
+            t0, status = time.time(), 0
+            try:
+                status = self._chunking(method, path)
+            finally:
+                STATS.end(status)
+                log("%s inflight=%d %s %s -> %s %.0fms" % (
+                    time.strftime("%H:%M:%S"), inflight, method, path, status, (time.time() - t0) * 1000))
+            return
         t0 = time.time()
         depth = self.headers.get("Depth", "")
         status = 0
@@ -286,6 +310,8 @@ class Handler(BaseHTTPRequestHandler):
                 with STATS.lock:
                     STATS.slowed += 1
                 time.sleep(SLOW_MS / 1000.0)
+            if method == "PUT":
+                throttle_put(int(self.headers.get("Content-Length", "0") or 0))
             status = self._forward(method)
         finally:
             STATS.end(status)
@@ -293,6 +319,62 @@ class Handler(BaseHTTPRequestHandler):
                 time.strftime("%H:%M:%S", time.localtime(t0)) + ".%03d" % int((t0 % 1) * 1000),
                 inflight, method, path, depth or "-", status,
                 " (injected)" if faulted else "", (time.time() - t0) * 1000))
+
+    def _chunking(self, method, path):
+        """Nextcloud chunked upload v2, answered here (see CHUNKING)."""
+        session, _, leaf = path.rstrip("/").rpartition("/")
+        if method == "MKCOL":
+            self._drain_body()
+            with UPLOADS_LOCK:
+                UPLOADS[path.rstrip("/")] = {}
+            self._send_simple(201, "")
+            return 201
+        if method == "PUT":
+            n = int(self.headers.get("Content-Length", "0") or 0)
+            body = self.rfile.read(n) if n else b""
+            throttle_put(n)
+            with UPLOADS_LOCK:
+                chunks = UPLOADS.get(session)
+                if chunks is not None:
+                    chunks[leaf] = body
+            code = 201 if chunks is not None else 404
+            self._send_simple(code, "")
+            return code
+        if method == "MOVE" and leaf == ".file":
+            self._drain_body()
+            with UPLOADS_LOCK:
+                chunks = UPLOADS.pop(session, None)
+            if chunks is None:
+                self._send_simple(404, "no such upload\n")
+                return 404
+            data = b"".join(chunks[k] for k in sorted(chunks))
+            dest = urlsplit(self.headers.get("Destination", "")).path
+            conn = http.client.HTTPConnection(UP_HOST, UP_PORT, timeout=300)
+            try:
+                hdrs = {"Content-Length": str(len(data))}
+                if self.headers.get("Authorization"):
+                    hdrs["Authorization"] = self.headers["Authorization"]
+                conn.request("PUT", dest, body=data, headers=hdrs)
+                resp = conn.getresponse()
+                resp.read()
+                code, etag = resp.status, resp.getheader("ETag")
+            finally:
+                conn.close()
+            self.send_response(code)
+            if etag:
+                self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return code
+        if method == "DELETE":
+            self._drain_body()
+            with UPLOADS_LOCK:
+                UPLOADS.pop(path.rstrip("/"), None)
+            self._send_simple(204, "")
+            return 204
+        self._drain_body()
+        self._send_simple(405, "not emulated\n")
+        return 405
 
     def _forward(self, method):
         conn = http.client.HTTPConnection(UP_HOST, UP_PORT, timeout=300)
@@ -372,6 +454,12 @@ class Handler(BaseHTTPRequestHandler):
             return resp.status
         finally:
             conn.close()
+
+
+def throttle_put(nbytes):
+    delay = PUT_LATENCY_MS / 1000.0 + (nbytes / PUT_BPS if PUT_BPS else 0)
+    if delay:
+        time.sleep(delay)
 
 
 class Server(ThreadingHTTPServer):
