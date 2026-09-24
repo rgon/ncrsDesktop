@@ -185,3 +185,18 @@ Still open after this round:
 - A release racing rename(): a Put enqueued between rename's retarget and its journal entry replays before the MOVE, and the MOVE then replaces it. This is pre-existing and rare.
 - A writable open of a file whose streamed upload is queued holds a READ worker for up to `DOWNLOAD_TIMEOUT`.
 
+
+## Open follow-ups after the review of 6c460fb / 66d306e (not blocking this PR)
+
+- **HIGH, data loss (older than this PR): offline journal path rewriting.** When a Rename is queued, earlier Put/Unlink/MkDir entries are rewritten to the new names (`update_path_prefix`), but they still replay *before* the MOVE.
+  - Case 1: offline, `rm a`, create a new `a` = A2, then `mv a b`. The journal becomes `[Unlink b, Put b(no etag, A2), Rename a→b]`. On replay the DELETE of b gets a 404, the PUT of b writes A2, and then the MOVE a→b overwrites b with the old A. A2 is lost, and the file the user deleted comes back.
+  - Case 2 (no data loss): edit b, then `mv b c`. PUT c with b's If-Match gets a 412 and becomes a conflicted copy, then the MOVE puts the old content at c.
+  - Fix: stop rewriting earlier entries. Every op keeps the names it had when it was queued, and lookups that need a file's current name (`newest_upload`, `pending_put_staging`, `has_pending_put`, `supersede_uploads`, the Unlink coalesce, purge's protected set) push each entry's path forward through the Renames queued after it. That is the mirror image of `rename_source_of`.
+  - Optionally, retarget a Put that is only a queued create, instead of queuing its MOVE.
+  - Add replay tests of mixed Put/Unlink/Rename sequences against the FakeBackend.
+- **MED: READ pool starvation.** A writable non-truncating open of a file with a queued streamed finish parks one of the 32 READ workers. It polls every 100 ms for up to DOWNLOAD_TIMEOUT, and a slow download can add up to another DOWNLOAD_TIMEOUT. Cold `read()`s share that pool.
+  - Fix: a condvar woken when the entry leaves the journal instead of polling, and a cap of about 4 concurrent stream waiters (EAGAIN beyond that) or a small pool of their own. Give up at once while sync is paused.
+- **LOW:**
+  - On an old-format persisted rename chain, `rename_source_of` returns the wrong source. The open then fails with EIO until replay runs; this is a one-time upgrade window, offline only.
+  - The live MOVE's `has_pending_put(from)` guard is defeated by the Put rewrite. The live MOVE also never calls `claim(seq)`, so a replay can run the same entry twice.
+  - Offline, a read-only open of a kept file whose newest upload is streamed now gives EIO instead of serving the older version. This is a behaviour change to mention in the release notes.
