@@ -3,6 +3,7 @@ pub mod auth;
 pub mod backend;
 pub mod backoff;
 pub mod bg;
+pub mod walkers;
 pub mod config;
 pub mod desktop;
 pub mod login_flow;
@@ -1044,10 +1045,101 @@ fn error_to_errno(err: &str) -> Errno {
     }
 }
 
+/// The daemon's load-shedding state, registered once per process so the IPC
+/// server (which has no `ConnInfo`) can report it.
+struct HealthSources {
+    breaker: Arc<backoff::ServerBreaker>,
+    backoff: Arc<backoff::PathBackoff>,
+    walkers: Arc<walkers::WalkerTracker>,
+}
+static HEALTH: std::sync::OnceLock<HealthSources> = std::sync::OnceLock::new();
+
+#[derive(Serialize)]
+struct HealthReport {
+    threads: usize,
+    max_threads: usize,
+    pools: Vec<bg::PoolStats>,
+    breaker: Option<backoff::BreakerStats>,
+    paths_backing_off: usize,
+    walkers: Vec<walkers::WalkerStats>,
+}
+
+fn process_threads() -> usize {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Threads:").map(|v| v.trim().parse().unwrap_or(0))))
+        .unwrap_or(0)
+}
+
+fn health_report() -> HealthReport {
+    let now = Instant::now();
+    let h = HEALTH.get();
+    HealthReport {
+        threads: process_threads(),
+        max_threads: bg::MAX_THREADS,
+        pools: bg::stats(),
+        breaker: h.map(|h| h.breaker.stats(now)),
+        paths_backing_off: h.map_or(0, |h| h.backoff.len()),
+        walkers: h.map(|h| h.walkers.active(now)).unwrap_or_default(),
+    }
+}
+
+/// JSON for the IPC `HEALTH` command: threads, pools, breaker, walkers.
+pub fn health_json() -> String {
+    serde_json::to_string(&health_report()).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Logs one HEALTH line a minute — at INFO whenever something is worth
+/// knowing (refused jobs, an open breaker, a walker, threads near the cap),
+/// else at DEBUG. The 0.1.76 incident left nothing in the journal that said
+/// which threads were piling up; this line would have.
+fn health_log_loop(shutdown: Arc<AtomicBool>) {
+    let mut last_rejected: u64 = 0;
+    while !shutdown.load(Ordering::Relaxed) {
+        for _ in 0..60 {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        let r = health_report();
+        let rejected: u64 = r.pools.iter().map(|p| p.rejected).sum();
+        let busy: Vec<String> = r.pools.iter()
+            .filter(|p| p.active > 0 || p.queued > 0)
+            .map(|p| format!("{} {}/{}+{}q", p.name, p.active, p.max_workers, p.queued))
+            .collect();
+        let walkers: Vec<String> = r.walkers.iter()
+            .map(|w| format!("{} {}/min", w.chain, w.uncached_last_min))
+            .collect();
+        let open = r.breaker.as_ref().is_some_and(|b| b.open);
+        let line = format!(
+            "HEALTH threads={}/{} pools=[{}] refused+{} breaker={} backing_off={} walkers=[{}]",
+            r.threads, r.max_threads, busy.join(", "), rejected - last_rejected.min(rejected),
+            if open { "open" } else { "closed" }, r.paths_backing_off, walkers.join("; "),
+        );
+        let notable = rejected > last_rejected || open || !r.walkers.is_empty() || r.threads * 4 > r.max_threads * 3;
+        if notable {
+            log::info!("{}", line);
+        } else {
+            log::debug!("{}", line);
+        }
+        last_rejected = rejected;
+    }
+}
+
 /// Starts one of the daemon's fixed, named long-lived threads.
 fn start_service(name: &str, f: impl FnOnce() + Send + 'static) {
     if let Err(e) = bg::spawn_service(name, f) {
         log::error!("could not start the {} thread: {}", name, e);
+    }
+}
+
+/// Errno for "the parent listing is unavailable" after a failed re-list: only
+/// the server saying the parent is gone (404) justifies ENOENT for the child.
+fn relist_errno(err: Option<&str>) -> Errno {
+    match err {
+        Some(e) => error_to_errno(e),
+        None => Errno::ENOENT,
     }
 }
 
@@ -2901,6 +2993,8 @@ struct ConnInfo {
     backoff: Arc<backoff::PathBackoff>,
     /// Server-wide 5xx breaker: pauses background listing work while open.
     breaker: Arc<backoff::ServerBreaker>,
+    /// Per-process accounting and rate limit for uncached listings (see `walkers.rs`).
+    walkers: Arc<walkers::WalkerTracker>,
 }
 
 /// Clears an in-progress flag on drop, so a panicking worker cannot latch it.
@@ -3187,6 +3281,15 @@ impl NextCloudFs {
             passthrough_capable: Arc::new(AtomicBool::new(true)),
             backoff: Arc::new(backoff::PathBackoff::new()),
             breaker: Arc::new(backoff::ServerBreaker::new()),
+            // NCRS_WALKER_LIMIT=off keeps the accounting and warnings but lifts the limit.
+            walkers: Arc::new(walkers::WalkerTracker::new(
+                !matches!(std::env::var("NCRS_WALKER_LIMIT").as_deref(), Ok("off" | "0" | "false")),
+            )),
+        });
+        let _ = HEALTH.set(HealthSources {
+            breaker: conn.breaker.clone(),
+            backoff: conn.backoff.clone(),
+            walkers: conn.walkers.clone(),
         });
 
         Ok(NextCloudFs {
@@ -3987,16 +4090,61 @@ impl NextCloudFs {
     /// be gone by the time the kernel asks about that inode again. Every caller
     /// that used to treat a miss as "does not exist" has to re-list first.
     fn relist_if_missing(&self, dir: &Path) -> Option<Arc<Vec<RemoteEntry>>> {
-        if let Some(files) = self.cache.safe_lock().get_cached_dir_readonly(dir) {
-            return Some(files);
-        }
-        if let Err(e) = get_or_list_dir(&self.conn, &self.cache, dir.to_path_buf(), None) {
-            log::debug!("relist {}: {}", dir.display(), e);
-        }
-        self.cache.safe_lock().get_cached_dir_readonly(dir)
+        self.parent_listing(dir, None).ok()
     }
 
-    fn readdir_common(&self, ino: INodeNo, fh: u64, offset: u64, reply: DirReply) {
+    /// The listing of `dir` to answer a child lookup from: the cached one if
+    /// resident, else whatever a (possibly joined, still streaming) fetch
+    /// returns. When `want` is named and not in a partial listing yet, waits —
+    /// up to `PROPFIND_TIMEOUT` — for the stream to finish before answering.
+    ///
+    /// Reading the finished-listing cache after `get_or_list_dir` (what this
+    /// used to do) missed every listing still streaming: `find` read a wide
+    /// directory from the partial snapshot, then got ENOENT stat'ing a child
+    /// it had just been shown.
+    fn parent_listing(&self, dir: &Path, want: Option<&str>) -> Result<Arc<Vec<RemoteEntry>>, Option<String>> {
+        if let Some(files) = self.cache.safe_lock().get_cached_dir_readonly(dir) {
+            return Ok(files);
+        }
+        let files = match get_or_list_dir(&self.conn, &self.cache, dir.to_path_buf(), None) {
+            Ok((files, _)) => files,
+            Err(e) => {
+                log::debug!("re-list {} failed: {}", dir.display(), e);
+                // A listing may have landed meanwhile (another reader's fetch).
+                return self.cache.safe_lock().get_cached_dir_readonly(dir).ok_or(Some(e));
+            }
+        };
+        let Some(name) = want else { return Ok(files) };
+        let has = |f: &[RemoteEntry]| f.iter().any(|e| e.path.file_name().and_then(|n| n.to_str()) == Some(name));
+        if has(&files) {
+            return Ok(files);
+        }
+        let deadline = Instant::now() + PROPFIND_TIMEOUT;
+        let notify = self.cache.safe_lock().pending_notify.clone();
+        loop {
+            {
+                let mut c = self.cache.safe_lock();
+                if let Some(done) = c.get_cached_dir_readonly(dir) {
+                    return Ok(done);
+                }
+                match c.get_pending_snapshot(dir) {
+                    Ok(Some(partial)) if has(&partial) => return Ok(Arc::new(partial)),
+                    Ok(Some(_)) => {}
+                    // No fetch in flight any more and nothing cached: the partial
+                    // listing we got is all there is.
+                    Ok(None) => return Ok(files),
+                    Err(e) => return Err(Some(e)),
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(files);
+            }
+            let guard = notify.0.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = notify.1.wait_timeout(guard, Duration::from_millis(50));
+        }
+    }
+
+    fn readdir_common(&self, pid: u32, ino: INodeNo, fh: u64, offset: u64, reply: DirReply) {
         let (path, parent_ino) = {
             let c = self.cache.safe_lock();
             let path = match c.get_path(ino.0) {
@@ -4123,6 +4271,17 @@ impl NextCloudFs {
                 }
                 reply.ok();
                 return;
+            }
+
+            // A listing we'll have to fetch counts against the requesting
+            // process's budget; a walker over it waits here, on this pool
+            // worker — never on the dispatch thread, never for cached folders.
+            let cold = cache.safe_lock().dir_cache.get(&path).is_none_or(|e| e.invalidated || e.hard_expired);
+            if cold {
+                let wait = conn.walkers.note_uncached(pid, Instant::now());
+                if !wait.is_zero() {
+                    thread::sleep(wait);
+                }
             }
 
             let t_readdir = Instant::now();
@@ -4460,13 +4619,25 @@ impl NextCloudFs {
                     }
                 }
                 Err(e) => {
-                    log::error!("readdir {}: {}", path.display(), e);
-                    let kind = if error_to_errno(&e).code() == libc::EACCES {
-                        SyncErrorKind::PermissionDenied
-                    } else {
-                        SyncErrorKind::NetworkError
+                    let server_code = backend::server_error_code(&e);
+                    let kind = match server_code {
+                        Some(401 | 403) => SyncErrorKind::PermissionDenied,
+                        Some(code) => SyncErrorKind::ServerError(code),
+                        None if error_to_errno(&e).code() == libc::EACCES => SyncErrorKind::PermissionDenied,
+                        None => SyncErrorKind::NetworkError,
                     };
-                    push_error(&elog, path.clone(), kind, e.clone());
+                    if server_code.is_some_and(backoff::is_struggling) {
+                        // The per-path cooldown already limits this to once per
+                        // window per directory; during a storm the breaker's own
+                        // message stands in for thousands of per-folder entries.
+                        log::warn!("readdir {}: {}", path.display(), e);
+                        if !conn.breaker.is_open(Instant::now()) {
+                            push_error(&elog, path.clone(), kind, e.clone());
+                        }
+                    } else {
+                        log::error!("readdir {}: {}", path.display(), e);
+                        push_error(&elog, path.clone(), kind, e.clone());
+                    }
                     reply.error(error_to_errno(&e));
                 }
             }
@@ -4509,17 +4680,11 @@ impl Filesystem for NextCloudFs {
             ghosts.remove(&full_path);
         }
 
-        let is_cached = self.cache.safe_lock().dir_cache.contains_key(&parent_path);
-        if !is_cached {
-            if let Err(e) = get_or_list_dir(&self.conn, &self.cache, parent_path.clone(), None) {
-                log::debug!("lookup: list {} failed (will return ENOENT): {}", parent_path.display(), e);
-            }
-        }
-
-        let entries = match self.cache.safe_lock().get_cached_dir_readonly(&parent_path) {
-            Some(files) => files,
-            None => { reply.error(Errno::ENOENT); return; }
-            // Arc cloned; guard drops here, releasing the lock before the scan.
+        let entries = match self.parent_listing(&parent_path, Some(&name_str)) {
+            Ok(files) => files,
+            // We don't know the parent's contents, so we can't say the name is
+            // absent: a walker told ENOENT believes it, while EAGAIN/EIO says "ask later".
+            Err(e) => { reply.error(relist_errno(e.as_deref())); return; }
         };
 
         let found = entries.iter().find(|e| {
@@ -4610,12 +4775,10 @@ impl Filesystem for NextCloudFs {
         let entries = match cached {
             Some(files) => files,
             None => {
-                if let Err(e) = get_or_list_dir(&self.conn, &self.cache, parent.clone(), None) {
-                    log::debug!("getattr: re-list {} failed: {}", parent.display(), e);
-                }
-                match self.cache.safe_lock().get_cached_dir_readonly(&parent) {
-                    Some(files) => files,
-                    None => { reply.error(Errno::ENOENT); return; }
+                let want = path.file_name().and_then(|n| n.to_str()).map(str::to_string);
+                match self.parent_listing(&parent, want.as_deref()) {
+                    Ok(files) => files,
+                    Err(e) => { reply.error(relist_errno(e.as_deref())); return; }
                 }
             }
         };
@@ -5656,12 +5819,12 @@ impl Filesystem for NextCloudFs {
         reply.ok();
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectory) {
-        self.readdir_common(ino, fh.0, offset, DirReply::Plain(reply));
+    fn readdir(&self, req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectory) {
+        self.readdir_common(req.pid(), ino, fh.0, offset, DirReply::Plain(reply));
     }
 
-    fn readdirplus(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectoryPlus) {
-        self.readdir_common(ino, fh.0, offset, DirReply::Plus(reply));
+    fn readdirplus(&self, req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectoryPlus) {
+        self.readdir_common(req.pid(), ino, fh.0, offset, DirReply::Plus(reply));
     }
 
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
@@ -7423,6 +7586,11 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             }
             log::info!("AUTO_KEEP: done");
         });
+    }
+
+    {
+        let health_shutdown = filesystem.shutdown_flag();
+        start_service("health-log", move || health_log_loop(health_shutdown));
     }
 
     // Storage stats update thread
