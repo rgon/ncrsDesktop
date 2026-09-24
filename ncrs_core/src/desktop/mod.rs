@@ -135,6 +135,12 @@ impl DesktopPolicy {
         Some(None)
     }
 
+    /// Whether an open with `flags` looks like some active probe's sniff,
+    /// whoever sends it (no `/proc` read).
+    pub fn sniff_flags_match(&self, flags: i32) -> bool {
+        self.sniff_probes.iter().any(|p| p.matches_open(flags))
+    }
+
     /// Whether `name` is a MIME-type xattr some active probe's toolkit reads.
     pub fn serves_mime_xattr(&self, name: &[u8]) -> bool {
         self.sniff_probes.iter().any(|p| p.xattr.is_some_and(|x| x.as_bytes() == name))

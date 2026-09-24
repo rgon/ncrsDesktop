@@ -4182,8 +4182,8 @@ fn open_continue<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, re
                 });
                 match queued {
                     Ok(()) => return,
-                    Err((_, (r, q, _))) => {
-                        open_unclassified(q, r);
+                    Err((_, (r, q, e))) => {
+                        open_unclassified(ctx, q, e, r);
                         return;
                     }
                 }
@@ -4213,21 +4213,30 @@ fn open_continue<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, re
 
 /// open() of an uncached file whose caller could not be classified: the
 /// dispatch thread could not decide it (see `desktop::process::lock_free`)
-/// and `bg::META` refused the job. Getting here means a thumbnailer matcher
-/// or a sniff probe matching these flags (GLib's O_NOATIME) was undecided —
-/// every other open is decided inline — so a plain read would be exactly the
-/// full download the probe and the thumbnailer guard exist to prevent, once
-/// per file of a listing storm that is filling the pool. "Try again" instead:
-/// GLib falls back to the extension-based type, a thumbnailer fails that one
-/// file. Never synthetic bytes: `rsync --open-noatime` and `tar` send the
-/// same flag and must get real content or an error.
+/// and `bg::META` refused the job.
 ///
-/// Before this, the refusal opened the file as a plain read: not what open()
-/// did before the checks moved off the dispatch thread (then they always ran,
-/// inline), and it brought the per-file downloads back.
-fn open_unclassified<R: OpenAnswer>(rq: OpenReq, reply: R) {
-    log::debug!("open {}: caller not classified (meta pool full) — try again", rq.path.display());
-    reply.error(Errno::EAGAIN);
+/// An open whose flags match a sniff probe (GLib's O_NOATIME) gets "try
+/// again": opened plain, it would be the full download the probe exists to
+/// prevent, once per file of the listing storm that is filling the pool, and
+/// GLib falls back to the extension-based type. Never synthetic bytes:
+/// `rsync --open-noatime` and `tar` send the same flag and must get real
+/// content or an error.
+///
+/// Any other open is opened plain. Only a thumbnailer matcher that reads
+/// `/proc` (KIO's `CmdlineContains`) can leave one undecided, and answering
+/// EAGAIN there failed every `cat`, `cp` or `rsync` of an uncached file while
+/// the pool was busy. The cost: a thumbnailer opening files during such a
+/// storm downloads them. Those downloads are bounded by the read throttle
+/// (`ConnInfo::read_throttle`), not by the thumbnail fetch permit, which only
+/// covers server previews.
+fn open_unclassified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, reply: R) {
+    if desktop::policy().sniff_flags_match(rq.flags) {
+        log::debug!("open {}: caller not classified (meta pool full) — try again", rq.path.display());
+        reply.error(Errno::EAGAIN);
+        return;
+    }
+    log::debug!("open {}: caller not classified (meta pool full) — opened plain", rq.path.display());
+    open_continue_classified(ctx, rq, entry, reply, None);
 }
 
 /// open() once the caller is classified: allocates the handle, and stages the
