@@ -686,12 +686,21 @@ impl WriteCtx {
         let ticket = uploads.ticket_entry(&remote_path);
         submit_mutation(move || {
             ticket.wait();
-            if !journal.safe_lock().claim(seq) {
-                log::debug!("streamed finish of {} skipped — superseded or replayed", remote_path.display());
-                if !journal.safe_lock().has_pending_put(&remote_path) {
-                    cache.safe_lock().uploading.remove(&remote_path);
+            match crate::claim_in_order(&journal, seq, &[&remote_path], || false, "streamed finish", crate::LIVE_ORDER_WAIT) {
+                crate::InOrder::Run => {}
+                crate::InOrder::Skip => {
+                    log::debug!("streamed finish of {} skipped — superseded or replayed", remote_path.display());
+                    if !journal.safe_lock().has_pending_put(&remote_path) {
+                        cache.safe_lock().uploading.remove(&remote_path);
+                    }
+                    return;
                 }
-                return;
+                // The replay assembles it, after the older changes of the file.
+                crate::InOrder::Deferred => {
+                    cache.safe_lock().uploading.remove(&remote_path);
+                    smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+                    return;
+                }
             }
             let etag = uploads.etag_for(&remote_path, opened_gen, original_etag);
             let _permit = conn.throttle.acquire();
@@ -848,12 +857,21 @@ impl WriteCtx {
 
             submit_mutation(move || {
                 ticket.wait();
-                if !journal.safe_lock().claim(seq) {
-                    log::debug!("PUT {} skipped — superseded or replayed", remote_path.display());
-                    if !journal.safe_lock().has_pending_put(&remote_path) {
-                        cache.safe_lock().uploading.remove(&remote_path);
+                match crate::claim_in_order(&journal, seq, &[&remote_path], || false, "PUT", crate::LIVE_ORDER_WAIT) {
+                    crate::InOrder::Run => {}
+                    crate::InOrder::Skip => {
+                        log::debug!("PUT {} skipped — superseded or replayed", remote_path.display());
+                        if !journal.safe_lock().has_pending_put(&remote_path) {
+                            cache.safe_lock().uploading.remove(&remote_path);
+                        }
+                        return;
                     }
-                    return;
+                    // The replay uploads it, after the older changes of the file.
+                    crate::InOrder::Deferred => {
+                        cache.safe_lock().uploading.remove(&remote_path);
+                        smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+                        return;
+                    }
                 }
                 let original_etag = uploads.etag_for(&remote_path, opened_gen, original_etag);
                 let _permit = conn.throttle.acquire();
