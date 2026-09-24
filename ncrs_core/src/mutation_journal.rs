@@ -176,6 +176,10 @@ pub struct MutationJournal {
     /// waiter sleeps until an entry leaves, instead of polling. Paired with
     /// the `SharedJournal` mutex this journal lives in.
     changed: Arc<Condvar>,
+    /// Uploads loaded from a journal written by 0.1.77 or older that may
+    /// replay in the wrong order (`flag_old_reorders`): each one's bytes are
+    /// copied to `recovered/` before it is sent. Never persisted.
+    old_suspects: std::collections::HashSet<SeqId>,
 }
 
 pub type SharedJournal = Arc<Mutex<MutationJournal>>;
@@ -441,9 +445,19 @@ pub(crate) fn move_to_recovered(cache_dir: &Path, src: &Path, remote_path: Optio
     move_to_recovered_noted(cache_dir, src, remote_path, reason, None)
 }
 
-/// `move_to_recovered` for the tail of a streamed upload, whose first
+/// `move_to_recovered_noted` for the tail of a streamed upload, whose first
 /// `offset` bytes are in the server's upload session `session`.
 fn move_to_recovered_noted(cache_dir: &Path, src: &Path, remote_path: Option<&Path>, reason: &str, session: Option<(&str, u64)>) -> Option<PathBuf> {
+    place_in_recovered(cache_dir, src, remote_path, reason, session, false)
+}
+
+/// `move_to_recovered`, but `src` stays where it is: for bytes the journal
+/// still sends, kept aside in case sending them goes wrong.
+fn copy_to_recovered(cache_dir: &Path, src: &Path, remote_path: Option<&Path>, reason: &str) -> Option<PathBuf> {
+    place_in_recovered(cache_dir, src, remote_path, reason, None, true)
+}
+
+fn place_in_recovered(cache_dir: &Path, src: &Path, remote_path: Option<&Path>, reason: &str, session: Option<(&str, u64)>, copy: bool) -> Option<PathBuf> {
     let dir = cache_dir.join(RECOVERED_DIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::error!("cannot create {}: {} — leaving {} in place", dir.display(), e, src.display());
@@ -455,8 +469,9 @@ fn move_to_recovered_noted(cache_dir: &Path, src: &Path, remote_path: Option<&Pa
         dest = dir.join(format!("{}.{}", name, now_ms()));
     }
     let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-    if let Err(e) = std::fs::rename(src, &dest) {
-        log::error!("cannot move {} to {}: {}", src.display(), dest.display(), e);
+    let placed = if copy { std::fs::copy(src, &dest).map(|_| ()) } else { std::fs::rename(src, &dest) };
+    if let Err(e) = placed {
+        log::error!("cannot {} {} to {}: {}", if copy { "copy" } else { "move" }, src.display(), dest.display(), e);
         return None;
     }
     let sidecar = RecoveredSidecar {
@@ -808,6 +823,7 @@ impl MutationJournal {
             delete_after_save: Vec::new(),
             reserved: std::collections::HashSet::new(),
             changed: Arc::new(Condvar::new()),
+            old_suspects: std::collections::HashSet::new(),
             journal_path,
             conflicts_path,
         };
@@ -816,6 +832,7 @@ impl MutationJournal {
                 description: format!("staging file missing for journal entry seq={}", seq),
             });
         }
+        journal.flag_old_reorders();
         if !journal.conflicts.is_empty() {
             journal.save_conflicts();
         }
@@ -823,6 +840,53 @@ impl MutationJournal {
             log::info!("JOURNAL: loaded {} pending entries", journal.entries.len());
         }
         journal
+    }
+
+    /// 0.1.77 and older rewrote an entry's paths into the names every later
+    /// Rename gives, and replayed it before that Rename's MOVE: offline
+    /// `rm a; create a; mv a b` was saved as [Unlink b, Put b, Rename a→b],
+    /// whose MOVE then puts the deleted a over the new one. Which of its entries were rewritten is not in the
+    /// file, so they still replay as stored. Each old upload under the
+    /// target of a later old Rename is flagged: a notice names it, and its
+    /// bytes are copied to `recovered/` before it is sent, so whatever the
+    /// MOVE does after it the user still has them.
+    fn flag_old_reorders(&mut self) {
+        let mut named = Vec::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.queued_names || matches!(e.op, MutationOp::Rename { .. }) || e.op.staging_path().is_none() {
+                continue;
+            }
+            let path = e.op.path();
+            let over = self.entries.range(i + 1..).find_map(|r| match &r.op {
+                MutationOp::Rename { from, to } if !r.queued_names && path.starts_with(to) => Some((from.clone(), to.clone())),
+                _ => None,
+            });
+            if let Some((from, to)) = over {
+                log::warn!("JOURNAL: {} was queued by 0.1.77 or older before the rename {} → {}: it may replay in the wrong order — its bytes are kept in {} before it is sent", path.display(), from.display(), to.display(), RECOVERED_DIR);
+                self.old_suspects.insert(e.seq);
+                named.push(path.display().to_string());
+            }
+        }
+        if named.is_empty() {
+            return;
+        }
+        let dir = self.journal_path.parent().map(|d| d.join(RECOVERED_DIR));
+        self.add_conflict(ConflictKind::PermanentFailure {
+            description: format!(
+                "Changes queued by an older version before a rename may reach the server in the wrong order: {}. A copy of each is kept in {} before it is uploaded — check these files once the sync is done.",
+                named.join(", "),
+                dir.as_deref().unwrap_or(Path::new(RECOVERED_DIR)).display(),
+            ),
+        });
+    }
+
+    /// Whether `seq` is an upload `flag_old_reorders` flagged whose bytes
+    /// were not kept yet; true once. The cache dir to keep them in with it.
+    fn take_old_suspect(&mut self, seq: SeqId) -> Option<PathBuf> {
+        if !self.old_suspects.remove(&seq) {
+            return None;
+        }
+        self.journal_path.parent().map(Path::to_path_buf)
     }
 
     pub fn enqueue(&mut self, op: MutationOp) -> SeqId {
@@ -1486,7 +1550,7 @@ pub(crate) fn replay_journal(
     use crate::MutexExt;
 
     loop {
-        let (entry, now_at) = {
+        let (entry, now_at, keep_in) = {
             let mut j = journal.safe_lock();
             match j.peek_front() {
                 // A live worker is executing it; later entries may depend on it, so stop.
@@ -1505,7 +1569,8 @@ pub(crate) fn replay_journal(
                     // Replayed under its queued name; the local bookkeeping
                     // (status, listing) is the file's, under its name now.
                     let now_at = j.forward(0, e.op.path());
-                    (e, now_at)
+                    let keep_in = j.take_old_suspect(e.seq);
+                    (e, now_at, keep_in)
                 }
                 None => {
                     log::info!("JOURNAL: replay complete — queue empty");
@@ -1513,6 +1578,14 @@ pub(crate) fn replay_journal(
                 }
             }
         };
+
+        // Off the journal lock: a copy of the whole file.
+        if let (Some(dir), Some(staging)) = (keep_in, entry.op.staging_path()) {
+            match copy_to_recovered(&dir, staging, Some(entry.op.path()), "queued by 0.1.77 or older before a rename, whose MOVE may replace it on the server") {
+                Some(kept) => log::warn!("JOURNAL: kept a copy of {} at {} before sending it", entry.op.path().display(), kept.display()),
+                None => log::error!("JOURNAL: could not keep a copy of {} before sending it", entry.op.path().display()),
+            }
+        }
 
         if entry.attempts >= MutationJournal::max_attempts() {
             log::warn!("JOURNAL: entry seq={} exceeded max attempts, marking permanent failure", entry.seq);

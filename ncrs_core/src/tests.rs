@@ -6227,6 +6227,44 @@ mod upload_order_tests {
             assert_eq!(log[0], "PUT /b if e_a refused");
             assert!(log[1].starts_with("PUT /b (conflicted copy") && log[2] == "MOVE /a /b" && log[3] == "MOVE /b /c", "{log:?}");
             assert!(srv.files().iter().any(|(p, b)| p.starts_with("/b (conflicted copy") && b == "A2"), "the edit is never lost");
-            assert!(matches!(conflicts.as_slice(), [mutation_journal::ConflictKind::EditConflict { .. }]));
+            assert!(matches!(conflicts.as_slice(), [
+                mutation_journal::ConflictKind::PermanentFailure { .. },
+                mutation_journal::ConflictKind::EditConflict { .. },
+            ]), "the notice about the old journal, then the conflict: {conflicts:?}");
+        }
+
+        #[test]
+        fn a_0_1_77_upload_under_a_later_renames_target_is_named_and_its_bytes_kept() {
+            // 0.1.77 saved offline `rm a; create a; mv a b` as [Unlink b,
+            // Put b, Rename a→b]: replayed as stored, the MOVE puts the
+            // deleted a over the new one. Which entries were rewritten is not
+            // in the file; the new a's bytes must survive whatever happens.
+            let off = Offline::new();
+            let staging = off.dir.path().join("write_9");
+            std::fs::write(&staging, "N").unwrap();
+            let old = serde_json::json!([
+                {"seq": 1, "op": {"Unlink": {"path": "/b"}}, "created_at_ms": 1, "attempts": 0, "last_error": null},
+                {"seq": 2, "op": {"Put": {"remote_path": "/b", "staging_path": staging, "if_match_etag": null}}, "created_at_ms": 2, "attempts": 0, "last_error": null},
+                {"seq": 3, "op": {"Rename": {"from": "/a", "to": "/b"}}, "created_at_ms": 3, "attempts": 0, "last_error": null},
+                {"seq": 4, "op": {"Put": {"remote_path": "/elsewhere", "staging_path": staging, "if_match_etag": null}}, "created_at_ms": 4, "attempts": 0, "last_error": null},
+            ]);
+            std::fs::write(off.dir.path().join("mutation_journal.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+            let off = Offline { journal: Arc::new(Mutex::new(MutationJournal::load_or_create(off.dir.path()))), ..off };
+            let notice = off.journal.safe_lock().unresolved_conflicts().iter().map(|c| c.kind.clone()).collect::<Vec<_>>();
+            match notice.as_slice() {
+                [mutation_journal::ConflictKind::PermanentFailure { description }] => {
+                    assert!(description.contains("/b") && !description.contains("/elsewhere"), "{description}");
+                }
+                other => panic!("one notice naming b: {other:?}"),
+            }
+            let srv = TreeServer::new(&[("/a", "A"), ("/b", "B")], &[]);
+            off.replay(&srv);
+            assert_eq!(srv.log(), ["DELETE /b", "PUT /b ok", "MOVE /a /b", "PUT /elsewhere ok"], "replayed as stored");
+            let recovered = off.dir.path().join(mutation_journal::RECOVERED_DIR);
+            let kept: Vec<_> = std::fs::read_dir(&recovered).unwrap().map(|e| e.unwrap().path()).collect();
+            let bytes: Vec<_> = kept.iter().filter(|p| p.extension().is_none()).map(|p| std::fs::read_to_string(p).unwrap()).collect();
+            assert_eq!(bytes, ["N"], "the new a is kept, and only the flagged upload: {kept:?}");
+            let sidecar: mutation_journal::RecoveredSidecar = serde_json::from_slice(&std::fs::read(kept.iter().find(|p| p.extension().is_some_and(|x| x == "json")).unwrap()).unwrap()).unwrap();
+            assert_eq!(sidecar.remote_path.as_deref(), Some(Path::new("/b")));
         }
     }
