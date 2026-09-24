@@ -4925,6 +4925,26 @@ mod upload_order_tests {
         }
 
         #[test]
+        fn a_local_re_create_is_told_from_the_file_it_replaced() {
+            // Neither version has a file id or etag yet: only create()'s number differs.
+            let (_, conn, cache) = setup(vec![]);
+            let local = |n: u64| {
+                let mut e = entry_in("/d", "f.txt");
+                e.change_token = None;
+                e.modified = Some(UNIX_EPOCH + Duration::from_nanos(n));
+                e
+            };
+            cache.safe_lock().put_dir_cache(PathBuf::from("/d"), None, None, vec![local(1)]);
+            let mut c = cache.safe_lock();
+            let h = lookup_pick(&mut c, Path::new("/d/f.txt"), &local(1));
+            drop(c);
+            assert!(matches!(lookup_recheck(&cache, &h), Recheck::Same));
+            cache.safe_lock().dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(vec![local(2)]);
+            assert!(matches!(lookup_recheck(&cache, &h), Recheck::Replaced(_)), "rm f; touch f looked like the same file");
+            let _ = conn;
+        }
+
+        #[test]
         fn with_child_within_says_which_answers_come_from_a_worker() {
             let cold = FakeDir { entries: names("/cold", 3), before_first: Duration::from_millis(50), ..Default::default() };
             let (_, conn, cache) = setup(vec![("/cold", cold)]);
