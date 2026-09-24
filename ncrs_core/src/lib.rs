@@ -5500,6 +5500,11 @@ fn purge_all(
     // A staging file this process made after the purge began may not be
     // registered anywhere yet (create() makes it just before the handle).
     let started = SystemTime::now();
+    // A second of slack: a file's mtime can be stamped from a coarser clock
+    // than SystemTime::now() (the kernel's jiffy-granular timestamp), so a
+    // staging file created just after `started` may carry an mtime just
+    // before it.
+    let made_since = started - Duration::from_secs(1);
     // Staging files the journal dropped are deleted by its next save;
     // until then the journal on disk still names them. Write it now,
     // so what this purge sees unreferenced is unreferenced on disk too.
@@ -5560,7 +5565,7 @@ fn purge_all(
                 None => continue,
                 Some(mutation_journal::StagingName::Ours(fh)) if open_fhs.contains(&fh) => continue,
                 Some(mutation_journal::StagingName::Ours(_))
-                    if entry.metadata().and_then(|m| m.modified()).map_or(true, |t| t >= started) => continue,
+                    if entry.metadata().and_then(|m| m.modified()).map_or(true, |t| t >= made_since) => continue,
                 Some(_) => {}
             }
             match std::fs::remove_file(&path) {
