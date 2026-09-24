@@ -5730,6 +5730,16 @@ mod upload_order_tests {
                 self.journal.safe_lock().pending_put_staging(Path::new(path)).map(|p| std::fs::read_to_string(p).unwrap())
             }
 
+            /// One replay run, as the connectivity monitor starts it.
+            fn replay_pass(&self, srv: &Arc<TreeServer>) {
+                let status: ipc::StatusMap = Arc::new(RwLock::new(HashMap::new()));
+                let ctx = mutation_journal::ReplayContext { backend: srv.clone(), status };
+                let cache = Arc::new(Mutex::new(make_test_cache()));
+                let dirty: ipc::DirtySet = Arc::new(Mutex::new(HashSet::new()));
+                let elog: ErrorLog = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+                mutation_journal::replay_journal(&self.journal, &ctx, &cache, &dirty, &elog);
+            }
+
             /// Back online: replays until the journal is empty.
             fn replay(&self, srv: &Arc<TreeServer>) -> Vec<mutation_journal::ConflictKind> {
                 let status: ipc::StatusMap = Arc::new(RwLock::new(HashMap::new()));
@@ -5931,6 +5941,55 @@ mod upload_order_tests {
             assert!(off.journal.safe_lock().claim(c), "claimable again, by the replay");
             // Gone or claimed elsewhere: skipped.
             assert_eq!(claim_in_order(&off.journal, c, &[Path::new("/c")], || false, "PUT", Duration::from_secs(1)), InOrder::Skip);
+        }
+
+        #[test]
+        fn a_waiting_live_change_whose_entry_leaves_does_nothing() {
+            let mut off = Offline::new();
+            off.rm("/x");
+            let put = off.save("/x", "X", None);
+            let (r, gone, done) = std::thread::scope(|sc| {
+                let worker = sc.spawn(|| {
+                    let r = claim_in_order(&off.journal, put, &[Path::new("/x")], || false, "PUT", Duration::from_secs(10));
+                    (r, Instant::now())
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(!worker.is_finished());
+                let gone = Instant::now();
+                off.journal.safe_lock().remove(put);
+                let (r, done) = worker.join().unwrap();
+                (r, gone, done)
+            });
+            assert_eq!(r, InOrder::Skip, "an entry that left is never sent, least of all ahead of the DELETE still queued");
+            assert!(done.duration_since(gone) < Duration::from_secs(1), "{:?}", done.duration_since(gone));
+        }
+
+        #[test]
+        fn a_claimed_create_is_not_coalesced_away_under_its_waiting_worker() {
+            // Backlog `mv a b` (the server has a = A). A new `a` is saved
+            // live: its PUT claims and waits for that MOVE. Then `mv a c`,
+            // `rm c`. Dropping the claimed PUT let the worker send the new a
+            // ahead of the MOVE, which moved it over b: A was lost.
+            let srv = TreeServer::new(&[("/a", "A")], &[]);
+            let mut off = Offline::new();
+            off.mv("/a", "/b");
+            let put = off.save("/a", "N", None);
+            std::thread::scope(|sc| {
+                let worker = sc.spawn(|| claim_in_order(&off.journal, put, &[Path::new("/a")], || false, "PUT", Duration::from_secs(10)));
+                std::thread::sleep(Duration::from_millis(200));
+                off.mv("/a", "/c");
+                off.rm("/c");
+                assert!(off.journal.safe_lock().contains(put), "claimed: kept, {:?}", off.journal.safe_lock().entries());
+                // The replay lands the MOVE and stops at the claimed PUT.
+                off.replay_pass(&srv);
+                assert_eq!(worker.join().unwrap(), InOrder::Run);
+                // The worker sends it, now in order.
+                crate::backend::CloudBackend::put_file(&*srv, Path::new("/a"), b"N".to_vec(), None).unwrap();
+                off.journal.safe_lock().remove(put);
+            });
+            assert!(off.replay(&srv).is_empty(), "{:?}", srv.log());
+            assert_eq!(srv.files(), tree(&[("/b", "A")]), "{:?}", srv.log());
+            assert_eq!(srv.log(), ["MOVE /a /b", "PUT /a ok", "MOVE /a /c", "DELETE /c"]);
         }
 
         #[test]

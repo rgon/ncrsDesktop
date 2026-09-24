@@ -1327,15 +1327,26 @@ impl MutationJournal {
                 // server, so they can go. Nothing later depends on them but a
                 // Rename of the file, whose MOVE then fails as a
                 // MoveSourceGone for a file that is deleted anyway.
-                let (mut ours, mut on_server) = (std::collections::HashSet::new(), false);
+                //
+                // Unless one is claimed: its live worker is sending it, or
+                // waits for older entries to land first and then will. Dropped
+                // from under that worker, it ran anyway, and out of order: a
+                // backlog `mv a b` queued, a new `a` saved live (its PUT
+                // waiting on that MOVE), then `mv a c; rm c` dropped the PUT,
+                // the worker saw nothing older left of an entry that was gone
+                // and sent the new `a` ahead of the MOVE, which then moved it
+                // over `b`. Kept, every entry of the file replays in order and
+                // this Unlink deletes on the server what the PUT puts there.
+                let (mut ours, mut on_server, mut claimed) = (std::collections::HashSet::new(), false, false);
                 self.walk_history(path, |e, at| {
                     if e.op.is_upload_of(at) {
                         on_server |= e.op.upload_etag().is_some();
+                        claimed |= e.in_flight;
                         ours.insert(e.seq);
                     }
                     false
                 });
-                if !on_server && !ours.is_empty() {
+                if !on_server && !claimed && !ours.is_empty() {
                     let staging_to_delete: Vec<PathBuf> = self.entries.iter()
                         .filter(|e| ours.contains(&e.seq))
                         .filter_map(|e| e.op.staging_path().map(Path::to_path_buf))
@@ -1353,7 +1364,10 @@ impl MutationJournal {
                     }
                     mkdir.is_some()
                 });
-                if let Some(seq) = mkdir.filter(|&s| !self.needed_as_parent(s)) {
+                // A claimed MkDir stays: its worker may be sending the MKCOL
+                // now, and this RmDir must delete what it makes.
+                let claimed = |s: SeqId| self.entries.iter().any(|e| e.seq == s && e.in_flight);
+                if let Some(seq) = mkdir.filter(|&s| !self.needed_as_parent(s) && !claimed(s)) {
                     self.entries.retain(|e| e.seq != seq);
                     log::debug!("JOURNAL: coalesced — removed MkDir for {} before RmDir", path.display());
                 }
@@ -2211,6 +2225,29 @@ mod tests {
         let mkdir = j.enqueue(MutationOp::MkDir { path: PathBuf::from("/f") });
         mv(&mut j, "/f", "/g");
         j.enqueue(MutationOp::RmDir { path: PathBuf::from("/g") });
+        assert!(j.contains(mkdir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_delete_never_coalesces_away_an_upload_or_folder_a_worker_has_claimed() {
+        let dir = temp_dir("coalesce_claimed");
+        let mut j = MutationJournal::load_or_create(&dir);
+        // A new `a` whose live PUT waits (claimed), then `mv a c; rm c`.
+        let put = j.enqueue(put_at(&dir, "/a", "N", None));
+        assert!(j.claim(put));
+        let later = j.enqueue(put_at(&dir, "/a", "N2", None));
+        let moved = mv(&mut j, "/a", "/c");
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/c") });
+        assert!(j.contains(put) && j.contains(later) && j.contains(moved), "the file's whole history stays, so it replays in order: {:?}", j.entries());
+        // Not claimed: dropped as before.
+        let free = j.enqueue(put_at(&dir, "/f", "F", None));
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/f") });
+        assert!(!j.contains(free));
+        // A claimed MkDir stays for its RmDir to delete.
+        let mkdir = j.enqueue(MutationOp::MkDir { path: PathBuf::from("/d") });
+        assert!(j.claim(mkdir));
+        j.enqueue(MutationOp::RmDir { path: PathBuf::from("/d") });
         assert!(j.contains(mkdir));
         let _ = fs::remove_dir_all(&dir);
     }
