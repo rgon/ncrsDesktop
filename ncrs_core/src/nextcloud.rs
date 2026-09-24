@@ -317,6 +317,17 @@ impl CloudBackend for NextcloudBackend {
             .map_err(BackendWriteError::from)
     }
 
+    fn put_chunk_from_path(
+        &self,
+        session: &crate::backend::ChunkedUploadSession,
+        index: u64,
+        path: &Path,
+        len: u64,
+    ) -> Result<(), BackendWriteError> {
+        webdav_ops::put_chunk_from_path(&self.clients.get(), &self.creds, &session.uploads_base, index, path, len)
+            .map_err(BackendWriteError::from)
+    }
+
     fn finish_chunked_upload(
         &self,
         session: &crate::backend::ChunkedUploadSession,

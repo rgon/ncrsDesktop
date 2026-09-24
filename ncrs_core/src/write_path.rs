@@ -37,6 +37,10 @@ pub(crate) struct WriteCtx {
     // `bg::UPLOAD` and `bg::DISK`; tests swap in pools that refuse.
     pub(crate) upload_pool: &'static bg::Pool,
     pub(crate) disk_pool: &'static bg::Pool,
+    // Where a graduation goes when `upload_pool` refuses it and the tail
+    // already holds `TAIL_CAP_CHUNKS` chunks: `bg::MUTATION`, which never
+    // refuses (see `dispatch_write`).
+    pub(crate) spill_pool: &'static bg::Pool,
 }
 
 impl std::ops::Deref for WriteCtx {
@@ -77,7 +81,14 @@ pub(crate) enum WriteCost {
     Seed,
     /// This write fills a chunk of a streamed upload, which is then PUT (`bg::UPLOAD`).
     Graduate,
+    /// As `Graduate`, with `TAIL_CAP_CHUNKS` chunks already waiting in the tail:
+    /// a refusal must not grow it further (see `dispatch_write`).
+    GraduateCapped,
 }
+
+/// How many unsent chunks a streamed upload's tail may hold before a refused
+/// graduation stops appending on the caller and waits for a worker instead.
+pub(crate) const TAIL_CAP_CHUNKS: u64 = 2;
 
 /// Seeds a staging file with the kept copy (or empty), via a temp file, so a
 /// copy that fails halfway never leaves a staging file a later write would
@@ -107,6 +118,12 @@ impl WriteCtx {
     /// release commits the longer tail as the last chunk. So a refusal costs a
     /// little extra staging disk, never a network wait on the dispatch thread
     /// and never an error to the writer.
+    ///
+    /// Only a little: once the tail holds `TAIL_CAP_CHUNKS` chunks, a refused
+    /// graduation goes to `spill_pool` (`bg::MUTATION`, which never refuses)
+    /// instead of the caller. The lane waits for it there like anywhere else,
+    /// so the handle's later writes stay in order behind it, and the writer is
+    /// slowed to the upload's pace rather than filling the disk.
     pub(crate) fn dispatch_write(
         &self,
         fh: u64,
@@ -123,11 +140,12 @@ impl WriteCtx {
                 None => self.disk_pool,
             },
             WriteCost::Seed => self.disk_pool,
-            WriteCost::Graduate => self.upload_pool,
+            WriteCost::Graduate | WriteCost::GraduateCapped => self.upload_pool,
         };
+        let spill = (cost == WriteCost::GraduateCapped).then_some(self.spill_pool);
         let (c, data) = (self.clone(), data.to_vec());
-        self.lanes.run(fh, pool, move |ran| {
-            let may_graduate = cost == WriteCost::Graduate && ran == fh_lane::Ran::OnPool;
+        self.lanes.run_or_spill(fh, pool, spill, move |ran| {
+            let may_graduate = matches!(cost, WriteCost::Graduate | WriteCost::GraduateCapped) && ran == fh_lane::Ran::OnPool;
             let r = c.write_answer(fh, &path, offset, &data, may_graduate);
             move || reply(r)
         });
@@ -217,6 +235,9 @@ impl WriteCtx {
         if of.stream_eligible && offset == of.total_written && !blocked_by_offline
             && of.total_written + len as u64 - confirmed >= webdav_ops::CHUNK_SIZE as u64
         {
+            if of.total_written - confirmed >= TAIL_CAP_CHUNKS * webdav_ops::CHUNK_SIZE as u64 {
+                return WriteCost::GraduateCapped;
+            }
             return WriteCost::Graduate;
         }
         WriteCost::Inline

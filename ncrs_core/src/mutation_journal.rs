@@ -1399,15 +1399,18 @@ pub(crate) fn finish_chunked(
     let tail_len = total_len.saturating_sub(bytes_confirmed);
     if tail_len > 0 {
         // Server(0, _): a local fault, never transient, so it is not retried forever.
-        let tail = std::fs::read(tail_path)
-            .map_err(|e| BackendWriteError::Server(0, format!("staging tail {}: {}", tail_path.display(), e)))?;
-        if tail.len() as u64 != tail_len {
+        let on_disk = std::fs::metadata(tail_path)
+            .map_err(|e| BackendWriteError::Server(0, format!("staging tail {}: {}", tail_path.display(), e)))?
+            .len();
+        if on_disk != tail_len {
             return Err(BackendWriteError::Server(0, format!(
                 "staging tail is {} bytes, expected {} — refusing to assemble a truncated file",
-                tail.len(), tail_len,
+                on_disk, tail_len,
             )));
         }
-        crate::retry_chunk_write("final chunk upload", || backend.put_chunk(&session, next_index, tail.clone()))?;
+        // Streamed from the file, not read into memory: the tail can hold
+        // more than one chunk.
+        crate::retry_chunk_write("final chunk upload", || backend.put_chunk_from_path(&session, next_index, tail_path, tail_len))?;
     }
     crate::retry_chunk_write("chunked-upload finish", || backend.finish_chunked_upload(&session, remote_path, if_match))
 }

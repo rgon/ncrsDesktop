@@ -742,17 +742,14 @@ fn append_to_tail_file(wp: &Path, data: &[u8]) -> std::io::Result<()> {
 /// completed chunk — this is what keeps the tail bounded to ~CHUNK_SIZE
 /// regardless of the total file size.
 fn shrink_tail_file(wp: &Path, skip: u64) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    let mut leftover = Vec::new();
-    {
-        let mut src = std::fs::File::open(wp)?;
-        src.seek(SeekFrom::Start(skip))?;
-        src.read_to_end(&mut leftover)?;
-    }
+    use std::io::{Seek, SeekFrom};
     let tmp = wp.with_extension("tmp");
     {
+        // Copied through a small buffer: the leftover can be more than a chunk.
+        let mut src = std::fs::File::open(wp)?;
+        src.seek(SeekFrom::Start(skip))?;
         let mut dst = std::fs::File::create(&tmp)?;
-        dst.write_all(&leftover)?;
+        std::io::copy(&mut src, &mut dst)?;
     }
     std::fs::rename(&tmp, wp)
 }
@@ -5515,6 +5512,7 @@ impl NextCloudFs {
             cache_dir: self.cache.safe_lock().cache_dir.clone(),
             upload_pool: &bg::UPLOAD,
             disk_pool: &bg::DISK,
+            spill_pool: &bg::MUTATION,
         })
     }
 

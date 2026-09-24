@@ -444,6 +444,24 @@ pub trait CloudBackend: Send + Sync + 'static {
         Err(BackendWriteError::Unsupported)
     }
 
+    /// `put_chunk` of the first `len` bytes of the file at `path`. A backend
+    /// that can should stream it: a streamed upload's last chunk is its
+    /// staging tail, which can be longer than a chunk. The default reads it.
+    fn put_chunk_from_path(
+        &self,
+        session: &ChunkedUploadSession,
+        index: u64,
+        path: &Path,
+        len: u64,
+    ) -> Result<(), BackendWriteError> {
+        use std::io::Read;
+        let mut body = Vec::with_capacity(len as usize);
+        std::fs::File::open(path)
+            .and_then(|f| f.take(len).read_to_end(&mut body))
+            .map_err(|e| BackendWriteError::Server(0, format!("staging tail {}: {}", path.display(), e)))?;
+        self.put_chunk(session, index, body)
+    }
+
     fn finish_chunked_upload(
         &self,
         _session: &ChunkedUploadSession,

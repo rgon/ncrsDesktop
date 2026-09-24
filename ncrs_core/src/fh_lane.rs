@@ -54,6 +54,9 @@ type Job = Box<dyn FnOnce(Ran) -> Box<dyn FnOnce()> + Send + 'static>;
 
 struct Step {
     pool: &'static Pool,
+    /// Where the step goes when `pool` refuses it, before the caller; a pool
+    /// that never refuses (`bg::MUTATION`) for a step that must not run there.
+    spill: Option<&'static Pool>,
     job: Job,
 }
 
@@ -119,7 +122,20 @@ impl FhLanes {
         pool: &'static Pool,
         job: impl FnOnce(Ran) -> D + Send + 'static,
     ) {
-        let step = Step { pool, job: Box::new(move |ran| Box::new(job(ran)) as Box<dyn FnOnce()>) };
+        self.run_or_spill(fh, pool, None, job)
+    }
+
+    /// `run`, but a step `pool` refuses goes to `spill` before it would run
+    /// on the caller. Still in the lane's order: the lane waits for it
+    /// wherever it runs.
+    pub fn run_or_spill<D: FnOnce() + 'static>(
+        self: &Arc<Self>,
+        fh: u64,
+        pool: &'static Pool,
+        spill: Option<&'static Pool>,
+        job: impl FnOnce(Ran) -> D + Send + 'static,
+    ) {
+        let step = Step { pool, spill, job: Box::new(move |ran| Box::new(job(ran)) as Box<dyn FnOnce()>) };
         {
             let mut l = self.lock();
             if let Some(q) = l.get_mut(&fh) {
@@ -140,14 +156,21 @@ impl FhLanes {
     // its pool refuses, on this thread, in order.
     fn start(self: &Arc<Self>, fh: u64, mut step: Step) {
         loop {
-            let lanes = self.clone();
-            let job = match step.pool.submit_owning(step.job, move |job| {
+            let on_pool = |lanes: Arc<Self>| move |job: Job| {
                 if let Some(next) = lanes.finish_step(fh, job, Ran::OnPool) {
                     lanes.start(fh, next);
                 }
-            }) {
+            };
+            let job = match step.pool.submit_owning(step.job, on_pool(self.clone())) {
                 Ok(()) => return,
                 Err((_, job)) => job,
+            };
+            let job = match step.spill {
+                Some(spill) => match spill.submit_owning(job, on_pool(self.clone())) {
+                    Ok(()) => return,
+                    Err((_, job)) => job,
+                },
+                None => job,
             };
             // The pool is full: run it here rather than drop or reorder it.
             match self.finish_step(fh, job, Ran::OnCaller) {
