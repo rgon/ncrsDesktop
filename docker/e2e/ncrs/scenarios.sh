@@ -961,6 +961,99 @@ for _ in $(seq 1 45); do
 done
 [ "$got" = "$(sha < /tmp/relock.new)" ] && ok "evicted kept file re-reads as the new server content" \
     || no "kept file did not re-read as the server edit (got ${got:0:12})"
+echo "→ 29. STOP SIGNALS — offline saves survive a SIGTERM and a SIGKILL of the daemon"
+# The last offline saves sit in the journal's group commit for a few ms, and
+# a superseded save's staging used to be deleted before the journal that
+# stopped naming it was written. SIGTERM must flush and unmount cleanly;
+# SIGKILL must leave either the newest save queued, or the one before it
+# queued and the newest kept in recovered/ — never neither.
+SIG_LOG=/tmp/ncrs_restart29.log
+restart_daemon29() {
+    RUST_LOG="${RUST_LOG:-info}" ncrs --config "$HOME/.config/ncrs/config.yaml" >>"$SIG_LOG" 2>&1 &
+    for _ in $(seq 1 30); do
+        mountpoint -q "$MOUNT" && return 0
+        sleep 1
+    done
+    tail -40 "$SIG_LOG" | sed 's/^/    /'
+    return 1
+}
+wait_exit29() {  # <pid> <secs>
+    for _ in $(seq 1 "$2"); do
+        kill -0 "$1" 2>/dev/null || return 0
+        sleep 1
+    done
+    return 1
+}
+# Baselines synced first (as in 13): the offline saves below overwrite them.
+mkdir -p "$MOUNT/sig29"
+for f in term kill; do
+    B29="baseline $f $(date +%s%N)"
+    printf '%s' "$B29" > "$MOUNT/sig29/$f.txt"
+    wait_dav_sha "sig29/$f.txt" "$(printf '%s' "$B29" | sha)" 60 || no "baseline sig29/$f.txt never synced (setup failed)"
+    cat "$MOUNT/sig29/$f.txt" >/dev/null 2>&1
+done
+
+server_down
+printf 'term v1 %s' "$(date +%s%N)" > "$MOUNT/sig29/term.txt"
+sleep 1
+T2="term v2 $(date +%s%N)"
+printf '%s' "$T2" > "$MOUNT/sig29/term.txt"
+WT2="$(printf '%s' "$T2" | sha)"
+sleep 1
+PID29="$(pgrep -x ncrs | head -1)"
+kill -TERM "$PID29"
+if wait_exit29 "$PID29" 20; then
+    ok "daemon exited on SIGTERM"
+else
+    no "daemon still running 20s after SIGTERM"
+    kill -9 "$PID29" 2>/dev/null; wait_exit29 "$PID29" 10
+fi
+if grep -qs "$MOUNT" /proc/mounts; then
+    no "SIGTERM left the mount attached (no clean unmount)"
+else
+    ok "SIGTERM unmounted cleanly"
+fi
+server_up
+if restart_daemon29; then
+    wait_dav_sha sig29/term.txt "$WT2" 60 \
+        && ok "the newest offline save reached the server after SIGTERM + restart" \
+        || no "offline save lost across SIGTERM (server has $(dav_sha sig29/term.txt | cut -c1-12))"
+else
+    no "daemon did not remount after SIGTERM"
+fi
+
+cat "$MOUNT/sig29/kill.txt" >/dev/null 2>&1
+server_down
+K1="kill v1 $(date +%s%N)"
+printf '%s' "$K1" > "$MOUNT/sig29/kill.txt"
+sleep 1
+K2="kill v2 $(date +%s%N)"
+printf '%s' "$K2" > "$MOUNT/sig29/kill.txt"
+PID29="$(pgrep -x ncrs | head -1)"
+kill -9 "$PID29"
+wait_exit29 "$PID29" 10
+server_up
+if restart_daemon29; then
+    WK1="$(printf '%s' "$K1" | sha)"; WK2="$(printf '%s' "$K2" | sha)"
+    got=""
+    for _ in $(seq 1 60); do
+        got="$(dav_sha sig29/kill.txt)"
+        [ "$got" = "$WK2" ] || [ "$got" = "$WK1" ] && break
+        sleep 1
+    done
+    rec="$(cat "$HOME"/.cache/ncrs/*/recovered/* 2>/dev/null | grep -c "$K2")"
+    if [ "$got" = "$WK2" ]; then
+        ok "the newest save reached the server after SIGKILL + restart"
+    elif [ "$got" = "$WK1" ] && [ "$rec" -gt 0 ]; then
+        ok "SIGKILL beat the newest save's release: the previous save was uploaded and the newest kept in recovered/"
+    else
+        no "SIGKILL lost the offline saves (server has ${got:0:12}, newest in recovered/: $rec)"
+        tail -40 "$SIG_LOG" | grep -i "journal\|staging\|kill.txt" | sed 's/^/    /'
+    fi
+else
+    no "daemon did not remount after SIGKILL"
+fi
+
 stuck=0
 for w in /sys/fs/fuse/connections/*/waiting; do
     [ -r "$w" ] && [ "$(cat "$w")" != 0 ] && stuck=$((stuck + $(cat "$w")))
