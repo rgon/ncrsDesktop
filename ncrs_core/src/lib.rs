@@ -4719,6 +4719,18 @@ fn retarget_open_files(c: &mut FsCache, open_files: &Mutex<HashMap<u64, OpenFile
     uncommitted_source
 }
 
+/// The modification time of an entry create() makes: now, but never equal to
+/// an earlier create's. A listing entry made locally has no file id or etag
+/// yet, so this is what tells `rm f; touch f` from the `f` it replaced (see
+/// `lookup_recheck`).
+fn local_create_time() -> SystemTime {
+    static LAST_NS: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let prev = LAST_NS.fetch_max(now, Ordering::Relaxed);
+    let ns = if now > prev { now } else { LAST_NS.fetch_add(1, Ordering::Relaxed) + 1 };
+    UNIX_EPOCH + Duration::from_nanos(ns)
+}
+
 /// What `lookup` hands the kernel and the IPC maps for one found entry.
 struct LookupHit {
     target: PathBuf,
@@ -4728,6 +4740,9 @@ struct LookupHit {
     fileid: Option<u64>,
     /// With `fileid`, which version of the name this is (see `lookup_recheck`).
     etag: Option<String>,
+    /// Without a file id or etag (a local create), the entry's modification
+    /// time, which tells it from an earlier create (`local_create_time`).
+    local_created: Option<SystemTime>,
     detail: ipc::FileDetail,
 }
 
@@ -4742,6 +4757,7 @@ fn lookup_pick(c: &mut FsCache, path: &Path, entry: &RemoteEntry) -> LookupHit {
         is_shared: entry.ext.flag("is_shared"),
         fileid: entry.ext.int("fileid"),
         etag: entry.change_token.clone(),
+        local_created: entry.modified,
         detail: ipc::FileDetail {
             permissions: entry.ext.str("permissions").map(str::to_string),
             owner_id: entry.ext.str("owner_id").map(str::to_string),
@@ -4773,7 +4789,8 @@ enum LookupAnswer {
 }
 
 /// How often a worker's lookup re-picks a name that keeps being replaced
-/// under it before it gives up and answers ENOENT.
+/// under it. After that it answers with the version it picked last: the name
+/// exists, and ENOENT would be wrong.
 const LOOKUP_REPICKS: usize = 2;
 
 /// The IPC-map side of a lookup (Nautilus' DETAIL queries read these), and
@@ -4817,11 +4834,11 @@ fn lookup_commit(ctx: &MetaCtx, hit: LookupHit, recheck: bool) -> LookupAnswer {
                 clear_lookup_maps(ctx, &hit.target);
                 return LookupAnswer::Gone;
             }
+            // Replaced yet again after the last re-pick: still there, just
+            // changing. Keep this pick, whose maps are written.
+            Recheck::Replaced(_) if repicks == LOOKUP_REPICKS => break,
             Recheck::Replaced(next) => {
                 clear_lookup_maps(ctx, &hit.target);
-                if repicks == LOOKUP_REPICKS {
-                    return LookupAnswer::Gone;
-                }
                 repicks += 1;
                 hit = *next;
             }
@@ -4877,7 +4894,8 @@ enum Recheck {
 /// Is `hit` still what its name refers to? A resident parent listing is the
 /// authority: unlink and rename edit it, and create adds to it, so a name
 /// re-created after an unlink is there — as a different entry, which the
-/// file id and etag tell apart (a local create has neither yet). Without a
+/// file id and etag tell apart, or for a local create (which has neither
+/// yet) its creation time (`local_create_time`). Without a
 /// listing, a DELETE still in flight says the name is gone.
 fn lookup_recheck(cache: &Arc<Mutex<FsCache>>, hit: &LookupHit) -> Recheck {
     let path = hit.target.as_path();
@@ -4886,7 +4904,8 @@ fn lookup_recheck(cache: &Arc<Mutex<FsCache>>, hit: &LookupHit) -> Recheck {
     match c.find_child(dir, name) {
         Some((files, Some(i))) => {
             let now = &files[i];
-            if now.ext.int("fileid") == hit.fileid && now.change_token == hit.etag {
+            let same_local = hit.fileid.is_some() || hit.etag.is_some() || now.modified == hit.local_created;
+            if now.ext.int("fileid") == hit.fileid && now.change_token == hit.etag && same_local {
                 Recheck::Same
             } else {
                 Recheck::Replaced(Box::new(lookup_pick(&mut c, path, now)))
@@ -7185,7 +7204,7 @@ impl Filesystem for NextCloudFs {
 
         let ino = self.cache.safe_lock().allocate_inode(remote_path.clone());
 
-        let now = SystemTime::now();
+        let now = local_create_time();
         let mut ext = backend::EntryExtensions::default();
         ext.set_str("permissions", "RGDNVW");
         let new_entry = RemoteEntry {
