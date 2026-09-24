@@ -2911,3 +2911,258 @@ mod upload_order_tests {
         assert_eq!(backend::server_error_code("PROPFIND /server error 500"), None);
         assert_eq!(backend::server_error_code("server error x"), None);
     }
+
+    // ── Child resolution off a missing parent listing (2026-09-24 review) ────
+
+    mod child_resolution {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+
+        fn entry_in(dir: &str, name: &str) -> RemoteEntry {
+            let mut e = make_dav_entry(name, None);
+            e.path = Path::new(dir).join(name);
+            e
+        }
+
+        fn names(dir: &str, n: usize) -> Vec<RemoteEntry> {
+            (0..n).map(|i| entry_in(dir, &format!("f{i}.txt"))).collect()
+        }
+
+        #[test]
+        fn find_child_answers_wide_listings_from_the_index() {
+            let mut c = make_test_cache();
+            c.put_dir_cache(PathBuf::from("/w"), None, None, names("/w", 5000));
+            for i in [0usize, 1, 2500, 4999] {
+                let (files, pos) = c.find_child(Path::new("/w"), &format!("f{i}.txt")).expect("resident");
+                assert_eq!(files[pos.expect("present")].path, PathBuf::from(format!("/w/f{i}.txt")));
+            }
+            assert_eq!(c.find_child(Path::new("/w"), "nope").map(|(_, p)| p), Some(None));
+            assert!(c.find_child(Path::new("/elsewhere"), "f1.txt").is_none(), "not resident is not absent");
+            assert!(c.dir_cache[Path::new("/w")].name_index.is_some(), "a wide listing gets an index");
+
+            // Any mutation swaps the Arc, and the index must follow it.
+            let mut files = (*c.dir_cache[Path::new("/w")].files).clone();
+            files.retain(|e| e.path != Path::new("/w/f10.txt"));
+            files.push(entry_in("/w", "added.txt"));
+            c.dir_cache.get_mut(Path::new("/w")).unwrap().files = Arc::new(files);
+            assert_eq!(c.find_child(Path::new("/w"), "f10.txt").map(|(_, p)| p), Some(None));
+            assert!(c.find_child(Path::new("/w"), "added.txt").and_then(|(_, p)| p).is_some());
+            assert!(c.find_child(Path::new("/w"), "f11.txt").and_then(|(_, p)| p).is_some(), "positions shifted");
+        }
+
+        #[test]
+        fn an_ambiguous_hash_falls_back_to_a_scan() {
+            let files = names("/a", 3);
+            let mut ix = NameIndex::default();
+            ix.extend(&files);
+            // Force the shared-hash case two real names would produce.
+            ix.map.insert(name_hash("f1.txt"), NAME_AMBIGUOUS);
+            assert_eq!(ix.find(&files, "f1.txt"), Some(1));
+            assert_eq!(ix.find(&files, "f0.txt"), Some(0));
+            assert_eq!(ix.find(&files, "f9.txt"), None);
+        }
+
+        fn start(c: &mut FsCache, dir: &str) -> (mpsc::Sender<RemoteEntry>, mpsc::Sender<Result<Option<String>, String>>) {
+            let (tx, rx) = mpsc::channel();
+            let (etx, erx) = mpsc::channel();
+            let (_stx, srx) = mpsc::channel();
+            c.start_pending(PathBuf::from(dir), rx, erx, srx);
+            (tx, etx)
+        }
+
+        #[test]
+        fn pending_find_sees_streamed_names_and_never_calls_a_partial_listing_complete() {
+            let mut c = make_test_cache();
+            let (tx, etx) = start(&mut c, "/s");
+            for e in names("/s", 400) {
+                tx.send(e).unwrap();
+            }
+            assert!(matches!(c.pending_find(Path::new("/s"), "f399.txt"), PendingLookup::Found(e) if e.path == Path::new("/s/f399.txt")));
+            assert!(matches!(c.pending_find(Path::new("/s"), "late.txt"), PendingLookup::Streaming));
+            tx.send(entry_in("/s", "late.txt")).unwrap();
+            assert!(matches!(c.pending_find(Path::new("/s"), "late.txt"), PendingLookup::Found(_)));
+            // The entry stream ends a moment before the result is sent: until it
+            // is, the listing may have broken off, so nothing is absent yet.
+            drop(tx);
+            assert!(matches!(c.pending_find(Path::new("/s"), "never.txt"), PendingLookup::Streaming));
+            assert!(c.dir_cache.get(Path::new("/s")).is_none());
+            etx.send(Ok(Some("etag".into()))).unwrap();
+            assert!(matches!(c.pending_find(Path::new("/s"), "never.txt"), PendingLookup::Finished));
+            assert!(matches!(c.resolve_child_cached(Path::new("/s"), "never.txt"), Some(Child::Absent)));
+            assert!(matches!(c.resolve_child_cached(Path::new("/s"), "late.txt"), Some(Child::Found(_))));
+            assert!(matches!(c.pending_find(Path::new("/s"), "x"), PendingLookup::NoFetch));
+        }
+
+        #[test]
+        fn a_listing_that_broke_off_is_a_failure_not_an_answer() {
+            let mut c = make_test_cache();
+            let (tx, etx) = start(&mut c, "/b");
+            tx.send(entry_in("/b", "a.txt")).unwrap();
+            drop(tx);
+            etx.send(Err("truncated: body error".into())).unwrap();
+            assert!(matches!(c.pending_find(Path::new("/b"), "z.txt"), PendingLookup::Failed(e) if e.starts_with("truncated")));
+            assert!(c.dir_cache.get(Path::new("/b")).is_none(), "a broken listing must not be cached as complete");
+        }
+
+        #[test]
+        fn an_unresolved_child_is_never_enoent_unless_the_server_said_so() {
+            let e = |s: Option<&str>| unknown_child_errno(s).code();
+            assert_eq!(e(None), libc::ETIMEDOUT);
+            assert_eq!(e(Some("PROPFIND timeout for /Music/2404")), libc::ETIMEDOUT);
+            assert_eq!(e(Some("listing ended before the name was seen")), libc::EAGAIN);
+            assert_eq!(e(Some("network: listing /x404 deferred — too many listings in flight")), libc::EAGAIN);
+            assert_eq!(e(Some("/Not Found not available offline")), libc::EAGAIN);
+            assert_eq!(e(Some("server error 503: busy")), libc::EAGAIN);
+            assert_eq!(e(Some("server error 404: gone")), libc::ENOENT);
+            assert_eq!(e(Some("not found")), libc::ENOENT);
+        }
+
+        // ── A backend with per-directory latency ────────────────────────────
+
+        #[derive(Clone, Default)]
+        struct FakeDir {
+            entries: Vec<RemoteEntry>,
+            before_first: Duration,
+            between: Duration,
+            fail: Option<u16>,
+        }
+
+        #[derive(Default)]
+        struct FakeBackend {
+            dirs: Mutex<HashMap<PathBuf, FakeDir>>,
+            lists: AtomicUsize,
+        }
+
+        impl FakeBackend {
+            fn with(dirs: Vec<(&str, FakeDir)>) -> Arc<Self> {
+                let b = FakeBackend::default();
+                for (p, d) in dirs {
+                    b.dirs.lock().unwrap().insert(PathBuf::from(p), d);
+                }
+                Arc::new(b)
+            }
+        }
+
+        fn unsupported() -> backend::BackendReadError {
+            backend::BackendReadError::Network("not in the fake".into())
+        }
+
+        impl crate::backend::CloudBackend for FakeBackend {
+            fn list_dir(&self, _: &Path, _: Duration) -> Result<(Option<String>, Option<RemoteEntry>, Vec<RemoteEntry>), backend::BackendReadError> {
+                Err(unsupported())
+            }
+            fn list_dir_streaming(&self, path: &Path, _: Duration, tx: mpsc::Sender<RemoteEntry>, _: mpsc::Sender<RemoteEntry>) -> Result<Option<String>, backend::BackendReadError> {
+                self.lists.fetch_add(1, Ordering::SeqCst);
+                let d = self.dirs.lock().unwrap().get(path).cloned().ok_or(backend::BackendReadError::NotFound)?;
+                std::thread::sleep(d.before_first);
+                for e in d.entries {
+                    let _ = tx.send(e);
+                    std::thread::sleep(d.between);
+                }
+                match d.fail {
+                    Some(code) => Err(backend::BackendReadError::Server(code, "fake".into())),
+                    None => Ok(Some("etag".into())),
+                }
+            }
+            fn dir_change_token(&self, _: &Path, _: Duration) -> Result<Option<String>, backend::BackendReadError> {
+                Err(unsupported())
+            }
+            fn download_file(&self, _: &Path, _: &mut dyn std::io::Write, _: Duration) -> Result<u64, backend::BackendReadError> {
+                Err(unsupported())
+            }
+            fn read_file_range(&self, _: &Path, _: u64, _: &mut [u8], _: Duration) -> Result<usize, backend::BackendReadError> {
+                Err(unsupported())
+            }
+            fn put_file(&self, _: &Path, _: Vec<u8>, _: Option<&str>) -> Result<backend::PutResult, backend::BackendWriteError> {
+                Err(backend::BackendWriteError::Unsupported)
+            }
+            fn mkdir(&self, _: &Path) -> Result<(), backend::BackendWriteError> {
+                Err(backend::BackendWriteError::Unsupported)
+            }
+            fn delete(&self, _: &Path) -> Result<(), backend::BackendWriteError> {
+                Err(backend::BackendWriteError::Unsupported)
+            }
+            fn rename(&self, _: &Path, _: &Path) -> Result<(), backend::BackendWriteError> {
+                Err(backend::BackendWriteError::Unsupported)
+            }
+            fn is_reachable(&self, _: Duration) -> bool {
+                true
+            }
+        }
+
+        fn setup(dirs: Vec<(&str, FakeDir)>) -> (Arc<FakeBackend>, Arc<ConnInfo>, Arc<Mutex<FsCache>>) {
+            let fake = FakeBackend::with(dirs);
+            let conn = ConnInfo::for_tests(fake.clone());
+            (fake, conn, Arc::new(Mutex::new(make_test_cache())))
+        }
+
+        fn resolve(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, dir: &str, name: &str, within: Duration) -> (Child, Duration) {
+            let t = Instant::now();
+            let child = resolve_child_slow(conn, cache, Path::new(dir), name, 0, t + within);
+            (child, t.elapsed())
+        }
+
+        #[test]
+        fn a_listing_still_streaming_at_the_deadline_is_unknown_never_absent() {
+            let slow = FakeDir { entries: names("/slow", 3), before_first: Duration::from_secs(3), ..Default::default() };
+            let mut trickle = FakeDir { entries: names("/trickle", 2), between: Duration::from_secs(3), ..Default::default() };
+            trickle.entries.push(entry_in("/trickle", "last.txt"));
+            let (_, conn, cache) = setup(vec![("/slow", slow), ("/trickle", trickle)]);
+
+            let (child, took) = resolve(&conn, &cache, "/slow", "f1.txt", Duration::from_millis(300));
+            assert!(matches!(child, Child::Unknown(None)), "{child:?}");
+            assert!(took < Duration::from_secs(1), "the deadline bounds the wait: {took:?}");
+
+            let (child, _) = resolve(&conn, &cache, "/trickle", "last.txt", Duration::from_millis(500));
+            assert!(matches!(child, Child::Unknown(None)), "a partial listing lacking the name is not an answer: {child:?}");
+        }
+
+        #[test]
+        fn a_name_that_streams_in_late_is_found_as_soon_as_it_arrives() {
+            let dir = FakeDir { entries: names("/late", 60), between: Duration::from_millis(5), ..Default::default() };
+            let (_, conn, cache) = setup(vec![("/late", dir)]);
+            let (child, took) = resolve(&conn, &cache, "/late", "f59.txt", Duration::from_secs(10));
+            assert!(matches!(&child, Child::Found(e) if e.path == Path::new("/late/f59.txt")), "{child:?}");
+            assert!(took < Duration::from_secs(5), "{took:?}");
+            // Once the listing is complete, a name it lacks is a real absence.
+            let t = Instant::now();
+            while cache.safe_lock().dir_cache.get(Path::new("/late")).is_none() {
+                assert!(t.elapsed() < Duration::from_secs(5), "listing never landed");
+                let _ = cache.safe_lock().pending_find(Path::new("/late"), "");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let (child, _) = resolve(&conn, &cache, "/late", "missing.txt", Duration::from_secs(5));
+            assert!(matches!(child, Child::Absent), "{child:?}");
+        }
+
+        #[test]
+        fn resolvers_waiting_on_one_directory_share_one_propfind() {
+            let dir = FakeDir { entries: names("/j", 16), before_first: Duration::from_millis(300), ..Default::default() };
+            let (fake, conn, cache) = setup(vec![("/j", dir)]);
+            let found = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for i in 0..8 {
+                    let (conn, cache, found) = (&conn, &cache, &found);
+                    s.spawn(move || {
+                        let (child, _) = resolve(conn, cache, "/j", &format!("f{i}.txt"), Duration::from_secs(10));
+                        if matches!(child, Child::Found(_)) {
+                            found.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                }
+            });
+            assert_eq!(found.load(Ordering::SeqCst), 8);
+            assert_eq!(fake.lists.load(Ordering::SeqCst), 1, "joined resolvers must not each list the directory");
+        }
+
+        #[test]
+        fn a_failed_listing_is_unknown_and_carries_the_servers_answer() {
+            let dir = FakeDir { entries: names("/f", 1), fail: Some(503), ..Default::default() };
+            let (_, conn, cache) = setup(vec![("/f", dir)]);
+            let (child, _) = resolve(&conn, &cache, "/f", "other.txt", Duration::from_secs(5));
+            match child {
+                Child::Unknown(Some(e)) => assert_eq!(unknown_child_errno(Some(&e)).code(), libc::EAGAIN, "{e}"),
+                other => panic!("expected Unknown with the error, got {other:?}"),
+            }
+        }
+    }
