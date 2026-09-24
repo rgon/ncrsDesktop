@@ -29,7 +29,7 @@ pub mod signals;
 pub mod webdav_ops;
 mod write_path;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1508,7 +1508,9 @@ fn open_file_timeout(
 
 pub(crate) struct FsCache {
     inodes: HashMap<u64, PathBuf>,
-    paths: HashMap<PathBuf, u64>,
+    // Ordered by path component, so a directory and everything under it are
+    // one contiguous range (see `move_inode`).
+    paths: BTreeMap<PathBuf, u64>,
     next_inode: u64,
     dir_cache: HashMap<PathBuf, DirCacheEntry>,
     /// LRU ceiling on `dir_cache`; 0 means unbounded.
@@ -1612,17 +1614,41 @@ impl FsCache {
         })
     }
 
-    /// Keeps the inode-to-path map consistent with a rename. Without this,
-    /// getattr(ino) resolves the inode to the old source path, finds nothing in
-    /// dir_cache, and returns ENOENT — causing the renamed file to disappear.
+    /// Keeps the inode-to-path map consistent with a rename of `from` to
+    /// `to`: the inode of `from` and, when it is a directory, of everything
+    /// known under it, keep their numbers and move to the new paths. Without
+    /// this, getattr(ino) resolves the inode to the old source path, finds
+    /// nothing in dir_cache, and returns ENOENT — causing the renamed file to
+    /// disappear; and a write or open under a renamed directory resolved its
+    /// inode to the old path, so the upload went to a path that no longer
+    /// exists. An inode the rename overwrites at the destination is dropped.
+    ///
+    /// Costs O(k log n) for the k inodes moved: `paths` is ordered, so the
+    /// subtree is one range starting at `from`, never a scan of every inode.
     fn move_inode(&mut self, from: &Path, to: &Path) {
-        if let Some(ino) = self.paths.remove(from) {
-            self.inodes.insert(ino, to.to_path_buf());
-            if let Some(displaced) = self.paths.insert(to.to_path_buf(), ino) {
+        if from == to || to.starts_with(from) {
+            // rename(2) refuses to move a directory into itself.
+            return;
+        }
+        let moved: Vec<(PathBuf, u64)> = self.paths
+            .range::<Path, _>((std::ops::Bound::Included(from), std::ops::Bound::Unbounded))
+            .take_while(|(p, _)| p.starts_with(from))
+            .map(|(p, &ino)| (p.clone(), ino))
+            .collect();
+        for (old, _) in &moved {
+            self.paths.remove(old);
+        }
+        for (old, ino) in moved {
+            let new = match old.strip_prefix(from) {
+                Ok(rest) if !rest.as_os_str().is_empty() => to.join(rest),
+                _ => to.to_path_buf(),
+            };
+            if let Some(displaced) = self.paths.insert(new.clone(), ino) {
                 if displaced != ino {
                     self.inodes.remove(&displaced);
                 }
             }
+            self.inodes.insert(ino, new);
         }
     }
 
@@ -4399,18 +4425,51 @@ fn mark_unlinked(open_files: &Mutex<HashMap<u64, OpenFile>>, path: &Path) {
     }
 }
 
-/// rename() of `from` to `to`: handles open under the source now commit to the
-/// destination. True if one of them was made by create() and not uploaded
-/// yet, i.e. the server has no copy of the source to MOVE.
-fn retarget_open_files(open_files: &Mutex<HashMap<u64, OpenFile>>, from: &Path, to: &Path) -> bool {
+/// The size of what a handle that changed `path` has written, for rename's
+/// optimistic listing entry. Only such a handle: a clean one's staging file
+/// holds the server's content, possibly still being downloaded. A streamed
+/// handle's staging file is only the unsent tail (and may be mid-shrink), so
+/// its size is what it has written, as in `overlay_local_size`.
+fn staged_size(open_files: &Mutex<HashMap<u64, OpenFile>>, path: &Path) -> Option<u64> {
+    let staged = open_files.safe_lock()
+        .values()
+        .find(|of| of.remote_path == path && (of.dirty || of.created))
+        .and_then(|of| match (&of.chunk_upload, &of.write_path) {
+            (Some(_), _) => Some(Ok(of.total_written)),
+            (None, Some(wp)) => Some(Err(wp.clone())),
+            (None, None) => None,
+        });
+    match staged? {
+        Ok(n) => Some(n),
+        // Stat outside the lock.
+        Err(wp) => std::fs::metadata(&wp).ok().map(|m| m.len()),
+    }
+}
+
+/// rename() of `from` to `to` (a file, or a directory and everything under
+/// it): handles open under the source now commit to the destination, and the
+/// listing each one keeps resident moves with it. True if the source itself
+/// was made by create() and not uploaded yet, i.e. the server has no copy of
+/// it to MOVE. Called with the cache locked (rename nests `cache` then
+/// `open_files`), so a release can't unpin between the handle and the pin.
+fn retarget_open_files(c: &mut FsCache, open_files: &Mutex<HashMap<u64, OpenFile>>, from: &Path, to: &Path) -> bool {
     let mut uncommitted_source = false;
     for of in open_files.safe_lock().values_mut() {
-        if let Ok(suffix) = of.remote_path.strip_prefix(from) {
-            if suffix.as_os_str().is_empty() {
-                uncommitted_source |= of.created && !of.unlinked;
-                of.remote_path = to.to_path_buf();
-            } else {
-                of.remote_path = to.join(suffix);
+        let Ok(suffix) = of.remote_path.strip_prefix(from) else { continue };
+        if suffix.as_os_str().is_empty() {
+            uncommitted_source |= of.created && !of.unlinked;
+            of.remote_path = to.to_path_buf();
+        } else {
+            of.remote_path = to.join(suffix);
+        }
+        // A handle still being registered has no pin yet; `insert_open_file`
+        // pins where the inode map says the file is by then.
+        let new_parent = of.remote_path.parent().map(Path::to_path_buf);
+        if let (Some(old), Some(new)) = (of.pinned_parent.as_ref(), new_parent) {
+            if *old != new {
+                c.unpin_dir(old);
+                c.pin_dir(&new);
+                of.pinned_parent = Some(new);
             }
         }
     }
@@ -4609,7 +4668,7 @@ impl NextCloudFs {
         mutation_journal::quarantine_unreferenced_staging(&mut journal_arc.safe_lock(), &cache_dir);
 
         let mut inodes = HashMap::new();
-        let mut paths = HashMap::new();
+        let mut paths = BTreeMap::new();
         inodes.insert(1, PathBuf::from("/"));
         paths.insert(PathBuf::from("/"), 1);
 
@@ -7327,6 +7386,7 @@ impl Filesystem for NextCloudFs {
             }
         }
 
+        let uncommitted_source;
         {
             let mut c = self.cache.safe_lock();
             let mut moved_entry = None;
@@ -7342,15 +7402,7 @@ impl Filesystem for NextCloudFs {
                 // flush() does its synchronous update — which may not have run yet.  Read
                 // the staging file's actual size so the optimistic update shows the right
                 // byte count immediately.
-                // Only a handle that changed the file: a clean one's staging file
-                // holds the server's content, possibly still being downloaded.
-                let staged_size = self.open_files.safe_lock()
-                    .values()
-                    .find(|of| of.remote_path == from && (of.dirty || of.created))
-                    .and_then(|of| of.write_path.as_ref())
-                    .and_then(|wp| std::fs::metadata(wp).ok())
-                    .map(|m| m.len());
-                if let Some(sz) = staged_size {
+                if let Some(sz) = staged_size(&self.open_files, &from) {
                     entry.size = sz;
                 }
                 entry.path = to.clone();
@@ -7363,6 +7415,9 @@ impl Filesystem for NextCloudFs {
                 }
             }
             c.move_inode(&from, &to);
+            // Before the reply: once it is out, a write under the new path
+            // resolves its inode there, and its handle must commit there too.
+            uncommitted_source = retarget_open_files(&mut c, &self.open_files, &from, &to);
         }
         // Keep in-memory maps consistent with the rename so DETAILDIR/STATUS reflect the new
         // path immediately, without waiting for the next readdir of either directory.
@@ -7397,9 +7452,8 @@ impl Filesystem for NextCloudFs {
         }
         reply.ok();
 
-        // Handles still open under the source now commit to the destination. One made by
-        // create() means the server has no copy of the source yet, so there is nothing to MOVE.
-        let uncommitted_source = retarget_open_files(&self.open_files, &from, &to);
+        // Handles open under the source were retargeted above. One made by create() means
+        // the server has no copy of the source yet, so there is nothing to MOVE.
         if uncommitted_source && !self.journal.safe_lock().has_pending_put(&from) {
             log::info!("rename {} → {}: source not uploaded yet — retargeted, no MOVE needed", from.display(), to.display());
             let mut c = self.cache.safe_lock();

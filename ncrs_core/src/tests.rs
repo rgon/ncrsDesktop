@@ -2,7 +2,7 @@
 
     fn make_test_cache() -> FsCache {
         let mut inodes = HashMap::new();
-        let mut paths = HashMap::new();
+        let mut paths = BTreeMap::new();
         inodes.insert(1, PathBuf::from("/"));
         paths.insert(PathBuf::from("/"), 1);
         FsCache {
@@ -47,8 +47,9 @@
             putting: AtomicUsize,
             max_putting: AtomicUsize,
             aborts: AtomicUsize,
-            // Threads that talked to the server.
+            // Threads that talked to the server, and the paths sessions were opened for.
             net_threads: Mutex<Vec<std::thread::ThreadId>>,
+            opened_for: Mutex<Vec<PathBuf>>,
             finished: Mutex<Vec<(PathBuf, Vec<u8>)>>,
             puts: Mutex<Vec<(PathBuf, Vec<u8>)>>,
         }
@@ -86,8 +87,9 @@
             fn rename(&self, _: &Path, _: &Path) -> Result<(), backend::BackendWriteError> {
                 Err(backend::BackendWriteError::Unsupported)
             }
-            fn open_chunked_upload(&self, _: &Path) -> Result<backend::ChunkedUploadSession, backend::BackendWriteError> {
+            fn open_chunked_upload(&self, path: &Path) -> Result<backend::ChunkedUploadSession, backend::BackendWriteError> {
                 self.net_threads.lock().unwrap().push(std::thread::current().id());
+                self.opened_for.lock().unwrap().push(path.to_path_buf());
                 if self.open_unsupported {
                     return Err(backend::BackendWriteError::Unsupported);
                 }
@@ -473,6 +475,65 @@
         }
 
         #[test]
+        fn a_rename_of_a_streamed_handle_lists_what_it_wrote_not_its_tail() {
+            let r = rig("rename_size", ChunkServer::default());
+            r.open(14, "/m.bin", None);
+            let data = pattern(12 * MIB, 14);
+            for (i, piece) in data.chunks(MIB).enumerate() {
+                assert!(recv(&r.write(14, "/m.bin", (i * MIB) as u64, piece), "write").is_ok());
+            }
+            let wp = r.of(14, |of| of.write_path.clone().unwrap());
+            assert_eq!(std::fs::metadata(&wp).unwrap().len(), 2 * MIB as u64, "only the tail is on disk");
+            assert_eq!(staged_size(&r.ctx.open_files, Path::new("/m.bin")), Some(12 * MIB as u64));
+            // Unstreamed: the staging file is the whole file.
+            r.open(15, "/n.bin", None);
+            assert!(recv(&r.write(15, "/n.bin", 3, b"abc"), "write").is_ok());
+            assert_eq!(staged_size(&r.ctx.open_files, Path::new("/n.bin")), Some(6));
+        }
+
+        #[test]
+        fn a_directory_rename_moves_open_handles_their_pins_and_their_uploads() {
+            let r = rig("dir_rename", ChunkServer::default());
+            let ino = {
+                let mut c = r.ctx.cache.safe_lock();
+                c.allocate_inode(PathBuf::from("/a"));
+                c.allocate_inode(PathBuf::from("/a/b"));
+                c.pin_dir(Path::new("/a/b"));
+                c.allocate_inode(PathBuf::from("/a/b/c.bin"))
+            };
+            r.open(16, "/a/b/c.bin", None);
+            r.ctx.open_files.safe_lock().get_mut(&16).unwrap().pinned_parent = Some(PathBuf::from("/a/b"));
+            let data = pattern(12 * MIB, 16);
+            for (i, piece) in data[..5 * MIB].chunks(MIB).enumerate() {
+                assert!(recv(&r.write(16, "/a/b/c.bin", (i * MIB) as u64, piece), "write").is_ok());
+            }
+            // mv /a/b /z/b while the file is being written, as rename() does it.
+            {
+                let mut c = r.ctx.cache.safe_lock();
+                c.move_inode(Path::new("/a/b"), Path::new("/z/b"));
+                assert!(!retarget_open_files(&mut c, &r.ctx.open_files, Path::new("/a/b"), Path::new("/z/b")));
+                assert_eq!(c.get_path(ino).as_deref(), Some(Path::new("/z/b/c.bin")), "the child's inode kept the old path");
+                assert_eq!(c.get_inode(Path::new("/z/b/c.bin")), Some(ino), "same inode number");
+                assert_eq!(c.get_inode(Path::new("/a/b/c.bin")), None);
+                assert_eq!(c.pins.get(Path::new("/z/b")), Some(&1), "the pin follows the handle");
+                assert!(!c.pins.contains_key(Path::new("/a/b")));
+            }
+            assert_eq!(r.of(16, |of| (of.remote_path.clone(), of.pinned_parent.clone())),
+                (PathBuf::from("/z/b/c.bin"), Some(PathBuf::from("/z/b"))));
+            // write() resolves its path from the inode, now the new one.
+            let now_at = r.ctx.cache.safe_lock().get_path(ino).unwrap();
+            for (i, piece) in data[5 * MIB..].chunks(MIB).enumerate() {
+                assert!(recv(&r.write(16, now_at.to_str().unwrap(), ((5 + i) * MIB) as u64, piece), "write").is_ok());
+            }
+            assert_eq!(*r.server.opened_for.lock().unwrap(), vec![PathBuf::from("/z/b/c.bin")], "the session was opened for the old path");
+            recv(&r.release(16), "release");
+            wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
+            let finished = r.server.finished.lock().unwrap();
+            assert_eq!(finished[0].0, Path::new("/z/b/c.bin"), "release committed to the vanished path");
+            assert!(finished[0].1 == data);
+        }
+
+        #[test]
         fn a_clean_handle_is_flushed_and_released_on_the_spot() {
             let r = rig("clean", ChunkServer::default());
             r.open(8, "/c.bin", None);
@@ -502,6 +563,38 @@
 
     fn empty_notifier_slot() -> fuse_notify::NotifierSlot {
         Arc::new(Mutex::new(None))
+    }
+
+    // ── move_inode ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn move_inode_moves_a_directory_subtree_and_keeps_inode_numbers() {
+        let mut c = make_test_cache();
+        // Plenty of unrelated inodes, so a scan of all of them would show.
+        for i in 0..200_000 {
+            c.allocate_inode(PathBuf::from(format!("/other/{}/f{}", i % 97, i)));
+        }
+        let names = ["/a", "/a/b", "/a/b/c", "/a/b/c/d.txt", "/a/b/e.txt", "/a/b.txt", "/a/bx", "/a/b-c", "/z", "/z/b"];
+        let ino: HashMap<&str, u64> = names.iter().map(|n| (*n, c.allocate_inode(PathBuf::from(n)))).collect();
+        let t = Instant::now();
+        c.move_inode(Path::new("/a/b"), Path::new("/z/b"));
+        eprintln!("move_inode of a 4-entry subtree among {} inodes: {:?}", c.inodes.len(), t.elapsed());
+        for (old, new) in [("/a/b", "/z/b"), ("/a/b/c", "/z/b/c"), ("/a/b/c/d.txt", "/z/b/c/d.txt"), ("/a/b/e.txt", "/z/b/e.txt")] {
+            assert_eq!(c.get_path(ino[old]).as_deref(), Some(Path::new(new)), "{old}");
+            assert_eq!(c.get_inode(Path::new(new)), Some(ino[old]), "{new}");
+            assert_eq!(c.get_inode(Path::new(old)), None, "{old} still resolves");
+        }
+        // Siblings that merely share a name prefix stay put.
+        for keep in ["/a", "/a/b.txt", "/a/bx", "/a/b-c", "/z"] {
+            assert_eq!(c.get_path(ino[keep]).as_deref(), Some(Path::new(keep)));
+        }
+        assert_eq!(c.get_path(ino["/z/b"]), None, "the overwritten destination's inode is dropped");
+        assert_eq!(c.inodes.len(), c.paths.len());
+        // A file rename, and moving a directory into itself (refused by rename(2)).
+        c.move_inode(Path::new("/a/bx"), Path::new("/a/by"));
+        assert_eq!(c.get_path(ino["/a/bx"]).as_deref(), Some(Path::new("/a/by")));
+        c.move_inode(Path::new("/z/b"), Path::new("/z/b/inner"));
+        assert_eq!(c.get_path(ino["/a/b"]).as_deref(), Some(Path::new("/z/b")));
     }
 
     // ── perms_to_mode ──────────────────────────────────────────────────────────
@@ -3958,7 +4051,7 @@ mod upload_order_tests {
             assert_eq!(meta.open_writers.load(Ordering::SeqCst), 1);
             assert_eq!(meta.cache.safe_lock().pins.get(Path::new("/d")), Some(&1));
             meta.cache.safe_lock().move_inode(Path::new("/d/a.txt"), Path::new("/d/b.txt"));
-            retarget_open_files(&meta.open_files, Path::new("/d/a.txt"), Path::new("/d/b.txt"));
+            retarget_open_files(&mut meta.cache.safe_lock(), &meta.open_files, Path::new("/d/a.txt"), Path::new("/d/b.txt"));
             let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
             {
                 let files = meta.open_files.safe_lock();
