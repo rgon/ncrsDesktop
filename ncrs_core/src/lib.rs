@@ -8122,6 +8122,8 @@ fn build_fuse_options() -> Vec<MountOption> {
 pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>, paused: Option<Arc<AtomicBool>>, hpb_connected: Option<Arc<AtomicBool>>, offline: Option<OfflineStatus>) -> Result<(), String> {
     // Must run before any other thread is spawned (see seccomp_harden::install).
     seccomp_harden::install();
+    // Next, so a stop signal is never left pending through a slow startup.
+    signals::start_watcher();
 
     // Must run before anything that touches shared resources (the IPC socket,
     // cache dirs, journal): a refused second instance must leave the running
@@ -8139,6 +8141,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     if let Some(j) = journal {
         filesystem.journal = j;
     }
+    signals::set_journal(filesystem.journal());
     // One shared pause flag for the FUSE connection, background workers, and
     // the IPC PAUSE/RESUME verbs — callers without their own flag get one.
     let paused_flag = paused.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
@@ -8596,8 +8599,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         c.mount_options = fuse_options;
         c
     };
+    signals::mounting();
     let session = fuser::Session::new(filesystem, &options.mount_point, &fuse_config)
-        .map_err(|e| format!("FUSE session init failed: {}", e))?;
+        .map_err(|e| {
+            signals::mount_failed();
+            format!("FUSE session init failed: {}", e)
+        })?;
 
     // The kernel accepted the mount — record that ncrs now owns this exact
     // path so a later restart on it (rather than a fresh setup elsewhere) is
@@ -8607,11 +8614,11 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     *notifier_slot.safe_lock() = Some(session.notifier());
     log::info!("FUSE notifier ready");
 
-    // The `ncrs` binary's stop signals: flush the journal, then a clean
-    // unmount that ends the session below (no-op for library callers).
+    // The `ncrs` binary's stop signals: from here on, flush the journal, then
+    // a clean unmount that ends the session below (no-op for library callers).
     {
         let lanes = shutdown_lanes.clone();
-        signals::start_watcher(options.mount_point.clone(), shutdown_journal.clone(), move || lanes.busy_count());
+        signals::mounted(options.mount_point.clone(), move || lanes.busy_count());
     }
 
     let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;

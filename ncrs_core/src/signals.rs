@@ -8,8 +8,9 @@
 //!
 //! The binary blocks those signals before any thread exists
 //! ([`block_shutdown_signals`]), so every thread inherits the mask and none is
-//! interrupted; `mount_ncfs` then starts the `signals` service, which waits
-//! for them. On the first one it:
+//! interrupted; `mount_ncfs` then starts the `signals` service first thing,
+//! which waits for them. Before the mount exists, the first one writes the
+//! journal (once loaded) and exits. Once mounted, it:
 //! 1. writes the journal now and switches it to synchronous saves, so what
 //!    the process does from here on — including being `SIGKILL`ed when the
 //!    stop timeout runs out — can no longer lose a change;
@@ -29,6 +30,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::mutation_journal::{self, SharedJournal};
@@ -145,10 +147,67 @@ fn flush_and_exit(journal: &SharedJournal, busy: &dyn Fn() -> usize, why: &str) 
     unsafe { libc::_exit(0) }
 }
 
+/// Where `mount_ncfs` is, as the `signals` service sees it.
+enum Phase {
+    /// No mount yet: a stop signal writes the journal (once there is one)
+    /// and exits, there is nothing to unmount.
+    Starting,
+    /// `fuser::Session::new` is running: a signal waits for its outcome.
+    Mounting,
+    /// Mounted at this path; the closure counts handles whose release may
+    /// still have to reach the journal.
+    Mounted(PathBuf, Box<dyn Fn() -> usize + Send>),
+}
+
+struct Watch {
+    phase: Mutex<Phase>,
+    changed: Condvar,
+    journal: Mutex<Option<SharedJournal>>,
+}
+
+fn watch() -> &'static Watch {
+    static WATCH: OnceLock<Watch> = OnceLock::new();
+    WATCH.get_or_init(|| Watch { phase: Mutex::new(Phase::Starting), changed: Condvar::new(), journal: Mutex::new(None) })
+}
+
+fn set_phase(p: Phase) {
+    let w = watch();
+    *w.phase.lock().unwrap_or_else(|e| e.into_inner()) = p;
+    w.changed.notify_all();
+}
+
+/// The journal a stop signal must write; set as soon as it is loaded.
+pub(crate) fn set_journal(journal: SharedJournal) {
+    *watch().journal.lock().unwrap_or_else(|e| e.into_inner()) = Some(journal);
+}
+
+/// Called right before `fuser::Session::new`: a signal from here on waits
+/// for the mount's outcome instead of exiting under it (which would leave a
+/// dead mount behind).
+pub(crate) fn mounting() {
+    set_phase(Phase::Mounting);
+}
+
+/// The mount exists: a stop signal from here on unmounts it cleanly.
+pub(crate) fn mounted(mount_point: PathBuf, busy_lanes: impl Fn() -> usize + Send + 'static) {
+    set_phase(Phase::Mounted(mount_point, Box::new(busy_lanes)));
+}
+
+/// `fuser::Session::new` failed: back to exiting on a signal.
+pub(crate) fn mount_failed() {
+    set_phase(Phase::Starting);
+}
+
 /// Starts the `signals` service when [`block_shutdown_signals`] ran; a no-op
-/// for library callers. `busy_lanes` counts handles whose release may still
-/// have to reach the journal.
-pub(crate) fn start_watcher(mount_point: PathBuf, journal: SharedJournal, busy_lanes: impl Fn() -> usize + Send + 'static) {
+/// for library callers. Called first thing in `mount_ncfs` (right after the
+/// seccomp filter, which must precede every thread), so a stop signal is
+/// never left pending through a slow startup: before the mount exists it
+/// writes the journal, if loaded, and exits. The signals are kept blocked
+/// from `main` on rather than unblocked until the session exists: a thread
+/// spawned while they were unblocked would inherit that mask, and a stop
+/// signal delivered to it would kill the process with the default action,
+/// mid-save, however late in the run.
+pub(crate) fn start_watcher() {
     if !BLOCKED.load(Ordering::SeqCst) {
         return;
     }
@@ -158,6 +217,34 @@ pub(crate) fn start_watcher(mount_point: PathBuf, journal: SharedJournal, busy_l
             log::error!("signals: sigwaitinfo failed: {}", std::io::Error::last_os_error());
             return;
         };
+        let w = watch();
+        let journal = || w.journal.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (mount_point, busy_lanes) = {
+            let mut phase = w.phase.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                match std::mem::replace(&mut *phase, Phase::Starting) {
+                    // Holding the lock: no mount can start meanwhile.
+                    Phase::Starting => {
+                        if let Some(j) = journal() {
+                            mutation_journal::flush_deferred(&j);
+                        }
+                        log::warn!("signals: received signal {} before the mount existed — exiting", sig);
+                        // SAFETY: as in flush_and_exit.
+                        unsafe { libc::_exit(0) }
+                    }
+                    Phase::Mounting => {
+                        *phase = Phase::Mounting;
+                        phase = w.changed.wait(phase).unwrap_or_else(|e| e.into_inner());
+                    }
+                    Phase::Mounted(mp, busy) => break (mp, busy),
+                }
+            }
+        };
+        let Some(journal) = journal() else {
+            log::error!("signals: mounted without a journal — exiting");
+            // SAFETY: as in flush_and_exit.
+            unsafe { libc::_exit(0) }
+        };
         log::warn!("signals: received signal {} — writing the journal and unmounting {}", sig, mount_point.display());
         mutation_journal::save_synchronously(&journal);
         let mut logged_busy = false;
@@ -165,7 +252,7 @@ pub(crate) fn start_watcher(mount_point: PathBuf, journal: SharedJournal, busy_l
             match try_unmount(&mount_point) {
                 // The session loop returns; mount_ncfs shuts down from there.
                 Unmount::Done => break,
-                Unmount::NotMounted => flush_and_exit(&journal, &busy_lanes, "mount already detached"),
+                Unmount::NotMounted => flush_and_exit(&journal, &*busy_lanes, "mount already detached"),
                 Unmount::Busy => {
                     if !logged_busy {
                         log::warn!("signals: {} is busy — still serving, retrying the unmount every {:?}", mount_point.display(), UNMOUNT_RETRY);
