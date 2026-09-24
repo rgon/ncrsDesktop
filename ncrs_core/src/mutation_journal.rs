@@ -533,6 +533,16 @@ pub(crate) fn quarantine_unreferenced_staging(journal: &mut MutationJournal, cac
             ),
         });
     }
+    let kept_bytes = dir_size(&recovered_dir);
+    if kept_bytes > RECOVERED_WARN_BYTES {
+        log::warn!("startup: {} holds {} MB", recovered_dir.display(), kept_bytes >> 20);
+        journal.add_conflict(ConflictKind::PermanentFailure {
+            description: format!(
+                "{} holds {} MB of kept local bytes (each file with a .json note saying what it was). Nothing there is deleted before {} days; move or delete what you do not need.",
+                recovered_dir.display(), kept_bytes >> 20, RECOVERED_KEEP_FOR.as_secs() / 86_400,
+            ),
+        });
+    }
     if !moved.is_empty() {
         journal.add_conflict(ConflictKind::PermanentFailure {
             description: format!(
@@ -544,6 +554,15 @@ pub(crate) fn quarantine_unreferenced_staging(journal: &mut MutationJournal, cac
         });
     }
     moved.len()
+}
+
+/// Above this, the startup sweep tells the user how much `recovered/` holds.
+/// Only a warning: size never evicts (see `RECOVERED_KEEP_FOR`).
+const RECOVERED_WARN_BYTES: u64 = 4 << 30;
+
+/// Total size of the files directly in `dir` (`recovered/` is flat).
+fn dir_size(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).map_or(0, |rd| rd.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
 }
 
 /// Deletes what `recovered/` has kept for longer than `RECOVERED_KEEP_FOR`,
@@ -1683,6 +1702,20 @@ mod tests {
         let told: Vec<_> = j.unresolved_conflicts().iter().map(|c| format!("{:?}", c.kind)).collect();
         assert!(told.iter().any(|c| c.contains("/movies/big.mkv")), "the lost copy is named: {told:?}");
         assert_eq!(fs::read_to_string(rec.join("write_10")).unwrap(), "the whole file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_large_recovered_folder_is_reported_but_never_evicted() {
+        let dir = temp_dir("recovered_big");
+        let rec = dir.join(RECOVERED_DIR);
+        fs::create_dir_all(&rec).unwrap();
+        let big = fs::File::create(rec.join("write_1")).unwrap();
+        big.set_len(RECOVERED_WARN_BYTES + 1).unwrap(); // sparse
+        let mut j = MutationJournal::load_or_create(&dir);
+        quarantine_unreferenced_staging(&mut j, &dir);
+        assert!(rec.join("write_1").exists());
+        assert!(j.unresolved_conflicts().iter().any(|c| format!("{:?}", c.kind).contains("MB of kept local bytes")));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -587,21 +587,18 @@ impl WriteCtx {
         }
     }
 
-    /// The staging file of a streamed upload that failed mid-copy (the writer
-    /// got EIO). Once a chunk has left it, it is only the end of the file and
-    /// goes; before that it still holds every byte written, which are kept in
-    /// `recovered/`.
+    /// The staging file of a streamed upload that failed mid-copy. It goes,
+    /// whether or not a chunk had left it yet: the writer got EIO, so nothing
+    /// was saved, and keeping it in `recovered/` kept up to `TAIL_CAP_CHUNKS`
+    /// chunks of every failed copy there, unasked.
     fn drop_failed_stream_staging(&self, fh: u64, of: &OpenFile, wp: &Path) {
-        if of.chunk_upload.as_ref().is_some_and(|cs| cs.bytes_confirmed > 0) {
-            let _ = mutation_journal::remove_staging_file(wp);
-            return;
-        }
-        if std::fs::metadata(wp).map_or(true, |m| m.len() == 0) {
-            let _ = std::fs::remove_file(wp);
-            return;
-        }
-        if let Some(p) = mutation_journal::move_to_recovered(&self.cache_dir, wp, Some(&of.remote_path), "a streamed upload failed before any chunk reached the server; the writer got an error") {
-            log::warn!("release: fh {} of {} failed to upload — the written bytes are kept at {}", fh, of.remote_path.display(), p.display());
+        let len = std::fs::metadata(wp).map_or(0, |m| m.len());
+        let _ = mutation_journal::remove_staging_file(wp);
+        if len > 0 {
+            log::warn!(
+                "release: fh {} streamed copy of {} failed (the writer got an error) — dropped its {} unsent bytes",
+                fh, of.remote_path.display(), len,
+            );
         }
     }
 
