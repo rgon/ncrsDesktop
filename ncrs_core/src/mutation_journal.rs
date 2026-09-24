@@ -113,6 +113,10 @@ pub struct MutationJournal {
     /// `load_or_create` drops an entry whose staging is gone — while the newer
     /// entry that replaced it was never written. That lost both versions.
     delete_after_save: Vec<PathBuf>,
+    /// Staging files of handles release() has taken out of `open_files` but
+    /// not journaled yet: in neither place, a purge would take them for
+    /// orphans (see `reserve_staging`). Never persisted.
+    reserved: std::collections::HashSet<PathBuf>,
 }
 
 pub type SharedJournal = Arc<Mutex<MutationJournal>>;
@@ -600,6 +604,7 @@ impl MutationJournal {
             deferred: None,
             save_pending: false,
             delete_after_save: Vec::new(),
+            reserved: std::collections::HashSet::new(),
             journal_path,
             conflicts_path,
         };
@@ -789,6 +794,31 @@ impl MutationJournal {
 
     pub fn entries(&self) -> &VecDeque<JournalEntry> {
         &self.entries
+    }
+
+    /// Marks staging file `p` as about to be journaled. release() calls it
+    /// before it takes the handle out of `open_files` and
+    /// `unreserve_staging` after the commit enqueued (or gave up on) it, so
+    /// at every moment the file is in `open_files`, reserved here, or named
+    /// by an entry — what a purge that reads `open_files` first and then
+    /// `staging_in_use` relies on.
+    pub fn reserve_staging(&mut self, p: &Path) {
+        self.reserved.insert(p.to_path_buf());
+    }
+
+    pub fn unreserve_staging(&mut self, p: &Path) {
+        self.reserved.remove(p);
+    }
+
+    /// Every staging file the journal still needs or will delete itself:
+    /// named by an entry, waiting for the save that stops naming it (the
+    /// journal on disk still does), or reserved by a release in progress.
+    pub fn staging_in_use(&self) -> std::collections::HashSet<PathBuf> {
+        self.entries.iter()
+            .filter_map(|e| e.op.staging_path().map(Path::to_path_buf))
+            .chain(self.delete_after_save.iter().cloned())
+            .chain(self.reserved.iter().cloned())
+            .collect()
     }
 
     pub fn max_attempts() -> u32 {

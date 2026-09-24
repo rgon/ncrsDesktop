@@ -4584,6 +4584,41 @@ mod upload_order_tests {
         }
 
         #[test]
+        fn a_purge_keeps_the_staging_of_a_handle_released_while_it_ran() {
+            let (_, meta, tmp, _) = open_setup(vec![], true);
+            let old = std::time::SystemTime::now() - Duration::from_secs(60);
+            let make = |fh: u64| {
+                let p = tmp.path().join(mutation_journal::staging_file_name(fh));
+                std::fs::write(&p, b"edit").unwrap();
+                std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
+                p
+            };
+            let (releasing, orphan) = (make(5), make(6));
+            // Handle 5 is between leaving `open_files` and being journaled.
+            meta.journal.safe_lock().reserve_staging(&releasing);
+            let purge = || {
+                let status: StatusMap = Arc::new(RwLock::new(HashMap::new()));
+                purge_all(&meta.cache, &status, &Arc::new(Mutex::new(HashSet::new())), &meta.journal, &meta.open_files, &Arc::new(Mutex::new(None))).unwrap()
+            };
+            purge();
+            assert!(releasing.exists(), "the purge deleted an edit on its way into the journal");
+            assert!(!orphan.exists(), "a real orphan is still reclaimed");
+            // Journaled now: still kept, by the entry.
+            meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Put {
+                remote_path: PathBuf::from("/d/a.txt"), staging_path: releasing.clone(), if_match_etag: None,
+            });
+            meta.journal.safe_lock().unreserve_staging(&releasing);
+            purge();
+            assert!(releasing.exists());
+            // Made after the purge started, not registered anywhere yet.
+            let fresh = tmp.path().join(mutation_journal::staging_file_name(7));
+            std::fs::write(&fresh, b"new").unwrap();
+            std::fs::File::options().write(true).open(&fresh).unwrap().set_modified(std::time::SystemTime::now() + Duration::from_secs(5)).unwrap();
+            purge();
+            assert!(fresh.exists());
+        }
+
+        #[test]
         fn a_written_handle_unlinked_without_proof_keeps_its_bytes_in_recovered() {
             let (fake, meta, tmp, ino) = open_setup(vec![], true);
             let w = write_ctx(&meta, tmp.path());
