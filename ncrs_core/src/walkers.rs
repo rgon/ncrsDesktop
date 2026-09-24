@@ -128,6 +128,14 @@ impl WalkerTracker {
         wait
     }
 
+    /// True when `pid` is currently crawling: it gets no speculative work
+    /// (thumbnails, revalidation) on its behalf — a `find` never looks at images.
+    pub fn is_walker(&self, pid: u32, now: Instant) -> bool {
+        self.lock().get(&pid).is_some_and(|r| {
+            now.duration_since(r.last_seen) < Duration::from_secs(60) && r.in_window.max(r.last_rate) > WALKER_PER_MIN
+        })
+    }
+
     /// Processes that crawled in the last minute, busiest first.
     pub fn active(&self, now: Instant) -> Vec<WalkerStats> {
         let m = self.lock();
@@ -219,6 +227,18 @@ mod tests {
         let later = t + Duration::from_secs(2);
         let free = (0..40).take_while(|_| w.note_uncached(PID, later).is_zero()).count();
         assert!((REFILL_PER_SEC as usize..=2 * REFILL_PER_SEC as usize + 1).contains(&free), "{free}");
+    }
+
+    #[test]
+    fn a_crawler_is_flagged_and_a_browser_is_not() {
+        let w = WalkerTracker::new(true);
+        let t = Instant::now();
+        for _ in 0..=WALKER_PER_MIN {
+            let _ = w.note_uncached(PID, t);
+        }
+        assert!(w.is_walker(PID, t));
+        assert!(!w.is_walker(2, t));
+        assert!(!w.is_walker(PID, t + Duration::from_secs(120)));
     }
 
     #[test]
