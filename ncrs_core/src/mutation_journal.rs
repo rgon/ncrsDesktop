@@ -9,6 +9,13 @@ const JOURNAL_FILE: &str = "mutation_journal.json";
 const CONFLICTS_FILE: &str = "conflicts.json";
 const MAX_ATTEMPTS: u32 = 3;
 
+/// How long an entry the server rejected `attempts` times waits before its
+/// next try: 1 min, then 5, then 25 (the last before it is given up), so a
+/// permission or quota an admin fixes meanwhile still lets it through.
+fn retry_backoff(attempts: u32) -> Duration {
+    Duration::from_secs(60 * 5u64.saturating_pow(attempts.saturating_sub(1)).min(60))
+}
+
 pub type SeqId = u64;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,6 +58,11 @@ pub struct JournalEntry {
     pub created_at_ms: u64,
     pub attempts: u32,
     pub last_error: Option<String>,
+    /// Not retried before this time (ms since the epoch). A server rejection
+    /// backs off (`retry_backoff`) instead of the replay spending every
+    /// attempt on the same entry within one pass.
+    #[serde(default)]
+    pub not_before_ms: u64,
     /// Claimed by a live worker or the replay loop; never persisted, so a restart
     /// makes every entry replayable again.
     #[serde(skip)]
@@ -360,12 +372,24 @@ pub(crate) struct RecoveredSidecar {
     pub reason: String,
     /// Its staging file's name.
     pub staging_name: String,
+    /// For the end of a streamed upload: the server's upload session holding
+    /// the file's first `tail_offset` bytes, until the server expires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_offset: Option<u64>,
 }
 
 /// Moves staging file `src` into `<cache_dir>/recovered/` with a sidecar
 /// (`<file>.json`), and returns where it went. For bytes that are neither on
 /// the server nor named by the journal and must not be deleted.
 pub(crate) fn move_to_recovered(cache_dir: &Path, src: &Path, remote_path: Option<&Path>, reason: &str) -> Option<PathBuf> {
+    move_to_recovered_noted(cache_dir, src, remote_path, reason, None)
+}
+
+/// `move_to_recovered` for the tail of a streamed upload, whose first
+/// `offset` bytes are in the server's upload session `session`.
+fn move_to_recovered_noted(cache_dir: &Path, src: &Path, remote_path: Option<&Path>, reason: &str, session: Option<(&str, u64)>) -> Option<PathBuf> {
     let dir = cache_dir.join(RECOVERED_DIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::error!("cannot create {}: {} — leaving {} in place", dir.display(), e, src.display());
@@ -387,6 +411,8 @@ pub(crate) fn move_to_recovered(cache_dir: &Path, src: &Path, remote_path: Optio
         recovered_at_ms: now_ms(),
         reason: reason.to_string(),
         staging_name: name,
+        upload_session: session.map(|(s, _)| s.to_string()),
+        tail_offset: session.map(|(_, o)| o),
     };
     let json = dest.with_file_name(format!("{}.json", dest.file_name()?.to_string_lossy()));
     if let Err(e) = serde_json::to_vec_pretty(&sidecar).map_err(std::io::Error::other).and_then(|b| std::fs::write(&json, b)) {
@@ -513,6 +539,8 @@ fn prune_recovered(dir: &Path, now: SystemTime) {
                     recovered_at_ms: now_ms,
                     reason: "kept by an earlier version".into(),
                     staging_name: name.clone(),
+                    upload_session: None,
+                    tail_offset: None,
                 };
                 if let Ok(b) = serde_json::to_vec_pretty(&s) {
                     let _ = std::fs::write(&note, b);
@@ -693,6 +721,7 @@ impl MutationJournal {
             created_at_ms: now_ms(),
             attempts: 0,
             last_error: None,
+            not_before_ms: 0,
             in_flight: false,
         });
         if let Some(sp) = self.entries.back().and_then(|e| e.op.staging_path()) {
@@ -815,8 +844,17 @@ impl MutationJournal {
             entry.attempts += 1;
             entry.last_error = Some(error);
             entry.in_flight = false;
+            entry.not_before_ms = now_ms() + retry_backoff(entry.attempts).as_millis() as u64;
         }
         self.save_journal();
+    }
+
+    /// Makes every entry due now, as if its backoff had run out.
+    #[cfg(test)]
+    pub(crate) fn skip_backoff(&mut self) {
+        for e in &mut self.entries {
+            e.not_before_ms = 0;
+        }
     }
 
     /// Record a transient failure (network down / unreachable) without counting
@@ -1113,6 +1151,11 @@ pub(crate) fn replay_journal(
                     log::debug!("JOURNAL: replay paused — seq={} is being uploaded live", e.seq);
                     return;
                 }
+                // Later entries may depend on it too: wait for its backoff.
+                Some(e) if e.not_before_ms > now_ms() => {
+                    log::debug!("JOURNAL: replay paused — seq={} was rejected {} time(s), next try in {} s", e.seq, e.attempts, (e.not_before_ms - now_ms()) / 1000);
+                    return;
+                }
                 Some(e) => {
                     let e = e.clone();
                     j.claim(e.seq);
@@ -1127,26 +1170,37 @@ pub(crate) fn replay_journal(
 
         if entry.attempts >= MutationJournal::max_attempts() {
             log::warn!("JOURNAL: entry seq={} exceeded max attempts, marking permanent failure", entry.seq);
+            let last_err = entry.last_error.as_deref().unwrap_or("unknown");
             // Preserve the local bytes instead of deleting them — a permanent
             // failure must never silently destroy the user's edit.
-            let recovered = if let MutationOp::Put { staging_path, remote_path, .. } = &entry.op {
-                journal.safe_lock().recover_staging(staging_path, remote_path)
-            } else {
-                None
+            let desc = match &entry.op {
+                MutationOp::Put { staging_path, remote_path, .. } => {
+                    match journal.safe_lock().recover_staging(staging_path, remote_path) {
+                        Some(p) => format!("{:?}: {} — local copy preserved at {}", entry.op, last_err, p.display()),
+                        None => format!("{:?}: {}", entry.op, last_err),
+                    }
+                }
+                // Never aborted, and its tail never deleted: the session holds
+                // every byte but the tail's, and together they are the only
+                // copy of the file. The session is left for the server to
+                // expire; the tail goes to `recovered/` with a note naming it.
+                MutationOp::FinishChunked { remote_path, uploads_base, bytes_confirmed, tail_path, .. } => {
+                    let cache_dir = journal.safe_lock().journal_path.parent().map(Path::to_path_buf);
+                    let kept = cache_dir.and_then(|d| move_to_recovered_noted(
+                        &d, tail_path, Some(remote_path),
+                        "the end of a streamed upload the server refused to assemble",
+                        Some((uploads_base, *bytes_confirmed)),
+                    ));
+                    let _ = std::fs::remove_file(tail_marker(tail_path));
+                    format!(
+                        "{} could not be assembled on the server ({}). Nothing was deleted: its first {} bytes are in the server's upload session {} until the server expires it, and the rest is kept at {}. Copy the file again, or have an admin assemble the session.",
+                        remote_path.display(), last_err, bytes_confirmed, uploads_base,
+                        kept.as_deref().unwrap_or(tail_path).display(),
+                    )
+                }
+                _ => format!("{:?}: {}", entry.op, last_err),
             };
-            // A streamed tail is not the whole file, so it is not worth preserving.
-            if let MutationOp::FinishChunked { uploads_base, .. } = &entry.op {
-                ctx.backend.abort_chunked_upload(&crate::backend::ChunkedUploadSession { uploads_base: uploads_base.clone() });
-            }
             let mut j = journal.safe_lock();
-            if let MutationOp::FinishChunked { tail_path, .. } = &entry.op {
-                j.discard_staging(tail_path);
-            }
-            let last_err = entry.last_error.as_deref().unwrap_or("unknown");
-            let desc = match recovered {
-                Some(p) => format!("{:?}: {} — local copy preserved at {}", entry.op, last_err, p.display()),
-                None => format!("{:?}: {}", entry.op, last_err),
-            };
             j.add_conflict(ConflictKind::PermanentFailure { description: desc });
             j.dequeue_front();
             if let MutationOp::Unlink { path } | MutationOp::RmDir { path } = &entry.op {
@@ -1878,6 +1932,7 @@ mod tests {
             created_at_ms: now_ms(),
             attempts: 0,
             last_error: None,
+            not_before_ms: 0,
             in_flight: false,
         }];
         let journal_path = dir.join(JOURNAL_FILE);
