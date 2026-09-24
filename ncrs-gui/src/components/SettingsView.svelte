@@ -19,6 +19,8 @@
         cleanup_stale_gio_temps: boolean;
         stale_gio_temp_mins: number;
         fuse_passthrough: boolean;
+        walker_rate_limit: boolean;
+        walker_listings_per_sec: number;
     }
 
     // One desktop profile, as reported by the service (`INTEGRATIONS`):
@@ -158,6 +160,7 @@
             // Clearing a number input binds null, which the u64 field cannot
             // deserialize — the whole save would fail with an opaque error.
             dir_cache_max_stale_mins: Math.max(0, Math.round(settings.dir_cache_max_stale_mins || 0)),
+            walker_listings_per_sec: Math.min(1000, Math.max(1, Math.round(settings.walker_listings_per_sec || 10))),
         };
         try {
             await invoke("save_config_values", { values: payload });
@@ -299,6 +302,36 @@
                         min="1"
                         max="64"
                         bind:value={settings.max_concurrent_requests}
+                    />
+                </div>
+
+                <div class="sv-toggle">
+                    <div>
+                        <label class="sv-toggle-label" for="walker-limit">Slow down folder crawlers</label>
+                        <p class="sv-hint">
+                            Protects your Nextcloud server from being overwhelmed. Programs that
+                            walk the whole folder tree — a <code>find</code> or search across the
+                            disk, a backup tool, an indexer, a coding assistant looking for a
+                            file — cause one server request for every folder they enter, and can
+                            send thousands a minute. With this on, such a program is paced to the
+                            rate below once it has used up a short burst. Folders you already have
+                            cached are never slowed, so normal browsing is unaffected. Applies
+                            immediately when saved.
+                        </p>
+                    </div>
+                    <input id="walker-limit" type="checkbox" class="sv-check" bind:checked={settings.walker_rate_limit} />
+                </div>
+
+                <div class="sv-field">
+                    <label class="sv-label" for="walker-rate">Crawler pace (folders per second, per program)</label>
+                    <input
+                        id="walker-rate"
+                        class="nc-input sv-num"
+                        type="number"
+                        min="1"
+                        max="1000"
+                        disabled={!settings.walker_rate_limit}
+                        bind:value={settings.walker_listings_per_sec}
                     />
                 </div>
 

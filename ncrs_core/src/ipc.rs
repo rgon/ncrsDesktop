@@ -1375,6 +1375,23 @@ fn handle_client_loop(
             serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())
         } else if trimmed == "HEALTH" {
             crate::health_json()
+        } else if trimmed == "WALKER_LIMIT" {
+            crate::walker_limit_status().unwrap_or_else(|| "error: not mounted".to_string())
+        } else if let Some(args) = trimmed.strip_prefix("WALKER_LIMIT ") {
+            // "WALKER_LIMIT on 10" / "WALKER_LIMIT off 10"
+            let mut it = args.split_whitespace();
+            let enabled = match it.next() {
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                _ => None,
+            };
+            let per_sec = it.next().and_then(|n| n.parse::<u32>().ok())
+                .filter(|n| crate::config::WALKER_LISTINGS_PER_SEC_RANGE.contains(n));
+            match (enabled, per_sec) {
+                (Some(on), Some(n)) if crate::set_walker_limit(on, n) => "ok".to_string(),
+                (Some(_), Some(_)) => "error: not mounted".to_string(),
+                _ => "error: usage WALKER_LIMIT on|off <listings/s 1-1000>".to_string(),
+            }
         } else if trimmed == "STATE" {
             let active = !transfer_map.safe_lock().is_empty();
             state_word(&paused, &offline, active).to_string()
