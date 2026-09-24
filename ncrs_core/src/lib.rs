@@ -7418,9 +7418,19 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let watcher_offline = offline_flag.clone();
             let debounce = filesystem.refresh_debounce();
 
+            let watcher_backoff = filesystem.conn.backoff.clone();
             let watcher = backend.start_change_watcher(Box::new(move |event| {
                 if watcher_paused.load(Ordering::Relaxed) { return; }
                 if watcher_offline.load(Ordering::Relaxed) { return; }
+                // The server just told us these changed: a cooldown from an
+                // earlier failure no longer says anything about them.
+                if event.invalidate_all {
+                    watcher_backoff.clear_all();
+                } else {
+                    for dir in &event.invalidated_dirs {
+                        watcher_backoff.clear(dir);
+                    }
+                }
                 notify_push::handle_change_event(
                     event,
                     &watcher_backend,

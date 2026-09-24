@@ -78,6 +78,10 @@ impl PathBackoff {
         self.lock().remove(path);
     }
 
+    pub fn clear_all(&self) {
+        self.lock().clear();
+    }
+
     /// `Some((remaining, last_code))` while `path` is cooling down.
     pub fn blocked(&self, path: &Path, now: Instant) -> Option<(Duration, u16)> {
         let m = self.lock();
