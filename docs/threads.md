@@ -40,7 +40,7 @@ graph LR
 | Pool | Workers | Queue | Full → | Used for |
 |---|---|---|---|---|
 | `readdir` | 24 | 512 | EAGAIN to the kernel | `readdir`/`readdirplus` workers; the reply travels in the job |
-| `meta` | 16 | 1024 | EAGAIN (getxattr: ENODATA; open's process classification proceeds unclassified) | lookup/getattr/setattr/getxattr/listxattr/open whose parent listing is not cached (a hit is answered on `fuser-0`), and open's process classification when it would read `/proc/<pid>/maps` or `cmdline`. The reply travels in the job; each job has one deadline, `PROPFIND_TIMEOUT` from submission |
+| `meta` | 16 | 1024 | EAGAIN (getxattr: ENODATA; an open left unclassified gets EAGAIN only if its flags match a sniff probe, else opens plain) | lookup/getattr/setattr/getxattr/listxattr/open whose parent listing is not cached (a hit is answered on `fuser-0`), and open's process classification when it would read `/proc/<pid>/maps` or `cmdline`. The reply travels in the job; each job has one deadline, `PROPFIND_TIMEOUT` from submission |
 | `read` | 32 | 2048 | EAGAIN | read waits on read-ahead streams, range streams; staging a writable open's current content (download, or copy of the cached file) |
 | `list` | 16 | 2048 | error (stale listing served if cached) | streaming lists, soft-TTL refreshes |
 | `bg` | 4 | 256 | dropped | revalidation on read, prefetch, GIO temp purge |

@@ -4422,6 +4422,16 @@ mod upload_order_tests {
             let fh = fh_of(open(libc::O_RDONLY));
             assert!(meta.open_files.safe_lock()[&fh].mime_detect_ct.is_none());
             release_bookkeeping(&meta, fh);
+            // Left undecided by a /proc-reading thumbnailer matcher (KIO's), a
+            // plain read must still open: `cat`/`cp` of an uncached file under load.
+            let (r, rx) = reply();
+            open_unclassified(&meta, OpenReq { pid, ..rq(ino, "/d/a.txt", libc::O_RDONLY, None) }, listed(5), r);
+            let fh = fh_of(rx.try_recv().expect("answered inline"));
+            assert!(meta.open_files.safe_lock()[&fh].mime_detect_ct.is_none());
+            release_bookkeeping(&meta, fh);
+            let (r, rx) = reply();
+            open_unclassified(&meta, OpenReq { pid, ..rq(ino, "/d/a.txt", libc::O_RDONLY | libc::O_NOATIME, None) }, listed(5), r);
+            assert_eq!(rx.try_recv().unwrap(), OpenOutcome::Error(libc::EAGAIN));
             assert_all_given_back(&meta, ino);
             let _ = child.kill();
             let _ = child.wait();
