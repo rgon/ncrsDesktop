@@ -4241,14 +4241,26 @@ fn open_unclassified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry
 
 /// open() once the caller is classified: allocates the handle, and stages the
 /// current content for a writable open.
-fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, reply: R, probe_max_read: Option<usize>) {
+fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, mut rq: OpenReq, entry: OpenEntry, reply: R, probe_max_read: Option<usize>) {
     let fh = next_fh(ctx);
+
+    // A queued upload of the file holds its newest content. Looked up before
+    // the cache lock (the journal is never locked while holding it), and only
+    // when it matters: a kept copy to judge, or a writable open to seed.
+    let upload = if rq.local.is_some() || (rq.writable && !rq.truncating) {
+        ctx.journal.safe_lock().newest_upload(&rq.path)
+    } else {
+        None
+    };
 
     // Pin the cached-copy freshness for this handle's lifetime (see OpenFile).
     // file_cache_matches_remote() returns false when the file is not cached,
     // and true when offline (no remote etag to compare) so offline reads of a
-    // kept copy are never forced into an unsatisfiable re-download.
-    let cache_fresh = {
+    // kept copy are never forced into an unsatisfiable re-download. Never
+    // fresh while an upload of the file is queued: the listing's etag is the
+    // server's older version's until that upload lands, so it still matches
+    // a kept copy of the older version.
+    let cache_fresh = upload.is_none() && {
         let c = ctx.cache.safe_lock();
         if entry.listed {
             c.file_cache_matches(&rq.path, entry.etag.as_deref(), entry.modified)
@@ -4267,19 +4279,26 @@ fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: Op
     // 0 (O_APPEND, an in-place edit) would otherwise upload a zero-filled prefix.
     let seed = if rq.truncating {
         None
-    } else if let Some(staged) = ctx.journal.safe_lock().pending_put_staging(&rq.path) {
-        // A queued upload holds the newest content, which neither the server
-        // nor a kept copy has yet (and whose name a re-list may have dropped).
-        Some(Seed::Pending(staged))
-    } else if let Some(local) = rq.local.clone().filter(|_| cache_fresh) {
-        Some(Seed::Local(local))
-    } else if entry.size > 0 || entry.absent {
-        // Absent from its listing is not "empty": the name may be missing
-        // only until a rename's MOVE lands (see `download_seed`).
-        Some(Seed::Download { absent: entry.absent })
     } else {
-        None
+        match upload {
+            // A queued upload holds the newest content, which neither the server
+            // nor a kept copy has yet (and whose name a re-list may have dropped).
+            Some(mutation_journal::PendingUpload::Put(staged)) => Some(Seed::Pending(staged)),
+            // A streamed one exists only as the server's upload session and the
+            // local tail until it is assembled: wait for that (see `seed_from_queue`).
+            Some(mutation_journal::PendingUpload::Stream) => Some(Seed::AwaitStream),
+            None if cache_fresh && rq.local.is_some() => rq.local.clone().map(Seed::Local),
+            // Absent from its listing is not "empty": the name may be missing
+            // only until a rename's MOVE lands (see `download_seed`).
+            None if entry.size > 0 || entry.absent => Some(Seed::Download { absent: entry.absent }),
+            None => None,
+        }
     };
+    // A kept copy this open does not seed from is not the file's content: the
+    // first write must not seed from it either (`WriteCtx::write_cost`).
+    if rq.writable && !matches!(seed, Some(Seed::Local(_))) {
+        rq.local = None;
+    }
     let Some(seed_from) = seed else {
         // Nothing to seed: a truncating open starts from an empty file, and an
         // empty remote file needs none (write() creates it on first use).
@@ -4319,13 +4338,15 @@ fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: Op
             Seed::Local(local) => std::fs::copy(&local, &wp).map(|_| ()).map_err(|e| e.to_string()),
             Seed::Pending(staged) => match std::fs::copy(&staged, &wp) {
                 Ok(_) => Ok(()),
-                // Uploaded meanwhile: its staging goes once it is on the server.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => download_seed(&worker_ctx, &wp, &now_at, false),
+                // Uploaded or superseded meanwhile: its staging goes once it is
+                // on the server, or once the newer upload replaced it.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => seed_from_queue(&worker_ctx, fh, &path, &wp),
                 Err(e) => Err(e.to_string()),
             },
+            Seed::AwaitStream => seed_from_queue(&worker_ctx, fh, &path, &wp),
             Seed::Download { absent } => download_seed(&worker_ctx, &wp, &now_at, absent),
         };
-        let path = now_at;
+        let path = worker_ctx.open_files.safe_lock().get(&fh).map_or(now_at, |of| of.remote_path.clone());
         if let Err(e) = staged {
             log::error!("open: cannot stage current content of {} for writing: {}", path.display(), e);
             drop(undo);
@@ -4345,10 +4366,79 @@ fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: Op
 enum Seed {
     /// A queued upload's staging file.
     Pending(PathBuf),
+    /// A queued streamed upload: the server once it is assembled.
+    AwaitStream,
     /// A fresh kept or cached copy.
     Local(PathBuf),
     /// The server. `absent`: the listing did not have the name.
     Download { absent: bool },
+}
+
+/// How often `seed_from_queue` looks at the journal while a streamed upload
+/// of the file is still being assembled.
+const STREAM_SEED_POLL: Duration = Duration::from_millis(100);
+
+/// Stages handle `fh` from whatever the journal now says is the file's newest
+/// content, on a READ worker: the staging of a queued Put, or the server once
+/// no streamed upload (`FinishChunked`) of it is queued any more.
+///
+/// A streamed upload's content is the server's upload session plus the local
+/// tail until it is assembled. Seeding from anything else meanwhile — the
+/// server (older version, or 404 for a new file), a kept copy of the older
+/// version, an older Put's staging — stages the wrong bytes, and this
+/// handle's own upload then replaces the streamed file with them: an
+/// unclaimed finish is superseded (its session never assembled), a running
+/// one is overwritten. So this waits, up to DOWNLOAD_TIMEOUT, re-reading the
+/// handle's path each round (a rename rewrites the journal's paths). Offline
+/// the upload cannot land: EIO at once, never an empty or older seed.
+fn seed_from_queue(ctx: &MetaCtx, fh: u64, opened_as: &Path, wp: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + DOWNLOAD_TIMEOUT;
+    let mut waited = false;
+    let mut missing: Option<PathBuf> = None;
+    loop {
+        let (now_at, unlinked) = ctx.open_files.safe_lock().get(&fh)
+            .map_or((opened_as.to_path_buf(), Unlinked::No), |of| (of.remote_path.clone(), of.unlinked));
+        if unlinked == Unlinked::Local {
+            return std::fs::File::create(wp).map(|_| ()).map_err(|e| e.to_string());
+        }
+        let newest = ctx.journal.safe_lock().newest_upload(&now_at);
+        match newest {
+            Some(mutation_journal::PendingUpload::Put(staged)) => match std::fs::copy(&staged, wp) {
+                Ok(_) => return Ok(()),
+                // Named by the journal and still missing a round later: not a
+                // race with its upload; the server's copy is all there is.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && missing.as_ref() == Some(&staged) => {
+                    return download_seed(ctx, wp, &now_at, false);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = Some(staged),
+                Err(e) => return Err(e.to_string()),
+            },
+            Some(mutation_journal::PendingUpload::Stream) => {
+                if ctx.conn.is_offline.load(Ordering::Relaxed) {
+                    log::error!(
+                        "open: {} is a streamed copy not yet assembled on the server, which is unreachable — refusing to open it for writing until the copy lands",
+                        now_at.display(),
+                    );
+                    return Err("streamed upload not assembled yet, and offline".into());
+                }
+                if !waited {
+                    log::info!("open: waiting for the streamed upload of {} to be assembled before staging it for writing", now_at.display());
+                    waited = true;
+                }
+            }
+            None => {
+                if waited {
+                    log::info!("open: streamed upload of {} landed — staging it from the server", now_at.display());
+                }
+                return download_seed(ctx, wp, &now_at, false);
+            }
+        }
+        if Instant::now() >= deadline {
+            log::error!("open: the streamed upload of {} did not land within {:?} — refusing to open it for writing", now_at.display(), DOWNLOAD_TIMEOUT);
+            return Err("streamed upload still not assembled".into());
+        }
+        std::thread::sleep(STREAM_SEED_POLL);
+    }
 }
 
 /// Whether a download error is the server's 404.

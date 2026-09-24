@@ -3863,6 +3863,12 @@ mod upload_order_tests {
             files: Mutex<HashMap<PathBuf, (Vec<u8>, Duration)>>,
             /// Every PUT, in order.
             puts: Mutex<Vec<(PathBuf, Vec<u8>)>>,
+            /// A streamed upload's chunks already on the server; assembling it
+            /// serves them, then the chunks PUT since, as the file.
+            session_prefix: Mutex<Vec<u8>>,
+            chunks: Mutex<BTreeMap<u64, Vec<u8>>>,
+            /// Every assembled streamed upload, in order.
+            finished: Mutex<Vec<PathBuf>>,
         }
 
         impl FakeBackend {
@@ -3923,6 +3929,17 @@ mod upload_order_tests {
             }
             fn rename(&self, _: &Path, _: &Path) -> Result<(), backend::BackendWriteError> {
                 Err(backend::BackendWriteError::Unsupported)
+            }
+            fn put_chunk(&self, _: &backend::ChunkedUploadSession, index: u64, body: Vec<u8>) -> Result<(), backend::BackendWriteError> {
+                self.chunks.lock().unwrap().insert(index, body);
+                Ok(())
+            }
+            fn finish_chunked_upload(&self, _: &backend::ChunkedUploadSession, path: &Path, _: Option<&str>) -> Result<backend::PutResult, backend::BackendWriteError> {
+                let mut body = self.session_prefix.lock().unwrap().clone();
+                body.extend(self.chunks.lock().unwrap().values().flatten());
+                self.files.lock().unwrap().insert(path.to_path_buf(), (body, Duration::ZERO));
+                self.finished.lock().unwrap().push(path.to_path_buf());
+                Ok(backend::PutResult { new_change_token: Some("assembled".into()) })
             }
             fn is_reachable(&self, _: Duration) -> bool {
                 true
@@ -4705,6 +4722,156 @@ mod upload_order_tests {
             assert_eq!(meta.open_files.safe_lock()[&fh].unlinked, Unlinked::No);
             append_and_release(&write_ctx(&meta, tmp.path()), fh, b"x");
             assert_eq!(wait_for_put(&fake, "/d/a.txt"), b"x");
+        }
+
+        // ── A streamed upload still being assembled is the file's content ───
+        //
+        // From release until its finish lands (offline: the whole time; after a
+        // restart: until the replay), a streamed copy exists only as the
+        // server's upload session and the local tail. A writable open of it
+        // then must neither stage what the server or a kept copy still has,
+        // nor let its own upload replace the streamed one.
+
+        /// Queues the finish of a streamed upload of `path` whose session holds
+        /// `sent` on the server and whose tail file holds `tail`.
+        fn queue_stream(fake: &FakeBackend, meta: &MetaCtx, dir: &Path, path: &str, sent: &[u8], tail: &[u8]) -> mutation_journal::SeqId {
+            *fake.session_prefix.lock().unwrap() = sent.to_vec();
+            let tail_path = dir.join(format!("write_tail_{}", path.replace('/', "_")));
+            std::fs::write(&tail_path, tail).unwrap();
+            meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::FinishChunked {
+                remote_path: PathBuf::from(path),
+                uploads_base: "uploads/7".into(),
+                next_index: 1,
+                bytes_confirmed: sent.len() as u64,
+                total_len: (sent.len() + tail.len()) as u64,
+                tail_path,
+                if_match_etag: None,
+            })
+        }
+
+        fn replay_meta(fake: &Arc<FakeBackend>, meta: &MetaCtx) {
+            let ctx = mutation_journal::ReplayContext { backend: fake.clone(), status: meta.status.clone() };
+            mutation_journal::replay_journal(&meta.journal, &ctx, &meta.cache, &Arc::new(Mutex::new(HashSet::new())), &Arc::new(Mutex::new(std::collections::VecDeque::new())));
+        }
+
+        /// A kept copy of the version the server has, fresh by the listing's etag.
+        fn keep_old_copy(meta: &MetaCtx, dir: &Path) -> PathBuf {
+            let kept = dir.join("kept_a.txt");
+            std::fs::write(&kept, b"hello").unwrap();
+            meta.cache.safe_lock().file_cache.insert(PathBuf::from("/d/a.txt"), FileCacheEntry {
+                local_path: kept.clone(), remote_modified: None, etag: Some("etag1".into()), kept: true, size: 5,
+            });
+            kept
+        }
+
+        #[test]
+        fn a_writable_open_waits_for_a_queued_streamed_upload_and_seeds_from_what_it_assembled() {
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            fake.files.lock().unwrap().insert(PathBuf::from("/d/a.txt"), (b"hello".to_vec(), Duration::ZERO));
+            let kept = keep_old_copy(&meta, tmp.path());
+            let seq = queue_stream(&fake, &meta, tmp.path(), "/d/a.txt", b"streamed ", b"content");
+            // `rsync --inplace`, `dd conv=notrunc`, a tag editor: writable, not truncating.
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_RDWR, Some(kept)), listed(5), r, false);
+            assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "staged before the streamed upload was assembled");
+            assert!(meta.journal.safe_lock().contains(seq), "the open must not drop the queued finish");
+            // The replay assembles it; only then is the open staged.
+            replay_meta(&fake, &meta);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            {
+                let files = meta.open_files.safe_lock();
+                let of = &files[&fh];
+                assert_eq!(std::fs::read(of.write_path.as_ref().unwrap()).unwrap(), b"streamed content");
+                assert!(of.local.is_none(), "a first write must not seed from the older kept copy");
+            }
+            append_and_release(&write_ctx(&meta, tmp.path()), fh, b"+tag");
+            assert_eq!(wait_for_put(&fake, "/d/a.txt"), b"streamed content+tag");
+            assert_eq!(*fake.finished.lock().unwrap(), vec![PathBuf::from("/d/a.txt")], "the streamed upload was assembled, not superseded");
+        }
+
+        #[test]
+        fn a_writable_open_of_a_streamed_upload_queued_while_offline_fails_instead_of_staging_old_bytes() {
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            fake.files.lock().unwrap().insert(PathBuf::from("/d/a.txt"), (b"hello".to_vec(), Duration::ZERO));
+            let kept = keep_old_copy(&meta, tmp.path());
+            let seq = queue_stream(&fake, &meta, tmp.path(), "/d/a.txt", b"streamed ", b"content");
+            meta.conn.is_offline.store(true, Ordering::SeqCst);
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, Some(kept)), listed(5), r, false);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), OpenOutcome::Error(libc::EIO), "offline the finish cannot land: fail at once");
+            assert_all_given_back(&meta, ino);
+            assert!(meta.journal.safe_lock().contains(seq));
+            assert!(fake.puts.lock().unwrap().is_empty());
+            // A truncating open needs no seed: it may still replace the file.
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_TRUNC, None), listed(5), r, false);
+            assert!(matches!(rx.try_recv(), Ok(OpenOutcome::Opened(_))));
+        }
+
+        #[test]
+        fn an_older_put_is_never_the_seed_of_a_file_whose_newer_upload_is_streamed() {
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            let old = tmp.path().join("write_old_put");
+            std::fs::write(&old, b"older version").unwrap();
+            let put = meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Put {
+                remote_path: PathBuf::from("/d/a.txt"), staging_path: old, if_match_etag: None,
+            });
+            // In flight (claimed by a live worker), so the stream did not supersede it.
+            assert!(meta.journal.safe_lock().claim(put));
+            let stream = queue_stream(&fake, &meta, tmp.path(), "/d/a.txt", b"new ", b"stream");
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+            assert!(rx.recv_timeout(Duration::from_millis(400)).is_err(), "seeded from the older Put's staging");
+            // The Put lands, then the stream: the open follows the newest.
+            meta.journal.safe_lock().remove(put);
+            assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "still streaming");
+            replay_meta(&fake, &meta);
+            assert!(!meta.journal.safe_lock().contains(stream));
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            assert_eq!(std::fs::read(meta.open_files.safe_lock()[&fh].write_path.as_ref().unwrap()).unwrap(), b"new stream");
+        }
+
+        #[test]
+        fn a_kept_copy_is_not_fresh_while_an_upload_of_its_file_is_queued() {
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            let kept = keep_old_copy(&meta, tmp.path());
+            let seq = queue_stream(&fake, &meta, tmp.path(), "/d/a.txt", b"x", b"y");
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_RDONLY, Some(kept.clone())), listed(5), r, false);
+            let fh = fh_of(rx.try_recv().expect("a read-only open is answered inline"));
+            assert!(!meta.open_files.safe_lock()[&fh].cache_fresh, "reads would serve the older version");
+            release_bookkeeping(&meta, fh);
+            meta.journal.safe_lock().remove(seq);
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_RDONLY, Some(kept)), listed(5), r, false);
+            let fh = fh_of(rx.try_recv().unwrap());
+            assert!(meta.open_files.safe_lock()[&fh].cache_fresh, "fresh again once nothing is queued");
+        }
+
+        #[test]
+        fn a_pending_put_gone_during_staging_seeds_from_what_replaced_it() {
+            // L6: the Put the open picked was superseded before its staging was
+            // copied. The newest upload is the content, not the server.
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            let newer = tmp.path().join("write_newer");
+            std::fs::write(&newer, b"newer").unwrap();
+            meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Put {
+                remote_path: PathBuf::from("/d/a.txt"), staging_path: newer, if_match_etag: None,
+            });
+            let (r, _rx) = reply();
+            let wp = tmp.path().join("w9");
+            let _ = open_register(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY, None), listed(5), 9, false, Some(wp.clone()), true, None, &r);
+            seed_from_queue(&meta, 9, Path::new("/d/a.txt"), &wp).unwrap();
+            assert_eq!(std::fs::read(&wp).unwrap(), b"newer");
+            // Nothing queued any more: the server's copy.
+            let queued: Vec<_> = meta.journal.safe_lock().entries().iter().map(|e| e.seq).collect();
+            for seq in queued {
+                meta.journal.safe_lock().remove(seq);
+            }
+            seed_from_queue(&meta, 9, Path::new("/d/a.txt"), &wp).unwrap();
+            assert_eq!(std::fs::read(&wp).unwrap(), b"hello");
+            let _ = fake;
+            release_bookkeeping(&meta, 9);
         }
 
         #[test]
