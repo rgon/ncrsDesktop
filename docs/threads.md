@@ -41,7 +41,7 @@ graph LR
 |---|---|---|---|---|
 | `readdir` | 24 | 512 | EAGAIN to the kernel | `readdir`/`readdirplus` workers; the reply travels in the job |
 | `meta` | 16 | 1024 | EAGAIN (getxattr: ENODATA; an open left unclassified gets EAGAIN only if its flags match a sniff probe, else opens plain) | lookup/getattr/setattr/getxattr/listxattr/open whose parent listing is not cached (a hit is answered on `fuser-0`), and open's process classification when it would read `/proc/<pid>/maps` or `cmdline`. The reply travels in the job; each job has one deadline, `PROPFIND_TIMEOUT` from submission |
-| `read` | 32 | 2048 | EAGAIN | read waits on read-ahead streams, range streams; staging a writable open's current content (download, or copy of the cached file) |
+| `read` | 32 | 2048 | EAGAIN | read waits on read-ahead streams, range streams; staging a writable open's current content (download, or copy of the cached file). At most 4 of these (`STREAM_WAITERS_MAX`) wait for a queued streamed upload of their file to be assembled, asleep on the journal's condvar until it leaves the journal (up to `DOWNLOAD_TIMEOUT`); a fifth such open gets EAGAIN before it takes a worker, and one while offline or paused gets EIO |
 | `list` | 16 | 2048 | error (stale listing served if cached) | streaming lists, soft-TTL refreshes |
 | `bg` | 4 | 256 | dropped | revalidation on read, prefetch, GIO temp purge |
 | `mutate` | 16 | unbounded | journal replays it | PUT/MKCOL/DELETE/MOVE commits (`PathSeq` FIFO; see `path_seq.rs`); abort of an abandoned chunk-upload session (never dropped: a lost abort leaks the session's chunks) |
