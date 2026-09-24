@@ -36,6 +36,11 @@ pub(crate) struct Tombstones {
     generation: u64,
     /// Inode → generation of its latest local unlink.
     by_ino: HashMap<u64, u64>,
+    /// The same, generation → inode, so pruning pops the oldest from the
+    /// front instead of scanning every tombstone on each unlink: `rm -rf`
+    /// of N files under an old in-flight open was O(N²) on the dispatch
+    /// thread, under the cache lock.
+    by_gen: BTreeMap<u64, u64>,
     /// Snapshots of opens not registered yet, counted per generation. Its own
     /// lock, never held while taking another, so a snapshot may be dropped
     /// anywhere, the cache lock included.
@@ -73,7 +78,10 @@ impl Tombstones {
     pub(crate) fn record(&mut self, ino: u64) {
         self.prune();
         self.generation += 1;
-        self.by_ino.insert(ino, self.generation);
+        if let Some(older) = self.by_ino.insert(ino, self.generation) {
+            self.by_gen.remove(&older);
+        }
+        self.by_gen.insert(self.generation, ino);
     }
 
     /// Whether this mount removed `ino` after `snap` was taken.
@@ -86,12 +94,24 @@ impl Tombstones {
     /// Drops the tombstones no open in flight can still need: an open cares
     /// only about those newer than its snapshot.
     fn prune(&mut self) {
-        if self.by_ino.is_empty() {
+        if self.by_gen.is_empty() {
             return;
         }
-        match self.in_flight.safe_lock().keys().next().copied() {
-            None => self.by_ino.clear(),
-            Some(oldest) => self.by_ino.retain(|_, g| *g > oldest),
+        let oldest = self.in_flight.safe_lock().keys().next().copied();
+        match oldest {
+            None => {
+                self.by_ino.clear();
+                self.by_gen.clear();
+            }
+            Some(oldest) => {
+                while let Some((&g, &ino)) = self.by_gen.first_key_value() {
+                    if g > oldest {
+                        break;
+                    }
+                    self.by_gen.pop_first();
+                    self.by_ino.remove(&ino);
+                }
+            }
         }
     }
 
@@ -115,6 +135,25 @@ mod tests {
         assert!(t.removed_since(8, &snap));
         assert!(!t.removed_since(9, &snap), "another inode");
         drop(snap);
+    }
+
+    #[test]
+    fn many_unlinks_under_an_old_open_stay_cheap() {
+        let mut t = Tombstones::default();
+        let old = t.snapshot();
+        let start = std::time::Instant::now();
+        for ino in 0..50_000 {
+            t.record(ino);
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "{:?}", start.elapsed());
+        assert_eq!(t.len(), 50_000);
+        assert!(t.removed_since(49_999, &old));
+        // Re-unlinking an inode keeps one tombstone for it.
+        t.record(7);
+        assert_eq!(t.len(), 50_000);
+        drop(old);
+        t.record(1);
+        assert_eq!(t.len(), 1);
     }
 
     #[test]
