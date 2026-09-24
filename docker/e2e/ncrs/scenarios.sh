@@ -1054,6 +1054,39 @@ else
     no "daemon did not remount after SIGKILL"
 fi
 
+# The same with no pause at all: two saves back to back, SIGKILL the moment
+# the second returns (its RELEASE may not even have reached the daemon). The
+# newest bytes must be on the server or in recovered/.
+cat "$MOUNT/sig29/kill.txt" >/dev/null 2>&1
+server_down
+printf 'kill now v1 %s' "$(date +%s%N)" > "$MOUNT/sig29/kill.txt"
+K4="kill now v2 $(date +%s%N)"
+printf '%s' "$K4" > "$MOUNT/sig29/kill.txt"
+PID29="$(pgrep -x ncrs | head -1)"
+kill -9 "$PID29"
+wait_exit29 "$PID29" 10
+server_up
+if restart_daemon29; then
+    WK4="$(printf '%s' "$K4" | sha)"
+    got=""
+    for _ in $(seq 1 60); do
+        got="$(dav_sha sig29/kill.txt)"
+        [ "$got" = "$WK4" ] && break
+        sleep 1
+    done
+    rec="$(cat "$HOME"/.cache/ncrs/*/recovered/* 2>/dev/null | grep -c "$K4")"
+    if [ "$got" = "$WK4" ]; then
+        ok "a save SIGKILLed the moment it returned reached the server after restart"
+    elif [ "$rec" -gt 0 ]; then
+        ok "a save SIGKILLed the moment it returned was kept in recovered/"
+    else
+        no "SIGKILL right after a save lost it (server has ${got:0:12}, in recovered/: $rec)"
+        tail -40 "$SIG_LOG" | grep -i "journal\|staging\|kill.txt" | sed 's/^/    /'
+    fi
+else
+    no "daemon did not remount after the immediate SIGKILL"
+fi
+
 stuck=0
 for w in /sys/fs/fuse/connections/*/waiting; do
     [ -r "$w" ] && [ "$(cat "$w")" != 0 ] && stuck=$((stuck + $(cat "$w")))
