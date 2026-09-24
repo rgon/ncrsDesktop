@@ -146,6 +146,8 @@ fn effective_dir_ttl(optimistic_listing: bool, notify_push_connected: &AtomicBoo
     }
 }
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a download waits for one of the `read_throttle` slots.
+const DOWNLOAD_SLOT_WAIT: Duration = Duration::from_secs(30);
 // Bounds only the TCP/TLS connect phase, independent of the (longer) per-request
 // body timeouts. Keeps a legitimately slow large download alive while making a
 // dead network surface in seconds instead of after the full request timeout.
@@ -619,8 +621,22 @@ pub struct TransferProgress {
 
 pub type TransferMap = Arc<Mutex<HashMap<PathBuf, TransferProgress>>>;
 
+/// True for a rendered [`backend::BackendReadError::Server`]: the server
+/// answered with an HTTP error status. Not a transport failure, so never a
+/// reason to go offline or to retry in the foreground.
+fn is_server_error(e: &str) -> bool {
+    backend::server_error_code(e).is_some()
+}
+
 fn is_transient_network_err(e: &str) -> bool {
+    // A server that answered is not a transport failure, however its message
+    // (which embeds the path) happens to read.
+    if is_server_error(e) {
+        return false;
+    }
     e.starts_with("network:")
+        // A listing body that broke off mid-stream: worth one retry.
+        || e.starts_with(backend::TRUNCATED_PREFIX)
         || e.contains("connection reset")
         || e.contains("Connection reset")
         || e.contains("Connection refused")
@@ -640,7 +656,14 @@ fn is_transient_network_err(e: &str) -> bool {
 }
 
 fn is_timeout_err(e: &str) -> bool {
-    e.contains("timeout") || e.contains("Timeout") || e.contains("timed out")
+    if is_server_error(e) {
+        return false;
+    }
+    // Match the shapes our own timeouts render as ("timeout", "PROPFIND timeout
+    // for /x", "WebDAV download timeout", reqwest's "operation timed out") — not
+    // the bare word, which also matches a directory called `timeout`.
+    e == "timeout" || e.contains("timed out") || e.starts_with("PROPFIND timeout")
+        || e.ends_with(" timeout")
 }
 
 /// Retries a single chunked-upload backend call (open/put-chunk/finish) a
@@ -982,6 +1005,25 @@ pub fn mime_magic_bytes(content_type: &str) -> &'static [u8] {
 }
 
 fn error_to_errno(err: &str) -> Errno {
+    // Typed backend errors first: their messages embed the path, so the
+    // substring heuristics below would read a directory named `2404` as a 404.
+    if let Some(code) = backend::server_error_code(err) {
+        return match code {
+            401 | 403 => Errno::EACCES,
+            404 | 410 => Errno::ENOENT,
+            507 => Errno::ENOSPC,
+            // The server is struggling (or throttling us): "try again", never EIO,
+            // which makes Nautilus mark the whole mount inaccessible.
+            429 | 500..=599 => Errno::EAGAIN,
+            _ => Errno::EIO,
+        };
+    }
+    if err == "not found" {
+        return Errno::ENOENT;
+    }
+    if err.starts_with("network:") || err.starts_with(backend::TRUNCATED_PREFIX) {
+        return if err == OFFLINE_READ_ERR { Errno::ETIMEDOUT } else { Errno::EAGAIN };
+    }
     if err.contains("401") || err.contains("403") || err.contains("Unauthorized") || err.contains("Forbidden") {
         Errno::EACCES
     } else if err.contains("404") || err.contains("Not Found") {
@@ -999,37 +1041,38 @@ fn error_to_errno(err: &str) -> Errno {
     }
 }
 
+/// Lists `path` from the server, retrying transport failures. Runs on the
+/// caller's thread: every caller is already a background worker, and each
+/// attempt is bounded by `PROPFIND_TIMEOUT`, so the thread this used to spawn
+/// (and orphan when its outer deadline fired) bought nothing but a leak.
+///
+/// A 5xx is not retried here — the server answered, and asking again at once
+/// is how a struggling server stays down. The permit is taken per attempt so
+/// the backoff sleep never holds a request slot.
 fn list_dir_propfind(
     conn: &Arc<ConnInfo>,
     path: PathBuf,
 ) -> Result<(Option<String>, Option<RemoteEntry>, Vec<RemoteEntry>), String> {
     log::debug!("LIST {}", path.display());
-    let (tx, rx) = mpsc::channel();
-    let c = conn.clone();
     const MAX_RETRIES: u32 = 2;
-    thread::spawn(move || {
-        let _permit = c.throttle.acquire();
-        let mut delay = Duration::from_millis(500);
-        let mut result = Err(String::new());
-        for attempt in 0..=MAX_RETRIES {
-            result = c.backend.list_dir(&path, PROPFIND_TIMEOUT).map_err(|e| e.to_string());
-            match &result {
-                Ok(_) => break,
-                Err(e) if attempt < MAX_RETRIES && (is_transient_network_err(e) || is_timeout_err(e)) => {
-                    log::warn!("PROPFIND {} failed (attempt {}/{}): {} — retrying in {:?}",
-                        path.display(), attempt + 1, MAX_RETRIES + 1, e, delay);
-                    thread::sleep(delay);
-                    delay = (delay * 2).min(Duration::from_secs(8));
-                }
-                Err(_) => break,
+    let mut delay = Duration::from_millis(500);
+    let mut attempt = 0u32;
+    loop {
+        let result = match conn.throttle.acquire_timeout(PROPFIND_TIMEOUT) {
+            Some(_permit) => conn.backend.list_dir(&path, PROPFIND_TIMEOUT).map_err(|e| e.to_string()),
+            None => Err(format!("PROPFIND timeout for {} (no request slot)", path.display())),
+        };
+        match result {
+            Err(e) if attempt < MAX_RETRIES && (is_transient_network_err(&e) || is_timeout_err(&e)) => {
+                log::warn!("PROPFIND {} failed (attempt {}/{}): {} — retrying in {:?}",
+                    path.display(), attempt + 1, MAX_RETRIES + 1, e, delay);
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(8));
+                attempt += 1;
             }
+            other => return other,
         }
-        let _ = tx.send(result);
-    });
-    // Outer timeout covers all retry attempts plus a small margin.
-    let outer = PROPFIND_TIMEOUT * (MAX_RETRIES + 1) + Duration::from_secs(2);
-    rx.recv_timeout(outer)
-        .unwrap_or_else(|_| Err("WebDAV PROPFIND timeout".into()))
+    }
 }
 
 struct ProgressWriter {
@@ -1062,22 +1105,19 @@ fn open_file_timeout(
     transfers: Option<TransferMap>,
 ) -> Result<(), String> {
     log::info!("DOWNLOAD {}", path.display());
-    let (tx, rx) = mpsc::channel();
-    let c = conn.clone();
-    thread::spawn(move || {
-        let _permit = c.read_throttle.acquire();
-        let mut writer: Box<dyn std::io::Write + Send> = if let Some(tm) = transfers {
-            Box::new(ProgressWriter { inner: dest, path: path.clone(), transfer_map: tm, written: 0 })
-        } else {
-            Box::new(dest)
-        };
-        let result = c.backend.download_file(&path, &mut *writer, DOWNLOAD_TIMEOUT)
-            .map(|_| ())
-            .map_err(|e| e.to_string());
-        let _ = tx.send(result);
-    });
-    rx.recv_timeout(DOWNLOAD_TIMEOUT)
-        .unwrap_or_else(|_| Err("WebDAV download timeout".into()))
+    // Runs on the caller's thread: the request carries its own DOWNLOAD_TIMEOUT,
+    // so a helper thread only added one that outlived its caller's deadline.
+    let Some(_permit) = conn.read_throttle.acquire_timeout(DOWNLOAD_SLOT_WAIT) else {
+        return Err("WebDAV download timeout (no download slot)".into());
+    };
+    let mut writer: Box<dyn std::io::Write + Send> = if let Some(tm) = transfers {
+        Box::new(ProgressWriter { inner: dest, path: path.clone(), transfer_map: tm, written: 0 })
+    } else {
+        Box::new(dest)
+    };
+    conn.backend.download_file(&path, &mut *writer, DOWNLOAD_TIMEOUT)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // ── Cache layer ───────────────────────────────────────────────────────────────
@@ -2025,7 +2065,10 @@ fn get_or_list_dir(
 /// failure or timeout, including our own "PROPFIND timeout" give-up) rather than a
 /// server that answered with a rejection.
 fn is_unreachable_listing_error(e: &str) -> bool {
+    // A 5xx is an answer, but not one about the directory: a listing we already
+    // have beats an error the walker can do nothing with.
     is_transient_network_err(e) || is_timeout_err(e)
+        || backend::server_error_code(e).is_some_and(|c| c >= 500 || c == 429)
 }
 
 fn list_dir_cached_or_fresh(
@@ -4305,9 +4348,7 @@ impl NextCloudFs {
                 }
                 Err(e) => {
                     log::error!("readdir {}: {}", path.display(), e);
-                    let kind = if e.contains("401") || e.contains("403")
-                        || e.contains("Unauthorized") || e.contains("Forbidden")
-                    {
+                    let kind = if error_to_errno(&e).code() == libc::EACCES {
                         SyncErrorKind::PermissionDenied
                     } else {
                         SyncErrorKind::NetworkError
