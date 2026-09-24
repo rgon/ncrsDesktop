@@ -22,6 +22,7 @@
             deleting: HashSet::new(),
             trackerignore_hidden: false,
             pins: HashMap::new(),
+            tombstones: tombstones::Tombstones::default(),
         }
     }
 
@@ -141,11 +142,12 @@
             std::fs::create_dir_all(&dir).unwrap();
             let server = Arc::new(server);
             let conn = ConnInfo::for_tests(server.clone());
-            let meta = MetaCtx::for_tests(conn, Arc::new(Mutex::new(make_test_cache())), Duration::from_secs(5));
+            let journal = Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&dir)));
+            let meta = MetaCtx { journal: journal.clone(), ..MetaCtx::for_tests(conn, Arc::new(Mutex::new(make_test_cache())), Duration::from_secs(5)) };
             let ctx = WriteCtx {
                 meta,
                 lanes: fh_lane::FhLanes::new(),
-                journal: Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&dir))),
+                journal,
                 dirty: Arc::new(Mutex::new(HashSet::new())),
                 error_log: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 log_user: Arc::from("t"),
@@ -196,7 +198,7 @@
                     io_kind: iomode::IoKind::Cached,
                     upload_failed: false,
                     created: false,
-                    unlinked: false,
+                    unlinked: Unlinked::No,
                     opened_gen: 0,
                     writer: false,
                     pinned_parent: None,
@@ -3743,8 +3745,11 @@ mod upload_order_tests {
         struct FakeBackend {
             dirs: Mutex<HashMap<PathBuf, FakeDir>>,
             lists: AtomicUsize,
-            /// Content served by `download_file`, after the given pause.
+            /// Content served by `download_file`, after the given pause; any
+            /// other path is a 404.
             files: Mutex<HashMap<PathBuf, (Vec<u8>, Duration)>>,
+            /// Every PUT, in order.
+            puts: Mutex<Vec<(PathBuf, Vec<u8>)>>,
         }
 
         impl FakeBackend {
@@ -3785,7 +3790,7 @@ mod upload_order_tests {
                 Err(unsupported())
             }
             fn download_file(&self, path: &Path, out: &mut dyn std::io::Write, _: Duration) -> Result<u64, backend::BackendReadError> {
-                let (bytes, pause) = self.files.lock().unwrap().get(path).cloned().ok_or_else(unsupported)?;
+                let (bytes, pause) = self.files.lock().unwrap().get(path).cloned().ok_or(backend::BackendReadError::NotFound)?;
                 std::thread::sleep(pause);
                 out.write_all(&bytes).map_err(|e| backend::BackendReadError::Network(e.to_string()))?;
                 Ok(bytes.len() as u64)
@@ -3793,8 +3798,9 @@ mod upload_order_tests {
             fn read_file_range(&self, _: &Path, _: u64, _: &mut [u8], _: Duration) -> Result<usize, backend::BackendReadError> {
                 Err(unsupported())
             }
-            fn put_file(&self, _: &Path, _: Vec<u8>, _: Option<&str>) -> Result<backend::PutResult, backend::BackendWriteError> {
-                Err(backend::BackendWriteError::Unsupported)
+            fn put_file(&self, path: &Path, body: Vec<u8>, _: Option<&str>) -> Result<backend::PutResult, backend::BackendWriteError> {
+                self.puts.lock().unwrap().push((path.to_path_buf(), body));
+                Ok(backend::PutResult { new_change_token: Some("put".into()) })
             }
             fn mkdir(&self, _: &Path) -> Result<(), backend::BackendWriteError> {
                 Err(backend::BackendWriteError::Unsupported)
@@ -4010,7 +4016,7 @@ mod upload_order_tests {
 
         fn rq(ino: u64, path: &str, flags: i32, local: Option<PathBuf>) -> OpenReq {
             let writable = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
-            OpenReq { ino, flags, pid: 0, writable, truncating: writable && flags & libc::O_TRUNC != 0, path: PathBuf::from(path), local }
+            OpenReq { ino, flags, pid: 0, writable, truncating: writable && flags & libc::O_TRUNC != 0, path: PathBuf::from(path), local, unlink_snap: None }
         }
 
         fn listed(size: u64) -> OpenEntry {
@@ -4066,9 +4072,12 @@ mod upload_order_tests {
             }
             assert_eq!(meta.open_writers.load(Ordering::SeqCst), 1);
             assert_eq!(meta.cache.safe_lock().pins.get(Path::new("/d")), Some(&1));
+            // As rename() does: its MOVE is queued, and lands after the download.
+            let seq = meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/d/a.txt"), to: PathBuf::from("/d/b.txt") });
             meta.cache.safe_lock().move_inode(Path::new("/d/a.txt"), Path::new("/d/b.txt"));
             retarget_open_files(&mut meta.cache.safe_lock(), &meta.open_files, Path::new("/d/a.txt"), Path::new("/d/b.txt"));
             let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            meta.journal.safe_lock().remove(seq);
             {
                 let files = meta.open_files.safe_lock();
                 let of = &files[&fh];
@@ -4082,9 +4091,9 @@ mod upload_order_tests {
             meta.cache.safe_lock().move_inode(Path::new("/d/b.txt"), Path::new("/d/a.txt"));
             let (r, rx) = reply();
             open_continue(&meta, rq(ino, "/d/a.txt", libc::O_RDWR, None), listed(5), r, false);
-            mark_unlinked(&meta.open_files, Path::new("/d/a.txt"));
+            mark_unlinked(&meta.open_files, Path::new("/d/a.txt"), Some(ino));
             let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
-            assert!(meta.open_files.safe_lock()[&fh].unlinked);
+            assert_eq!(meta.open_files.safe_lock()[&fh].unlinked, Unlinked::Local);
         }
 
         #[test]
@@ -4306,7 +4315,7 @@ mod upload_order_tests {
         }
 
         #[test]
-        fn staging_follows_a_rename_and_skips_an_unlinked_file() {
+        fn staging_follows_a_rename_and_skips_a_locally_unlinked_file() {
             let (fake, meta, _tmp, ino) = open_setup(vec![], true);
             fake.files.lock().unwrap().insert(PathBuf::from("/e/a.txt"), (b"moved".to_vec(), Duration::ZERO));
             // Renamed while open() resolved it: registered at, and staged from, the new path.
@@ -4316,11 +4325,13 @@ mod upload_order_tests {
             let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
             {
                 let files = meta.open_files.safe_lock();
-                assert_eq!(std::fs::read(files[&fh].write_path.as_ref().unwrap()).unwrap(), b"moved", "staged the old path's content");
+                assert_eq!(std::fs::read(files[&fh].write_path.as_ref().unwrap()).unwrap(), b"moved", "staged the new path's content");
             }
             release_bookkeeping(&meta, fh);
-            // Its MOVE has not reached the server yet: staged from where it was.
+            // Its MOVE has not reached the server yet: staged from the source the
+            // journal's Rename names, and only because the journal names it.
             meta.cache.safe_lock().move_inode(Path::new("/e/a.txt"), Path::new("/f/a.txt"));
+            let seq = meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/d/a.txt"), to: PathBuf::from("/f/a.txt") });
             let (r, rx) = reply();
             open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
             let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
@@ -4330,32 +4341,269 @@ mod upload_order_tests {
                 assert_eq!(std::fs::read(files[&fh].write_path.as_ref().unwrap()).unwrap(), b"hello");
             }
             release_bookkeeping(&meta, fh);
-            meta.cache.safe_lock().move_inode(Path::new("/f/a.txt"), Path::new("/d/a.txt"));
-
-            // Unlinked while open() resolved it: the resident listing no longer has
-            // the name. The handle is born unlinked (release will not PUT it back),
-            // and there is nothing to download.
-            meta.cache.safe_lock().dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(vec![]);
-            fake.files.lock().unwrap().clear();
+            // No Rename queued: the path it was opened under is not where the
+            // content is (after `mv f f~; mv tmp f` it is another file).
+            meta.journal.safe_lock().remove(seq);
             let (r, rx) = reply();
             open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), OpenOutcome::Error(libc::EIO));
+            meta.cache.safe_lock().move_inode(Path::new("/f/a.txt"), Path::new("/d/a.txt"));
+
+            // Unlinked by this mount while open() resolved it: a tombstone newer
+            // than the open's snapshot. The handle is born unlinked (release will
+            // not PUT it back), and there is nothing to download.
+            let snap = meta.cache.safe_lock().tombstones.snapshot();
+            {
+                let mut c = meta.cache.safe_lock();
+                c.dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(vec![]);
+                c.tombstones.record(ino);
+            }
+            mark_unlinked(&meta.open_files, Path::new("/d/a.txt"), Some(ino));
+            let (r, rx) = reply();
+            open_continue(&meta, OpenReq { unlink_snap: Some(snap), ..rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None) }, OpenEntry::absent(), r, false);
             let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
             {
                 let files = meta.open_files.safe_lock();
-                assert!(files[&fh].unlinked, "release would re-create the deleted file");
+                assert_eq!(files[&fh].unlinked, Unlinked::Local, "release would re-create the deleted file");
                 assert_eq!(std::fs::metadata(files[&fh].write_path.as_ref().unwrap()).unwrap().len(), 0);
             }
             release_bookkeeping(&meta, fh);
 
-            // A name whose upload is in flight is not gone, even if a refresh
-            // dropped it from the listing.
-            meta.cache.safe_lock().uploading.insert(PathBuf::from("/d/a.txt"), None);
+            // The listing lost the name, but nothing here unlinked it: not gone,
+            // and staged from the server.
+            let snap = meta.cache.safe_lock().tombstones.snapshot();
             let (r, rx) = reply();
-            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY, None), listed(0), r, false);
-            let fh = fh_of(rx.try_recv().expect("inline"));
-            assert!(!meta.open_files.safe_lock()[&fh].unlinked);
+            open_continue(&meta, OpenReq { unlink_snap: Some(snap), ..rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None) }, OpenEntry::absent(), r, false);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            {
+                let files = meta.open_files.safe_lock();
+                assert_eq!(files[&fh].unlinked, Unlinked::No);
+                assert_eq!(std::fs::read(files[&fh].write_path.as_ref().unwrap()).unwrap(), b"hello");
+            }
             release_bookkeeping(&meta, fh);
             assert_all_given_back(&meta, ino);
+        }
+
+        #[test]
+        fn an_unlink_matches_handles_by_inode_not_by_a_path_a_registration_has_not_updated() {
+            let (_, meta, tmp, ino) = open_setup(vec![], true);
+            let (r, _rx) = reply();
+            let _ = open_register(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY, None), listed(0), 7, false, Some(tmp.path().join("w7")), false, None, &r);
+            // Another file now at the same path (`mv a b; mv c a`), unlinked.
+            mark_unlinked(&meta.open_files, Path::new("/d/a.txt"), Some(ino + 1000));
+            assert_eq!(meta.open_files.safe_lock()[&7].unlinked, Unlinked::No);
+            // An unlink that did not know the inode is only a hint.
+            mark_unlinked(&meta.open_files, Path::new("/d/a.txt"), None);
+            assert_eq!(meta.open_files.safe_lock()[&7].unlinked, Unlinked::Unverified);
+            mark_unlinked(&meta.open_files, Path::new("/d/a.txt"), Some(ino));
+            assert_eq!(meta.open_files.safe_lock()[&7].unlinked, Unlinked::Local);
+            release_bookkeeping(&meta, 7);
+            assert_all_given_back(&meta, ino);
+        }
+
+        // ── Writes survive a listing that lost the name (review of 6bdfb93) ─
+        //
+        // Only this mount unlinking a file may drop what is written to it. These
+        // open the file the way the kernel does with a dentry still cached (by
+        // inode, the listing resident but without the name), append, release,
+        // and check what reaches the server.
+
+        fn write_ctx(meta: &MetaCtx, dir: &Path) -> crate::write_path::WriteCtx {
+            crate::write_path::WriteCtx {
+                meta: meta.clone(),
+                lanes: fh_lane::FhLanes::new(),
+                journal: meta.journal.clone(),
+                dirty: Arc::new(Mutex::new(HashSet::new())),
+                error_log: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                log_user: Arc::from("t"),
+                auto_keep_locally_modified_files: false,
+                cache_dir: dir.to_path_buf(),
+                upload_pool: &bg::UPLOAD,
+                disk_pool: &bg::DISK,
+            }
+        }
+
+        /// What open() computes on the dispatch thread for inode `ino`.
+        fn open_by_inode(meta: &MetaCtx, ino: u64, flags: i32) -> OpenOutcome {
+            let (path, entry, snap) = {
+                let mut c = meta.cache.safe_lock();
+                let path = c.get_path(ino).expect("inode known");
+                let snap = c.tombstones.snapshot();
+                let (dir, name) = (path.parent().unwrap().to_path_buf(), path.file_name().unwrap().to_str().unwrap().to_string());
+                let entry = c.find_child(&dir, &name).expect("listing resident")
+                    .1.map_or_else(OpenEntry::absent, |_| listed(5));
+                (path, entry, snap)
+            };
+            let (r, rx) = reply();
+            open_continue(meta, OpenReq { unlink_snap: Some(snap), ..rq(ino, path.to_str().unwrap(), flags, None) }, entry, r, false);
+            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        }
+
+        /// Appends `data` to handle `fh`'s staging file and releases it.
+        fn append_and_release(w: &crate::write_path::WriteCtx, fh: u64, data: &[u8]) {
+            let (path, wp) = {
+                let files = w.open_files.safe_lock();
+                (files[&fh].remote_path.clone(), files[&fh].write_path.clone().unwrap())
+            };
+            let off = std::fs::metadata(&wp).map_or(0, |m| m.len());
+            let (tx, rx) = mpsc::channel();
+            w.dispatch_write(fh, path, off, data, move |r| tx.send(r.is_ok()).unwrap());
+            assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "write failed");
+            let (tx, rx) = mpsc::channel();
+            w.dispatch_release(fh, Box::new(move || tx.send(()).unwrap()));
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        fn wait_for_put(fake: &FakeBackend, path: &str) -> Vec<u8> {
+            let t = Instant::now();
+            loop {
+                if let Some((_, body)) = fake.puts.lock().unwrap().iter().rev().find(|(p, _)| p == Path::new(path)) {
+                    return body.clone();
+                }
+                assert!(t.elapsed() < Duration::from_secs(10), "no PUT of {path}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn drop_from_listing(meta: &MetaCtx, dir: &str) {
+            meta.cache.safe_lock().put_dir_cache(PathBuf::from(dir), None, None, vec![]);
+        }
+
+        #[test]
+        fn a_write_to_a_file_whose_failed_upload_a_relist_dropped_is_committed_on_top_of_it() {
+            // (a) create + write, its PUT failed transiently (the Put stays
+            // journaled, the upload guard is gone), and a refresh of the parent
+            // dropped the name. `echo more >> f` must append to what was saved.
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            fake.files.lock().unwrap().clear();
+            let saved = tmp.path().join("write_saved");
+            std::fs::write(&saved, b"saved").unwrap();
+            let seq = meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Put {
+                remote_path: PathBuf::from("/d/a.txt"), staging_path: saved.clone(), if_match_etag: None,
+            });
+            meta.journal.safe_lock().mark_deferred(seq, "503".into());
+            drop_from_listing(&meta, "/d");
+            let fh = fh_of(open_by_inode(&meta, ino, libc::O_WRONLY | libc::O_APPEND));
+            assert_eq!(meta.open_files.safe_lock()[&fh].unlinked, Unlinked::No, "a lost name is not an unlink");
+            append_and_release(&write_ctx(&meta, tmp.path()), fh, b" more");
+            assert_eq!(wait_for_put(&fake, "/d/a.txt"), b"saved more");
+        }
+
+        #[test]
+        fn a_write_to_a_renamed_file_listed_before_its_move_landed_keeps_its_content() {
+            // (b) `mv x/f y/g`, then a re-list of y comes back from the server
+            // before the MOVE did. g is still at x/f there.
+            let (fake, meta, tmp, _) = open_setup(vec![], true);
+            fake.files.lock().unwrap().insert(PathBuf::from("/x/f"), (b"orig".to_vec(), Duration::ZERO));
+            let ino = {
+                let mut c = meta.cache.safe_lock();
+                let ino = c.allocate_inode(PathBuf::from("/x/f"));
+                c.move_inode(Path::new("/x/f"), Path::new("/y/g"));
+                ino
+            };
+            meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/x/f"), to: PathBuf::from("/y/g") });
+            drop_from_listing(&meta, "/y");
+            let fh = fh_of(open_by_inode(&meta, ino, libc::O_WRONLY | libc::O_APPEND));
+            assert_eq!(meta.open_files.safe_lock()[&fh].unlinked, Unlinked::No);
+            append_and_release(&write_ctx(&meta, tmp.path()), fh, b"+");
+            assert_eq!(wait_for_put(&fake, "/y/g"), b"orig+");
+        }
+
+        #[test]
+        fn a_write_to_a_file_another_client_deleted_re_creates_it() {
+            // (c) Deleted elsewhere, a refresh dropped it; the local edit wins.
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            fake.files.lock().unwrap().clear();
+            drop_from_listing(&meta, "/d");
+            let fh = fh_of(open_by_inode(&meta, ino, libc::O_WRONLY | libc::O_APPEND));
+            assert_eq!(meta.open_files.safe_lock()[&fh].unlinked, Unlinked::No);
+            append_and_release(&write_ctx(&meta, tmp.path()), fh, b"new");
+            assert_eq!(wait_for_put(&fake, "/d/a.txt"), b"new");
+        }
+
+        #[test]
+        fn a_write_under_a_directory_renamed_over_an_empty_one_keeps_its_content() {
+            // (d) `mkdir d2; mv d d2`: d2's empty listing is resident and rename
+            // does not re-key listings, so d2 "lacks" a.txt.
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            meta.cache.safe_lock().put_dir_cache(PathBuf::from("/d2"), None, None, vec![]);
+            meta.cache.safe_lock().move_inode(Path::new("/d"), Path::new("/d2"));
+            meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/d"), to: PathBuf::from("/d2") });
+            let fh = fh_of(open_by_inode(&meta, ino, libc::O_WRONLY | libc::O_APPEND));
+            assert_eq!(meta.open_files.safe_lock()[&fh].remote_path, PathBuf::from("/d2/a.txt"));
+            assert_eq!(meta.open_files.safe_lock()[&fh].unlinked, Unlinked::No);
+            append_and_release(&write_ctx(&meta, tmp.path()), fh, b"!");
+            assert_eq!(wait_for_put(&fake, "/d2/a.txt"), b"hello!");
+        }
+
+        #[test]
+        fn a_file_this_mount_unlinked_during_staging_is_not_resurrected() {
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            let w = write_ctx(&meta, tmp.path());
+            // Slow download: the unlink lands while the content is being staged.
+            fake.files.lock().unwrap().insert(PathBuf::from("/d/a.txt"), (b"hello".to_vec(), Duration::from_millis(300)));
+            let snap = meta.cache.safe_lock().tombstones.snapshot();
+            let (r, rx) = reply();
+            open_continue(&meta, OpenReq { unlink_snap: Some(snap), ..rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None) }, listed(5), r, false);
+            {
+                let mut c = meta.cache.safe_lock();
+                c.dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(vec![]);
+                c.tombstones.record(ino);
+            }
+            mark_unlinked(&meta.open_files, Path::new("/d/a.txt"), Some(ino));
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            let wp = meta.open_files.safe_lock()[&fh].write_path.clone().unwrap();
+            append_and_release(&w, fh, b"x");
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(fake.puts.lock().unwrap().is_empty(), "the deleted file was PUT back");
+            assert!(!wp.exists(), "its staging is dropped");
+            assert!(meta.journal.safe_lock().is_empty());
+        }
+
+        #[test]
+        fn rm_then_echo_into_the_same_name_is_committed() {
+            // `rm f; echo x > f`: the re-created file keeps the path's inode; its
+            // open comes after the unlink's tombstone, so it is not unlinked.
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            {
+                let mut c = meta.cache.safe_lock();
+                c.dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(vec![]);
+                c.tombstones.record(ino);
+            }
+            // create() puts the name back into the listing.
+            {
+                let mut c = meta.cache.safe_lock();
+                let mut e = entry_in("/d", "a.txt");
+                e.size = 0;
+                c.dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(vec![e]);
+            }
+            let fh = fh_of(open_by_inode(&meta, ino, libc::O_WRONLY | libc::O_TRUNC));
+            assert_eq!(meta.open_files.safe_lock()[&fh].unlinked, Unlinked::No);
+            append_and_release(&write_ctx(&meta, tmp.path()), fh, b"x");
+            assert_eq!(wait_for_put(&fake, "/d/a.txt"), b"x");
+        }
+
+        #[test]
+        fn a_written_handle_unlinked_without_proof_keeps_its_bytes_in_recovered() {
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            let w = write_ctx(&meta, tmp.path());
+            let fh = fh_of(open_by_inode(&meta, ino, libc::O_WRONLY | libc::O_TRUNC));
+            let (tx, rx) = mpsc::channel();
+            w.dispatch_write(fh, PathBuf::from("/d/a.txt"), 0, b"precious", move |r| tx.send(r.is_ok()).unwrap());
+            assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            mark_unlinked(&meta.open_files, Path::new("/d/a.txt"), None);
+            let (tx, rx) = mpsc::channel();
+            w.dispatch_release(fh, Box::new(move || tx.send(()).unwrap()));
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let recovered = tmp.path().join(mutation_journal::RECOVERED_DIR);
+            let kept: Vec<_> = std::fs::read_dir(&recovered).unwrap().flatten().map(|e| e.path()).collect();
+            let data = kept.iter().find(|p| p.extension().is_none_or(|x| x != "json")).expect("bytes kept");
+            assert_eq!(std::fs::read(data).unwrap(), b"precious");
+            let sidecar: mutation_journal::RecoveredSidecar = serde_json::from_slice(&std::fs::read(data.with_file_name(format!("{}.json", data.file_name().unwrap().to_str().unwrap()))).unwrap()).unwrap();
+            assert_eq!(sidecar.remote_path.as_deref(), Some(Path::new("/d/a.txt")));
+            assert_eq!(sidecar.size, 8);
+            assert!(fake.puts.lock().unwrap().is_empty());
+            assert_eq!(meta.journal.safe_lock().unresolved_conflicts().len(), 1, "the user is told where");
         }
 
         #[test]
@@ -4367,7 +4615,7 @@ mod upload_order_tests {
             // where the handle is in `open_files` but has no pin yet.
             meta.open_files.safe_lock().get_mut(&7).unwrap().pinned_parent = None;
             meta.cache.safe_lock().unpin_dir(Path::new("/d"));
-            let (now_at, gone) = pin_where_it_lives(&meta, ino, Path::new("/d/a.txt"));
+            let (now_at, gone) = pin_where_it_lives(&meta, ino, Path::new("/d/a.txt"), None);
             assert_eq!((now_at.as_path(), gone), (Path::new("/d/a.txt"), false));
             {
                 let mut c = meta.cache.safe_lock();
@@ -4397,7 +4645,7 @@ mod upload_order_tests {
             let mut files = meta.open_files.safe_lock();
             let of = files.get_mut(&fh).unwrap();
             of.dirty = true;
-            of.unlinked = unlinked;
+            of.unlinked = if unlinked { Unlinked::Local } else { Unlinked::No };
         }
 
         #[test]

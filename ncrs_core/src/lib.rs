@@ -16,6 +16,7 @@ pub mod http_clients;
 mod fh_lane;
 mod iomode;
 mod path_seq;
+mod tombstones;
 pub mod mutation_journal;
 pub mod nextcloud;
 pub mod notifications;
@@ -586,6 +587,26 @@ struct ChunkUploadState {
     bytes_confirmed: u64,
 }
 
+/// Whether a handle's file was deleted while it was open, and how sure that is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Unlinked {
+    #[default]
+    No,
+    /// This mount removed this very file (unlink, or a rename over it): its
+    /// bytes are dropped at release, as a deleted file's are.
+    Local,
+    /// Something said the file is gone without proving it is this file (an
+    /// unlink of its path whose inode was unknown). release() keeps the bytes
+    /// in `recovered/` rather than dropping or uploading them.
+    Unverified,
+}
+
+impl Unlinked {
+    fn is(self) -> bool {
+        self != Unlinked::No
+    }
+}
+
 struct OpenFile {
     remote_path: PathBuf,
     local: Option<PathBuf>,
@@ -642,8 +663,8 @@ struct OpenFile {
     upload_failed: bool,
     // Made by create() and not uploaded yet: the server has no copy until release().
     created: bool,
-    // The path was deleted while this handle was open; release() must not re-create it.
-    unlinked: bool,
+    // The file was deleted while this handle was open; release() must not re-create it.
+    unlinked: Unlinked,
     // UploadOrder generation when opened, for etag chaining (see UploadOrder::etag_for).
     opened_gen: u64,
     // Counted in MetaCtx::open_writers (set by `insert_open_file`), so release
@@ -1542,6 +1563,9 @@ pub(crate) struct FsCache {
     // open fds. Evicting a listing in use turned the next stat of a file the
     // user has open into a synchronous re-list (review of 2026-09-24).
     pins: HashMap<PathBuf, u32>,
+    // Local unlinks an open still being resolved could have missed (see
+    // `tombstones.rs`).
+    pub(crate) tombstones: tombstones::Tombstones,
 }
 
 impl FsCache {
@@ -3725,6 +3749,9 @@ struct MetaCtx {
     // Where lookups and opens go when they cannot be answered inline:
     // `bg::META` (in tests, possibly a pool that refuses every job).
     meta_pool: &'static bg::Pool,
+    // A writable open seeds from a queued upload's staging file and finds a
+    // rename's source here. Never locked while holding `cache`.
+    journal: mutation_journal::SharedJournal,
 }
 
 #[cfg(test)]
@@ -3748,6 +3775,13 @@ impl MetaCtx {
             thumbnail: Arc::new(|_| false),
             resolve_within,
             meta_pool: &bg::META,
+            journal: {
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let dir = std::env::temp_dir().join(format!("ncrs-meta-journal-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::create_dir_all(&dir);
+                Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&dir)))
+            },
         }
     }
 }
@@ -3807,7 +3841,7 @@ fn overlay_local_size(ctx: &MetaCtx, path: &Path, attr: &mut FileAttr) {
     let local: Vec<Result<u64, PathBuf>> = {
         let files = ctx.open_files.safe_lock();
         files.values()
-            .filter(|of| of.dirty && !of.unlinked && of.remote_path == path && of.write_path.is_some())
+            .filter(|of| of.dirty && !of.unlinked.is() && of.remote_path == path && of.write_path.is_some())
             .map(|of| match (&of.chunk_upload, &of.write_path) {
                 // Sent chunks are gone from the tail file; the total is the size.
                 (Some(_), _) => Ok(of.total_written),
@@ -3962,6 +3996,10 @@ struct OpenEntry {
     /// freshness can be judged from this entry itself — the listing it came
     /// from may be evicted again by the time the open is answered.
     listed: bool,
+    /// The resident listing (or the server) does not have the name. Not proof
+    /// the file is gone: a listing re-fetched before a rename's MOVE or a
+    /// retried upload reached the server lacks it too.
+    absent: bool,
 }
 
 impl OpenEntry {
@@ -3973,7 +4011,12 @@ impl OpenEntry {
             content_type: e.content_type.clone(),
             modified: e.modified,
             listed: true,
+            absent: false,
         }
+    }
+
+    fn absent() -> Self {
+        OpenEntry { absent: true, ..OpenEntry::default() }
     }
 }
 
@@ -3986,6 +4029,10 @@ struct OpenReq {
     truncating: bool,
     path: PathBuf,
     local: Option<PathBuf>,
+    /// Taken where open() resolved the inode, before any hop to a worker;
+    /// registration checks it against local unlinks (`tombstones.rs`). None
+    /// where no unlink can run in between (tests driving one step).
+    unlink_snap: Option<tombstones::OpenSnapshot>,
 }
 
 fn next_fh(ctx: &MetaCtx) -> u64 {
@@ -4062,7 +4109,7 @@ fn open_unlisted<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, reply: R) {
     with_child_within(ctx, rq.pid, &path, within, (reply, rq), |_, _, e| OpenEntry::of(e), |_| None, |ctx, _, (reply, rq), r, _| match r {
         Resolved::Found(entry) => open_continue(ctx, rq, entry, reply, false),
         // Not on the server: nothing to seed from.
-        Resolved::Absent => open_continue(ctx, rq, OpenEntry::default(), reply, false),
+        Resolved::Absent => open_continue(ctx, rq, OpenEntry::absent(), reply, false),
         // A truncating open discards the content anyway, and a read-only open
         // of a kept copy keeps working offline (served as before, from the copy
         // we have).
@@ -4212,12 +4259,18 @@ fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: Op
     let wp = ctx.cache.safe_lock().cache_dir.join(mutation_journal::staging_file_name(fh));
     // Stage the current content before any write: a write that does not start at
     // 0 (O_APPEND, an in-place edit) would otherwise upload a zero-filled prefix.
-    let seed: Option<Option<PathBuf>> = if rq.truncating {
+    let seed = if rq.truncating {
         None
+    } else if let Some(staged) = ctx.journal.safe_lock().pending_put_staging(&rq.path) {
+        // A queued upload holds the newest content, which neither the server
+        // nor a kept copy has yet (and whose name a re-list may have dropped).
+        Some(Seed::Pending(staged))
     } else if let Some(local) = rq.local.clone().filter(|_| cache_fresh) {
-        Some(Some(local))
-    } else if entry.size > 0 {
-        Some(None)
+        Some(Seed::Local(local))
+    } else if entry.size > 0 || entry.absent {
+        // Absent from its listing is not "empty": the name may be missing
+        // only until a rename's MOVE lands (see `download_seed`).
+        Some(Seed::Download { absent: entry.absent })
     } else {
         None
     };
@@ -4250,29 +4303,21 @@ fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: Op
     let worker_ctx = ctx.clone();
     let queued = bg::READ.submit_owning((undo, reply, grant), move |(mut undo, reply, grant)| {
         // Where the file is *now*: a rename or unlink since the open was
-        // requested updated the handle, not `path`. An unlinked handle is
-        // never committed (release drops its staging file), so its content is
-        // not needed.
+        // requested updated the handle, not `path`. A handle this mount
+        // unlinked is never committed (release drops its staging file), so
+        // its content is not needed.
         let (now_at, unlinked) = worker_ctx.open_files.safe_lock().get(&fh)
-            .map_or((path.clone(), false), |of| (of.remote_path.clone(), of.unlinked));
-        let download = |from: &Path| {
-            std::fs::File::create(&wp)
-                .map_err(|e| e.to_string())
-                .and_then(|dest| open_file_timeout(&worker_ctx.conn, from.to_path_buf(), dest, Some(worker_ctx.transfer_map.clone())))
-        };
+            .map_or((path.clone(), Unlinked::No), |of| (of.remote_path.clone(), of.unlinked));
         let staged = match seed_from {
-            _ if unlinked => std::fs::File::create(&wp).map(|_| ()).map_err(|e| e.to_string()),
-            Some(local) => std::fs::copy(&local, &wp).map(|_| ()).map_err(|e| e.to_string()),
-            // A rename's MOVE reaches the server after rename() answered, so
-            // the content can still be at the old path: try that one too
-            // (File::create starts the staging file over).
-            None => download(&now_at).or_else(|e| {
-                if now_at == path {
-                    return Err(e);
-                }
-                log::debug!("open: {} not on the server yet ({}) — staging from {}, before its rename", now_at.display(), e, path.display());
-                download(&path)
-            }),
+            _ if unlinked == Unlinked::Local => std::fs::File::create(&wp).map(|_| ()).map_err(|e| e.to_string()),
+            Seed::Local(local) => std::fs::copy(&local, &wp).map(|_| ()).map_err(|e| e.to_string()),
+            Seed::Pending(staged) => match std::fs::copy(&staged, &wp) {
+                Ok(_) => Ok(()),
+                // Uploaded meanwhile: its staging goes once it is on the server.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => download_seed(&worker_ctx, &wp, &now_at, false),
+                Err(e) => Err(e.to_string()),
+            },
+            Seed::Download { absent } => download_seed(&worker_ctx, &wp, &now_at, absent),
         };
         let path = now_at;
         if let Err(e) = staged {
@@ -4287,6 +4332,56 @@ fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: Op
     if let Err((_, (undo, reply, _))) = queued {
         drop(undo);
         reply.error(Errno::EAGAIN);
+    }
+}
+
+/// Where a writable open's staging file gets the file's current content.
+enum Seed {
+    /// A queued upload's staging file.
+    Pending(PathBuf),
+    /// A fresh kept or cached copy.
+    Local(PathBuf),
+    /// The server. `absent`: the listing did not have the name.
+    Download { absent: bool },
+}
+
+/// Whether a download error is the server's 404.
+fn is_not_found_err(e: &str) -> bool {
+    e == backend::BackendReadError::NotFound.to_string() || backend::server_error_code(e) == Some(404)
+}
+
+/// Downloads `now_at` into the staging file `wp`. A 404 is answered from the
+/// journal: while a rename's MOVE has not reached the server, the content is
+/// still at the rename's source, so it is staged from there — only then, and
+/// only from the source the journal names (a path merely opened under an
+/// older name can hold a different file by now: `mv f f~; mv tmp f`). A name
+/// that was absent from its listing and that no rename explains is a file
+/// someone else deleted: it starts empty, and writing re-creates it.
+fn download_seed(ctx: &MetaCtx, wp: &Path, now_at: &Path, absent: bool) -> Result<(), String> {
+    let download = |from: &Path| {
+        std::fs::File::create(wp)
+            .map_err(|e| e.to_string())
+            .and_then(|dest| open_file_timeout(&ctx.conn, from.to_path_buf(), dest, Some(ctx.transfer_map.clone())))
+    };
+    let e = match download(now_at) {
+        Ok(()) => return Ok(()),
+        Err(e) if is_not_found_err(&e) => e,
+        Err(e) => return Err(e),
+    };
+    let source = ctx.journal.safe_lock().rename_source_of(now_at);
+    match source {
+        Some(from) => {
+            log::debug!("open: {} not on the server yet ({}) — staging from {}, before its rename", now_at.display(), e, from.display());
+            download(&from).or_else(|e2| {
+                // The MOVE landed between the two downloads.
+                if is_not_found_err(&e2) { download(now_at) } else { Err(e2) }
+            })
+        }
+        None if absent => {
+            log::info!("open: {} is gone from the server — starting it empty", now_at.display());
+            std::fs::File::create(wp).map(|_| ()).map_err(|e| e.to_string())
+        }
+        None => Err(e),
     }
 }
 
@@ -4426,6 +4521,7 @@ fn open_register<R: OpenAnswer>(
         _ => {}
     }
 
+    let unlink_snap = rq.unlink_snap;
     insert_open_file(
         ctx,
         fh,
@@ -4450,11 +4546,12 @@ fn open_register<R: OpenAnswer>(
             io_kind: grant.kind(),
             upload_failed: false,
             created: false,
-            unlinked: false,
+            unlinked: Unlinked::No,
             opened_gen: ctx.uploads.generation(),
             writer: false,
             pinned_parent: None,
         },
+        unlink_snap.as_ref(),
     );
     grant
 }
@@ -4467,34 +4564,36 @@ fn open_register<R: OpenAnswer>(
 /// thread, so the handle is inserted first and only then checked against
 /// where the inode lives now: a rename that already moved the inode is picked
 /// up here, and one that has not reached `open_files` yet finds the handle
-/// there. Likewise an unlink that already took the name out of its listing
-/// (while this open was resolving it on a worker) marks the handle unlinked
-/// here, so release does not PUT the file back; one that runs later finds the
-/// handle. The two locks are taken one after the other, never nested —
-/// rename nests `cache` → `open_files` and write nests the other way round,
-/// and a worker holding either while taking the other could deadlock against
-/// them.
-fn insert_open_file(ctx: &MetaCtx, fh: u64, mut of: OpenFile) {
+/// there. Likewise an unlink that ran after `unlink_snap` was taken (while
+/// this open was resolving on a worker) left a tombstone, which marks the
+/// handle unlinked here, so release does not PUT the file back; one that runs
+/// later finds the handle. Only that counts as unlinked: a listing without
+/// the name is no proof (see `tombstones.rs`). The two locks are taken one
+/// after the other, never nested — rename nests `cache` → `open_files` and
+/// write nests the other way round, and a worker holding either while taking
+/// the other could deadlock against them.
+fn insert_open_file(ctx: &MetaCtx, fh: u64, mut of: OpenFile, unlink_snap: Option<&tombstones::OpenSnapshot>) {
     of.writer = of.write_path.is_some();
     if of.writer {
         ctx.open_writers.fetch_add(1, Ordering::Relaxed);
     }
     let (ino, opened_as) = (of.ino, of.remote_path.clone());
     ctx.open_files.safe_lock().insert(fh, of);
-    let (now_at, gone) = pin_where_it_lives(ctx, ino, &opened_as);
+    let (now_at, gone) = pin_where_it_lives(ctx, ino, &opened_as, unlink_snap);
     adopt_pin(ctx, fh, &opened_as, &now_at, gone);
 }
 
 /// Keeps the parent listing of where inode `ino` lives now resident while it
 /// is open (every stat, write-size overlay and re-open resolves against it):
-/// pins it, and says whether that listing no longer has the file.
-fn pin_where_it_lives(ctx: &MetaCtx, ino: u64, opened_as: &Path) -> (PathBuf, bool) {
+/// pins it, and says whether this mount unlinked the file since the open
+/// took `unlink_snap`.
+fn pin_where_it_lives(ctx: &MetaCtx, ino: u64, opened_as: &Path, unlink_snap: Option<&tombstones::OpenSnapshot>) -> (PathBuf, bool) {
     let mut c = ctx.cache.safe_lock();
     let now_at = c.get_path(ino).unwrap_or_else(|| opened_as.to_path_buf());
     if let Some(parent) = now_at.parent() {
         c.pin_dir(parent);
     }
-    let gone = listed_absent(&mut c, &now_at);
+    let gone = unlink_snap.is_some_and(|s| c.tombstones.removed_since(ino, s));
     (now_at, gone)
 }
 
@@ -4514,7 +4613,7 @@ fn adopt_pin(ctx: &MetaCtx, fh: u64, opened_as: &Path, now_at: &Path, gone: bool
                     of.remote_path = now_at.to_path_buf();
                 }
                 if gone {
-                    of.unlinked = true;
+                    of.unlinked = Unlinked::Local;
                 }
                 of.pinned_parent = pinned.clone();
                 Some(of.remote_path.parent().map(Path::to_path_buf))
@@ -4547,12 +4646,18 @@ fn adopt_pin(ctx: &MetaCtx, fh: u64, opened_as: &Path, now_at: &Path, gone: bool
     ctx.cache.safe_lock().unpin_dir(&release);
 }
 
-/// unlink() of `path`: a handle still open on it must not re-create the file
-/// when it is released.
-fn mark_unlinked(open_files: &Mutex<HashMap<u64, OpenFile>>, path: &Path) {
+/// unlink() of `path` (inode `ino`), or a rename over it: a handle still open
+/// on that file must not re-create it when it is released. Matched by inode:
+/// a handle still being registered can carry a path that is by now another
+/// file's (`mv f g; mv h f; rm f` while `f` was being opened). Without an
+/// inode only the path is known, which is not proof enough to drop a
+/// handle's bytes (`Unlinked::Unverified`).
+fn mark_unlinked(open_files: &Mutex<HashMap<u64, OpenFile>>, path: &Path, ino: Option<u64>) {
     for of in open_files.safe_lock().values_mut() {
-        if of.remote_path == path {
-            of.unlinked = true;
+        match ino {
+            Some(ino) if of.ino == ino => of.unlinked = Unlinked::Local,
+            None if of.remote_path == path && !of.unlinked.is() => of.unlinked = Unlinked::Unverified,
+            _ => {}
         }
     }
 }
@@ -4589,7 +4694,7 @@ fn retarget_open_files(c: &mut FsCache, open_files: &Mutex<HashMap<u64, OpenFile
     for of in open_files.safe_lock().values_mut() {
         let Ok(suffix) = of.remote_path.strip_prefix(from) else { continue };
         if suffix.as_os_str().is_empty() {
-            uncommitted_source |= of.created && !of.unlinked;
+            uncommitted_source |= of.created && !of.unlinked.is();
             of.remote_path = to.to_path_buf();
         } else {
             of.remote_path = to.join(suffix);
@@ -4785,16 +4890,6 @@ fn lookup_recheck(cache: &Arc<Mutex<FsCache>>, hit: &LookupHit) -> Recheck {
         None if c.deleting.contains(path) => Recheck::Gone,
         None => Recheck::Same,
     }
-}
-
-/// Whether `path`'s parent listing is resident and does not have it: the
-/// file was unlinked or renamed away. A name whose upload is in flight counts
-/// as present (put_dir_cache keeps those, but only if the old listing was
-/// still resident). Unlike `lookup_recheck`, a DELETE in flight without a
-/// listing says nothing here: `rm f; echo x > f` re-creates `f` meanwhile.
-fn listed_absent(c: &mut FsCache, path: &Path) -> bool {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return false };
-    matches!(c.find_child(dir, name), Some((_, None))) && !c.uploading.contains_key(path)
 }
 
 pub struct NextCloudFs {
@@ -5065,6 +5160,7 @@ impl NextCloudFs {
                 deleting: HashSet::new(),
                 trackerignore_hidden: false,
                 pins: HashMap::new(),
+                tombstones: tombstones::Tombstones::default(),
             }));
             load_dir_cache(&c);
             c
@@ -5424,6 +5520,7 @@ impl NextCloudFs {
             thumbnail: self.thumbnail_callback(),
             resolve_within: CHILD_RESOLVE_DEADLINE,
             meta_pool: &bg::META,
+            journal: self.journal.clone(),
         })
     }
 
@@ -5445,8 +5542,10 @@ impl NextCloudFs {
         with_child(&self.meta(), pid, path, reply, pick, inline_miss, answer)
     }
 
+    /// For create(), which runs on the dispatch thread: no unlink can run
+    /// between it and the registration, so it takes no unlink snapshot.
     fn insert_open_file(&self, fh: u64, of: OpenFile) {
-        insert_open_file(&self.meta(), fh, of);
+        insert_open_file(&self.meta(), fh, of, None);
     }
 
     fn readdir_common(&self, pid: u32, ino: INodeNo, fh: u64, offset: u64, reply: DirReply) {
@@ -6121,7 +6220,7 @@ impl Filesystem for NextCloudFs {
         // FUSE_ATOMIC_O_TRUNC is negotiated, so a truncating open arrives here instead of
         // as a separate setattr and must start from an empty staging file.
         let truncating = writable && flags.0 & libc::O_TRUNC != 0;
-        let (path, local, listed) = {
+        let (path, local, listed, unlink_snap) = {
             let mut c = self.cache.safe_lock();
             let path = match c.get_path(ino.0) {
                 Some(p) => p,
@@ -6130,6 +6229,9 @@ impl Filesystem for NextCloudFs {
                     return;
                 }
             };
+            // Under the same lock as the path: an unlink after this point
+            // leaves a tombstone newer than the snapshot.
+            let unlink_snap = c.tombstones.snapshot();
             let local = c
                 .file_cache
                 .get(&path)
@@ -6138,10 +6240,10 @@ impl Filesystem for NextCloudFs {
             // None: the parent listing is not resident.
             let listed = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
                 (Some(dir), Some(name)) => c.find_child(dir, name)
-                    .map(|(files, pos)| pos.map(|i| OpenEntry::of(&files[i])).unwrap_or_default()),
+                    .map(|(files, pos)| pos.map_or_else(OpenEntry::absent, |i| OpenEntry::of(&files[i]))),
                 _ => Some(OpenEntry::default()),
             };
-            (path, local, listed)
+            (path, local, listed, unlink_snap)
         };
 
         // The synthetic `.trackerignore` overlay entry is read-only — there is
@@ -6151,7 +6253,7 @@ impl Filesystem for NextCloudFs {
             return;
         }
 
-        let rq = OpenReq { ino: ino.0, flags: flags.0, pid: req.pid(), writable, truncating, path, local };
+        let rq = OpenReq { ino: ino.0, flags: flags.0, pid: req.pid(), writable, truncating, path, local, unlink_snap: Some(unlink_snap) };
         match listed {
             Some(entry) => open_continue(&self.meta(), rq, entry, reply, false),
             // The parent listing was evicted (see `open_unlisted`).
@@ -7018,7 +7120,7 @@ impl Filesystem for NextCloudFs {
                                     io_kind,
                                     upload_failed: false,
                                     created: false,
-                                    unlinked: false,
+                                    unlinked: Unlinked::No,
                                     opened_gen: self.uploads.generation(),
                                     writer: false,
                                     pinned_parent: None,
@@ -7106,7 +7208,7 @@ impl Filesystem for NextCloudFs {
                 io_kind,
                 upload_failed: false,
                 created: true,
-                unlinked: false,
+                unlinked: Unlinked::No,
                 opened_gen: self.uploads.generation(),
                 writer: false,
                 pinned_parent: None,
@@ -7291,18 +7393,26 @@ impl Filesystem for NextCloudFs {
             }
         }
 
-        {
+        let unlinked_ino = {
             let mut c = self.cache.safe_lock();
             if let Some(dir) = c.dir_cache.get_mut(&parent_path) {
                 let files: Vec<RemoteEntry> = dir.files.iter().filter(|e| e.path != remote_path).cloned().collect();
                 dir.files = Arc::new(files);
+            }
+            // Where the listing is edited: an open resolving this file on a
+            // worker sees the tombstone if it registers after mark_unlinked
+            // below has scanned `open_files` (see `tombstones.rs`).
+            let ino = c.get_inode(&remote_path);
+            if let Some(ino) = ino {
+                c.tombstones.record(ino);
             }
             // Guard against racing PROPFIND refreshes re-surfacing this file
             // before the server DELETE completes (mirrors the `uploading` guard).
             c.deleting.insert(remote_path.clone());
             // Evict cached bytes immediately so a re-inserted dir entry can't serve stale content.
             c.file_cache.remove(&remote_path);
-        }
+            ino
+        };
 
         // Keep in-memory maps consistent with the delete so DETAILDIR/STATUS no longer
         // return stale records for the deleted path before the next readdir of the parent.
@@ -7315,7 +7425,7 @@ impl Filesystem for NextCloudFs {
         self.fileids.safe_write().remove(&remote_path);
 
         self.dirty.safe_lock().insert(parent_path);
-        let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
+        let child_ino = unlinked_ino.unwrap_or(0);
         reply.ok();
 
         // Tell the kernel about the deletion so that other processes (e.g. Nautilus)
@@ -7341,7 +7451,7 @@ impl Filesystem for NextCloudFs {
         }
 
         // A handle still open on the deleted file must not re-create it when it is released.
-        mark_unlinked(&self.open_files, &remote_path);
+        mark_unlinked(&self.open_files, &remote_path, unlinked_ino);
 
         let seq = self.journal.safe_lock().enqueue(
             mutation_journal::MutationOp::Unlink { path: remote_path.clone() },
@@ -7452,6 +7562,9 @@ impl Filesystem for NextCloudFs {
                 dir.files = Arc::new(files);
             }
             c.dir_cache.remove(&remote_path);
+            if let Some(ino) = c.get_inode(&remote_path) {
+                c.tombstones.record(ino);
+            }
             // Guard against racing PROPFIND refreshes re-surfacing this directory
             // before the server DELETE completes (mirrors the `uploading` guard in
             // unlink and the `deleting` guard added for files).
@@ -7628,10 +7741,19 @@ impl Filesystem for NextCloudFs {
                     dir.files = Arc::new(files);
                 }
             }
+            // A file the rename replaces is gone, like an unlinked one: its
+            // open handles must not bring it back over the renamed file.
+            let displaced = c.get_inode(&to).filter(|&d| c.get_inode(&from) != Some(d));
+            if let Some(ino) = displaced {
+                c.tombstones.record(ino);
+            }
             c.move_inode(&from, &to);
             // Before the reply: once it is out, a write under the new path
             // resolves its inode there, and its handle must commit there too.
             uncommitted_source = retarget_open_files(&mut c, &self.open_files, &from, &to);
+            if let Some(ino) = displaced {
+                mark_unlinked(&self.open_files, &to, Some(ino));
+            }
         }
         // Keep in-memory maps consistent with the rename so DETAILDIR/STATUS reflect the new
         // path immediately, without waiting for the next readdir of either directory.

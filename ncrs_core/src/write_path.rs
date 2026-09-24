@@ -485,14 +485,12 @@ impl WriteCtx {
         self.io_modes.safe_lock().release(of.ino, of.io_kind);
         reply();
 
-        if of.upload_failed || of.unlinked {
+        if of.upload_failed || of.unlinked.is() {
             // A write already returned EIO after chunks reached the server (assembling them
             // would publish an incomplete file), or the file was deleted while open
             // (committing would re-create it). Tear any session down instead.
-            if of.unlinked {
-                if let Some(ref wp) = of.write_path {
-                    let _ = std::fs::remove_file(wp);
-                }
+            if let Some(ref wp) = of.write_path {
+                self.drop_unlinked_staging(fh, &of, wp);
             }
             self.cache.safe_lock().uploading.remove(&of.remote_path);
             if let Some(cs) = of.chunk_upload {
@@ -523,6 +521,39 @@ impl WriteCtx {
         }
     }
 
+    /// The staging file of a released handle whose file was deleted while it
+    /// was open. This mount deleting that very file (`Unlinked::Local`) is the
+    /// only proof that its bytes are unwanted. When the proof is weaker, a
+    /// written file's bytes are kept in `recovered/`, never just deleted. A
+    /// streamed handle's staging is only the unsent end of the file, which
+    /// is worth nothing alone.
+    fn drop_unlinked_staging(&self, fh: u64, of: &OpenFile, wp: &Path) {
+        match of.unlinked {
+            Unlinked::No => {}
+            Unlinked::Unverified if of.dirty && of.chunk_upload.is_none() => {
+                let kept = mutation_journal::move_to_recovered(
+                    &self.cache_dir, wp, Some(&of.remote_path),
+                    "released after an unlink of its path that could not be matched to this file",
+                );
+                log::warn!(
+                    "release: fh {} of {} was written after an unlink that may not have been of this file — its bytes are kept at {}",
+                    fh, of.remote_path.display(), kept.as_deref().map_or_else(|| wp.display().to_string(), |p| p.display().to_string()),
+                );
+                if let Some(p) = kept {
+                    self.journal.safe_lock().add_conflict(mutation_journal::ConflictKind::PermanentFailure {
+                        description: format!("{} was written while it was being deleted; the written bytes are kept at {}", of.remote_path.display(), p.display()),
+                    });
+                }
+            }
+            Unlinked::Local | Unlinked::Unverified => {
+                if of.dirty {
+                    log::info!("release: fh {} of {} was deleted while open — dropping its writes", fh, of.remote_path.display());
+                }
+                let _ = std::fs::remove_file(wp);
+            }
+        }
+    }
+
     /// Publishes the size a committing handle is about to upload while the
     /// handle still overlays it (`overlay_local_size`), so a `stat` between
     /// the handle's removal and the commit never sees the server's older,
@@ -533,7 +564,7 @@ impl WriteCtx {
     /// guard is left alone: nothing clears one once the journal replays.
     fn publish_released_size(&self, fh: u64) {
         let staged = self.open_files.safe_lock().get(&fh)
-            .filter(|of| of.dirty && !of.upload_failed && !of.unlinked)
+            .filter(|of| of.dirty && !of.upload_failed && !of.unlinked.is())
             .and_then(|of| {
                 let streamed = of.chunk_upload.as_ref().map(|_| of.total_written);
                 of.write_path.clone().map(|wp| (of.remote_path.clone(), wp, streamed))

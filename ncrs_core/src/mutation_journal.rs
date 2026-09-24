@@ -335,6 +335,52 @@ pub(crate) fn parse_staging_name(name: &str) -> Option<StagingName> {
     Some(if boot == Some(boot_tag()) { StagingName::Ours(n) } else { StagingName::Earlier })
 }
 
+/// What `recovered/<file>.json` says about `recovered/<file>`, so the user can
+/// tell what a kept file was.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RecoveredSidecar {
+    /// The file it was written as, when known.
+    pub remote_path: Option<PathBuf>,
+    pub size: u64,
+    pub recovered_at_ms: u64,
+    pub reason: String,
+    /// Its staging file's name.
+    pub staging_name: String,
+}
+
+/// Moves staging file `src` into `<cache_dir>/recovered/` with a sidecar
+/// (`<file>.json`), and returns where it went. For bytes that are neither on
+/// the server nor named by the journal and must not be deleted.
+pub(crate) fn move_to_recovered(cache_dir: &Path, src: &Path, remote_path: Option<&Path>, reason: &str) -> Option<PathBuf> {
+    let dir = cache_dir.join(RECOVERED_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::error!("cannot create {}: {} — leaving {} in place", dir.display(), e, src.display());
+        return None;
+    }
+    let name = src.file_name()?.to_string_lossy().into_owned();
+    let mut dest = dir.join(&name);
+    if dest.exists() {
+        dest = dir.join(format!("{}.{}", name, now_ms()));
+    }
+    let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    if let Err(e) = std::fs::rename(src, &dest) {
+        log::error!("cannot move {} to {}: {}", src.display(), dest.display(), e);
+        return None;
+    }
+    let sidecar = RecoveredSidecar {
+        remote_path: remote_path.map(Path::to_path_buf),
+        size,
+        recovered_at_ms: now_ms(),
+        reason: reason.to_string(),
+        staging_name: name,
+    };
+    let json = dest.with_file_name(format!("{}.json", dest.file_name()?.to_string_lossy()));
+    if let Err(e) = serde_json::to_vec_pretty(&sidecar).map_err(std::io::Error::other).and_then(|b| std::fs::write(&json, b)) {
+        log::warn!("cannot write {}: {}", json.display(), e);
+    }
+    Some(dest)
+}
+
 /// Where the startup sweep keeps staging files no journal entry names.
 pub(crate) const RECOVERED_DIR: &str = "recovered";
 const RECOVERED_KEEP_FILES: usize = 64;
@@ -627,6 +673,19 @@ impl MutationJournal {
             MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
                 Some(staging_path.clone())
             }
+            _ => None,
+        })
+    }
+
+    /// Where the server still has what this mount renamed to `path`, itself
+    /// or with a directory above it: the source of the oldest queued Rename
+    /// ending at `path` or at one of its ancestors (a later rename rewrote an
+    /// earlier one's destination, so the oldest names the server's path).
+    pub fn rename_source_of(&self, path: &Path) -> Option<PathBuf> {
+        self.entries.iter().find_map(|e| match &e.op {
+            MutationOp::Rename { from, to } => path.strip_prefix(to).ok().map(|rest| {
+                if rest.as_os_str().is_empty() { from.clone() } else { from.join(rest) }
+            }),
             _ => None,
         })
     }
