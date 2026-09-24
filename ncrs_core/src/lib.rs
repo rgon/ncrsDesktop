@@ -4453,31 +4453,45 @@ fn is_not_found_err(e: &str) -> bool {
 /// older name can hold a different file by now: `mv f f~; mv tmp f`). A name
 /// that was absent from its listing and that no rename explains is a file
 /// someone else deleted: it starts empty, and writing re-creates it.
+///
+/// The rename's source is looked up *before* the first download. Looked up
+/// after its 404, a MOVE landing in between has already left the journal:
+/// the name then looks deleted, and the empty seed's upload (no If-Match, a
+/// re-create) replaced the real file. With the source known first, a 404
+/// from it means the MOVE landed, and the new path is tried again. Found no
+/// source up front, every rename of the file had already landed, so a 404 is
+/// a real absence; it is still asked once more before starting empty.
 fn download_seed(ctx: &MetaCtx, wp: &Path, now_at: &Path, absent: bool) -> Result<(), String> {
     let download = |from: &Path| {
         std::fs::File::create(wp)
             .map_err(|e| e.to_string())
             .and_then(|dest| open_file_timeout(&ctx.conn, from.to_path_buf(), dest, Some(ctx.transfer_map.clone())))
     };
+    let source = ctx.journal.safe_lock().rename_source_of(now_at);
     let e = match download(now_at) {
         Ok(()) => return Ok(()),
         Err(e) if is_not_found_err(&e) => e,
         Err(e) => return Err(e),
     };
-    let source = ctx.journal.safe_lock().rename_source_of(now_at);
-    match source {
-        Some(from) => {
-            log::debug!("open: {} not on the server yet ({}) — staging from {}, before its rename", now_at.display(), e, from.display());
-            download(&from).or_else(|e2| {
-                // The MOVE landed between the two downloads.
-                if is_not_found_err(&e2) { download(now_at) } else { Err(e2) }
-            })
-        }
-        None if absent => {
+    // rename() journals its MOVE after answering the kernel: one queued since.
+    let source = source.or_else(|| ctx.journal.safe_lock().rename_source_of(now_at));
+    if let Some(from) = source {
+        log::debug!("open: {} not on the server yet ({}) — staging from {}, before its rename", now_at.display(), e, from.display());
+        return download(&from).or_else(|e2| {
+            // The MOVE landed between the two downloads.
+            if is_not_found_err(&e2) { download(now_at) } else { Err(e2) }
+        });
+    }
+    if !absent {
+        return Err(e);
+    }
+    match download(now_at) {
+        Ok(()) => Ok(()),
+        Err(e) if is_not_found_err(&e) => {
             log::info!("open: {} is gone from the server — starting it empty", now_at.display());
             std::fs::File::create(wp).map(|_| ()).map_err(|e| e.to_string())
         }
-        None => Err(e),
+        Err(e) => Err(e),
     }
 }
 

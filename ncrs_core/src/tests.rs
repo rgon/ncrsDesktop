@@ -3869,6 +3869,9 @@ mod upload_order_tests {
             chunks: Mutex<BTreeMap<u64, Vec<u8>>>,
             /// Every assembled streamed upload, in order.
             finished: Mutex<Vec<PathBuf>>,
+            /// Runs after each download was answered, with the path asked for:
+            /// lets a test land a MOVE between two downloads.
+            after_download: Mutex<Option<Box<dyn FnMut(&FakeBackend, &Path) + Send>>>,
         }
 
         impl FakeBackend {
@@ -3909,7 +3912,13 @@ mod upload_order_tests {
                 Err(unsupported())
             }
             fn download_file(&self, path: &Path, out: &mut dyn std::io::Write, _: Duration) -> Result<u64, backend::BackendReadError> {
-                let (bytes, pause) = self.files.lock().unwrap().get(path).cloned().ok_or(backend::BackendReadError::NotFound)?;
+                let found = self.files.lock().unwrap().get(path).cloned();
+                let hook = self.after_download.lock().unwrap().take();
+                if let Some(mut hook) = hook {
+                    hook(self, path);
+                    *self.after_download.lock().unwrap() = Some(hook);
+                }
+                let (bytes, pause) = found.ok_or(backend::BackendReadError::NotFound)?;
                 std::thread::sleep(pause);
                 out.write_all(&bytes).map_err(|e| backend::BackendReadError::Network(e.to_string()))?;
                 Ok(bytes.len() as u64)
@@ -4872,6 +4881,35 @@ mod upload_order_tests {
             assert_eq!(std::fs::read(&wp).unwrap(), b"hello");
             let _ = fake;
             release_bookkeeping(&meta, 9);
+        }
+
+        #[test]
+        fn a_move_landing_between_the_seed_downloads_does_not_make_the_file_look_deleted() {
+            // `mv f g` is queued; a re-list dropped g (absent). The open's first
+            // download of g gets 404, then the MOVE lands and leaves the journal.
+            let (fake, meta, tmp, _) = open_setup(vec![], true);
+            fake.files.lock().unwrap().insert(PathBuf::from("/d/f"), (b"real".to_vec(), Duration::ZERO));
+            let ino = {
+                let mut c = meta.cache.safe_lock();
+                let ino = c.allocate_inode(PathBuf::from("/d/f"));
+                c.move_inode(Path::new("/d/f"), Path::new("/d/g"));
+                ino
+            };
+            let seq = meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/d/f"), to: PathBuf::from("/d/g") });
+            let journal = meta.journal.clone();
+            *fake.after_download.lock().unwrap() = Some(Box::new(move |fake, path| {
+                if path == Path::new("/d/g") && journal.safe_lock().contains(seq) {
+                    let moved = fake.files.lock().unwrap().remove(Path::new("/d/f")).unwrap();
+                    fake.files.lock().unwrap().insert(PathBuf::from("/d/g"), moved);
+                    journal.safe_lock().remove(seq);
+                }
+            }));
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/g", libc::O_WRONLY | libc::O_APPEND, None), OpenEntry::absent(), r, false);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            assert_eq!(std::fs::read(meta.open_files.safe_lock()[&fh].write_path.as_ref().unwrap()).unwrap(), b"real", "staged empty: the append would replace g");
+            append_and_release(&write_ctx(&meta, tmp.path()), fh, b"+");
+            assert_eq!(wait_for_put(&fake, "/d/g"), b"real+");
         }
 
         #[test]
