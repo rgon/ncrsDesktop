@@ -71,6 +71,7 @@ graph LR
 | `ipc-accept` | `ipc::start_ipc_server` | process exit |
 | `change-log` | `ipc::start_ipc_server` (IPC v3 change-log pump, every 250 ms) | process exit |
 | `signals` | `mount_ncfs`, first thing after the seccomp filter, only when the `ncrs` binary blocked SIGTERM/SIGINT/SIGHUP at startup (`signals::block_shutdown_signals`) | process exit |
+| `log` | `logging::init`, from the `ncrs` binary's `main` (writes the bounded log queue to stderr, so no thread waits on a slow stderr) | process exit |
 | `desktop-refresh` | `desktop::Desktop::spawn_refresher` (re-detects file-browser profiles every 10 min) | process exit |
 
 ## Scoped fan-outs (`std::thread::scope`, joined before returning)

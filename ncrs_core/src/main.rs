@@ -55,13 +55,22 @@ struct Cli {
     dump_mime_magic: bool,
 }
 
+/// Exits once the queued log lines are out (or a short wait has passed).
+fn exit(code: i32) -> ! {
+    ncrs_core::logging::flush(LOG_FLUSH_WAIT);
+    std::process::exit(code)
+}
+
+const LOG_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn main() {
     // First, before any thread exists, so every thread inherits the mask: a
     // stop signal is then handled by the `signals` service (journal flush,
     // clean unmount) instead of killing the daemon mid-save.
     ncrs_core::signals::block_shutdown_signals();
     // The GUI spawns the daemon without RUST_LOG; bare env_logger::init() would then log nothing.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // After the mask above, so the `log` writer thread inherits it too.
+    ncrs_core::logging::init("warn");
     let cli = Cli::parse();
 
     if cli.print_default_config {
@@ -92,14 +101,14 @@ fn main() {
             Ok(y) => y,
             Err(e) => {
                 eprintln!("ncrs: cannot read {}: {}", path.display(), e);
-                std::process::exit(1);
+                exit(1);
             }
         };
         match ncrs_core::configuration_parser(&yaml) {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("ncrs: {}", e);
-                std::process::exit(1);
+                exit(1);
             }
         }
     } else {
@@ -107,7 +116,7 @@ fn main() {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("ncrs: {}", e);
-                std::process::exit(1);
+                exit(1);
             }
         }
     };
@@ -123,7 +132,7 @@ fn main() {
         let url = ncrs_core::login_flow::normalize_webdav_url(&url, username);
         if let Err(e) = ncrs_core::login_flow::validate_server_scheme(&url, opts.allow_insecure_http) {
             eprintln!("ncrs: {}", e);
-            std::process::exit(1);
+            exit(1);
         }
         opts.url = url;
     }
@@ -146,6 +155,7 @@ fn main() {
 
     if let Err(e) = ncrs_core::mount_ncfs(opts, None, None, None, None, None, None) {
         eprintln!("ncrs: {}", e);
-        std::process::exit(1);
+        exit(1);
     }
+    ncrs_core::logging::flush(LOG_FLUSH_WAIT);
 }

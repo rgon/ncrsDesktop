@@ -26,6 +26,7 @@ pub mod propfind;
 pub mod remote_wipe;
 pub mod search;
 mod seccomp_harden;
+pub mod logging;
 pub mod signals;
 pub mod webdav_ops;
 mod write_path;
