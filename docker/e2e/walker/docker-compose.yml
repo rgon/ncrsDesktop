@@ -1,0 +1,91 @@
+# Walker regression harness: a large tree on a real WebDAV server (rclone), a
+# fault-injecting proxy in front of it, and the ncrs daemon walking the mount
+# while its threads / RSS / CPU are sampled.
+#
+# Run via scripts/e2e-walker.sh (it seeds the volume, sets a unique project
+# name, and always tears down with `down -v --rmi local`).
+x-walker-image: &walker-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+services:
+  webdav:
+    image: rclone/rclone:1.71
+    command:
+      - serve
+      - webdav
+      - /data
+      - --addr=:80
+      - --baseurl=/remote.php/dav/files/testuser
+      - --user=testuser
+      - --pass=testpass
+    volumes:
+      - webdav-data:/data
+
+  faultproxy:
+    <<: *walker-image
+    command: ["python3", "-u", "/walker/faultproxy.py"]
+    depends_on: [webdav]
+    environment:
+      UPSTREAM: webdav:80
+      LISTEN_PORT: "8080"
+      FAULT_RATE: ${FAULT_RATE:-0}
+      FAULT_MODE: ${FAULT_MODE:-hash}
+      BURST_SECS: ${BURST_SECS:-10}
+      BURST_RATE: ${BURST_RATE:-0.95}
+      FAULT_PATH_SUBSTR: ${FAULT_PATH_SUBSTR:-}
+      FAULT_ROOT: ${FAULT_ROOT:-0}
+      FAULT_ARMED: ${FAULT_ARMED:-1}
+      FAULT_DEPTHS: ${FAULT_DEPTHS:-1}
+      FAULT_MIN_DEPTH: ${FAULT_MIN_DEPTH:-2}
+      LATENCY_MS: ${LATENCY_MS:-0}
+      QUIET: ${PROXY_QUIET:-1}
+
+  ncrs:
+    <<: *walker-image
+    entrypoint: ["/walker/run_walker.sh"]
+    depends_on: [faultproxy]
+    environment:
+      DAV_URL: http://faultproxy:8080/remote.php/dav/files/testuser/
+      PROXY: http://faultproxy:8080
+      RUST_LOG: ${RUST_LOG:-info}
+      WALK_SECS: ${WALK_SECS:-300}
+      WALK_REPEAT: ${WALK_REPEAT:-0}
+      WALK_FINDS: ${WALK_FINDS:-2}
+      IDLE_SECS: ${IDLE_SECS:-60}
+      SAMPLE_SECS: ${SAMPLE_SECS:-2}
+      MAX_THREADS: ${MAX_THREADS:-200}
+      IDLE_MAX_THREADS: ${IDLE_MAX_THREADS:-60}
+      IDLE_MAX_CPU: ${IDLE_MAX_CPU:-5}
+      OPTIMISTIC_LISTING: ${OPTIMISTIC_LISTING:-false}
+      DIR_CACHE_MAX_STALE_MINS: ${DIR_CACHE_MAX_STALE_MINS:-15}
+      SEEDED_DIRS: ${DIRS:-20000}
+      RUN_LABEL: ${RUN_LABEL:-}
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+      # lets the sampler read /proc/<pid>/task/*/{wchan,syscall} of the daemon
+      - SYS_PTRACE
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ${NCRS_BIN:?set NCRS_BIN to an ncrs binary}:/usr/local/bin/ncrs:ro
+      - ${RESULTS_DIR:-./results/latest}:/results
+
+  # One-shot volume seeder (not started by `up`; run with `--profile seed run`).
+  seed:
+    <<: *walker-image
+    profiles: [seed]
+    entrypoint: ["/walker/seed_tree.sh"]
+    environment:
+      DIRS: ${DIRS:-20000}
+      MAX_DEPTH: ${MAX_DEPTH:-18}
+      FILES_PER_DIR: ${FILES_PER_DIR:-3}
+      SEED_ROOT: /data
+    volumes:
+      - webdav-data:/data
+
+volumes:
+  webdav-data:
