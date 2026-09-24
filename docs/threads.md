@@ -2,7 +2,7 @@
 
 Every OS thread the daemon creates comes from [`ncrs_core/src/bg.rs`](../ncrs_core/src/bg.rs). It is either a worker of one of the fixed pools below or one of the named long-lived services. `std::thread::spawn` is banned everywhere else by `ncrs_core/clippy.toml`, and CI enforces this with `clippy -D clippy::disallowed_methods`. `std::thread::scope` stays allowed, because it joins its threads before returning.
 
-This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (166) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 50) + the main thread + reqwest's runtime threads (≤ 8), which is **249**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
+This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (182) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 50) + the main thread + reqwest's runtime threads (≤ 8), which is **265**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
 
 Why this matters: 0.1.76 spawned a detached thread per FUSE request and per background revalidation, and took its concurrency permit *inside* the thread. During a `find /` over a server answering 500, 9,800 of those threads parked on a 10-slot throttle. The daemon reached 10,160 threads and ~900 load average (2026-09-24; see `docs/plans/2026-09-24-thread-leak-5xx-walker.md`).
 
@@ -12,6 +12,9 @@ Why this matters: 0.1.76 spawned a detached thread per FUSE request and per back
 graph LR
   K[kernel request] --> F0[fuser-0: FUSE dispatch — never blocks on the network]
   F0 -->|submit_owning(reply), EAGAIN if full| RD[[readdir ×24, q512]]
+  F0 -->|parent listing not cached: with_child(reply), EAGAIN if full| ME[[meta ×16, q1024]]
+  ME -->|starts or joins the listing; one deadline| LI
+  ME -->|open: stage current content| RE
   F0 -->|run_read_job(reply), EAGAIN if full| RE[[read ×32, q2048]]
   F0 -->|submit_mutation — ticket taken first, FIFO, never refused| MU[[mutate ×16, q∞]]
   F0 -->|notify_later| NO[[notify ×1, q8192]]
@@ -33,7 +36,8 @@ graph LR
 | Pool | Workers | Queue | Full → | Used for |
 |---|---|---|---|---|
 | `readdir` | 24 | 512 | EAGAIN to the kernel | `readdir`/`readdirplus` workers; the reply travels in the job |
-| `read` | 32 | 2048 | EAGAIN | read waits on read-ahead streams, range streams |
+| `meta` | 16 | 1024 | EAGAIN (getxattr: ENODATA) | lookup/getattr/setattr/getxattr/listxattr/open whose parent listing is not cached (a hit is answered on `fuser-0`), and open's process classification when it would read `/proc/<pid>/maps` or `cmdline`. The reply travels in the job; each job has one deadline, `PROPFIND_TIMEOUT` from submission |
+| `read` | 32 | 2048 | EAGAIN | read waits on read-ahead streams, range streams; staging a writable open's current content (download, or copy of the cached file) |
 | `list` | 16 | 2048 | error (stale listing served if cached) | streaming lists, soft-TTL refreshes |
 | `bg` | 4 | 256 | dropped | revalidation on read, prefetch, GIO temp purge, chunk-upload abort |
 | `mutate` | 16 | unbounded | journal replays it | PUT/MKCOL/DELETE/MOVE commits (`PathSeq` FIFO; see `path_seq.rs`) |
