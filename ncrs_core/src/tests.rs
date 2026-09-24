@@ -275,13 +275,15 @@
             assert_eq!(total, 25 * MIB as u64);
             assert_eq!((cs.next_index, cs.bytes_confirmed), (2, 20 * MIB as u64));
             assert_eq!(std::fs::metadata(&wp).unwrap().len(), 5 * MIB as u64, "the tail holds only the unsent bytes");
-            assert!(mutation_journal::tail_marker(&wp).exists(), "a crash now must not keep the tail as a recovered file");
+            let marker: mutation_journal::TailMarker = serde_json::from_slice(&std::fs::read(mutation_journal::tail_marker(&wp)).unwrap()).expect("a crash now must not keep the tail as a recovered file");
+            assert_eq!((marker.remote_path.as_path(), marker.offset), (Path::new("/big.bin"), 20 * MIB as u64));
 
             recv(&r.flush(1), "flush");
             recv(&r.release(1), "release");
-            assert!(!mutation_journal::tail_marker(&wp).exists(), "journaled now");
+            assert!(mutation_journal::tail_marker(&wp).exists(), "journaled: kept with its tail until the finish lands");
             wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
             std::thread::sleep(Duration::from_millis(200));
+            wait_for("the tail and its marker to go", || !wp.exists() && !mutation_journal::tail_marker(&wp).exists());
             let finished = r.server.finished.lock().unwrap();
             assert_eq!(finished.len(), 1, "committed exactly once");
             assert_eq!(finished[0].0, Path::new("/big.bin"));
