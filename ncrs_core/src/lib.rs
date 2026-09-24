@@ -5354,88 +5354,105 @@ impl NextCloudFs {
         let open_files = self.open_files.clone();
         let notifier_slot = self.notifier_slot.clone();
         Arc::new(move || {
-            // Staging files the journal dropped are deleted by its next save;
-            // until then the journal on disk still names them. Write it now,
-            // so what this purge sees unreferenced is unreferenced on disk too.
-            mutation_journal::flush_deferred(&journal);
-            // Paths with a queued Put must be preserved — their local bytes are
-            // unsynced. Collect them under the journal lock alone to avoid nesting.
-            let (protected, staged): (std::collections::HashSet<PathBuf>, std::collections::HashSet<PathBuf>) = {
-                let j = journal.safe_lock();
-                let mut protected = std::collections::HashSet::new();
-                let mut staged = std::collections::HashSet::new();
-                for e in j.entries() {
-                    if let Some(staging_path) = e.op.staging_path() {
-                        protected.insert(e.op.path().to_path_buf());
-                        staged.insert(staging_path.to_path_buf());
-                    }
-                }
-                (protected, staged)
-            };
-            let to_remove: Vec<(PathBuf, PathBuf)> = {
-                let c = cache.safe_lock();
-                c.file_cache.iter()
-                    .filter(|(p, _)| !protected.contains(*p))
-                    .map(|(p, e)| (p.clone(), e.local_path.clone()))
-                    .collect()
-            };
-            let mut purged = 0usize;
-            for (remote, local) in &to_remove {
-                match std::fs::remove_file(local) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        log::warn!("purge: failed to remove cached file {}: {}", local.display(), e);
-                        continue;
-                    }
-                }
-                cache.safe_lock().file_cache.remove(remote);
-                status.safe_write().insert(remote.clone(), FileStatus::Remote);
-                dirty.safe_lock().insert(remote.clone());
-                purged += 1;
-            }
-            save_file_cache(&cache);
-
-            // Reclaim orphaned write_<fh> staging files: skip anything the journal
-            // still needs for upload replay, and anything whose fh a client still
-            // holds open (write() may have succeeded once and not yet flushed, or
-            // failed mid-write leaving the handle dirty) — an unparsable filename
-            // is left alone rather than guessed at.
-            let mut staging_purged = 0usize;
-            let cache_dir = cache.safe_lock().cache_dir.clone();
-            let open_fhs: std::collections::HashSet<u64> = open_files.safe_lock().keys().copied().collect();
-            if let Ok(dir_entries) = std::fs::read_dir(&cache_dir) {
-                for entry in dir_entries.flatten() {
-                    let path = entry.path();
-                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
-                    if !name.starts_with("write_") || staged.contains(&path) {
-                        continue;
-                    }
-                    // Handle numbers restart in each process: only a name this
-                    // process created can belong to one of its open handles.
-                    match mutation_journal::parse_staging_name(&name) {
-                        None => continue,
-                        Some(mutation_journal::StagingName::Ours(fh)) if open_fhs.contains(&fh) => continue,
-                        Some(_) => {}
-                    }
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => staging_purged += 1,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => log::warn!("purge: failed to remove orphaned staging file {}: {}", path.display(), e),
-                    }
-                }
-            }
-
-            // Drop in-memory directory listings so the next access re-PROPFINDs
-            // fresh metadata rather than trusting possibly-stale cached sizes/etags.
-            notify_push::invalidate_all_dirs(&cache, &dirty, &notifier_slot);
-            log::info!(
-                "purge: cleared {} cached file(s) ({} protected by pending upload), {} orphaned staging file(s)",
-                purged, protected.len(), staging_purged
-            );
-            Ok(purged + staging_purged)
+            purge_all(&cache, &status, &dirty, &journal, &open_files, &notifier_slot)
         })
     }
+}
+
+/// The work of `purge_callback`.
+fn purge_all(
+    cache: &Arc<Mutex<FsCache>>,
+    status: &StatusMap,
+    dirty: &ipc::DirtySet,
+    journal: &mutation_journal::SharedJournal,
+    open_files: &Arc<Mutex<HashMap<u64, OpenFile>>>,
+    notifier_slot: &fuse_notify::NotifierSlot,
+) -> Result<usize, String> {
+    // A staging file this process made after the purge began may not be
+    // registered anywhere yet (create() makes it just before the handle).
+    let started = SystemTime::now();
+    // Staging files the journal dropped are deleted by its next save;
+    // until then the journal on disk still names them. Write it now,
+    // so what this purge sees unreferenced is unreferenced on disk too.
+    mutation_journal::flush_deferred(journal);
+    // Paths with a queued Put must be preserved — their local bytes are
+    // unsynced. Collect them under the journal lock alone to avoid nesting.
+    let protected: std::collections::HashSet<PathBuf> = journal.safe_lock().entries().iter()
+        .filter(|e| e.op.staging_path().is_some())
+        .map(|e| e.op.path().to_path_buf())
+        .collect();
+    let to_remove: Vec<(PathBuf, PathBuf)> = {
+        let c = cache.safe_lock();
+        c.file_cache.iter()
+            .filter(|(p, _)| !protected.contains(*p))
+            .map(|(p, e)| (p.clone(), e.local_path.clone()))
+            .collect()
+    };
+    let mut purged = 0usize;
+    for (remote, local) in &to_remove {
+        match std::fs::remove_file(local) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::warn!("purge: failed to remove cached file {}: {}", local.display(), e);
+                continue;
+            }
+        }
+        cache.safe_lock().file_cache.remove(remote);
+        status.safe_write().insert(remote.clone(), FileStatus::Remote);
+        dirty.safe_lock().insert(remote.clone());
+        purged += 1;
+    }
+    save_file_cache(cache);
+
+    // Reclaim orphaned write_<fh> staging files: skip anything the journal
+    // still needs for upload replay, and anything whose fh a client still
+    // holds open (write() may have succeeded once and not yet flushed, or
+    // failed mid-write leaving the handle dirty) — an unparsable filename
+    // is left alone rather than guessed at.
+    //
+    // Both sets are read right before the scan, open handles first: a
+    // release takes its handle out of `open_files` only after reserving
+    // its staging in the journal, so a file is always in one of them.
+    let mut staging_purged = 0usize;
+    let cache_dir = cache.safe_lock().cache_dir.clone();
+    let open_fhs: std::collections::HashSet<u64> = open_files.safe_lock().keys().copied().collect();
+    let staged = journal.safe_lock().staging_in_use();
+    if let Ok(dir_entries) = std::fs::read_dir(&cache_dir) {
+        for entry in dir_entries.flatten() {
+            let path = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            if !name.starts_with("write_") || staged.contains(&path) {
+                continue;
+            }
+            // Handle numbers restart in each process: only a name this
+            // process created can belong to one of its open handles.
+            match mutation_journal::parse_staging_name(&name) {
+                None => continue,
+                Some(mutation_journal::StagingName::Ours(fh)) if open_fhs.contains(&fh) => continue,
+                Some(mutation_journal::StagingName::Ours(_))
+                    if entry.metadata().and_then(|m| m.modified()).map_or(true, |t| t >= started) => continue,
+                Some(_) => {}
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => staging_purged += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!("purge: failed to remove orphaned staging file {}: {}", path.display(), e),
+            }
+        }
+    }
+
+    // Drop in-memory directory listings so the next access re-PROPFINDs
+    // fresh metadata rather than trusting possibly-stale cached sizes/etags.
+    notify_push::invalidate_all_dirs(cache, dirty, notifier_slot);
+    log::info!(
+        "purge: cleared {} cached file(s) ({} protected by pending upload), {} orphaned staging file(s)",
+        purged, protected.len(), staging_purged
+    );
+    Ok(purged + staging_purged)
+}
+
+impl NextCloudFs {
 
     pub fn prefetch_callback(&self) -> ipc::PrefetchCallback {
         let conn = self.conn.clone();

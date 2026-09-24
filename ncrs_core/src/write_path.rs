@@ -471,6 +471,14 @@ impl WriteCtx {
     /// handle, so nothing waits on the commit.
     pub(crate) fn release_answer(&self, fh: u64, reply: impl FnOnce()) {
         self.publish_released_size(fh);
+        // Reserved before the handle leaves `open_files`, released once the
+        // commit has journaled it: a purge meanwhile must not take the staging
+        // file for an orphan (see `MutationJournal::reserve_staging`).
+        let staging = self.open_files.safe_lock().get(&fh).and_then(|of| of.write_path.clone());
+        if let Some(ref wp) = staging {
+            self.journal.safe_lock().reserve_staging(wp);
+        }
+        let _unreserve = staging.map(|wp| Unreserve { journal: self.journal.clone(), wp });
         // The last close of the handle: the only point where no further write can arrive.
         let Some(of) = self.open_files.safe_lock().remove(&fh) else {
             reply();
@@ -1021,5 +1029,17 @@ fn graduate_chunk(
 
         shrink_tail_file(wp, webdav_ops::CHUNK_SIZE as u64)
             .map_err(|e| (format!("tail rewrite: {}", e), state.clone()))?;
+    }
+}
+
+/// Gives back release()'s reservation of a staging file however it returns.
+struct Unreserve {
+    journal: mutation_journal::SharedJournal,
+    wp: PathBuf,
+}
+
+impl Drop for Unreserve {
+    fn drop(&mut self) {
+        self.journal.safe_lock().unreserve_staging(&self.wp);
     }
 }
