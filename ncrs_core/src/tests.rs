@@ -21,6 +21,7 @@
             uploading: HashMap::new(),
             deleting: HashSet::new(),
             trackerignore_hidden: false,
+            pins: HashMap::new(),
         }
     }
 
@@ -1523,6 +1524,97 @@
         assert!(!c.dir_cache.contains_key(&gone));
         assert!(c.get_cached_dir(&gone, DIR_CACHE_TTL, None).is_none(), "must read as a miss");
         assert!(c.get_cached_dir_readonly(&gone).is_none());
+    }
+
+    #[test]
+    fn listings_in_use_by_open_handles_survive_eviction_until_released() {
+        let mut c = make_test_cache();
+        c.dir_cache_max_dirs = 0;
+        for i in 0..12 {
+            let (d, f) = dir_with(&format!("d{i}"), 1);
+            c.put_dir_cache(d, None, None, f);
+        }
+        // Two handles on /d0 (an open directory and a file inside it), one on /d1.
+        c.pin_dir(Path::new("/d0"));
+        c.pin_dir(Path::new("/d0"));
+        c.pin_dir(Path::new("/d1"));
+        c.dir_cache_max_dirs = 4;
+        for i in 0..40 {
+            let (d, f) = dir_with(&format!("new{i}"), 1);
+            c.put_dir_cache(d, None, None, f);
+        }
+        assert!(c.dir_cache.contains_key(Path::new("/d0")) && c.dir_cache.contains_key(Path::new("/d1")));
+        assert!(c.dir_cache.len() <= 4 + 2, "only the pinned listings may exceed the ceiling, got {}", c.dir_cache.len());
+
+        c.unpin_dir(Path::new("/d0"));
+        c.unpin_dir(Path::new("/d1"));
+        assert_eq!(c.pins.len(), 1, "one handle on /d0 is still open");
+        for i in 0..40 {
+            let (d, f) = dir_with(&format!("later{i}"), 1);
+            c.put_dir_cache(d, None, None, f);
+        }
+        assert!(c.dir_cache.contains_key(Path::new("/d0")), "still pinned by its last handle");
+        assert!(!c.dir_cache.contains_key(Path::new("/d1")), "released listings are ordinary LRU entries again");
+        c.unpin_dir(Path::new("/d0"));
+        assert!(c.pins.is_empty());
+    }
+
+    #[test]
+    fn a_crawl_evicts_its_own_listings_before_anyone_elses() {
+        let mut c = make_test_cache();
+        c.dir_cache_max_dirs = 100;
+        // The folders a person is using: listed first, so the oldest in the LRU.
+        for i in 0..50 {
+            let (d, f) = dir_with(&format!("mine{i}"), 1);
+            c.put_dir_cache(d, None, None, f);
+        }
+        // A `find /` lists 1000 cold directories.
+        for i in 0..1000 {
+            let (d, f) = dir_with(&format!("crawl{i}"), 1);
+            let path = d.clone();
+            c.put_dir_cache(d, None, None, f);
+            c.mark_walker(&path, true);
+        }
+        assert!(c.dir_cache.len() <= 100, "the ceiling holds: {}", c.dir_cache.len());
+        for i in 0..50 {
+            assert!(c.dir_cache.contains_key(&PathBuf::from(format!("/mine{i}"))), "/mine{i} was pushed out by the crawl");
+        }
+        assert!(c.dir_cache.contains_key(Path::new("/crawl999")), "the newest crawl listing is still served");
+        // Space nobody else wants is the crawl's to use; once the person needs
+        // it, the crawl gives it back down to a fifth of the cache.
+        for i in 0..70 {
+            let (d, f) = dir_with(&format!("more{i}"), 1);
+            c.put_dir_cache(d, None, None, f);
+        }
+        let crawler = c.dir_cache.values().filter(|e| e.walker).count();
+        assert!(crawler <= 100 / 5, "the crawler segment yields down to a fifth: {crawler}");
+        assert!(crawler > 0, "but keeps its newest listings");
+        for i in 0..70 {
+            assert!(c.dir_cache.contains_key(&PathBuf::from(format!("/more{i}"))), "/more{i} lost to the crawl");
+        }
+
+        // A refresh keeps a crawler listing in its segment; a person listing it
+        // takes it out.
+        let (d, f) = dir_with("crawl999", 2);
+        c.put_dir_cache(d, None, None, f);
+        assert!(c.dir_cache[Path::new("/crawl999")].walker);
+        c.mark_walker(Path::new("/crawl999"), false);
+        assert!(!c.dir_cache[Path::new("/crawl999")].walker);
+    }
+
+    #[test]
+    fn a_crawler_fetch_still_streaming_is_marked_when_it_lands() {
+        let mut c = make_test_cache();
+        let (tx, rx) = mpsc::channel();
+        let (etx, erx) = mpsc::channel();
+        let (_stx, srx) = mpsc::channel();
+        c.start_pending(PathBuf::from("/c"), rx, erx, srx);
+        c.mark_walker(Path::new("/c"), true);
+        tx.send(make_dav_entry("x", None)).unwrap();
+        drop(tx);
+        etx.send(Ok(None)).unwrap();
+        c.promote_pending(Path::new("/c")).unwrap();
+        assert!(c.dir_cache[Path::new("/c")].walker);
     }
 
     // ── Boot cache loading ────────────────────────────────────────────────────

@@ -280,6 +280,12 @@ struct DirCacheEntry {
     // mutation site having to remember to drop it. The Weak also keeps the old
     // allocation's address from being reused while it is compared against.
     name_index: Option<(std::sync::Weak<Vec<RemoteEntry>>, NameIndex)>,
+    // Fetched cold for a process crawling the tree (walkers.rs). Such listings
+    // form their own LRU segment, evicted first whenever it holds more than a
+    // fifth of the cache, so a `find /` cannot push out the folders someone is
+    // actually using. Cleared when a non-walker lists the directory;
+    // runtime-only (not persisted).
+    walker: bool,
 }
 
 /// Listings up to this size are scanned: indexing them costs more than it saves.
@@ -407,6 +413,8 @@ struct PendingDir {
     // cache lock every 50 ms per waiter, which froze everything else during a
     // wide streaming listing (review of 2026-09-24).
     index: NameIndex,
+    // Carried into the dir cache on promotion (see DirCacheEntry::walker).
+    walker: bool,
 }
 
 impl PendingDir {
@@ -602,6 +610,9 @@ struct OpenFile {
     // Counted in MetaCtx::open_writers (set by `insert_open_file`), so release
     // gives back exactly what open took.
     writer: bool,
+    // The parent listing this handle pinned (see FsCache::pins), recorded so
+    // release unpins exactly that even if the file was renamed meanwhile.
+    pinned_parent: Option<PathBuf>,
 }
 
 /// Ordering and etag bookkeeping shared by the workers that change files on the server.
@@ -1224,6 +1235,30 @@ struct HealthReport {
     breaker: Option<backoff::BreakerStats>,
     paths_backing_off: usize,
     walkers: Vec<walkers::WalkerStats>,
+    metadata: MetaHealth,
+}
+
+/// Cumulative counters behind the "remember attributes of evicted listings?"
+/// decision (review of 2026-09-24): how often a request found its parent
+/// listing gone, how often that listing could not be had in time, and how
+/// much the dir cache evicts (and how much of that was a crawler's).
+#[derive(Serialize, Clone, Copy, Default)]
+struct MetaHealth {
+    slow_lookups: u64,
+    unresolved: u64,
+    dir_evictions: u64,
+    crawler_evictions: u64,
+}
+
+impl MetaHealth {
+    fn now() -> Self {
+        MetaHealth {
+            slow_lookups: META_MISSES.load(Ordering::Relaxed),
+            unresolved: META_UNRESOLVED.load(Ordering::Relaxed),
+            dir_evictions: DIR_EVICTED.load(Ordering::Relaxed),
+            crawler_evictions: DIR_EVICTED_WALKER.load(Ordering::Relaxed),
+        }
+    }
 }
 
 fn process_threads() -> usize {
@@ -1243,6 +1278,7 @@ fn health_report() -> HealthReport {
         breaker: h.map(|h| h.breaker.stats(now)),
         paths_backing_off: h.map_or(0, |h| h.backoff.len()),
         walkers: h.map(|h| h.walkers.active(now)).unwrap_or_default(),
+        metadata: MetaHealth::now(),
     }
 }
 
@@ -1277,6 +1313,7 @@ pub fn health_json() -> String {
 /// which threads were piling up; this line would have.
 fn health_log_loop(shutdown: Arc<AtomicBool>) {
     let mut last_rejected: u64 = 0;
+    let mut last_meta = MetaHealth::default();
     while !shutdown.load(Ordering::Relaxed) {
         for _ in 0..60 {
             if shutdown.load(Ordering::Relaxed) {
@@ -1294,12 +1331,19 @@ fn health_log_loop(shutdown: Arc<AtomicBool>) {
             .map(|w| format!("{} {}/min", w.chain, w.uncached_last_min))
             .collect();
         let open = r.breaker.as_ref().is_some_and(|b| b.open);
+        let m = r.metadata;
         let line = format!(
-            "HEALTH threads={}/{} pools=[{}] refused+{} breaker={} backing_off={} walkers=[{}]",
+            "HEALTH threads={}/{} pools=[{}] refused+{} breaker={} backing_off={} walkers=[{}] slow_lookups+{} unresolved+{} evicted+{} (crawler {})",
             r.threads, r.max_threads, busy.join(", "), rejected - last_rejected.min(rejected),
             if open { "open" } else { "closed" }, r.paths_backing_off, walkers.join("; "),
+            m.slow_lookups - last_meta.slow_lookups.min(m.slow_lookups),
+            m.unresolved - last_meta.unresolved.min(m.unresolved),
+            m.dir_evictions - last_meta.dir_evictions.min(m.dir_evictions),
+            m.crawler_evictions - last_meta.crawler_evictions.min(m.crawler_evictions),
         );
-        let notable = rejected > last_rejected || open || !r.walkers.is_empty() || r.threads * 4 > r.max_threads * 3;
+        let notable = rejected > last_rejected || open || !r.walkers.is_empty() || r.threads * 4 > r.max_threads * 3
+            || m.unresolved > last_meta.unresolved;
+        last_meta = m;
         if notable {
             log::info!("{}", line);
         } else {
@@ -1452,6 +1496,11 @@ pub(crate) struct FsCache {
     // to the root listing — mirrors the old real-file semantics ("stays opted
     // out only until the next mount") without ever touching the backend.
     trackerignore_hidden: bool,
+    // Listings eviction must keep, refcounted: the directory of every open
+    // directory handle and the parent of every open file handle. Bounded by
+    // open fds. Evicting a listing in use turned the next stat of a file the
+    // user has open into a synchronous re-list (review of 2026-09-24).
+    pins: HashMap<PathBuf, u32>,
 }
 
 impl FsCache {
@@ -1622,6 +1671,8 @@ impl FsCache {
         // Filter out files whose DELETE is still in flight: a racing PROPFIND
         // that completes before the server DELETE must not re-surface them.
         files.retain(|f| !self.deleting.contains(&f.path));
+        // A refresh does not make a crawler's listing one someone uses.
+        let walker = self.dir_cache.get(&path).is_some_and(|e| e.walker);
         // Overlay the synthetic `.trackerignore` marker onto every fresh root
         // listing (see trackerignore_entry()). Purely local — the server never
         // sees this entry — so it survives PROPFIND refreshes for free instead
@@ -1640,6 +1691,7 @@ impl FsCache {
             expiry_retry_after: None,
             last_access: AtomicU64::new(next_access_tick()),
             name_index: None,
+            walker,
         });
         self.evict_dir_cache();
     }
@@ -1672,26 +1724,79 @@ impl FsCache {
         let upload_parents: HashSet<&Path> = self.uploading.keys()
             .filter_map(|p| p.parent())
             .collect();
-        let mut candidates: Vec<(u64, PathBuf)> = self.dir_cache.iter()
+        let mut candidates: Vec<(u64, PathBuf, bool)> = self.dir_cache.iter()
             // Never evict a listing mid-refresh: its `refreshing` flag is the
             // interlock stopping a second concurrent PROPFIND for the same dir.
             .filter(|(_, e)| !e.refreshing)
             .filter(|(p, _)| !upload_parents.contains(p.as_path()))
-            .map(|(p, e)| (e.last_access.load(Ordering::Relaxed), p.clone()))
+            // Listings an open handle is using (see `pins`).
+            .filter(|(p, _)| !self.pins.contains_key(p.as_path()))
+            .map(|(p, e)| (e.last_access.load(Ordering::Relaxed), p.clone(), e.walker))
             .collect();
-        candidates.sort_unstable_by_key(|(tick, _)| *tick);
+        candidates.sort_unstable_by_key(|(tick, _, _)| *tick);
 
         let to_drop = self.dir_cache.len().saturating_sub(target);
-        let mut dropped = 0usize;
-        for (_, path) in candidates.into_iter().take(to_drop) {
+        // A crawler's listings go first, oldest first, while their segment holds
+        // more than a fifth of the ceiling; then plain LRU over everything.
+        let walker_cap = max / 5;
+        let mut walker_resident = self.dir_cache.values().filter(|e| e.walker).count();
+        let mut doomed: Vec<PathBuf> = Vec::with_capacity(to_drop);
+        let mut walker_dropped = 0usize;
+        for (_, path, walker) in candidates.iter_mut() {
+            if doomed.len() >= to_drop || walker_resident <= walker_cap {
+                break;
+            }
+            if *walker {
+                doomed.push(std::mem::take(path));
+                walker_resident -= 1;
+                walker_dropped += 1;
+            }
+        }
+        for (_, path, walker) in candidates.iter_mut() {
+            if doomed.len() >= to_drop {
+                break;
+            }
+            if !path.as_os_str().is_empty() {
+                walker_dropped += usize::from(*walker);
+                doomed.push(std::mem::take(path));
+            }
+        }
+        let dropped = doomed.len();
+        for path in doomed {
             self.dir_cache.remove(&path);
-            dropped += 1;
         }
         if dropped > 0 {
+            DIR_EVICTED.fetch_add(dropped as u64, Ordering::Relaxed);
+            DIR_EVICTED_WALKER.fetch_add(walker_dropped as u64, Ordering::Relaxed);
             log::info!(
-                "DIR_CACHE evicted {} least-recently-used listings ({} of max {} remain)",
-                dropped, self.dir_cache.len(), max
+                "DIR_CACHE evicted {} least-recently-used listings ({} from the crawler segment; {} of max {} remain, {} pinned)",
+                dropped, walker_dropped, self.dir_cache.len(), max, self.pins.len()
             );
+        }
+    }
+
+    /// Keeps `dir`'s listing resident until the matching `unpin_dir`.
+    fn pin_dir(&mut self, dir: &Path) {
+        *self.pins.entry(dir.to_path_buf()).or_insert(0) += 1;
+    }
+
+    fn unpin_dir(&mut self, dir: &Path) {
+        if let Some(n) = self.pins.get_mut(dir) {
+            *n -= 1;
+            if *n == 0 {
+                self.pins.remove(dir);
+            }
+        }
+    }
+
+    /// Moves `dir`'s listing into (or out of) the crawler segment, including a
+    /// fetch still streaming, which carries the flag into the cache.
+    fn mark_walker(&mut self, dir: &Path, walker: bool) {
+        if let Some(e) = self.dir_cache.get_mut(dir) {
+            e.walker = walker;
+        }
+        if let Some(p) = self.pending_dirs.get_mut(dir) {
+            p.walker = walker;
         }
     }
 
@@ -1736,6 +1841,7 @@ impl FsCache {
             self_entry: None,
             failed: None,
             index: NameIndex::default(),
+            walker: false,
         });
     }
 
@@ -1778,7 +1884,13 @@ impl FsCache {
                 }
             }
             let self_entry = pending.self_entry.take();
+            let walker = pending.walker;
             self.put_dir_cache(path.to_path_buf(), pending.etag, self_entry.clone(), pending.entries);
+            if walker {
+                if let Some(e) = self.dir_cache.get_mut(path) {
+                    e.walker = true;
+                }
+            }
             self.pending_notify.1.notify_all();
             Ok(self_entry)
         } else {
@@ -2172,6 +2284,7 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
             hard_expired: false,
             expiry_retry_after: None,
             name_index: None,
+            walker: false,
         });
         count += 1;
     }
@@ -2862,7 +2975,12 @@ fn resolve_child_slow(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, dir: &P
     if !wait.is_zero() {
         thread::sleep(wait.min(deadline.saturating_duration_since(Instant::now())));
     }
-    match list_dir_start(conn, cache, dir, None, Some(deadline)) {
+    let started = list_dir_start(conn, cache, dir, None, Some(deadline));
+    // Only a fetch this cold miss started or joined belongs to a crawler.
+    if matches!(started, Ok(ListStart::InFlight { .. })) && conn.walkers.is_walker(pid, Instant::now()) {
+        cache.safe_lock().mark_walker(dir, true);
+    }
+    match started {
         // A complete listing (cached meanwhile, offline, backing off, or
         // confirmed by etag). Re-read it under the lock for the final answer.
         Ok(ListStart::Ready(files, _)) => {
@@ -3537,6 +3655,9 @@ const META_REFUSED: &str = "network: metadata lookups deferred — too many in f
 /// parent, and how often that ran out of time.
 static META_MISSES: AtomicU64 = AtomicU64::new(0);
 static META_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+/// Listings the dir cache evicted, and how many of those were a crawler's.
+static DIR_EVICTED: AtomicU64 = AtomicU64::new(0);
+static DIR_EVICTED_WALKER: AtomicU64 = AtomicU64::new(0);
 
 /// `make_file_attr` plus what the listing cannot know yet: the size of bytes
 /// this daemon holds for the file but the server does not have. A refresh that
@@ -3951,6 +4072,7 @@ fn open_finish(
             unlinked: false,
             opened_gen: ctx.uploads.generation(),
             writer: false,
+            pinned_parent: None,
         },
     );
     // io_modes keeps the BackingId alive until the inode's last passthrough
@@ -3964,11 +4086,18 @@ fn open_finish(
 }
 
 /// Registers an open handle. A writable one is counted so `getattr` knows to
-/// overlay the size of its unsent writes (`overlay_local_size`).
+/// overlay the size of its unsent writes (`overlay_local_size`), and its
+/// parent listing is pinned against eviction until release.
 fn insert_open_file(ctx: &MetaCtx, fh: u64, mut of: OpenFile) {
     of.writer = of.write_path.is_some();
     if of.writer {
         ctx.open_writers.fetch_add(1, Ordering::Relaxed);
+    }
+    // Keep the parent listing resident while the file is open: every stat,
+    // write-size overlay and re-open resolves against it.
+    if let Some(parent) = of.remote_path.parent() {
+        ctx.cache.safe_lock().pin_dir(parent);
+        of.pinned_parent = Some(parent.to_path_buf());
     }
     ctx.open_files.safe_lock().insert(fh, of);
 }
@@ -4310,6 +4439,7 @@ impl NextCloudFs {
                 uploading: HashMap::new(),
                 deleting: HashSet::new(),
                 trackerignore_hidden: false,
+                pins: HashMap::new(),
             }));
             load_dir_cache(&c);
             c
@@ -5249,6 +5379,7 @@ impl NextCloudFs {
             }
 
             let t_readdir = Instant::now();
+            let walker = conn.walkers.is_walker(pid, Instant::now());
             match get_or_list_dir(&conn, &cache, path.clone(), Some(DirDetailArcs {
                 shared: shared.clone(),
                 fileids: fileids.clone(),
@@ -5258,6 +5389,13 @@ impl NextCloudFs {
             })) {
                 Ok((entries, self_entry)) => {
                     log::info!("READDIR {} get_or_list_dir returned {} entries in {:?}", path.display(), entries.len(), t_readdir.elapsed());
+                    // A crawler's cold fetch goes to the crawler segment of the
+                    // LRU; anyone else listing the directory takes it out again.
+                    if walker && cold {
+                        cache.safe_lock().mark_walker(&path, true);
+                    } else if !walker {
+                        cache.safe_lock().mark_walker(&path, false);
+                    }
 
                     // Cached listings are served for speed, not trusted for
                     // correctness: every read also probes the server etag in the
@@ -5265,7 +5403,7 @@ impl NextCloudFs {
                     // changes made while this client was offline, for which no
                     // notify-push event will ever arrive.
                     if !conn.is_offline.load(Ordering::Relaxed) && !conn.paused.load(Ordering::Relaxed)
-                        && !conn.walkers.is_walker(pid, Instant::now())
+                        && !walker
                     {
                         notify_push::revalidate_dir_on_read(
                             &path, &conn.backend, &cache, &dirty, &conn.active_streams,
@@ -6505,6 +6643,9 @@ impl Filesystem for NextCloudFs {
         if of.writer {
             self.meta.open_writers.fetch_sub(1, Ordering::Relaxed);
         }
+        if let Some(ref parent) = of.pinned_parent {
+            self.cache.safe_lock().unpin_dir(parent);
+        }
         self.io_modes.safe_lock().release(of.ino, of.io_kind);
         reply.ok();
 
@@ -6545,9 +6686,17 @@ impl Filesystem for NextCloudFs {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let path = match self.cache.safe_lock().get_path(ino.0) {
-            Some(p) => p,
-            None => { reply.error(Errno::ENOENT); return; }
+        let path = {
+            let mut c = self.cache.safe_lock();
+            match c.get_path(ino.0) {
+                // A directory someone holds open keeps its listing (see
+                // FsCache::pins); releasedir lets go.
+                Some(p) => {
+                    c.pin_dir(&p);
+                    p
+                }
+                None => { reply.error(Errno::ENOENT); return; }
+            }
         };
         let fh = {
             let mut n = self.next_fh.safe_lock();
@@ -6560,7 +6709,10 @@ impl Filesystem for NextCloudFs {
     }
 
     fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
-        self.open_dirs.safe_lock().remove(&fh.0);
+        let released = self.open_dirs.safe_lock().remove(&fh.0);
+        if let Some(d) = released {
+            self.cache.safe_lock().unpin_dir(&d.path);
+        }
         reply.ok();
     }
 
@@ -6965,6 +7117,7 @@ impl Filesystem for NextCloudFs {
                                     unlinked: false,
                                     opened_gen: self.uploads.generation(),
                                     writer: false,
+                                    pinned_parent: None,
                                 });
                                 log::info!("ghost create: {} (inotify trigger)", full_path.display());
                                 reply.created(&TTL, &attr, Generation(0), FileHandle(fh), plain_open_flags(io_kind));
@@ -7052,6 +7205,7 @@ impl Filesystem for NextCloudFs {
                 unlinked: false,
                 opened_gen: self.uploads.generation(),
                 writer: false,
+                pinned_parent: None,
             },
         );
 
