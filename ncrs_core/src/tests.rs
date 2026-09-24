@@ -3030,7 +3030,10 @@ mod upload_order_tests {
             }
             assert_eq!(c.find_child(Path::new("/w"), "nope").map(|(_, p)| p), Some(None));
             assert!(c.find_child(Path::new("/elsewhere"), "f1.txt").is_none(), "not resident is not absent");
-            assert!(c.dir_cache[Path::new("/w")].name_index.is_some(), "a wide listing gets an index");
+            for _ in 0..NAME_INDEX_AFTER_LOOKUPS {
+                let _ = c.find_child(Path::new("/w"), "f0.txt");
+            }
+            assert!(c.dir_cache[Path::new("/w")].name_index.as_ref().is_some_and(|s| s.index.is_some()), "a wide listing that is read gets an index");
 
             // Any mutation swaps the Arc, and the index must follow it.
             let mut files = (*c.dir_cache[Path::new("/w")].files).clone();

@@ -274,12 +274,9 @@ struct DirCacheEntry {
     // read path (`get_cached_dir_readonly`) can record an access too — a
     // directory that only ever gets stat'ed is still in use.
     last_access: AtomicU64,
-    // Built on the first child lookup in a wide listing (see `find_child`).
-    // Tagged with the `files` Arc it indexes: every mutation of a listing swaps
-    // that Arc, so a stale index is recognised and rebuilt instead of every
-    // mutation site having to remember to drop it. The Weak also keeps the old
-    // allocation's address from being reused while it is compared against.
-    name_index: Option<(std::sync::Weak<Vec<RemoteEntry>>, NameIndex)>,
+    // Name index of a wide listing, built once it has been looked up in often
+    // enough (see `find_child`).
+    name_index: Option<NameIndexSlot>,
     // Fetched cold for a process crawling the tree (walkers.rs). Such listings
     // form their own LRU segment, evicted first whenever it holds more than a
     // fifth of the cache, so a `find /` cannot push out the folders someone is
@@ -290,6 +287,23 @@ struct DirCacheEntry {
 
 /// Listings up to this size are scanned: indexing them costs more than it saves.
 const NAME_INDEX_MIN: usize = 256;
+/// Lookups one version of a wide listing is scanned for before it is indexed.
+/// Every mutation of a listing swaps its Arc, and indexing on the first lookup
+/// rebuilt the whole index per file during a bulk copy into a wide directory
+/// (a create, then a lookup, of each): O(n) under the cache lock, on fuser-0,
+/// per file. A version that gets this many lookups is being read, not written.
+const NAME_INDEX_AFTER_LOOKUPS: u32 = 8;
+
+/// The name index of one version of a listing. Tagged with the `files` Arc it
+/// belongs to: every mutation of a listing swaps that Arc, so a stale slot is
+/// recognised and started over instead of every mutation site having to
+/// remember to drop it. The Weak also keeps the old allocation's address from
+/// being reused while it is compared against.
+struct NameIndexSlot {
+    of: std::sync::Weak<Vec<RemoteEntry>>,
+    lookups: u32,
+    index: Option<NameIndex>,
+}
 /// A hash two different names share: look those up by scanning.
 const NAME_AMBIGUOUS: u32 = u32::MAX;
 
@@ -1608,13 +1622,21 @@ impl FsCache {
             let pos = scan_for_name(&files, name);
             return Some((files, pos));
         }
-        let current = matches!(&e.name_index, Some((of, _)) if std::ptr::eq(of.as_ptr(), Arc::as_ptr(&files)));
+        let current = matches!(&e.name_index, Some(slot) if std::ptr::eq(slot.of.as_ptr(), Arc::as_ptr(&files)));
         if !current {
+            e.name_index = Some(NameIndexSlot { of: Arc::downgrade(&files), lookups: 0, index: None });
+        }
+        let slot = e.name_index.as_mut().expect("set above");
+        slot.lookups = slot.lookups.saturating_add(1);
+        if slot.index.is_none() && slot.lookups > NAME_INDEX_AFTER_LOOKUPS {
             let mut ix = NameIndex::default();
             ix.extend(&files);
-            e.name_index = Some((Arc::downgrade(&files), ix));
+            slot.index = Some(ix);
         }
-        let pos = e.name_index.as_ref().and_then(|(_, ix)| ix.find(&files, name));
+        let pos = match &slot.index {
+            Some(ix) => ix.find(&files, name),
+            None => scan_for_name(&files, name),
+        };
         Some((files, pos))
     }
 
