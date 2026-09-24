@@ -13,6 +13,7 @@ pub mod fuse_notify;
 pub mod change_log;
 pub mod ipc;
 pub mod http_clients;
+mod fh_lane;
 mod iomode;
 mod path_seq;
 pub mod mutation_journal;
