@@ -5905,17 +5905,19 @@ mod upload_order_tests {
             off.rm("/a");
             let delete = off.journal.safe_lock().peek_front().unwrap().seq;
             let put = off.save("/a", "A2", None);
-            let j = off.journal.clone();
-            let worker = std::thread::spawn(move || {
-                let r = claim_in_order(&j, put, &[Path::new("/a")], || false, "PUT", Duration::from_secs(10));
-                (r, Instant::now())
+            let (r, ran, landed) = std::thread::scope(|sc| {
+                let worker = sc.spawn(|| {
+                    let r = claim_in_order(&off.journal, put, &[Path::new("/a")], || false, "PUT", Duration::from_secs(10));
+                    (r, Instant::now())
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(!worker.is_finished(), "ran ahead of the queued DELETE");
+                assert!(!off.journal.safe_lock().claim(put), "claimed while it waits, so the replay cannot run it too");
+                let landed = Instant::now();
+                off.journal.safe_lock().remove(delete);
+                let (r, ran) = worker.join().unwrap();
+                (r, ran, landed)
             });
-            std::thread::sleep(Duration::from_millis(300));
-            assert!(!worker.is_finished(), "ran ahead of the queued DELETE");
-            assert!(!off.journal.safe_lock().claim(put), "claimed while it waits, so the replay cannot run it too");
-            let landed = Instant::now();
-            off.journal.safe_lock().remove(delete);
-            let (r, ran) = worker.join().unwrap();
             assert_eq!(r, InOrder::Run);
             assert!(ran.duration_since(landed) < Duration::from_millis(40), "woken by the change, not a poll: {:?}", ran.duration_since(landed));
             // Unrelated older entries do not hold it up.
