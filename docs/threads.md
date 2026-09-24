@@ -43,8 +43,8 @@ graph LR
 | `meta` | 16 | 1024 | EAGAIN (getxattr: ENODATA; open's process classification proceeds unclassified) | lookup/getattr/setattr/getxattr/listxattr/open whose parent listing is not cached (a hit is answered on `fuser-0`), and open's process classification when it would read `/proc/<pid>/maps` or `cmdline`. The reply travels in the job; each job has one deadline, `PROPFIND_TIMEOUT` from submission |
 | `read` | 32 | 2048 | EAGAIN | read waits on read-ahead streams, range streams; staging a writable open's current content (download, or copy of the cached file) |
 | `list` | 16 | 2048 | error (stale listing served if cached) | streaming lists, soft-TTL refreshes |
-| `bg` | 4 | 256 | dropped | revalidation on read, prefetch, GIO temp purge, chunk-upload abort |
-| `mutate` | 16 | unbounded | journal replays it | PUT/MKCOL/DELETE/MOVE commits (`PathSeq` FIFO; see `path_seq.rs`) |
+| `bg` | 4 | 256 | dropped | revalidation on read, prefetch, GIO temp purge |
+| `mutate` | 16 | unbounded | journal replays it | PUT/MKCOL/DELETE/MOVE commits (`PathSeq` FIFO; see `path_seq.rs`); abort of an abandoned chunk-upload session (never dropped: a lost abort leaks the session's chunks) |
 | `upload` | 4 | 1024 | the write runs on the caller as a plain append; its chunk goes with the handle's next write | the `write()` that fills a 10 MB chunk of a streamed upload, and its PUT (with retries); the reply travels in the job. Queued per handle (`fh_lane.rs`), so a handle's later writes, flush and release wait behind it and nothing else does |
 | `disk` | 4 | 4096 | runs on the caller | seeding a staging file from the kept copy (first write, truncate), `flush`/`fsync` of a staging file (reply in the job), and a `release` queued behind a handle's in-flight write |
 | `journal` | 1 | 4 | left pending for the next change or the shutdown flush | the journal's group commit (`mutation_journal::DeferredSaves`): staging fsyncs, one durable write of the latest journal, then deleting the staging files it no longer names. A failed write is put back and retried with backoff (100 ms → 5 s) |

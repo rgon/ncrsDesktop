@@ -437,6 +437,42 @@
         }
 
         #[test]
+        fn release_publishes_the_new_size_before_the_handle_stops_overlaying_it() {
+            // What `stat` answers from: the listing (the server's older, smaller
+            // size), the upload guard, and the open-handle overlay.
+            fn stat_size(ctx: &WriteCtx, path: &Path) -> u64 {
+                let c = ctx.cache.safe_lock();
+                let e = c.dir_cache[Path::new("/")].files.iter().find(|e| e.path == path).unwrap().clone();
+                let mut attr = attr_for(&c, 5, path, &e);
+                drop(c);
+                overlay_local_size(&ctx.meta, path, &mut attr);
+                attr.size
+            }
+            // Whole-file staging, and a streamed upload (one chunk already sent).
+            for (fh, name, len) in [(12u64, "w.bin", 3 * MIB), (13, "s.bin", 12 * MIB)] {
+                let r = rig(name, ChunkServer::default());
+                let path = PathBuf::from(format!("/{name}"));
+                r.ctx.cache.safe_lock().put_dir_cache(PathBuf::from("/"), None, None, vec![make_dav_entry(name, None)]);
+                r.open(fh, path.to_str().unwrap(), None);
+                r.ctx.open_writers.fetch_add(1, Ordering::SeqCst);
+                r.ctx.open_files.safe_lock().get_mut(&fh).unwrap().writer = true;
+                let data = pattern(len, fh as u8);
+                for (i, piece) in data.chunks(MIB).enumerate() {
+                    assert!(recv(&r.write(fh, path.to_str().unwrap(), (i * MIB) as u64, piece), "write").is_ok());
+                }
+                assert_eq!(stat_size(&r.ctx, &path), len as u64, "the overlay covers the open handle");
+                // RELEASE is answered after the handle is gone and before its
+                // commit: exactly the gap a stat could fall into.
+                let (tx, rx) = channel();
+                let (ctx, p) = (r.ctx.clone(), path.clone());
+                r.ctx.dispatch_release(fh, move || tx.send(stat_size(&ctx, &p)).unwrap());
+                assert_eq!(recv(&rx, "release"), len as u64, "stat regressed to the server's size while the release committed");
+                assert_eq!(stat_size(&r.ctx, &path), len as u64);
+                wait_for("the upload", || !r.server.finished.lock().unwrap().is_empty() || !r.server.puts.lock().unwrap().is_empty());
+            }
+        }
+
+        #[test]
         fn a_clean_handle_is_flushed_and_released_on_the_spot() {
             let r = rig("clean", ChunkServer::default());
             r.open(8, "/c.bin", None);

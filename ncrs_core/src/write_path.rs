@@ -438,15 +438,7 @@ impl WriteCtx {
             }
         }
         if let Some(size) = streamed_size.or_else(|| std::fs::metadata(&wp).ok().map(|m| m.len())) {
-            let mut c = self.cache.safe_lock();
-            let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
-            if let Some(dir) = c.dir_cache.get_mut(&parent) {
-                let mut files = (*dir.files).clone();
-                if let Some(e) = files.iter_mut().find(|e| e.path == remote_path) {
-                    e.size = size;
-                }
-                dir.files = Arc::new(files);
-            }
+            set_listed_size(&mut self.cache.safe_lock(), &remote_path, size);
         }
     }
 
@@ -475,6 +467,7 @@ impl WriteCtx {
     /// before its commit starts, as before: RELEASE is the last request on a
     /// handle, so nothing waits on the commit.
     pub(crate) fn release_answer(&self, fh: u64, reply: impl FnOnce()) {
+        self.publish_released_size(fh);
         // The last close of the handle: the only point where no further write can arrive.
         let Some(of) = self.open_files.safe_lock().remove(&fh) else {
             reply();
@@ -504,8 +497,10 @@ impl WriteCtx {
                     "release: fh {} streamed upload of {} failed mid-copy ({}) — abandoning it, the copy must be retried",
                     fh, of.remote_path.display(), cs.uploads_base,
                 );
+                // On the mutation pool, which never refuses: a dropped abort
+                // leaks the session's chunks on the server.
                 let backend = self.conn.backend.clone();
-                let _ = bg::BACKGROUND.submit(move || {
+                submit_mutation(move || {
                     backend.abort_chunked_upload(&backend::ChunkedUploadSession { uploads_base: cs.uploads_base });
                 });
             }
@@ -523,6 +518,33 @@ impl WriteCtx {
         if let Err(e) = self.commit_released(FileHandle(fh), of) {
             log::warn!("release: commit of fh {} failed: {:?}", fh, e);
         }
+    }
+
+    /// Publishes the size a committing handle is about to upload while the
+    /// handle still overlays it (`overlay_local_size`), so a `stat` between
+    /// the handle's removal and the commit never sees the server's older,
+    /// smaller size: the kernel would shrink the inode and a concurrent reader
+    /// would take the old end for EOF. The listing entry carries it, and an
+    /// in-flight upload guard (create()'s, or an earlier commit's) is raised to
+    /// it, which `attr_for` prefers to a refresh from the server. Offline, a
+    /// guard is left alone: nothing clears one once the journal replays.
+    fn publish_released_size(&self, fh: u64) {
+        let staged = self.open_files.safe_lock().get(&fh)
+            .filter(|of| of.dirty && !of.upload_failed && !of.unlinked)
+            .and_then(|of| {
+                let streamed = of.chunk_upload.as_ref().map(|_| of.total_written);
+                of.write_path.clone().map(|wp| (of.remote_path.clone(), wp, streamed))
+            });
+        let Some((remote_path, wp, streamed)) = staged else { return };
+        // Stat outside both locks.
+        let Some(size) = streamed.or_else(|| std::fs::metadata(&wp).ok().map(|m| m.len())) else { return };
+        let mut c = self.cache.safe_lock();
+        if !self.conn.is_offline.load(Ordering::Relaxed) {
+            if let Some(guard) = c.uploading.get_mut(&remote_path) {
+                *guard = Some(size);
+            }
+        }
+        set_listed_size(&mut c, &remote_path, size);
     }
 
     /// Journals the end of a streamed upload and hands it to a worker, so a failed finish
@@ -875,6 +897,20 @@ impl WriteCtx {
         Ok(())
     }
 
+}
+
+/// Sets `path`'s size in its parent's resident listing, if any.
+fn set_listed_size(c: &mut FsCache, path: &Path, size: u64) {
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    if let Some(dir) = c.dir_cache.get_mut(parent) {
+        if let Some(i) = dir.files.iter().position(|e| e.path == path) {
+            if dir.files[i].size != size {
+                let mut files = (*dir.files).clone();
+                files[i].size = size;
+                dir.files = Arc::new(files);
+            }
+        }
+    }
 }
 
 /// Called from write() once the tail staging file has accumulated at
