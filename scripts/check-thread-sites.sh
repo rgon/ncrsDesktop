@@ -7,7 +7,7 @@ doc=docs/threads.md
 src=ncrs_core/src
 missing=0
 pools=$(grep -ho 'pub static [A-Z_]*: Pool = Pool::new("[a-z-]*"' "$src/bg.rs" | sed 's/.*Pool::new("\([a-z-]*\)"/\1/' | sort -u)
-services=$(grep -ho '\(start_service\|spawn_service\)("[a-z-]*"' "$src"/*.rs | sed 's/.*("\([a-z-]*\)"/\1/' | sort -u)
+services=$(grep -rho --include='*.rs' '\(start_service\|spawn_service\)("[a-z-]*"' "$src" | sed 's/.*("\([a-z-]*\)"/\1/' | sort -u)
 for name in $pools $services; do
     if ! grep -q "\`$name\`" "$doc"; then
         echo "::error file=$doc::thread '$name' is created in $src but not documented in $doc"

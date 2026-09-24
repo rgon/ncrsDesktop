@@ -4947,8 +4947,8 @@ impl Filesystem for NextCloudFs {
                 let fetch = self.thumbnail_callback();
                 let remote = path.clone();
                 // Off the FUSE worker: the prefetch stats and touches the file
-                // through this same mount.
-                thread::spawn(move || {
+                // through this same mount. A dropped job costs one thumbnail.
+                let _ = bg::THUMB.submit(move || {
                     fetch(remote);
                 });
                 reply.error(Errno::EACCES);

@@ -797,7 +797,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
         let log = v3.change_log.clone();
         let dirty = dirty_set.clone();
         let fcq = file_change_queue.clone();
-        std::thread::spawn(move || loop {
+        spawn_service("change-log", move || loop {
             log.pump(&dirty, &fcq);
             std::thread::sleep(Duration::from_millis(250));
         });

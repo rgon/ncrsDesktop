@@ -40,7 +40,7 @@ graph LR
 | `notify` | 1 | 8192 | dropped (entry times out) | every `inval_inode` / `inval_entry` / `delete` to the kernel |
 | `ipc` | 64 | 0 | connection closed | one per connected IPC client |
 | `housekeeping` | 3 | 16 | disarmed, retried later | dir-cache saver, journal replay, reconnect revalidation |
-| `thumb` | 2 | 64 | dropped | thumbnail prefetch batches |
+| `thumb` | 2 | 64 | dropped | thumbnail prefetch batches; thumbguard's server-preview fetch |
 | `user` | 4 | 4096 | dropped | IPC-requested KEEP / PREFETCH |
 
 ## Services (`bg::spawn_service`, at most 24 per process lifetime)
@@ -58,6 +58,8 @@ graph LR
 | `health-log` | `mount_ncfs` | shutdown |
 | `ipc-state` | `ipc::start_ipc_server` | process exit |
 | `ipc-accept` | `ipc::start_ipc_server` | process exit |
+| `change-log` | `ipc::start_ipc_server` (IPC v3 change-log pump, every 250 ms) | process exit |
+| `desktop-refresh` | `desktop::Desktop::spawn_refresher` (re-detects file-browser profiles every 10 min) | process exit |
 
 ## Scoped fan-outs (`std::thread::scope`, joined before returning)
 
