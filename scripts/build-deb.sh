@@ -148,9 +148,17 @@ fi
 # ── Write DEBIAN/control ──────────────────────────────────────────────────────
 # ncrs links libssl at build time; ncrs-gui dlopens libayatana-appindicator3
 # for the tray icon (invisible to ldd/shlibdeps) and panics without it.
-# The Dolphin plugin's Qt/KF libraries are deliberately not listed: only
-# Dolphin loads it, and Dolphin brings them, so GNOME users are not handed KDE.
-DEPENDS="fuse3, python3-nautilus | gir1.2-nautilus-3.0, libssl3t64 | libssl3, libimage-exiftool-perl, python3-gi, gir1.2-gdkpixbuf-2.0"
+#
+# Everything desktop-specific is a soft relationship, so one package suits
+# every desktop without pulling another's stack (or upgrading its browser):
+#   Recommends  the GNOME search provider / CR3 thumbnailer helpers, which
+#               degrade gracefully without them
+#   Suggests    python3-nautilus (the extension's loader). The service detects
+#               Nautilus and the GUI offers the install; a dpkg trigger then
+#               reloads Nautilus.
+#   (nothing)   the Dolphin plugin's Qt/KF libraries: only Dolphin loads it,
+#               and Dolphin brings them.
+DEPENDS="fuse3, libssl3t64 | libssl3"
 if ! $SKIP_GUI; then
     DEPENDS="$DEPENDS, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37, libayatana-appindicator3-1 | libappindicator3-1"
 fi
@@ -162,7 +170,9 @@ Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: Gonzalo Ruiz <gonza@logo.cl>
 Depends: ${DEPENDS}
-Recommends: libcap2-bin
+Recommends: libcap2-bin, python3-gi, gir1.2-gdkpixbuf-2.0, libimage-exiftool-perl
+Suggests: python3-nautilus | gir1.2-nautilus-3.0
+Enhances: nautilus, dolphin
 Section: net
 Priority: optional
 Description: Nextcloud FUSE virtual filesystem client
@@ -177,6 +187,20 @@ Description: Nextcloud FUSE virtual filesystem client
  fully-cached files on Linux 6.9+. Without it, ncrs runs identically but
  always falls back to normal buffered reads.
 EOF
+
+# ── dpkg triggers ─────────────────────────────────────────────────────────────
+# Fire when python3-nautilus installs its loader later, so postinst can reload
+# Nautilus. dpkg trigger paths are literal, hence the multiarch lookup.
+MULTIARCH="$(dpkg-architecture -a"$ARCH" -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
+if [[ -z "$MULTIARCH" ]]; then
+    case "$ARCH" in
+        amd64) MULTIARCH=x86_64-linux-gnu ;;
+        arm64) MULTIARCH=aarch64-linux-gnu ;;
+        *) echo "error: cannot map $ARCH to a multiarch triplet (install dpkg-dev)" >&2; exit 1 ;;
+    esac
+fi
+printf 'interest-noawait /usr/lib/%s/nautilus/extensions-4\ninterest-noawait /usr/lib/%s/nautilus/extensions-3.0\n' \
+    "$MULTIARCH" "$MULTIARCH" > "$PKG_DIR/DEBIAN/triggers"
 
 # ── Copy maintainer scripts ───────────────────────────────────────────────────
 for script in postinst prerm postrm; do

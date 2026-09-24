@@ -45,13 +45,29 @@ pub struct AdapterDescriptor {
     /// Files whose presence means the adapter is installed (see
     /// [`DetectEnv::path_exists`] for the `~/` and `@lib/` prefixes).
     pub installed_paths: &'static [&'static str],
+    /// A system package the adapter needs at runtime but the `.deb` only
+    /// Suggests, so installing ncrs never drags one desktop's bindings (and
+    /// browser upgrades) onto another's users.
+    pub runtime: Option<RuntimeNeed>,
+}
+
+/// A runtime package, and the files whose presence means it is installed.
+pub struct RuntimeNeed {
+    pub package: &'static str,
+    pub paths: &'static [&'static str],
 }
 
 impl AdapterDescriptor {
-    pub const NONE: AdapterDescriptor = AdapterDescriptor { client_ids: &[], installed_paths: &[] };
+    pub const NONE: AdapterDescriptor = AdapterDescriptor { client_ids: &[], installed_paths: &[], runtime: None };
 
     pub fn is_installed(&self, env: &DetectEnv) -> bool {
         self.installed_paths.iter().any(|p| env.path_exists(p))
+    }
+
+    /// The runtime package to install before the adapter can load, if missing.
+    pub fn missing_package(&self, env: &DetectEnv) -> Option<&'static str> {
+        let need = self.runtime.as_ref()?;
+        (!need.paths.iter().any(|p| env.path_exists(p))).then_some(need.package)
     }
 }
 
@@ -110,6 +126,14 @@ pub static PROFILES: &[Profile] = &[
                 "/usr/share/nautilus-python/extensions/ncrs-syncstate.py",
                 "~/.local/share/nautilus-python/extensions/syncstate.py",
             ],
+            // nautilus-python's loader; without it Nautilus ignores the extension.
+            runtime: Some(RuntimeNeed {
+                package: "python3-nautilus",
+                paths: &[
+                    "@lib/nautilus/extensions-4/libnautilus-python.so",
+                    "@lib/nautilus/extensions-3.0/libnautilus-python.so",
+                ],
+            }),
         },
     },
     Profile {
@@ -130,6 +154,8 @@ pub static PROFILES: &[Profile] = &[
                 "@lib/qt6/plugins/kf6/overlayicon/ncrsoverlayplugin.so",
                 "@lib/qt5/plugins/kf5/overlayicon/ncrsoverlayplugin.so",
             ],
+            // Needs only Qt/KF, which Dolphin itself brings.
+            runtime: None,
         },
     },
     Profile {
@@ -170,5 +196,20 @@ mod tests {
                 assert!(p.requires.is_empty(), "toolkit {} must not require anything", p.id);
             }
         }
+    }
+
+    #[test]
+    fn nautilus_adapter_asks_for_python3_nautilus_until_its_loader_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = DetectEnv { lib_dirs: vec![dir.path().to_path_buf()], ..Default::default() };
+        let adapter = &PROFILES.iter().find(|p| p.id == "nautilus").unwrap().adapter;
+        assert_eq!(adapter.missing_package(&env), Some("python3-nautilus"));
+        // Multiarch layout: <lib>/x86_64-linux-gnu/nautilus/extensions-4/…
+        let ext = dir.path().join("x86_64-linux-gnu/nautilus/extensions-4");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(ext.join("libnautilus-python.so"), b"").unwrap();
+        assert_eq!(adapter.missing_package(&env), None);
+        let dolphin = &PROFILES.iter().find(|p| p.id == "dolphin").unwrap().adapter;
+        assert_eq!(dolphin.missing_package(&env), None, "Dolphin brings everything its plugin needs");
     }
 }

@@ -719,6 +719,8 @@ pub struct Integration {
     #[serde(default)]
     pub adapter_client_ids: Vec<String>,
     pub adapter_installed: bool,
+    #[serde(default)]
+    pub adapter_needs_package: Option<String>,
     pub adapter_connected: bool,
 }
 
