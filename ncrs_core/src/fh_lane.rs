@@ -13,21 +13,44 @@
 //! A lane exists while its handle has work queued or running. A step is either
 //! done right away under a [`LaneGuard`] (the lane was idle and the step is
 //! cheap) or handed to a pool; the next step starts only once the previous one
-//! has finished, on whichever thread finished it. A step the pool refuses runs
-//! on the thread that tried to start it, so nothing is dropped or reordered.
+//! has finished, on whichever thread finished it.
 //!
-//! A pool step returns its reply instead of sending it, and the lane moves on
-//! before the reply goes out. The kernel sends a handle's next write, or its
-//! FLUSH and RELEASE, only after that reply, so a plain sequential writer always
-//! finds the lane idle and is answered on the dispatch thread; only the steps
-//! that really overlap (writeback of a shared mapping) queue.
+//! A step the pool refuses runs on the thread that tried to start it, so
+//! nothing is dropped or reordered. That thread can be the FUSE dispatch
+//! thread (a `run` on an idle lane, or a [`LaneGuard`] dropped there), so the
+//! step is told where it runs ([`Ran`]) and a step that would touch the
+//! network must do only its local part on the caller: the write path defers a
+//! refused chunk graduation to the handle's next write, and the release
+//! commit only journals and hands the upload to `bg::MUTATION`, which never
+//! refuses. Pool-full is therefore never an error for the kernel, and never a
+//! network wait on `fuser-0`.
+//!
+//! A step's reply goes out after the lane has moved on when nothing waits
+//! behind it (the lane is retired first), and before the next step starts when
+//! something does, so replies leave in the order the requests came in. The
+//! kernel sends a handle's next write, or its FLUSH and RELEASE, only after
+//! that reply, so a plain sequential writer always finds the lane idle and is
+//! answered on the dispatch thread; only the steps that really overlap
+//! (writeback of a shared mapping) queue. Steps queued behind one another are
+//! started in a loop, never by recursion, however many are refused in a row.
 
 use std::collections::{HashMap, VecDeque};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use crate::bg::Pool;
 
-type Job = Box<dyn FnOnce() -> Box<dyn FnOnce()> + Send + 'static>;
+/// Where a lane step runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ran {
+    /// On a worker of the pool it was queued for.
+    OnPool,
+    /// The pool refused it, so on the thread that started it, which may be the
+    /// FUSE dispatch thread: no network here.
+    OnCaller,
+}
+
+type Job = Box<dyn FnOnce(Ran) -> Box<dyn FnOnce()> + Send + 'static>;
 
 struct Step {
     pool: &'static Pool,
@@ -53,13 +76,16 @@ impl Drop for LaneGuard {
     }
 }
 
-// Starts the lane's next step when the current one ends, unwinding included:
-// a panicking job must not wedge every later write on its handle.
-struct Advance(Arc<FhLanes>, u64);
+// Starts the lane's next step if the current one unwinds: a panicking job
+// must not wedge every later write on its handle. Disarmed on the normal path,
+// where the caller takes the next step itself.
+struct OnUnwind(Option<(Arc<FhLanes>, u64)>);
 
-impl Drop for Advance {
+impl Drop for OnUnwind {
     fn drop(&mut self) {
-        self.0.advance(self.1);
+        if let Some((lanes, fh)) = self.0.take() {
+            lanes.advance(fh);
+        }
     }
 }
 
@@ -84,14 +110,16 @@ impl FhLanes {
     }
 
     /// Runs `job` on `pool` once everything already queued on `fh` has finished,
-    /// then what it returns (its reply) once the lane has moved on.
+    /// then what it returns (its reply). `job` is told where it runs: if the
+    /// pool refuses it, it runs on the thread that started it (see the module
+    /// doc), which may be this one, before `run` returns.
     pub fn run<D: FnOnce() + 'static>(
         self: &Arc<Self>,
         fh: u64,
         pool: &'static Pool,
-        job: impl FnOnce() -> D + Send + 'static,
+        job: impl FnOnce(Ran) -> D + Send + 'static,
     ) {
-        let step = Step { pool, job: Box::new(move || Box::new(job()) as Box<dyn FnOnce()>) };
+        let step = Step { pool, job: Box::new(move |ran| Box::new(job(ran)) as Box<dyn FnOnce()>) };
         {
             let mut l = self.lock();
             if let Some(q) = l.get_mut(&fh) {
@@ -108,36 +136,55 @@ impl FhLanes {
         self.lock().len()
     }
 
-    // Starts `step`, which now owns `fh`'s lane.
-    fn start(self: &Arc<Self>, fh: u64, step: Step) {
-        let lanes = self.clone();
-        if let Err((_, job)) = step.pool.submit_owning(step.job, move |job| {
-            let next = Advance(lanes, fh);
-            let reply = job();
-            drop(next);
-            reply();
-        }) {
+    // Starts `step`, which now owns `fh`'s lane, and every step after it that
+    // its pool refuses, on this thread, in order.
+    fn start(self: &Arc<Self>, fh: u64, mut step: Step) {
+        loop {
+            let lanes = self.clone();
+            let job = match step.pool.submit_owning(step.job, move |job| {
+                if let Some(next) = lanes.finish_step(fh, job, Ran::OnPool) {
+                    lanes.start(fh, next);
+                }
+            }) {
+                Ok(()) => return,
+                Err((_, job)) => job,
+            };
             // The pool is full: run it here rather than drop or reorder it.
-            let next = Advance(self.clone(), fh);
-            let reply = job();
-            drop(next);
-            reply();
+            match self.finish_step(fh, job, Ran::OnCaller) {
+                Some(next) => step = next,
+                None => return,
+            }
+        }
+    }
+
+    // Runs one step and sends its reply; returns the step queued behind it,
+    // which now owns the lane, or retires the lane (before the reply) if none.
+    fn finish_step(self: &Arc<Self>, fh: u64, job: Job, ran: Ran) -> Option<Step> {
+        let mut unwind = OnUnwind(Some((self.clone(), fh)));
+        let reply = job(ran);
+        unwind.0 = None;
+        let next = self.next_or_retire(fh);
+        // A reply that panics must not lose the steps behind it.
+        let _ = catch_unwind(AssertUnwindSafe(reply));
+        next
+    }
+
+    fn next_or_retire(&self, fh: u64) -> Option<Step> {
+        let mut l = self.lock();
+        match l.get_mut(&fh).and_then(VecDeque::pop_front) {
+            Some(step) => Some(step),
+            None => {
+                l.remove(&fh);
+                None
+            }
         }
     }
 
     // Starts the next queued step on `fh`, or retires the lane if none waits.
     fn advance(self: &Arc<Self>, fh: u64) {
-        let next = {
-            let mut l = self.lock();
-            match l.get_mut(&fh).and_then(VecDeque::pop_front) {
-                Some(step) => step,
-                None => {
-                    l.remove(&fh);
-                    return;
-                }
-            }
-        };
-        self.start(fh, next);
+        if let Some(next) = self.next_or_retire(fh) {
+            self.start(fh, next);
+        }
     }
 }
 
@@ -169,7 +216,7 @@ mod tests {
             let o = order.clone();
             // Alternate pools and vary the step length: order must not depend on either.
             let p = if i % 3 == 0 { a } else { b };
-            lanes.run(7, p, move || {
+            lanes.run(7, p, move |_| {
                 if i % 7 == 0 {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -189,14 +236,14 @@ mod tests {
         let g = gate.clone();
         let order = Arc::new(Mutex::new(Vec::new()));
         let o = order.clone();
-        lanes.run(1, p, move || {
+        lanes.run(1, p, move |_| {
             g.wait();
             o.lock().unwrap().push("graduation");
             || {}
         });
         assert!(lanes.claim(1).is_none(), "an in-flight step keeps the lane");
         let o = order.clone();
-        lanes.run(1, p, move || {
+        lanes.run(1, p, move |_| {
             o.lock().unwrap().push("flush");
             || {}
         });
@@ -216,7 +263,7 @@ mod tests {
         let ran = Arc::new(AtomicUsize::new(0));
         let guard = lanes.claim(3).unwrap();
         let r = ran.clone();
-        lanes.run(3, p, move || {
+        lanes.run(3, p, move |_| {
             r.fetch_add(1, Ordering::SeqCst);
             || {}
         });
@@ -235,20 +282,66 @@ mod tests {
         let lanes = FhLanes::new();
         let gate = Arc::new(Barrier::new(2));
         let g = gate.clone();
-        lanes.run(1, p, move || {
+        lanes.run(1, p, move |_| {
             g.wait();
             || {}
         });
         let caller = std::thread::current().id();
         let ran_on = Arc::new(Mutex::new(None));
         let r = ran_on.clone();
-        lanes.run(2, p, move || {
-            *r.lock().unwrap() = Some(std::thread::current().id());
+        lanes.run(2, p, move |ran| {
+            *r.lock().unwrap() = Some((std::thread::current().id(), ran));
             || {}
         });
-        assert_eq!(*ran_on.lock().unwrap(), Some(caller), "refused, so it ran inline before run() returned");
+        assert_eq!(*ran_on.lock().unwrap(), Some((caller, Ran::OnCaller)), "refused, so it ran inline before run() returned, and knew it");
         gate.wait();
         wait_idle(&lanes);
+    }
+
+    #[test]
+    fn a_long_run_of_refused_steps_runs_iteratively_with_replies_in_order() {
+        // A pool that refuses everything, and more steps queued behind an
+        // inline claim than a recursive advance could survive on the stack.
+        let never = pool("t-lane-never", 0, 0);
+        let lanes = FhLanes::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let guard = lanes.claim(5).unwrap();
+        const N: usize = 50_000;
+        for i in 0..N {
+            let o = order.clone();
+            lanes.run(5, never, move |ran| {
+                assert_eq!(ran, Ran::OnCaller);
+                move || o.lock().unwrap().push(i)
+            });
+        }
+        drop(guard);
+        assert_eq!(lanes.busy_count(), 0, "all ran on the thread that released the lane");
+        let order = order.lock().unwrap();
+        assert_eq!(order.len(), N);
+        assert!(order.iter().copied().eq(0..N), "replies left out of order");
+    }
+
+    #[test]
+    fn a_refused_step_behind_a_pool_step_replies_after_it() {
+        let p = pool("t-lane-order", 1, 8);
+        let never = pool("t-lane-order-never", 0, 0);
+        let lanes = FhLanes::new();
+        let gate = Arc::new(Barrier::new(2));
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let (g, r) = (gate.clone(), replies.clone());
+        lanes.run(6, p, move |ran| {
+            assert_eq!(ran, Ran::OnPool);
+            g.wait();
+            move || r.lock().unwrap().push("first")
+        });
+        let r = replies.clone();
+        lanes.run(6, never, move |ran| {
+            assert_eq!(ran, Ran::OnCaller, "refused: runs on whichever thread finished the step ahead");
+            move || r.lock().unwrap().push("second")
+        });
+        gate.wait();
+        wait_idle(&lanes);
+        assert_eq!(*replies.lock().unwrap(), vec!["first", "second"]);
     }
 
     #[test]
@@ -259,7 +352,7 @@ mod tests {
         let lanes = FhLanes::new();
         let seen = Arc::new(Mutex::new(None));
         let (l, s) = (lanes.clone(), seen.clone());
-        lanes.run(4, p, move || {
+        lanes.run(4, p, move |_| {
             move || {
                 *s.lock().unwrap() = Some(l.claim(4).is_some());
             }
@@ -278,9 +371,9 @@ mod tests {
         let p = pool("t-lane-panic", 1, 8);
         let lanes = FhLanes::new();
         let ran = Arc::new(AtomicUsize::new(0));
-        lanes.run(9, p, || -> fn() { panic!("boom") });
+        lanes.run(9, p, |_| -> fn() { panic!("boom") });
         let r = ran.clone();
-        lanes.run(9, p, move || {
+        lanes.run(9, p, move |_| {
             r.fetch_add(1, Ordering::SeqCst);
             || {}
         });

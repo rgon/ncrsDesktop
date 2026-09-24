@@ -47,6 +47,8 @@
             putting: AtomicUsize,
             max_putting: AtomicUsize,
             aborts: AtomicUsize,
+            // Threads that talked to the server.
+            net_threads: Mutex<Vec<std::thread::ThreadId>>,
             finished: Mutex<Vec<(PathBuf, Vec<u8>)>>,
             puts: Mutex<Vec<(PathBuf, Vec<u8>)>>,
         }
@@ -85,12 +87,14 @@
                 Err(backend::BackendWriteError::Unsupported)
             }
             fn open_chunked_upload(&self, _: &Path) -> Result<backend::ChunkedUploadSession, backend::BackendWriteError> {
+                self.net_threads.lock().unwrap().push(std::thread::current().id());
                 if self.open_unsupported {
                     return Err(backend::BackendWriteError::Unsupported);
                 }
                 Ok(backend::ChunkedUploadSession { uploads_base: "uploads/1".into() })
             }
             fn put_chunk(&self, _: &backend::ChunkedUploadSession, index: u64, body: Vec<u8>) -> Result<(), backend::BackendWriteError> {
+                self.net_threads.lock().unwrap().push(std::thread::current().id());
                 let n = self.putting.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_putting.fetch_max(n, Ordering::SeqCst);
                 std::thread::sleep(self.chunk_delay);
@@ -145,6 +149,8 @@
                 log_user: Arc::from("t"),
                 auto_keep_locally_modified_files: false,
                 cache_dir: dir.clone(),
+                upload_pool: &bg::UPLOAD,
+                disk_pool: &bg::DISK,
             };
             Rig { ctx, server, dir }
         }
@@ -360,6 +366,74 @@
             let wp = r.of(7, |of| of.write_path.clone().unwrap());
             assert!(std::fs::read(&wp).unwrap() == original[..1000]);
             assert!(r.of(7, |of| of.dirty && of.total_written == 1000));
+        }
+
+        /// A pool that refuses every job, as `bg::UPLOAD`/`bg::DISK` do when full.
+        fn refusing_pool() -> &'static bg::Pool {
+            Box::leak(Box::new(bg::Pool::new("t-refuses", 0, 0)))
+        }
+
+        #[test]
+        fn a_refused_graduation_never_puts_on_the_caller_and_the_next_write_catches_up() {
+            let mut r = rig("refused", ChunkServer::default());
+            r.ctx.upload_pool = refusing_pool();
+            r.ctx.disk_pool = refusing_pool();
+            r.open(10, "/r.bin", None);
+            let data = pattern(26 * MIB, 10);
+            let (first, last) = data.split_at(25 * MIB);
+            for (i, piece) in first.chunks(MIB).enumerate() {
+                let rx = r.write(10, "/r.bin", (i * MIB) as u64, piece);
+                // Refused, so it ran on this (the "dispatch") thread, before dispatch returned.
+                assert_eq!(rx.try_recv().expect("answered on the caller"), Ok(MIB as u32), "a refusal is never an error");
+            }
+            assert!(r.server.net_threads.lock().unwrap().is_empty(), "a refused step went to the network on the caller");
+            let wp = r.of(10, |of| {
+                assert!(of.chunk_upload.is_none() && of.stream_eligible && of.total_written == 25 * MIB as u64);
+                of.write_path.clone().unwrap()
+            });
+            assert_eq!(std::fs::metadata(&wp).unwrap().len(), 25 * MIB as u64, "the deferred chunks wait in the tail");
+
+            // Room again: the next write sends every full chunk the tail holds, off this thread.
+            r.ctx.upload_pool = &bg::UPLOAD;
+            r.ctx.disk_pool = &bg::DISK;
+            assert_eq!(r.ctx.write_cost(10, 25 * MIB as u64, MIB), crate::write_path::WriteCost::Graduate);
+            assert_eq!(recv(&r.write(10, "/r.bin", 25 * MIB as u64, last), "write"), Ok(MIB as u32));
+            let cs = r.of(10, |of| of.chunk_upload.clone().unwrap());
+            assert_eq!((cs.next_index, cs.bytes_confirmed), (2, 20 * MIB as u64));
+            assert_eq!(std::fs::metadata(&wp).unwrap().len(), 6 * MIB as u64);
+            let me = std::thread::current().id();
+            assert!(r.server.net_threads.lock().unwrap().iter().all(|t| *t != me), "a chunk went out on the caller");
+
+            recv(&r.release(10), "release");
+            wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
+            assert!(r.server.finished.lock().unwrap()[0].1 == data, "the assembled file is what was written");
+        }
+
+        #[test]
+        fn a_write_classified_inline_never_graduates_even_if_online_returns_before_it_runs() {
+            let r = rig("classify", ChunkServer::default());
+            r.open(11, "/c.bin", None);
+            let data = pattern(11 * MIB, 11);
+            for (i, piece) in data[..9 * MIB].chunks(MIB).enumerate() {
+                assert!(recv(&r.write(11, "/c.bin", (i * MIB) as u64, piece), "write").is_ok());
+            }
+            // The write that fills the chunk is classified while offline...
+            r.ctx.conn.is_offline.store(true, Ordering::SeqCst);
+            let cost = r.ctx.write_cost(11, 9 * MIB as u64, MIB);
+            assert_eq!(cost, crate::write_path::WriteCost::Inline);
+            // ...and runs, as dispatch_write runs an Inline write, once it is back.
+            r.ctx.conn.is_offline.store(false, Ordering::SeqCst);
+            let piece = &data[9 * MIB..10 * MIB];
+            assert_eq!(r.ctx.write_answer(11, Path::new("/c.bin"), 9 * MIB as u64, piece, false).map_err(|e| e.code()), Ok(MIB as u32));
+            assert!(r.server.net_threads.lock().unwrap().is_empty(), "an Inline write reached the server");
+            assert!(r.of(11, |of| of.chunk_upload.is_none() && of.stream_eligible && of.total_written == 10 * MIB as u64));
+            // The next write graduates the chunk the last one filled.
+            assert_eq!(r.ctx.write_cost(11, 10 * MIB as u64, MIB), crate::write_path::WriteCost::Graduate);
+            assert!(recv(&r.write(11, "/c.bin", 10 * MIB as u64, &data[10 * MIB..]), "write").is_ok());
+            assert_eq!(r.of(11, |of| of.chunk_upload.as_ref().map(|c| c.next_index)), Some(1));
+            recv(&r.release(11), "release");
+            wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
+            assert!(r.server.finished.lock().unwrap()[0].1 == data);
         }
 
         #[test]

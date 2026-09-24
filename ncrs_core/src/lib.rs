@@ -5130,6 +5130,8 @@ impl NextCloudFs {
             log_user: Arc::from(self.log_user.as_str()),
             auto_keep_locally_modified_files: self.auto_keep_locally_modified_files,
             cache_dir: self.cache.safe_lock().cache_dir.clone(),
+            upload_pool: &bg::UPLOAD,
+            disk_pool: &bg::DISK,
         })
     }
 
