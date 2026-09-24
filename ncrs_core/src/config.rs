@@ -73,7 +73,22 @@ pub struct MountOptions {
     /// suite) — never enable this for a real server.
     #[serde(default)]
     pub allow_insecure_http: bool,
+    /// Slow down a process that crawls the mount (a `find /`, a backup tool,
+    /// an indexer): past a short burst, its listings of folders we don't have
+    /// cached are paced to `walker_listings_per_sec`, so it can't flood the
+    /// server with requests. Cached folders are never slowed.
+    #[serde(default = "default_true")]
+    pub walker_rate_limit: bool,
+    #[serde(default = "default_walker_listings_per_sec")]
+    pub walker_listings_per_sec: u32,
 }
+
+pub fn default_walker_listings_per_sec() -> u32 {
+    crate::walkers::DEFAULT_LISTINGS_PER_SEC
+}
+
+/// Accepted range for `walker_listings_per_sec`.
+pub const WALKER_LISTINGS_PER_SEC_RANGE: std::ops::RangeInclusive<u32> = 1..=1000;
 
 impl std::fmt::Debug for MountOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -217,8 +232,13 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let cleanup_stale_gio_temps = doc["cleanup_stale_gio_temps"].as_bool().unwrap_or(true);
     let stale_gio_temp_mins = doc["stale_gio_temp_mins"].as_i64().map(|v| v as u64).unwrap_or(10);
     let fuse_passthrough = doc["fuse_passthrough"].as_bool().unwrap_or(true);
+    let walker_rate_limit = doc["walker_rate_limit"].as_bool().unwrap_or(true);
+    let walker_listings_per_sec = doc["walker_listings_per_sec"]
+        .as_i64()
+        .map(|n| n.clamp(*WALKER_LISTINGS_PER_SEC_RANGE.start() as i64, *WALKER_LISTINGS_PER_SEC_RANGE.end() as i64) as u32)
+        .unwrap_or_else(default_walker_listings_per_sec);
 
-    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough, allow_insecure_http })
+    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough, allow_insecure_http, walker_rate_limit, walker_listings_per_sec })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
@@ -463,6 +483,11 @@ pub struct ConfigSettings {
     // Defaulted for the same forward-compat reason as dir_cache_max_dirs above.
     #[serde(default = "default_true")]
     pub fuse_passthrough: bool,
+    // Defaulted for the same forward-compat reason as dir_cache_max_dirs above.
+    #[serde(default = "default_true")]
+    pub walker_rate_limit: bool,
+    #[serde(default = "default_walker_listings_per_sec")]
+    pub walker_listings_per_sec: u32,
 }
 
 impl Default for ConfigSettings {
@@ -489,6 +514,8 @@ impl Default for ConfigSettings {
             cleanup_stale_gio_temps: true,
             stale_gio_temp_mins: 10,
             fuse_passthrough: true,
+            walker_rate_limit: true,
+            walker_listings_per_sec: default_walker_listings_per_sec(),
         }
     }
 }
@@ -512,6 +539,8 @@ pub fn config_settings_from_opts(opts: &MountOptions) -> ConfigSettings {
         cleanup_stale_gio_temps: opts.cleanup_stale_gio_temps,
         stale_gio_temp_mins: opts.stale_gio_temp_mins,
         fuse_passthrough: opts.fuse_passthrough,
+        walker_rate_limit: opts.walker_rate_limit,
+        walker_listings_per_sec: opts.walker_listings_per_sec,
     }
 }
 
@@ -615,6 +644,13 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# silently falls back to normal reads when either is unavailable. Can be\n");
     content.push_str("# toggled live from the tray/settings without remounting.\n");
     content.push_str(&format!("fuse_passthrough: {}\n", settings.fuse_passthrough));
+    content.push_str("# Protect the server from folder crawlers. A process that walks the mount\n");
+    content.push_str("# (`find /`, a backup tool, a coding agent searching the disk) turns into one\n");
+    content.push_str("# server request per folder it enters. Past a short burst, such a process is\n");
+    content.push_str("# paced to this many uncached folder listings per second. Folders already in\n");
+    content.push_str("# the local cache are never slowed. Applies immediately, no remount needed.\n");
+    content.push_str(&format!("walker_rate_limit: {}\n", settings.walker_rate_limit));
+    content.push_str(&format!("walker_listings_per_sec: {}\n", settings.walker_listings_per_sec));
 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
@@ -683,6 +719,31 @@ mod tests {
             auth_line,
         );
         configuration_parser(&yaml).unwrap()
+    }
+
+    #[test]
+    fn walker_limit_defaults_on_and_clamps() {
+        let opts = minimal_config("password: \"p\"");
+        assert!(opts.walker_rate_limit);
+        assert_eq!(opts.walker_listings_per_sec, crate::walkers::DEFAULT_LISTINGS_PER_SEC);
+        let off = minimal_config("password: \"p\"\nwalker_rate_limit: false\nwalker_listings_per_sec: 25");
+        assert!(!off.walker_rate_limit);
+        assert_eq!(off.walker_listings_per_sec, 25);
+        assert_eq!(minimal_config("password: \"p\"\nwalker_listings_per_sec: 0").walker_listings_per_sec, 1);
+        assert_eq!(minimal_config("password: \"p\"\nwalker_listings_per_sec: 99999").walker_listings_per_sec, 1000);
+        let s = config_settings_from_opts(&off);
+        assert_eq!((s.walker_rate_limit, s.walker_listings_per_sec), (false, 25));
+    }
+
+    #[test]
+    fn settings_payload_from_an_older_gui_keeps_the_walker_limit_on() {
+        let mut v = serde_json::to_value(ConfigSettings::default()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("walker_rate_limit");
+        o.remove("walker_listings_per_sec");
+        let s: ConfigSettings = serde_json::from_value(v).unwrap();
+        assert!(s.walker_rate_limit);
+        assert_eq!(s.walker_listings_per_sec, crate::walkers::DEFAULT_LISTINGS_PER_SEC);
     }
 
     #[test]

@@ -15,13 +15,15 @@
 //! the refill rate.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Uncached listings a process may cause back-to-back.
 pub const BURST: f64 = 50.0;
-/// Sustained uncached listings per second per process once the burst is spent.
-pub const REFILL_PER_SEC: f64 = 10.0;
+/// Default sustained uncached listings per second per process once the burst
+/// is spent (`walker_listings_per_sec` in the config).
+pub const DEFAULT_LISTINGS_PER_SEC: u32 = 10;
 /// Longest a single listing is held back, so a throttled walker keeps moving.
 pub const MAX_WAIT: Duration = Duration::from_secs(2);
 /// A process causing more uncached listings than this per minute is a walker.
@@ -60,12 +62,30 @@ pub struct WalkerTracker {
     inner: Mutex<HashMap<u32, Requester>>,
     /// Our own pid: the daemon's internal requests are never limited.
     own_pid: u32,
-    enabled: bool,
+    /// Live-adjustable over IPC (`WALKER_LIMIT`) from the settings panel.
+    enabled: AtomicBool,
+    per_sec: AtomicU32,
 }
 
 impl WalkerTracker {
-    pub fn new(enabled: bool) -> Self {
-        WalkerTracker { inner: Mutex::new(HashMap::new()), own_pid: std::process::id(), enabled }
+    pub fn new(enabled: bool, per_sec: u32) -> Self {
+        WalkerTracker {
+            inner: Mutex::new(HashMap::new()),
+            own_pid: std::process::id(),
+            enabled: AtomicBool::new(enabled),
+            per_sec: AtomicU32::new(per_sec.max(1)),
+        }
+    }
+
+    /// Changes the limit for every process, effective on its next listing.
+    pub fn set_limit(&self, enabled: bool, per_sec: u32) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        self.per_sec.store(per_sec.max(1), Ordering::Relaxed);
+        log::info!("walker rate limit {} ({} uncached listings/s per process)", if enabled { "on" } else { "off" }, per_sec.max(1));
+    }
+
+    pub fn limit(&self) -> (bool, u32) {
+        (self.enabled.load(Ordering::Relaxed), self.per_sec.load(Ordering::Relaxed))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Requester>> {
@@ -97,24 +117,26 @@ impl WalkerTracker {
             r.in_window = 0;
         }
         r.in_window += 1;
+        let (enabled, per_sec) = self.limit();
+        let refill = per_sec as f64;
         let rate = r.in_window.max(r.last_rate);
         if rate > WALKER_PER_MIN && r.warned_at.is_none_or(|t| now.duration_since(t) >= WARN_EVERY) {
             r.warned_at = Some(now);
             log::warn!(
                 "WALKER pid={} {} is crawling the mount: {} uncached listings in the last minute{}",
                 pid, r.chain, rate,
-                if self.enabled {
-                    format!(" — limiting it to {}/s (cached folders stay instant)", REFILL_PER_SEC)
+                if enabled {
+                    format!(" — limiting it to {}/s (cached folders stay instant)", per_sec)
                 } else {
                     String::new()
                 }
             );
         }
-        if !self.enabled {
+        if !enabled {
             return Duration::ZERO;
         }
         let elapsed = now.duration_since(r.refilled_at).as_secs_f64();
-        r.tokens = (r.tokens + elapsed * REFILL_PER_SEC).min(BURST);
+        r.tokens = (r.tokens + elapsed * refill).min(BURST);
         r.refilled_at = now;
         if r.tokens >= 1.0 {
             r.tokens -= 1.0;
@@ -122,7 +144,7 @@ impl WalkerTracker {
         }
         // Borrow the token we're about to wait for, so concurrent requests
         // from the same walker queue up behind each other.
-        let wait = Duration::from_secs_f64((1.0 - r.tokens) / REFILL_PER_SEC).min(MAX_WAIT);
+        let wait = Duration::from_secs_f64((1.0 - r.tokens) / refill).min(MAX_WAIT);
         r.tokens -= 1.0;
         r.throttled += 1;
         wait
@@ -216,7 +238,7 @@ mod tests {
 
     #[test]
     fn a_burst_is_free_then_the_rate_is_limited() {
-        let w = WalkerTracker::new(true);
+        let w = WalkerTracker::new(true, DEFAULT_LISTINGS_PER_SEC);
         let t = Instant::now();
         for i in 0..BURST as usize {
             assert_eq!(w.note_uncached(PID, t), Duration::ZERO, "request {i} is within the burst");
@@ -226,12 +248,12 @@ mod tests {
         // After a second of refill, about REFILL_PER_SEC more are free again.
         let later = t + Duration::from_secs(2);
         let free = (0..40).take_while(|_| w.note_uncached(PID, later).is_zero()).count();
-        assert!((REFILL_PER_SEC as usize..=2 * REFILL_PER_SEC as usize + 1).contains(&free), "{free}");
+        assert!((DEFAULT_LISTINGS_PER_SEC as usize..=2 * DEFAULT_LISTINGS_PER_SEC as usize + 1).contains(&free), "{free}");
     }
 
     #[test]
     fn a_crawler_is_flagged_and_a_browser_is_not() {
-        let w = WalkerTracker::new(true);
+        let w = WalkerTracker::new(true, DEFAULT_LISTINGS_PER_SEC);
         let t = Instant::now();
         for _ in 0..=WALKER_PER_MIN {
             let _ = w.note_uncached(PID, t);
@@ -242,8 +264,25 @@ mod tests {
     }
 
     #[test]
+    fn the_limit_changes_live() {
+        let w = WalkerTracker::new(true, DEFAULT_LISTINGS_PER_SEC);
+        let t = Instant::now();
+        for _ in 0..BURST as usize {
+            let _ = w.note_uncached(PID, t);
+        }
+        assert!(!w.note_uncached(PID, t).is_zero());
+        w.set_limit(false, 10);
+        assert!(w.note_uncached(PID, t).is_zero(), "turned off: no waiting");
+        w.set_limit(true, 1000);
+        assert_eq!(w.limit(), (true, 1000));
+        // At 1000/s the wait for one token is about a millisecond.
+        let wait = w.note_uncached(PID, t + Duration::from_millis(1));
+        assert!(wait <= Duration::from_millis(5), "{wait:?}");
+    }
+
+    #[test]
     fn disabled_tracker_only_observes() {
-        let w = WalkerTracker::new(false);
+        let w = WalkerTracker::new(false, DEFAULT_LISTINGS_PER_SEC);
         let t = Instant::now();
         for _ in 0..500 {
             assert_eq!(w.note_uncached(PID, t), Duration::ZERO);
@@ -256,7 +295,7 @@ mod tests {
 
     #[test]
     fn kernel_and_own_requests_are_never_limited() {
-        let w = WalkerTracker::new(true);
+        let w = WalkerTracker::new(true, DEFAULT_LISTINGS_PER_SEC);
         let t = Instant::now();
         for _ in 0..500 {
             assert!(w.note_uncached(0, t).is_zero());
@@ -267,7 +306,7 @@ mod tests {
 
     #[test]
     fn a_slow_reader_is_not_a_walker() {
-        let w = WalkerTracker::new(true);
+        let w = WalkerTracker::new(true, DEFAULT_LISTINGS_PER_SEC);
         let mut t = Instant::now();
         for _ in 0..200 {
             assert!(w.note_uncached(PID, t).is_zero());

@@ -665,7 +665,17 @@ fn get_config_values() -> ncrs_core::config::ConfigSettings {
 
 #[tauri::command]
 fn save_config_values(values: ncrs_core::config::ConfigSettings) -> Result<(), String> {
-    ncrs_core::config::rewrite_config_settings(&values)
+    ncrs_core::config::rewrite_config_settings(&values)?;
+    // The walker limit applies live; everything else takes effect on remount.
+    let limit = format!(
+        "WALKER_LIMIT {} {}",
+        if values.walker_rate_limit { "on" } else { "off" },
+        values.walker_listings_per_sec,
+    );
+    if ipc_request(&[limit.as_str()]).is_none() {
+        log::debug!("walker limit saved; no daemon to forward it to right now");
+    }
+    Ok(())
 }
 
 /// Toggle kernel FUSE_PASSTHROUGH live, without a remount. Persists the choice

@@ -1084,6 +1084,26 @@ fn health_report() -> HealthReport {
     }
 }
 
+/// Applies the settings panel's walker limit to the running daemon (IPC
+/// `WALKER_LIMIT`). False before a mount has registered its tracker.
+pub fn set_walker_limit(enabled: bool, per_sec: u32) -> bool {
+    match HEALTH.get() {
+        Some(h) => {
+            h.walkers.set_limit(enabled, per_sec);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The running daemon's walker limit, as `on:<n>` / `off:<n>`.
+pub fn walker_limit_status() -> Option<String> {
+    HEALTH.get().map(|h| {
+        let (on, n) = h.walkers.limit();
+        format!("{}:{}", if on { "on" } else { "off" }, n)
+    })
+}
+
 /// JSON for the IPC `HEALTH` command: threads, pools, breaker, walkers.
 pub fn health_json() -> String {
     serde_json::to_string(&health_report()).unwrap_or_else(|_| "{}".to_string())
@@ -3281,9 +3301,12 @@ impl NextCloudFs {
             passthrough_capable: Arc::new(AtomicBool::new(true)),
             backoff: Arc::new(backoff::PathBackoff::new()),
             breaker: Arc::new(backoff::ServerBreaker::new()),
-            // NCRS_WALKER_LIMIT=off keeps the accounting and warnings but lifts the limit.
+            // Set from the settings panel (walker_rate_limit); NCRS_WALKER_LIMIT=off
+            // still forces it off. Off keeps the accounting and warnings.
             walkers: Arc::new(walkers::WalkerTracker::new(
-                !matches!(std::env::var("NCRS_WALKER_LIMIT").as_deref(), Ok("off" | "0" | "false")),
+                options.walker_rate_limit
+                    && !matches!(std::env::var("NCRS_WALKER_LIMIT").as_deref(), Ok("off" | "0" | "false")),
+                options.walker_listings_per_sec,
             )),
         });
         let _ = HEALTH.set(HealthSources {
