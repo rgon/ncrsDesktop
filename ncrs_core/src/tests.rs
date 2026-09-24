@@ -458,9 +458,9 @@
             wait_for("the abort", || r.server.aborts.load(Ordering::SeqCst) == 1);
             assert!(r.ctx.journal.safe_lock().is_empty(), "nothing is committed");
             assert!(r.server.finished.lock().unwrap().is_empty());
-            // No chunk left the staging file, so it is every byte written: kept.
-            let kept = r.dir.join(mutation_journal::RECOVERED_DIR).join(mutation_journal::staging_file_name(4));
-            assert!(std::fs::read(&kept).unwrap() == data, "the written bytes were dropped");
+            // The writer was told EIO: nothing was saved, so nothing is kept.
+            assert!(!r.dir.join(mutation_journal::staging_file_name(4)).exists(), "a failed copy's staging lingers");
+            assert!(!r.dir.join(mutation_journal::RECOVERED_DIR).exists());
         }
 
         #[test]
