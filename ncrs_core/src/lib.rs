@@ -4498,41 +4498,54 @@ fn is_not_found_err(e: &str) -> bool {
     e == backend::BackendReadError::NotFound.to_string() || backend::server_error_code(e) == Some(404)
 }
 
-/// Downloads `now_at` into the staging file `wp`. A 404 is answered from the
-/// journal: while a rename's MOVE has not reached the server, the content is
-/// still at the rename's source, so it is staged from there — only then, and
-/// only from the source the journal names (a path merely opened under an
-/// older name can hold a different file by now: `mv f f~; mv tmp f`). A name
-/// that was absent from its listing and that no rename explains is a file
-/// someone else deleted: it starts empty, and writing re-creates it.
+/// Downloads the current content of `now_at` into the staging file `wp`.
 ///
-/// The rename's source is looked up *before* the first download. Looked up
-/// after its 404, a MOVE landing in between has already left the journal:
-/// the name then looks deleted, and the empty seed's upload (no If-Match, a
-/// re-create) replaced the real file. With the source known first, a 404
-/// from it means the MOVE landed, and the new path is tried again. Found no
-/// source up front, every rename of the file had already landed, so a 404 is
-/// a real absence; it is still asked once more before starting empty.
+/// While a queued rename's MOVE has not reached the server, the content is
+/// still at the rename's source, so it is staged from there first — only
+/// then, and only from the source the journal names (a path merely opened
+/// under an older name can hold a different file by now: `mv f f~; mv tmp
+/// f`). What the server has at `now_at` meanwhile is, if anything, the file
+/// the rename replaces: staged from there, `mv a b` over an existing b made
+/// an edit of b start from the old b, and its upload (after the MOVE) put
+/// that over a's content. A source download counts only if the Rename is
+/// still queued once it is done: the MOVE had not landed, and nothing queued
+/// behind it (a new file at the source) had run. A 404 from the source, or
+/// the Rename gone, means the MOVE landed: `now_at` is tried.
+///
+/// rename() journals its MOVE after answering the kernel, so a 404 at
+/// `now_at` asks the journal again. A name that was absent from its listing
+/// and that no rename explains is a file someone else deleted: it starts
+/// empty, and writing re-creates it (asked once more first).
 fn download_seed(ctx: &MetaCtx, wp: &Path, now_at: &Path, absent: bool) -> Result<(), String> {
     let download = |from: &Path| {
         std::fs::File::create(wp)
             .map_err(|e| e.to_string())
             .and_then(|dest| open_file_timeout(&ctx.conn, from.to_path_buf(), dest, Some(ctx.transfer_map.clone())))
     };
-    let source = ctx.journal.safe_lock().rename_source_of(now_at);
+    let source_now = || ctx.journal.safe_lock().rename_source_of(now_at);
+    // Some(result) when the source settled it; None when its MOVE landed.
+    let from_source = |from: PathBuf| -> Option<Result<(), String>> {
+        log::debug!("open: {} is still at {} on the server (its rename is queued) — staging from there", now_at.display(), from.display());
+        match download(&from) {
+            Ok(()) if source_now().as_ref() == Some(&from) => Some(Ok(())),
+            Ok(()) => None,
+            Err(e) if is_not_found_err(&e) => None,
+            Err(e) => Some(Err(e)),
+        }
+    };
+    if let Some(done) = source_now().and_then(from_source) {
+        return done;
+    }
     let e = match download(now_at) {
         Ok(()) => return Ok(()),
         Err(e) if is_not_found_err(&e) => e,
         Err(e) => return Err(e),
     };
-    // rename() journals its MOVE after answering the kernel: one queued since.
-    let source = source.or_else(|| ctx.journal.safe_lock().rename_source_of(now_at));
-    if let Some(from) = source {
-        log::debug!("open: {} not on the server yet ({}) — staging from {}, before its rename", now_at.display(), e, from.display());
-        return download(&from).or_else(|e2| {
-            // The MOVE landed between the two downloads.
-            if is_not_found_err(&e2) { download(now_at) } else { Err(e2) }
-        });
+    if let Some(from) = source_now() {
+        return match from_source(from) {
+            Some(done) => done,
+            None => download(now_at),
+        };
     }
     if !absent {
         return Err(e);

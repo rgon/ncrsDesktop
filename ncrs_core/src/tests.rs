@@ -4945,9 +4945,10 @@ mod upload_order_tests {
         }
 
         #[test]
-        fn a_move_landing_between_the_seed_downloads_does_not_make_the_file_look_deleted() {
-            // `mv f g` is queued; a re-list dropped g (absent). The open's first
-            // download of g gets 404, then the MOVE lands and leaves the journal.
+        fn a_move_landing_during_the_seed_download_does_not_make_the_file_look_deleted() {
+            // `mv f g` is queued; a re-list dropped g (absent). The open stages
+            // from f, and the MOVE lands while it downloads: what f held may
+            // be another file by then, so it is staged from g again.
             let (fake, meta, tmp, _) = open_setup(vec![], true);
             fake.files.lock().unwrap().insert(PathBuf::from("/d/f"), (b"real".to_vec(), Duration::ZERO));
             let ino = {
@@ -4958,8 +4959,11 @@ mod upload_order_tests {
             };
             let seq = meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/d/f"), to: PathBuf::from("/d/g") });
             let journal = meta.journal.clone();
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let log = asked.clone();
             *fake.after_download.lock().unwrap() = Some(Box::new(move |fake, path| {
-                if path == Path::new("/d/g") && journal.safe_lock().contains(seq) {
+                log.lock().unwrap().push(path.to_path_buf());
+                if path == Path::new("/d/f") && journal.safe_lock().contains(seq) {
                     let moved = fake.files.lock().unwrap().remove(Path::new("/d/f")).unwrap();
                     fake.files.lock().unwrap().insert(PathBuf::from("/d/g"), moved);
                     journal.safe_lock().remove(seq);
@@ -4969,8 +4973,44 @@ mod upload_order_tests {
             open_continue(&meta, rq(ino, "/d/g", libc::O_WRONLY | libc::O_APPEND, None), OpenEntry::absent(), r, false);
             let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
             assert_eq!(std::fs::read(meta.open_files.safe_lock()[&fh].write_path.as_ref().unwrap()).unwrap(), b"real", "staged empty: the append would replace g");
+            assert_eq!(*asked.lock().unwrap(), [Path::new("/d/f"), Path::new("/d/g")]);
             append_and_release(&write_ctx(&meta, tmp.path()), fh, b"+");
             assert_eq!(wait_for_put(&fake, "/d/g"), b"real+");
+        }
+
+        #[test]
+        fn a_move_that_landed_before_the_seed_download_is_staged_from_its_new_name() {
+            // The MOVE ran, but its entry is not out of the journal yet: the
+            // source is a 404, and the file is at its new name.
+            let (fake, meta, tmp, _) = open_setup(vec![], true);
+            fake.files.lock().unwrap().insert(PathBuf::from("/d/g"), (b"real".to_vec(), Duration::ZERO));
+            let ino = meta.cache.safe_lock().allocate_inode(PathBuf::from("/d/g"));
+            let seq = meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/d/f"), to: PathBuf::from("/d/g") });
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/g", libc::O_WRONLY | libc::O_APPEND, None), OpenEntry::absent(), r, false);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            assert_eq!(std::fs::read(meta.open_files.safe_lock()[&fh].write_path.as_ref().unwrap()).unwrap(), b"real");
+            append_and_release(&write_ctx(&meta, tmp.path()), fh, b"+");
+            land_move(&fake, &meta, seq, "/d/f", "/d/g");
+            assert_eq!(wait_for_put(&fake, "/d/g"), b"real+");
+        }
+
+        #[test]
+        fn an_edit_of_a_file_renamed_over_another_starts_from_the_renamed_file() {
+            // `mv a b` over an existing b is queued: the server still has the
+            // old b. An edit of b must start from a's content.
+            let (fake, meta, tmp, _) = open_setup(vec![], true);
+            fake.files.lock().unwrap().insert(PathBuf::from("/d/a"), (b"from a".to_vec(), Duration::ZERO));
+            fake.files.lock().unwrap().insert(PathBuf::from("/d/b"), (b"old b".to_vec(), Duration::ZERO));
+            let ino = meta.cache.safe_lock().allocate_inode(PathBuf::from("/d/b"));
+            let seq = meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/d/a"), to: PathBuf::from("/d/b") });
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/b", libc::O_WRONLY | libc::O_APPEND, None), listed(6), r, false);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            assert_eq!(std::fs::read(meta.open_files.safe_lock()[&fh].write_path.as_ref().unwrap()).unwrap(), b"from a");
+            append_and_release(&write_ctx(&meta, tmp.path()), fh, b"+");
+            land_move(&fake, &meta, seq, "/d/a", "/d/b");
+            assert_eq!(wait_for_put(&fake, "/d/b"), b"from a+");
         }
 
         #[test]
