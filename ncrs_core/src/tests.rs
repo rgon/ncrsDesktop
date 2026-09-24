@@ -175,6 +175,7 @@
                 cache_dir: dir.clone(),
                 upload_pool: &bg::UPLOAD,
                 disk_pool: &bg::DISK,
+                spill_pool: &bg::MUTATION,
             };
             Rig { ctx, server, dir }
         }
@@ -469,6 +470,8 @@
             let mut r = rig("refused", ChunkServer::default());
             r.ctx.upload_pool = refusing_pool();
             r.ctx.disk_pool = refusing_pool();
+            // Not even the spill: this is the path of last resort.
+            r.ctx.spill_pool = refusing_pool();
             r.open(10, "/r.bin", None);
             let data = pattern(26 * MIB, 10);
             let (first, last) = data.split_at(25 * MIB);
@@ -487,7 +490,8 @@
             // Room again: the next write sends every full chunk the tail holds, off this thread.
             r.ctx.upload_pool = &bg::UPLOAD;
             r.ctx.disk_pool = &bg::DISK;
-            assert_eq!(r.ctx.write_cost(10, 25 * MIB as u64, MIB), crate::write_path::WriteCost::Graduate);
+            r.ctx.spill_pool = &bg::MUTATION;
+            assert_eq!(r.ctx.write_cost(10, 25 * MIB as u64, MIB), crate::write_path::WriteCost::GraduateCapped, "past the cap");
             assert_eq!(recv(&r.write(10, "/r.bin", 25 * MIB as u64, last), "write"), Ok(MIB as u32));
             let cs = r.of(10, |of| of.chunk_upload.clone().unwrap());
             assert_eq!((cs.next_index, cs.bytes_confirmed), (2, 20 * MIB as u64));
@@ -498,6 +502,28 @@
             recv(&r.release(10), "release");
             wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
             assert!(r.server.finished.lock().unwrap()[0].1 == data, "the assembled file is what was written");
+        }
+
+        #[test]
+        fn a_tail_stops_growing_at_its_cap_while_graduations_are_refused() {
+            let mut r = rig("capped", ChunkServer::default());
+            r.ctx.upload_pool = refusing_pool();
+            r.open(12, "/cap.bin", None);
+            let data = pattern(35 * MIB, 12);
+            let wp = |r: &Rig| r.of(12, |of| of.write_path.clone().unwrap());
+            let mut biggest = 0;
+            for (i, piece) in data.chunks(MIB).enumerate() {
+                assert_eq!(recv(&r.write(12, "/cap.bin", (i * MIB) as u64, piece), "write"), Ok(MIB as u32));
+                biggest = biggest.max(std::fs::metadata(wp(&r)).unwrap().len());
+            }
+            let cap = (crate::write_path::TAIL_CAP_CHUNKS as usize * 10 + 1) * MIB;
+            assert!(biggest <= cap as u64, "the tail grew to {biggest} bytes with the upload pool refusing");
+            assert!(r.of(12, |of| of.chunk_upload.as_ref().is_some_and(|c| c.bytes_confirmed >= 20 * MIB as u64)));
+            let me = std::thread::current().id();
+            assert!(r.server.net_threads.lock().unwrap().iter().all(|t| *t != me), "a chunk went out on the caller");
+            recv(&r.release(12), "release");
+            wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
+            assert!(r.server.finished.lock().unwrap()[0].1 == data, "the assembled file is what was written, in order");
         }
 
         #[test]
@@ -4507,6 +4533,7 @@ mod upload_order_tests {
                 cache_dir: dir.to_path_buf(),
                 upload_pool: &bg::UPLOAD,
                 disk_pool: &bg::DISK,
+                spill_pool: &bg::MUTATION,
             }
         }
 

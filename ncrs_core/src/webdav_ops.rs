@@ -250,12 +250,40 @@ pub fn put_chunk(
     index: u64,
     body: Vec<u8>,
 ) -> Result<(), WriteError> {
-    let len = body.len();
+    let len = body.len() as u64;
+    put_chunk_body(client, creds, uploads_base, index, reqwest::blocking::Body::from(body), len)
+}
+
+/// `put_chunk` of the first `len` bytes of `path`, streamed from the file.
+pub fn put_chunk_from_path(
+    client: &crate::http_clients::DavClient,
+    creds: &crate::auth::Credentials,
+    uploads_base: &str,
+    index: u64,
+    path: &Path,
+    len: u64,
+) -> Result<(), WriteError> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| WriteError::Server(0, format!("staging tail {}: {}", path.display(), e)))?;
+    put_chunk_body(client, creds, uploads_base, index, reqwest::blocking::Body::sized(file.take(len), len), len)
+}
+
+fn put_chunk_body(
+    client: &crate::http_clients::DavClient,
+    creds: &crate::auth::Credentials,
+    uploads_base: &str,
+    index: u64,
+    body: reqwest::blocking::Body,
+    len: u64,
+) -> Result<(), WriteError> {
     let chunk_url = format!("{}/{:010}", uploads_base, index);
     log::info!("CHUNKED_UPLOAD chunk {} ({} bytes) -> {}", index, len, uploads_base);
+    // A long last chunk (a tail that grew while chunk uploads were refused)
+    // gets time in proportion, as a streamed whole-file PUT does.
+    let timeout = CHUNK_UPLOAD_TIMEOUT.max(WRITE_TIMEOUT + std::time::Duration::from_secs(len / (512 * 1024)));
     let resp = creds.apply(client
         .put(&chunk_url)
-        .timeout(CHUNK_UPLOAD_TIMEOUT))
+        .timeout(timeout))
         .body(body)
         .send()
         .map_err(|e| WriteError::Network(format!("chunk {} upload: {}", index, e)))?;
