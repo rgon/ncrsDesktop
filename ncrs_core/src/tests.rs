@@ -25,6 +25,355 @@
         }
     }
 
+    // ── The write path off the dispatch thread (write_path.rs) ──────────────
+    //
+    // These drive `WriteCtx::dispatch_*` the way the kernel would, against a
+    // fake chunked-upload server whose chunk PUTs are slow.
+
+    mod write_path_tests {
+        use super::*;
+        use crate::write_path::WriteCtx;
+        use std::sync::mpsc::{channel, Receiver};
+
+        const MIB: usize = 1024 * 1024;
+
+        #[derive(Default)]
+        struct ChunkServer {
+            chunk_delay: Duration,
+            open_unsupported: bool,
+            fail_chunk: Option<u64>,
+            chunks: Mutex<HashMap<u64, Vec<u8>>>,
+            // Chunk PUTs running right now, and the most ever at once.
+            putting: AtomicUsize,
+            max_putting: AtomicUsize,
+            aborts: AtomicUsize,
+            finished: Mutex<Vec<(PathBuf, Vec<u8>)>>,
+            puts: Mutex<Vec<(PathBuf, Vec<u8>)>>,
+        }
+
+        fn not_here() -> backend::BackendReadError {
+            backend::BackendReadError::Network("not in the fake".into())
+        }
+
+        impl crate::backend::CloudBackend for ChunkServer {
+            fn list_dir(&self, _: &Path, _: Duration) -> Result<(Option<String>, Option<RemoteEntry>, Vec<RemoteEntry>), backend::BackendReadError> {
+                Err(not_here())
+            }
+            fn list_dir_streaming(&self, _: &Path, _: Duration, _: mpsc::Sender<RemoteEntry>, _: mpsc::Sender<RemoteEntry>) -> Result<Option<String>, backend::BackendReadError> {
+                Err(not_here())
+            }
+            fn dir_change_token(&self, _: &Path, _: Duration) -> Result<Option<String>, backend::BackendReadError> {
+                Err(not_here())
+            }
+            fn download_file(&self, _: &Path, _: &mut dyn std::io::Write, _: Duration) -> Result<u64, backend::BackendReadError> {
+                Err(not_here())
+            }
+            fn read_file_range(&self, _: &Path, _: u64, _: &mut [u8], _: Duration) -> Result<usize, backend::BackendReadError> {
+                Err(not_here())
+            }
+            fn put_file(&self, path: &Path, body: Vec<u8>, _: Option<&str>) -> Result<backend::PutResult, backend::BackendWriteError> {
+                self.puts.lock().unwrap().push((path.to_path_buf(), body));
+                Ok(backend::PutResult { new_change_token: Some("put".into()) })
+            }
+            fn mkdir(&self, _: &Path) -> Result<(), backend::BackendWriteError> {
+                Err(backend::BackendWriteError::Unsupported)
+            }
+            fn delete(&self, _: &Path) -> Result<(), backend::BackendWriteError> {
+                Err(backend::BackendWriteError::Unsupported)
+            }
+            fn rename(&self, _: &Path, _: &Path) -> Result<(), backend::BackendWriteError> {
+                Err(backend::BackendWriteError::Unsupported)
+            }
+            fn open_chunked_upload(&self, _: &Path) -> Result<backend::ChunkedUploadSession, backend::BackendWriteError> {
+                if self.open_unsupported {
+                    return Err(backend::BackendWriteError::Unsupported);
+                }
+                Ok(backend::ChunkedUploadSession { uploads_base: "uploads/1".into() })
+            }
+            fn put_chunk(&self, _: &backend::ChunkedUploadSession, index: u64, body: Vec<u8>) -> Result<(), backend::BackendWriteError> {
+                let n = self.putting.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_putting.fetch_max(n, Ordering::SeqCst);
+                std::thread::sleep(self.chunk_delay);
+                self.putting.fetch_sub(1, Ordering::SeqCst);
+                if self.fail_chunk == Some(index) {
+                    return Err(backend::BackendWriteError::Forbidden);
+                }
+                self.chunks.lock().unwrap().insert(index, body);
+                Ok(())
+            }
+            fn finish_chunked_upload(&self, _: &backend::ChunkedUploadSession, path: &Path, _: Option<&str>) -> Result<backend::PutResult, backend::BackendWriteError> {
+                let chunks = self.chunks.lock().unwrap();
+                let mut idx: Vec<_> = chunks.keys().copied().collect();
+                idx.sort();
+                let body = idx.iter().flat_map(|i| chunks[i].iter().copied()).collect();
+                self.finished.lock().unwrap().push((path.to_path_buf(), body));
+                Ok(backend::PutResult { new_change_token: Some("assembled".into()) })
+            }
+            fn abort_chunked_upload(&self, _: &backend::ChunkedUploadSession) {
+                self.aborts.fetch_add(1, Ordering::SeqCst);
+            }
+            fn is_reachable(&self, _: Duration) -> bool {
+                true
+            }
+        }
+
+        struct Rig {
+            ctx: WriteCtx,
+            server: Arc<ChunkServer>,
+            dir: PathBuf,
+        }
+
+        impl Drop for Rig {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        fn rig(name: &str, server: ChunkServer) -> Rig {
+            let dir = std::env::temp_dir().join(format!("ncrs_write_path_{}_{}", std::process::id(), name));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let server = Arc::new(server);
+            let conn = ConnInfo::for_tests(server.clone());
+            let meta = MetaCtx::for_tests(conn, Arc::new(Mutex::new(make_test_cache())), Duration::from_secs(5));
+            let ctx = WriteCtx {
+                meta,
+                lanes: fh_lane::FhLanes::new(),
+                journal: Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&dir))),
+                dirty: Arc::new(Mutex::new(HashSet::new())),
+                error_log: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                log_user: Arc::from("t"),
+                auto_keep_locally_modified_files: false,
+                cache_dir: dir.clone(),
+            };
+            Rig { ctx, server, dir }
+        }
+
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed as u32).to_le_bytes()[3]).collect()
+        }
+
+        fn recv<T>(rx: &Receiver<T>, what: &str) -> T {
+            let r = rx.recv_timeout(Duration::from_secs(20)).unwrap_or_else(|_| panic!("{what}: no reply"));
+            assert!(rx.try_recv().is_err(), "{what}: answered twice");
+            r
+        }
+
+        fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+            let t = Instant::now();
+            while !done() {
+                assert!(t.elapsed() < Duration::from_secs(20), "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        impl Rig {
+            fn open(&self, fh: u64, remote: &str, local: Option<PathBuf>) {
+                let of = OpenFile {
+                    remote_path: PathBuf::from(remote),
+                    stream_eligible: local.is_none(),
+                    local,
+                    buf: None,
+                    write_path: None,
+                    dirty: false,
+                    original_etag: None,
+                    mime_detect_ct: None,
+                    mime_detect_max_read: 0,
+                    cache_fresh: true,
+                    next_expected_off: 0,
+                    read_ahead_window: READ_AHEAD_INITIAL,
+                    total_written: 0,
+                    chunk_upload: None,
+                    ino: 100 + fh,
+                    io_kind: iomode::IoKind::Cached,
+                    upload_failed: false,
+                    created: false,
+                    unlinked: false,
+                    opened_gen: 0,
+                    writer: false,
+                    pinned_parent: None,
+                };
+                self.ctx.open_files.safe_lock().insert(fh, of);
+            }
+
+            fn write(&self, fh: u64, remote: &str, offset: u64, data: &[u8]) -> Receiver<Result<u32, i32>> {
+                let (tx, rx) = channel();
+                self.ctx.dispatch_write(fh, PathBuf::from(remote), offset, data, move |r| tx.send(r.map_err(|e| e.code())).unwrap());
+                rx
+            }
+
+            fn empty(&self, fh: u64, op: fn(&WriteCtx, u64, Box<dyn FnOnce() + Send>)) -> Receiver<()> {
+                let (tx, rx) = channel();
+                op(&self.ctx, fh, Box::new(move || tx.send(()).unwrap()));
+                rx
+            }
+
+            fn flush(&self, fh: u64) -> Receiver<()> {
+                self.empty(fh, |c, fh, r| c.dispatch_flush(fh, r))
+            }
+
+            fn release(&self, fh: u64) -> Receiver<()> {
+                self.empty(fh, |c, fh, r| c.dispatch_release(fh, r))
+            }
+
+            fn of<T>(&self, fh: u64, f: impl FnOnce(&OpenFile) -> T) -> T {
+                f(self.ctx.open_files.safe_lock().get(&fh).expect("handle is open"))
+            }
+        }
+
+        #[test]
+        fn a_chunk_upload_no_longer_holds_the_dispatch_thread() {
+            let r = rig("graduate", ChunkServer { chunk_delay: Duration::from_millis(800), ..Default::default() });
+            r.open(1, "/big.bin", None);
+            let data = pattern(25 * MIB, 1);
+            let mut slowest_dispatch = Duration::ZERO;
+            for (i, piece) in data.chunks(MIB).enumerate() {
+                // Like the kernel: the next write only after this one's reply.
+                let t = Instant::now();
+                let rx = r.write(1, "/big.bin", (i * MIB) as u64, piece);
+                slowest_dispatch = slowest_dispatch.max(t.elapsed());
+                assert_eq!(recv(&rx, "write"), Ok(MIB as u32));
+            }
+            assert!(slowest_dispatch < Duration::from_millis(300), "a write held the dispatcher for {slowest_dispatch:?}");
+            let (total, cs, wp) = r.of(1, |of| (of.total_written, of.chunk_upload.clone().unwrap(), of.write_path.clone().unwrap()));
+            assert_eq!(total, 25 * MIB as u64);
+            assert_eq!((cs.next_index, cs.bytes_confirmed), (2, 20 * MIB as u64));
+            assert_eq!(std::fs::metadata(&wp).unwrap().len(), 5 * MIB as u64, "the tail holds only the unsent bytes");
+
+            recv(&r.flush(1), "flush");
+            recv(&r.release(1), "release");
+            wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
+            std::thread::sleep(Duration::from_millis(200));
+            let finished = r.server.finished.lock().unwrap();
+            assert_eq!(finished.len(), 1, "committed exactly once");
+            assert_eq!(finished[0].0, Path::new("/big.bin"));
+            assert!(finished[0].1 == data, "the assembled file is what was written");
+        }
+
+        #[test]
+        fn overlapping_writes_on_one_handle_land_in_order() {
+            // Shared-mapping writeback can have several WRITEs in flight; the
+            // one that fills a chunk must not be overtaken by those behind it.
+            let r = rig("overlap", ChunkServer { chunk_delay: Duration::from_millis(300), ..Default::default() });
+            r.open(2, "/o.bin", None);
+            let data = pattern(23 * MIB, 2);
+            let rxs: Vec<_> = data.chunks(MIB).enumerate().map(|(i, p)| r.write(2, "/o.bin", (i * MIB) as u64, p)).collect();
+            for rx in &rxs {
+                assert_eq!(recv(rx, "write"), Ok(MIB as u32));
+            }
+            assert_eq!(r.server.max_putting.load(Ordering::SeqCst), 1, "one handle never PUTs two chunks at once");
+            recv(&r.release(2), "release");
+            wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
+            assert!(r.server.finished.lock().unwrap()[0].1 == data);
+        }
+
+        #[test]
+        fn flush_and_release_wait_for_the_graduation_in_flight() {
+            let r = rig("flush_wait", ChunkServer { chunk_delay: Duration::from_millis(600), ..Default::default() });
+            r.open(3, "/f.bin", None);
+            let data = pattern(10 * MIB + 7, 3);
+            let mut pending = Vec::new();
+            for (i, piece) in data.chunks(MIB).enumerate() {
+                let rx = r.write(3, "/f.bin", (i * MIB) as u64, piece);
+                if i < 9 {
+                    assert!(recv(&rx, "write").is_ok());
+                } else {
+                    pending.push(rx); // from the 10th on, the chunk PUT is in flight: don't wait
+                }
+            }
+            // A close() racing the in-flight chunk PUT (another thread's fd),
+            // then the last close. Each must run after the graduation landed.
+            let graduated = |srv: Arc<ChunkServer>, tx: mpsc::Sender<bool>| move || tx.send(srv.chunks.lock().unwrap().contains_key(&0)).unwrap();
+            let (ftx, frx) = channel();
+            r.ctx.dispatch_flush(3, graduated(r.server.clone(), ftx));
+            let (rtx, rrx) = channel();
+            r.ctx.dispatch_release(3, graduated(r.server.clone(), rtx));
+            assert!(recv(&frx, "flush"), "flush answered before the chunk in front of it was sent");
+            assert!(recv(&rrx, "release"), "release ran before the chunk in front of it was sent");
+            for rx in &pending {
+                assert!(recv(rx, "write").is_ok());
+            }
+            wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
+            std::thread::sleep(Duration::from_millis(200));
+            let finished = r.server.finished.lock().unwrap();
+            assert_eq!(finished.len(), 1, "committed exactly once");
+            assert!(finished[0].1 == data, "the commit saw every byte, the graduated chunk included");
+            assert!(r.ctx.open_files.safe_lock().get(&3).is_none());
+        }
+
+        #[test]
+        fn a_failed_chunk_answers_eio_once_and_release_abandons_the_session() {
+            let r = rig("fail", ChunkServer { fail_chunk: Some(0), ..Default::default() });
+            r.open(4, "/x.bin", None);
+            let data = pattern(10 * MIB, 4);
+            let replies: Vec<_> = data.chunks(MIB).enumerate().map(|(i, p)| recv(&r.write(4, "/x.bin", (i * MIB) as u64, p), "write")).collect();
+            assert!(replies[..9].iter().all(|x| x.is_ok()));
+            assert_eq!(replies[9], Err(libc::EIO));
+            assert!(r.of(4, |of| of.upload_failed && of.chunk_upload.is_some()), "the opened session is kept so it can be aborted");
+            // The next write on the failed handle is refused, not silently staged.
+            assert_eq!(recv(&r.write(4, "/x.bin", 0, b"again"), "write"), Err(libc::EIO));
+            recv(&r.release(4), "release");
+            wait_for("the abort", || r.server.aborts.load(Ordering::SeqCst) == 1);
+            assert!(r.ctx.journal.safe_lock().is_empty(), "nothing is committed");
+            assert!(r.server.finished.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_server_without_chunked_uploads_gets_the_whole_file_on_release() {
+            let r = rig("unsupported", ChunkServer { open_unsupported: true, ..Default::default() });
+            r.open(5, "/u.bin", None);
+            let data = pattern(12 * MIB + 3, 5);
+            for (i, piece) in data.chunks(MIB).enumerate() {
+                assert!(recv(&r.write(5, "/u.bin", (i * MIB) as u64, piece), "write").is_ok());
+            }
+            assert!(r.of(5, |of| !of.stream_eligible && of.chunk_upload.is_none()));
+            recv(&r.flush(5), "flush");
+            recv(&r.release(5), "release");
+            wait_for("the PUT", || !r.server.puts.lock().unwrap().is_empty());
+            std::thread::sleep(Duration::from_millis(200));
+            let puts = r.server.puts.lock().unwrap();
+            assert_eq!(puts.len(), 1, "committed exactly once");
+            assert!(puts[0].0 == Path::new("/u.bin") && puts[0].1 == data);
+        }
+
+        #[test]
+        fn the_first_write_and_a_truncate_seed_from_the_kept_copy() {
+            let r = rig("seed", ChunkServer::default());
+            let kept = r.dir.join("kept.bin");
+            let original = pattern(3 * MIB, 6);
+            std::fs::write(&kept, &original).unwrap();
+
+            r.open(6, "/k.bin", Some(kept.clone()));
+            assert_eq!(r.ctx.write_cost(6, MIB as u64, 4), crate::write_path::WriteCost::Seed);
+            assert_eq!(recv(&r.write(6, "/k.bin", MIB as u64, b"EDIT"), "write"), Ok(4));
+            let wp = r.of(6, |of| of.write_path.clone().unwrap());
+            let mut expect = original.clone();
+            expect[MIB..MIB + 4].copy_from_slice(b"EDIT");
+            assert!(std::fs::read(&wp).unwrap() == expect, "an in-place edit keeps the rest of the file");
+            assert_eq!(r.ctx.write_cost(6, 0, 4), crate::write_path::WriteCost::Inline, "seeded once");
+            assert!(!wp.with_extension("seed").exists());
+
+            r.open(7, "/k.bin", Some(kept));
+            let (tx, rx) = channel();
+            r.ctx.dispatch_truncate(7, 1000, move |_, res| tx.send(res.map_err(|e| e.code())).unwrap());
+            assert_eq!(recv(&rx, "truncate"), Ok(()));
+            let wp = r.of(7, |of| of.write_path.clone().unwrap());
+            assert!(std::fs::read(&wp).unwrap() == original[..1000]);
+            assert!(r.of(7, |of| of.dirty && of.total_written == 1000));
+        }
+
+        #[test]
+        fn a_clean_handle_is_flushed_and_released_on_the_spot() {
+            let r = rig("clean", ChunkServer::default());
+            r.open(8, "/c.bin", None);
+            // Answered before dispatch returns: no pool hop for a read-only close.
+            assert!(r.flush(8).try_recv().is_ok());
+            assert!(r.release(8).try_recv().is_ok());
+            assert!(r.ctx.open_files.safe_lock().get(&8).is_none());
+            assert!(r.ctx.journal.safe_lock().is_empty());
+        }
+    }
+
     fn make_dav_entry(name: &str, fileid: Option<u64>) -> RemoteEntry {
         let mut ext = backend::EntryExtensions::default();
         if let Some(fid) = fileid {
