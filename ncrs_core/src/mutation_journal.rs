@@ -1200,7 +1200,12 @@ fn execute_op(
                 Err(BackendWriteError::Conflict) => {
                     log::warn!("JOURNAL replay: PUT {} conflict — creating conflicted copy", remote_path.display());
                     let conflict_name = crate::make_conflict_name(remote_path);
-                    let _ = ctx.backend.put_file_from_path(&conflict_name, staging_path, None);
+                    // Only an uploaded copy lets the staging file go (see the
+                    // Conflict arm of `replay_journal`).
+                    if let Err(e) = ctx.backend.put_file_from_path(&conflict_name, staging_path, None) {
+                        log::error!("JOURNAL replay: conflicted copy {} not uploaded: {} — kept queued", conflict_name.display(), e);
+                        return conflict_copy_retry(e);
+                    }
                     crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                     ReplayResult::Conflict(ConflictKind::EditConflict {
                         local_path: remote_path.clone(),
@@ -1311,7 +1316,10 @@ fn execute_op(
                     log::warn!("JOURNAL replay: streamed upload {} conflict — assembling a conflicted copy", remote_path.display());
                     let conflict_name = crate::make_conflict_name(remote_path);
                     let session = crate::backend::ChunkedUploadSession { uploads_base: uploads_base.clone() };
-                    let _ = ctx.backend.finish_chunked_upload(&session, &conflict_name, None);
+                    if let Err(e) = ctx.backend.finish_chunked_upload(&session, &conflict_name, None) {
+                        log::error!("JOURNAL replay: conflicted copy {} not assembled: {} — kept queued", conflict_name.display(), e);
+                        return conflict_copy_retry(e);
+                    }
                     crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                     ReplayResult::Conflict(ConflictKind::EditConflict {
                         local_path: remote_path.clone(),
@@ -1328,6 +1336,13 @@ fn execute_op(
             }
         }
     }
+}
+
+/// A conflicted copy the server did not take: retried later, a transient
+/// failure without costing an attempt.
+fn conflict_copy_retry(e: crate::backend::BackendWriteError) -> ReplayResult {
+    let msg = format!("conflicted copy not uploaded: {}", e);
+    if e.is_transient() { ReplayResult::Retryable(msg) } else { ReplayResult::ServerError(msg) }
 }
 
 /// Uploads the tail of a streamed upload as its last chunk and assembles the session.

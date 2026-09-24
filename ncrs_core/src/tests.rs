@@ -53,6 +53,20 @@
             opened_for: Mutex<Vec<PathBuf>>,
             finished: Mutex<Vec<(PathBuf, Vec<u8>)>>,
             puts: Mutex<Vec<(PathBuf, Vec<u8>)>>,
+            // Uploads to this path answer 412 (changed on the server).
+            conflict_on: Option<PathBuf>,
+            // Uploads of a conflicted copy answer 503.
+            conflict_copy_fails: AtomicBool,
+        }
+
+        impl ChunkServer {
+            fn refuse(&self, path: &Path) -> Option<backend::BackendWriteError> {
+                if self.conflict_on.as_deref() == Some(path) {
+                    return Some(backend::BackendWriteError::Conflict);
+                }
+                let copy = path.to_string_lossy().contains("(conflicted copy");
+                (copy && self.conflict_copy_fails.load(Ordering::SeqCst)).then(|| backend::BackendWriteError::Server(503, "busy".into()))
+            }
         }
 
         fn not_here() -> backend::BackendReadError {
@@ -76,6 +90,9 @@
                 Err(not_here())
             }
             fn put_file(&self, path: &Path, body: Vec<u8>, _: Option<&str>) -> Result<backend::PutResult, backend::BackendWriteError> {
+                if let Some(e) = self.refuse(path) {
+                    return Err(e);
+                }
                 self.puts.lock().unwrap().push((path.to_path_buf(), body));
                 Ok(backend::PutResult { new_change_token: Some("put".into()) })
             }
@@ -109,6 +126,9 @@
                 Ok(())
             }
             fn finish_chunked_upload(&self, _: &backend::ChunkedUploadSession, path: &Path, _: Option<&str>) -> Result<backend::PutResult, backend::BackendWriteError> {
+                if let Some(e) = self.refuse(path) {
+                    return Err(e);
+                }
                 let chunks = self.chunks.lock().unwrap();
                 let mut idx: Vec<_> = chunks.keys().copied().collect();
                 idx.sort();
@@ -309,6 +329,68 @@
             assert_eq!(finished.len(), 1, "committed exactly once");
             assert!(finished[0].1 == data, "the commit saw every byte, the graduated chunk included");
             assert!(r.ctx.open_files.safe_lock().get(&3).is_none());
+        }
+
+        fn replay(r: &Rig) {
+            let ctx = mutation_journal::ReplayContext { backend: r.server.clone(), status: r.ctx.status.clone() };
+            mutation_journal::replay_journal(&r.ctx.journal, &ctx, &r.ctx.cache, &r.ctx.dirty, &r.ctx.error_log);
+        }
+
+        fn wait_for_retry_queued(r: &Rig) {
+            wait_for("the failed conflicted copy to be queued for retry", || {
+                r.ctx.journal.safe_lock().entries().iter()
+                    .any(|e| !e.in_flight && e.last_error.as_deref().is_some_and(|m| m.contains("conflicted copy")))
+            });
+        }
+
+        #[test]
+        fn a_conflicted_copy_that_fails_to_upload_keeps_the_edit_until_a_replay_makes_it() {
+            let r = rig("conflict_put", ChunkServer {
+                conflict_on: Some(PathBuf::from("/c.txt")),
+                conflict_copy_fails: AtomicBool::new(true),
+                ..Default::default()
+            });
+            r.open(8, "/c.txt", None);
+            assert_eq!(recv(&r.write(8, "/c.txt", 0, b"mine"), "write"), Ok(4));
+            let wp = r.of(8, |of| of.write_path.clone().unwrap());
+            recv(&r.release(8), "release");
+            // Live: the PUT conflicts and the conflicted copy fails.
+            wait_for_retry_queued(&r);
+            assert_eq!(std::fs::read(&wp).unwrap(), b"mine", "the only copy of the edit was deleted");
+            // Replay while the copy still fails: still kept.
+            replay(&r);
+            assert_eq!(r.ctx.journal.safe_lock().len(), 1);
+            assert!(wp.exists());
+            // Replay once the server takes it: the copy is made, then the staging goes.
+            r.server.conflict_copy_fails.store(false, Ordering::SeqCst);
+            replay(&r);
+            let puts = r.server.puts.lock().unwrap().clone();
+            assert!(puts.iter().any(|(p, b)| p.to_string_lossy().contains("(conflicted copy") && b == b"mine"), "{puts:?}");
+            assert!(r.ctx.journal.safe_lock().is_empty());
+        }
+
+        #[test]
+        fn a_streamed_conflicted_copy_that_fails_to_assemble_keeps_the_upload_queued() {
+            let r = rig("conflict_stream", ChunkServer {
+                conflict_on: Some(PathBuf::from("/s.bin")),
+                conflict_copy_fails: AtomicBool::new(true),
+                ..Default::default()
+            });
+            r.open(9, "/s.bin", None);
+            let data = pattern(10 * MIB + 100, 9);
+            for (i, piece) in data.chunks(MIB).enumerate() {
+                assert!(recv(&r.write(9, "/s.bin", (i * MIB) as u64, piece), "write").is_ok());
+            }
+            let tail = r.of(9, |of| of.write_path.clone().unwrap());
+            assert!(r.of(9, |of| of.chunk_upload.is_some()));
+            recv(&r.release(9), "release");
+            wait_for_retry_queued(&r);
+            assert_eq!(std::fs::metadata(&tail).unwrap().len(), 100, "the tail must stay for the retry");
+            r.server.conflict_copy_fails.store(false, Ordering::SeqCst);
+            replay(&r);
+            let finished = r.server.finished.lock().unwrap();
+            assert!(finished.iter().any(|(p, b)| p.to_string_lossy().contains("(conflicted copy") && *b == data), "the whole file is kept as the conflicted copy");
+            assert!(r.ctx.journal.safe_lock().is_empty());
         }
 
         #[test]

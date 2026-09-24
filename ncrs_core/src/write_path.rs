@@ -684,12 +684,20 @@ impl WriteCtx {
                     let conflict_name = make_conflict_name(&remote_path);
                     let session = backend::ChunkedUploadSession { uploads_base: cs.uploads_base.clone() };
                     match conn.backend.finish_chunked_upload(&session, &conflict_name, None) {
-                        Ok(_) => log::info!("conflicted copy assembled as {}", conflict_name.display()),
-                        Err(e) => log::error!("failed to assemble conflicted copy {}: {}", conflict_name.display(), e),
+                        Ok(_) => {
+                            log::info!("conflicted copy assembled as {}", conflict_name.display());
+                            push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
+                            smap.safe_write().remove(&remote_path);
+                            journal.safe_lock().remove_discarding(seq, &tail_path);
+                        }
+                        // The session (with every chunk) is the only copy of this
+                        // file: keep the entry, so the replay assembles it later.
+                        Err(e) => {
+                            log::error!("failed to assemble conflicted copy {}: {} — kept queued for retry", conflict_name.display(), e);
+                            smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+                            conflict_copy_failed(&journal, seq, &e);
+                        }
                     }
-                    push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
-                    smap.safe_write().remove(&remote_path);
-                    journal.safe_lock().remove_discarding(seq, &tail_path);
                 }
                 Err(ref e) if e.is_transient() => {
                     if e.is_network_down() {
@@ -875,18 +883,26 @@ impl WriteCtx {
                         cache.safe_lock().uploading.remove(&remote_path);
                         smap.safe_write().remove(&remote_path);
                         log::warn!("CONFLICT on PUT {} — creating conflicted copy", remote_path.display());
-                        push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                         let conflict_name = make_conflict_name(&remote_path);
                         match conn.backend.put_file_from_path(&conflict_name, &write_path, None) {
-                            Ok(_) => log::info!("conflicted copy uploaded as {}", conflict_name.display()),
-                            Err(e) => log::error!("failed to upload conflict copy: {}", e),
-                        }
-                        if let Some(of) = open_files.safe_lock().get_mut(&fh.0) {
-                            of.dirty = false;
+                            Ok(_) => {
+                                log::info!("conflicted copy uploaded as {}", conflict_name.display());
+                                push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
+                                if let Some(of) = open_files.safe_lock().get_mut(&fh.0) {
+                                    of.dirty = false;
+                                }
+                                journal.safe_lock().remove_discarding(seq, &write_path);
+                            }
+                            // The staging file is the only copy of the edit: keep the
+                            // entry, so the replay makes the conflicted copy later.
+                            Err(e) => {
+                                log::error!("failed to upload conflict copy {}: {} — kept queued for retry", conflict_name.display(), e);
+                                smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+                                conflict_copy_failed(&journal, seq, &e);
+                            }
                         }
                         dirty.safe_lock().insert(remote_path.clone());
                         dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
-                        journal.safe_lock().remove_discarding(seq, &write_path);
                     }
                     Err(ref e) => {
                         tmap.safe_lock().remove(&remote_path);
@@ -1041,5 +1057,16 @@ struct Unreserve {
 impl Drop for Unreserve {
     fn drop(&mut self) {
         self.journal.safe_lock().unreserve_staging(&self.wp);
+    }
+}
+
+/// A conflicted copy that could not be uploaded: the journal entry stays, and
+/// is retried (without counting a transient failure against its attempts).
+fn conflict_copy_failed(journal: &mutation_journal::SharedJournal, seq: mutation_journal::SeqId, e: &backend::BackendWriteError) {
+    let msg = format!("conflicted copy not uploaded: {}", e);
+    if e.is_transient() {
+        journal.safe_lock().mark_deferred(seq, msg);
+    } else {
+        journal.safe_lock().mark_failed(seq, msg);
     }
 }
