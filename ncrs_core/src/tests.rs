@@ -57,6 +57,8 @@
             conflict_on: Option<PathBuf>,
             // Uploads of a conflicted copy answer 503.
             conflict_copy_fails: AtomicBool,
+            // ... or 403: a share with edit but no create permission.
+            conflict_copy_forbidden: AtomicBool,
         }
 
         impl ChunkServer {
@@ -65,6 +67,9 @@
                     return Some(backend::BackendWriteError::Conflict);
                 }
                 let copy = path.to_string_lossy().contains("(conflicted copy");
+                if copy && self.conflict_copy_forbidden.load(Ordering::SeqCst) {
+                    return Some(backend::BackendWriteError::Forbidden);
+                }
                 (copy && self.conflict_copy_fails.load(Ordering::SeqCst)).then(|| backend::BackendWriteError::Server(503, "busy".into()))
             }
         }
@@ -394,6 +399,46 @@
             let finished = r.server.finished.lock().unwrap();
             assert!(finished.iter().any(|(p, b)| p.to_string_lossy().contains("(conflicted copy") && *b == data), "the whole file is kept as the conflicted copy");
             assert!(r.ctx.journal.safe_lock().is_empty());
+        }
+
+        #[test]
+        fn a_streamed_upload_the_server_keeps_refusing_backs_off_and_is_never_aborted() {
+            let r = rig("refused_stream", ChunkServer {
+                conflict_on: Some(PathBuf::from("/r.bin")),
+                conflict_copy_forbidden: AtomicBool::new(true),
+                ..Default::default()
+            });
+            r.open(10, "/r.bin", None);
+            let data = pattern(10 * MIB + 100, 10);
+            for (i, piece) in data.chunks(MIB).enumerate() {
+                assert!(recv(&r.write(10, "/r.bin", (i * MIB) as u64, piece), "write").is_ok());
+            }
+            let tail = r.of(10, |of| of.write_path.clone().unwrap());
+            recv(&r.release(10), "release");
+            wait_for_retry_queued(&r);
+            let attempts = || r.ctx.journal.safe_lock().entries().front().map_or(0, |e| e.attempts);
+            assert_eq!(attempts(), 1);
+            // Not due yet: the replay waits instead of spending the budget now.
+            replay(&r);
+            assert_eq!(attempts(), 1, "retried within its backoff");
+            for n in 2..=3 {
+                r.ctx.journal.safe_lock().skip_backoff();
+                replay(&r);
+                assert_eq!(attempts(), n);
+            }
+            r.ctx.journal.safe_lock().skip_backoff();
+            replay(&r);
+            assert!(r.ctx.journal.safe_lock().is_empty(), "given up after its attempts");
+            assert_eq!(r.server.aborts.load(Ordering::SeqCst), 0, "the session holds the rest of the only copy");
+            assert!(!tail.exists());
+            let recovered = r.dir.join(mutation_journal::RECOVERED_DIR);
+            let kept = recovered.join(tail.file_name().unwrap());
+            assert_eq!(std::fs::read(&kept).unwrap(), &data[10 * MIB..], "the tail is kept");
+            let note: mutation_journal::RecoveredSidecar = serde_json::from_slice(&std::fs::read(recovered.join(format!("{}.json", tail.file_name().unwrap().to_str().unwrap()))).unwrap()).unwrap();
+            assert_eq!(note.upload_session.as_deref(), Some("uploads/1"));
+            assert_eq!(note.tail_offset, Some(10 * MIB as u64));
+            let conflicts = r.ctx.journal.safe_lock().unresolved_conflicts().iter().map(|c| format!("{:?}", c.kind)).collect::<Vec<_>>();
+            assert!(conflicts.iter().any(|c| c.contains("/r.bin") && c.contains("uploads/1")), "{conflicts:?}");
         }
 
         #[test]
