@@ -121,6 +121,16 @@ pub struct MutationJournal {
 
 pub type SharedJournal = Arc<Mutex<MutationJournal>>;
 
+/// What `MutationJournal::newest_upload` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingUpload {
+    /// A whole-file upload, and its staging file.
+    Put(PathBuf),
+    /// The end of a streamed upload: the file's content exists only as the
+    /// server's upload session plus the local tail until it is assembled.
+    Stream,
+}
+
 /// Group commit for the journal file.
 ///
 /// Every enqueue used to rewrite the journal and fsync it and its directory
@@ -707,16 +717,28 @@ impl MutationJournal {
         self.entries.iter().any(|e| e.seq == seq)
     }
 
-    /// Staging file backing a still-queued Put for `path`, if any. Reads of a
-    /// locally-written-but-not-yet-uploaded file can be served from here instead
-    /// of streaming from a server that does not have the content yet.
-    pub fn pending_put_staging(&self, path: &Path) -> Option<PathBuf> {
+    /// The newest queued upload of `path`: it holds the file's current content,
+    /// which neither the server nor a kept copy has yet.
+    pub fn newest_upload(&self, path: &Path) -> Option<PendingUpload> {
         self.entries.iter().rev().find_map(|e| match &e.op {
             MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
-                Some(staging_path.clone())
+                Some(PendingUpload::Put(staging_path.clone()))
             }
+            MutationOp::FinishChunked { remote_path, .. } if remote_path == path => Some(PendingUpload::Stream),
             _ => None,
         })
+    }
+
+    /// Staging file of the newest queued upload of `path` when that upload is a
+    /// whole-file Put. Reads of a locally-written-but-not-yet-uploaded file can
+    /// be served from here instead of streaming from a server that does not
+    /// have the content yet. None when the newest is a streamed upload: an
+    /// older Put's staging is an older version of the file.
+    pub fn pending_put_staging(&self, path: &Path) -> Option<PathBuf> {
+        match self.newest_upload(path) {
+            Some(PendingUpload::Put(staging)) => Some(staging),
+            _ => None,
+        }
     }
 
     /// Where the server still has what this mount renamed to `path`, itself
@@ -1724,6 +1746,35 @@ mod tests {
         assert_eq!(j.pending_put_staging(&PathBuf::from("/docs/report.odt")), Some(staging));
         assert!(j.has_pending_put(&PathBuf::from("/docs/report.odt")));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_newest_upload_of_a_path_is_its_content() {
+        let dir = temp_dir("newest_upload");
+        let (put, staging) = staged_put(&dir, "write_old", "old", None);
+        let mut j = MutationJournal::load_or_create(&dir);
+        let first = j.enqueue(put);
+        j.claim(first); // in flight: a newer upload does not supersede it
+        let tail = dir.join("write_tail");
+        fs::write(&tail, b"end").unwrap();
+        let stream = j.enqueue(MutationOp::FinishChunked {
+            remote_path: PathBuf::from("/f.txt"),
+            uploads_base: "u/1".into(),
+            next_index: 1,
+            bytes_confirmed: 10,
+            total_len: 13,
+            tail_path: tail,
+            if_match_etag: None,
+        });
+        assert_eq!(j.newest_upload(Path::new("/f.txt")), Some(PendingUpload::Stream));
+        assert_eq!(j.pending_put_staging(Path::new("/f.txt")), None, "the older Put's bytes are an older version");
+        // A whole-file upload after the stream is the content again.
+        let (put2, staging2) = staged_put(&dir, "write_new", "new", None);
+        j.enqueue(put2);
+        assert_eq!(j.pending_put_staging(Path::new("/f.txt")), Some(staging2));
+        assert_ne!(j.pending_put_staging(Path::new("/f.txt")), Some(staging));
+        assert!(j.contains(stream));
         let _ = fs::remove_dir_all(&dir);
     }
 
