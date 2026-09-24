@@ -5361,3 +5361,443 @@ mod upload_order_tests {
             }
         }
     }
+
+    // ── Offline journal replay against a server tree ──────────────────────
+    //
+    // Each op replays under the name it had when it was queued, FIFO, so the
+    // server goes through the same steps the mount did. These build journals
+    // the way the FUSE ops do (unlink, release's Put + supersede, rename,
+    // mkdir, rmdir, a streamed finish) and replay them against a fake server
+    // with a real tree: MOVE/DELETE/PUT/MKCOL semantics and etags.
+    mod journal_replay {
+        use super::*;
+        use crate::backend::{BackendReadError, BackendWriteError, ChunkedUploadSession, PutResult};
+        use mutation_journal::{MutationJournal, MutationOp, SharedJournal};
+        use std::collections::BTreeSet;
+
+        #[derive(Default)]
+        struct Tree {
+            files: BTreeMap<PathBuf, (Vec<u8>, String)>,
+            dirs: BTreeSet<PathBuf>,
+            next_etag: u64,
+            /// Chunks of each upload session, by index.
+            sessions: HashMap<String, BTreeMap<u64, Vec<u8>>>,
+            /// Every write request, in order.
+            log: Vec<String>,
+        }
+
+        impl Tree {
+            fn etag(&mut self) -> String {
+                self.next_etag += 1;
+                format!("s{}", self.next_etag)
+            }
+
+            fn parent_ok(&self, p: &Path) -> bool {
+                self.dirs.contains(p.parent().unwrap_or(Path::new("/")))
+            }
+
+            fn remove_subtree(&mut self, p: &Path) {
+                self.files.retain(|f, _| !f.starts_with(p));
+                self.dirs.retain(|d| !d.starts_with(p));
+            }
+
+            fn write(&mut self, path: &Path, body: Vec<u8>, if_match: Option<&str>) -> Result<PutResult, BackendWriteError> {
+                if !self.parent_ok(path) || self.dirs.contains(path) {
+                    return Err(BackendWriteError::Server(409, "parent missing".into()));
+                }
+                if let Some(want) = if_match {
+                    if self.files.get(path).map(|(_, e)| e.as_str()) != Some(want) {
+                        return Err(BackendWriteError::Conflict);
+                    }
+                }
+                let etag = self.etag();
+                self.files.insert(path.to_path_buf(), (body, etag.clone()));
+                Ok(PutResult { new_change_token: Some(etag) })
+            }
+        }
+
+        /// Nextcloud keeps a file's etag across a MOVE (only the parents'
+        /// etags change); `etag_changes_on_move` models a server that does not.
+        struct TreeServer {
+            t: Mutex<Tree>,
+            etag_changes_on_move: bool,
+        }
+
+        fn moved_name(p: &Path, from: &Path, to: &Path) -> PathBuf {
+            let rest = p.strip_prefix(from).unwrap();
+            if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) }
+        }
+
+        impl TreeServer {
+            fn new(files: &[(&str, &str)], dirs: &[&str]) -> Arc<Self> {
+                let mut t = Tree::default();
+                t.dirs.insert(PathBuf::from("/"));
+                for d in dirs {
+                    t.dirs.insert(PathBuf::from(d));
+                }
+                for (p, body) in files {
+                    let e = format!("e_{}", p.trim_start_matches('/').replace('/', "_"));
+                    t.files.insert(PathBuf::from(p), (body.as_bytes().to_vec(), e));
+                }
+                Arc::new(TreeServer { t: Mutex::new(t), etag_changes_on_move: false })
+            }
+
+            fn files(&self) -> Vec<(String, String)> {
+                self.t.lock().unwrap().files.iter()
+                    .map(|(p, (b, _))| (p.display().to_string(), String::from_utf8_lossy(b).into_owned()))
+                    .collect()
+            }
+
+            fn dirs(&self) -> Vec<String> {
+                self.t.lock().unwrap().dirs.iter().map(|d| d.display().to_string()).collect()
+            }
+
+            fn log(&self) -> Vec<String> {
+                self.t.lock().unwrap().log.clone()
+            }
+        }
+
+        fn nope() -> BackendReadError {
+            BackendReadError::Network("not in the tree fake".into())
+        }
+
+        impl crate::backend::CloudBackend for TreeServer {
+            fn list_dir(&self, _: &Path, _: Duration) -> Result<(Option<String>, Option<RemoteEntry>, Vec<RemoteEntry>), BackendReadError> {
+                Err(nope())
+            }
+            fn list_dir_streaming(&self, _: &Path, _: Duration, _: mpsc::Sender<RemoteEntry>, _: mpsc::Sender<RemoteEntry>) -> Result<Option<String>, BackendReadError> {
+                Err(nope())
+            }
+            fn dir_change_token(&self, _: &Path, _: Duration) -> Result<Option<String>, BackendReadError> {
+                Err(nope())
+            }
+            fn download_file(&self, path: &Path, out: &mut dyn std::io::Write, _: Duration) -> Result<u64, BackendReadError> {
+                let body = self.t.lock().unwrap().files.get(path).map(|(b, _)| b.clone()).ok_or(BackendReadError::NotFound)?;
+                out.write_all(&body).map_err(|e| BackendReadError::Network(e.to_string()))?;
+                Ok(body.len() as u64)
+            }
+            fn read_file_range(&self, _: &Path, _: u64, _: &mut [u8], _: Duration) -> Result<usize, BackendReadError> {
+                Err(nope())
+            }
+            fn put_file(&self, path: &Path, body: Vec<u8>, if_match: Option<&str>) -> Result<PutResult, BackendWriteError> {
+                let mut t = self.t.lock().unwrap();
+                let r = t.write(path, body, if_match);
+                t.log.push(format!("PUT {}{} {}", path.display(), if_match.map(|e| format!(" if {e}")).unwrap_or_default(), if r.is_ok() { "ok" } else { "refused" }));
+                r
+            }
+            fn mkdir(&self, path: &Path) -> Result<(), BackendWriteError> {
+                let mut t = self.t.lock().unwrap();
+                t.log.push(format!("MKCOL {}", path.display()));
+                if !t.parent_ok(path) {
+                    return Err(BackendWriteError::Server(409, "parent missing".into()));
+                }
+                t.dirs.insert(path.to_path_buf()); // 405 for an existing one is Ok too
+                Ok(())
+            }
+            fn delete(&self, path: &Path) -> Result<(), BackendWriteError> {
+                let mut t = self.t.lock().unwrap();
+                t.log.push(format!("DELETE {}", path.display()));
+                t.remove_subtree(path); // a 404 is Ok, as `webdav_ops::delete` maps it
+                Ok(())
+            }
+            fn rename(&self, from: &Path, to: &Path) -> Result<(), BackendWriteError> {
+                let mut t = self.t.lock().unwrap();
+                t.log.push(format!("MOVE {} {}", from.display(), to.display()));
+                if !t.files.contains_key(from) && !t.dirs.contains(from) {
+                    return Err(BackendWriteError::Server(404, "no source".into()));
+                }
+                if !t.parent_ok(to) {
+                    return Err(BackendWriteError::Server(409, "no destination parent".into()));
+                }
+                t.remove_subtree(to); // Overwrite: T
+                let files: Vec<PathBuf> = t.files.keys().filter(|p| p.starts_with(from)).cloned().collect();
+                for p in files {
+                    let (body, etag) = t.files.remove(&p).unwrap();
+                    let etag = if self.etag_changes_on_move { t.etag() } else { etag };
+                    t.files.insert(moved_name(&p, from, to), (body, etag));
+                }
+                let dirs: Vec<PathBuf> = t.dirs.iter().filter(|p| p.starts_with(from)).cloned().collect();
+                for d in dirs {
+                    t.dirs.remove(&d);
+                    t.dirs.insert(moved_name(&d, from, to));
+                }
+                Ok(())
+            }
+            fn put_chunk(&self, s: &ChunkedUploadSession, index: u64, body: Vec<u8>) -> Result<(), BackendWriteError> {
+                self.t.lock().unwrap().sessions.entry(s.uploads_base.clone()).or_default().insert(index, body);
+                Ok(())
+            }
+            fn finish_chunked_upload(&self, s: &ChunkedUploadSession, path: &Path, if_match: Option<&str>) -> Result<PutResult, BackendWriteError> {
+                let mut t = self.t.lock().unwrap();
+                let body: Vec<u8> = t.sessions.get(&s.uploads_base).map(|c| c.values().flatten().copied().collect()).unwrap_or_default();
+                let r = t.write(path, body, if_match);
+                t.log.push(format!("ASSEMBLE {} {}", path.display(), if r.is_ok() { "ok" } else { "refused" }));
+                r
+            }
+            fn is_reachable(&self, _: Duration) -> bool {
+                true
+            }
+        }
+
+        /// A mount's offline session: queues ops as the FUSE handlers do.
+        struct Offline {
+            dir: tempfile::TempDir,
+            journal: SharedJournal,
+            n: usize,
+        }
+
+        impl Offline {
+            fn new() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let journal = Arc::new(Mutex::new(MutationJournal::load_or_create(dir.path())));
+                Offline { dir, journal, n: 0 }
+            }
+
+            fn enqueue(&self, op: MutationOp) -> mutation_journal::SeqId {
+                self.journal.safe_lock().enqueue(op)
+            }
+
+            /// release() of a written handle: its Put, then supersede.
+            fn save(&mut self, path: &str, bytes: &str, etag: Option<&str>) {
+                self.n += 1;
+                let staging = self.dir.path().join(format!("write_t_{}", self.n));
+                std::fs::write(&staging, bytes).unwrap();
+                let seq = self.enqueue(MutationOp::Put { remote_path: PathBuf::from(path), staging_path: staging, if_match_etag: etag.map(str::to_owned) });
+                self.journal.safe_lock().supersede_uploads(Path::new(path), seq);
+            }
+
+            /// The release of a streamed copy: the session holds `sent`.
+            fn stream(&mut self, srv: &TreeServer, path: &str, sent: &str, tail: &str) {
+                self.n += 1;
+                let base = format!("uploads/{}", self.n);
+                srv.t.lock().unwrap().sessions.entry(base.clone()).or_default().insert(0, sent.as_bytes().to_vec());
+                let tail_path = self.dir.path().join(format!("write_t_{}", self.n));
+                std::fs::write(&tail_path, tail).unwrap();
+                let seq = self.enqueue(MutationOp::FinishChunked {
+                    remote_path: PathBuf::from(path), uploads_base: base, next_index: 1,
+                    bytes_confirmed: sent.len() as u64, total_len: (sent.len() + tail.len()) as u64,
+                    tail_path, if_match_etag: None,
+                });
+                self.journal.safe_lock().supersede_uploads(Path::new(path), seq);
+            }
+
+            fn rm(&self, path: &str) {
+                self.enqueue(MutationOp::Unlink { path: PathBuf::from(path) });
+            }
+
+            fn rmdir(&self, path: &str) {
+                self.enqueue(MutationOp::RmDir { path: PathBuf::from(path) });
+            }
+
+            fn mkdir(&self, path: &str) {
+                self.enqueue(MutationOp::MkDir { path: PathBuf::from(path) });
+            }
+
+            fn mv(&self, from: &str, to: &str) {
+                self.enqueue(MutationOp::Rename { from: PathBuf::from(from), to: PathBuf::from(to) });
+            }
+
+            fn staged(&self, path: &str) -> Option<String> {
+                self.journal.safe_lock().pending_put_staging(Path::new(path)).map(|p| std::fs::read_to_string(p).unwrap())
+            }
+
+            /// Back online: replays until the journal is empty.
+            fn replay(&self, srv: &Arc<TreeServer>) -> Vec<mutation_journal::ConflictKind> {
+                let status: ipc::StatusMap = Arc::new(RwLock::new(HashMap::new()));
+                let ctx = mutation_journal::ReplayContext { backend: srv.clone(), status };
+                let cache = Arc::new(Mutex::new(make_test_cache()));
+                let dirty: ipc::DirtySet = Arc::new(Mutex::new(HashSet::new()));
+                let elog: ErrorLog = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+                for _ in 0..10 {
+                    mutation_journal::replay_journal(&self.journal, &ctx, &cache, &dirty, &elog);
+                    let mut j = self.journal.safe_lock();
+                    if j.is_empty() {
+                        break;
+                    }
+                    j.skip_backoff();
+                }
+                let j = self.journal.safe_lock();
+                assert!(j.is_empty(), "left queued: {:?}", j.entries());
+                j.unresolved_conflicts().iter().map(|c| c.kind.clone()).collect()
+            }
+        }
+
+        fn tree(files: &[(&str, &str)]) -> Vec<(String, String)> {
+            files.iter().map(|(p, b)| (p.to_string(), b.to_string())).collect()
+        }
+
+        #[test]
+        fn rm_then_create_then_rename_keeps_the_new_file_and_not_the_deleted_one() {
+            let srv = TreeServer::new(&[("/a", "A")], &[]);
+            let mut off = Offline::new();
+            off.rm("/a");
+            off.save("/a", "A2", None);
+            off.mv("/a", "/b");
+            assert_eq!(off.staged("/b").as_deref(), Some("A2"));
+            let conflicts = off.replay(&srv);
+            assert_eq!(srv.files(), tree(&[("/b", "A2")]), "{:?}", srv.log());
+            assert!(conflicts.is_empty(), "{conflicts:?}");
+            assert_eq!(srv.log(), ["DELETE /a", "PUT /a ok", "MOVE /a /b"]);
+        }
+
+        #[test]
+        fn an_edit_then_a_rename_uploads_before_it_moves() {
+            let srv = TreeServer::new(&[("/b", "B")], &[]);
+            let mut off = Offline::new();
+            off.save("/b", "B2", Some("e_b"));
+            off.mv("/b", "/c");
+            assert_eq!(off.staged("/c").as_deref(), Some("B2"));
+            assert!(off.replay(&srv).is_empty());
+            assert_eq!(srv.files(), tree(&[("/c", "B2")]));
+            assert_eq!(srv.log(), ["PUT /b if e_b ok", "MOVE /b /c"]);
+        }
+
+        #[test]
+        fn a_chain_of_renames_with_edits_between_ends_with_the_last_edit() {
+            for etag_changes_on_move in [false, true] {
+                let srv = TreeServer::new(&[("/a", "A")], &[]);
+                let srv = Arc::new(TreeServer { t: Mutex::new(std::mem::take(&mut *srv.t.lock().unwrap())), etag_changes_on_move });
+                let mut off = Offline::new();
+                // The listing entry moves with the file, so each edit carries a's etag.
+                off.save("/a", "A1", Some("e_a"));
+                off.mv("/a", "/b");
+                off.save("/b", "A2", Some("e_a"));
+                off.mv("/b", "/c");
+                off.save("/c", "A3", Some("e_a"));
+                assert_eq!(off.journal.safe_lock().len(), 3, "the older edits are superseded: {:?}", off.journal.safe_lock().entries());
+                let conflicts = off.replay(&srv);
+                let files = srv.files();
+                if etag_changes_on_move {
+                    // If-Match no longer matches: the edit is kept as a conflicted copy.
+                    assert!(files.iter().any(|(p, b)| p.starts_with("/c (conflicted copy") && b == "A3"), "{files:?}");
+                    assert!(files.contains(&("/c".into(), "A".into())));
+                    assert!(matches!(conflicts.as_slice(), [mutation_journal::ConflictKind::EditConflict { .. }]));
+                } else {
+                    assert_eq!(files, tree(&[("/c", "A3")]));
+                    assert!(conflicts.is_empty());
+                }
+            }
+            // A file created here: every step reaches the server, in order.
+            let srv = TreeServer::new(&[], &[]);
+            let mut off = Offline::new();
+            off.save("/n", "N1", None);
+            off.mv("/n", "/m");
+            off.save("/m", "N2", None);
+            off.mv("/m", "/o");
+            assert_eq!(off.staged("/o").as_deref(), Some("N2"));
+            assert!(off.replay(&srv).is_empty(), "{:?}", srv.log());
+            assert_eq!(srv.files(), tree(&[("/o", "N2")]));
+        }
+
+        #[test]
+        fn a_directory_rename_carries_files_created_before_and_after_it() {
+            let srv = TreeServer::new(&[("/d/x", "X")], &["/d"]);
+            let mut off = Offline::new();
+            off.save("/d/new", "N", None);
+            off.mkdir("/d/sub");
+            off.save("/d/sub/deep", "D", None);
+            off.mv("/d", "/e");
+            off.save("/e/after", "F", None);
+            off.save("/e/x", "X2", Some("e_d_x"));
+            assert_eq!(off.staged("/e/new").as_deref(), Some("N"));
+            assert_eq!(off.staged("/e/sub/deep").as_deref(), Some("D"));
+            assert!(off.replay(&srv).is_empty(), "{:?}", srv.log());
+            assert_eq!(srv.files(), tree(&[("/e/after", "F"), ("/e/new", "N"), ("/e/sub/deep", "D"), ("/e/x", "X2")]));
+            assert_eq!(srv.dirs(), ["/", "/e", "/e/sub"]);
+        }
+
+        #[test]
+        fn rm_r_then_mkdir_then_rename_away_leaves_only_the_new_tree() {
+            let srv = TreeServer::new(&[("/dir/a", "A"), ("/dir/b", "B")], &["/dir"]);
+            let mut off = Offline::new();
+            off.rm("/dir/a");
+            off.rm("/dir/b");
+            off.rmdir("/dir");
+            off.mkdir("/dir");
+            off.save("/dir/c", "C", None);
+            off.mv("/dir", "/dist");
+            assert_eq!(off.staged("/dist/c").as_deref(), Some("C"));
+            assert!(off.replay(&srv).is_empty(), "{:?}", srv.log());
+            assert_eq!(srv.files(), tree(&[("/dist/c", "C")]));
+            assert_eq!(srv.dirs(), ["/", "/dist"]);
+        }
+
+        #[test]
+        fn a_rename_back_and_a_rename_over_an_existing_file() {
+            let srv = TreeServer::new(&[("/a", "A"), ("/b", "B"), ("/p", "P"), ("/q", "Q")], &[]);
+            let mut off = Offline::new();
+            // `mv a t; edit t; mv t a`.
+            off.mv("/a", "/t");
+            off.save("/t", "A2", Some("e_a"));
+            off.mv("/t", "/a");
+            assert_eq!(off.staged("/a").as_deref(), Some("A2"));
+            // An edit of a, then `mv a b` over b: b is a's edit.
+            off.save("/b", "B2", Some("e_b"));
+            off.save("/p", "P2", Some("e_p"));
+            off.mv("/p", "/b");
+            assert_eq!(off.staged("/b").as_deref(), Some("P2"), "b's own older upload is the replaced file's");
+            // `mv q b` over it again, unedited: b is q.
+            off.mv("/q", "/b");
+            assert_eq!(off.staged("/b"), None);
+            assert!(off.replay(&srv).is_empty(), "{:?}", srv.log());
+            assert_eq!(srv.files(), tree(&[("/a", "A2"), ("/b", "Q")]));
+        }
+
+        #[test]
+        fn a_created_folder_renamed_before_its_files_land() {
+            let srv = TreeServer::new(&[], &[]);
+            let mut off = Offline::new();
+            off.mkdir("/n");
+            off.save("/n/f", "F", None);
+            off.mv("/n", "/m");
+            off.save("/m/g", "G", None);
+            off.mv("/m/f", "/f");
+            off.rmdir("/m/none"); // never existed: a no-op DELETE
+            assert!(off.replay(&srv).is_empty(), "{:?}", srv.log());
+            assert_eq!(srv.files(), tree(&[("/f", "F"), ("/m/g", "G")]));
+        }
+
+        #[test]
+        fn a_queued_streamed_copy_is_assembled_before_its_rename() {
+            let srv = TreeServer::new(&[], &["/in"]);
+            let mut off = Offline::new();
+            off.stream(&srv, "/in/big.bin", "first ", "last");
+            off.mv("/in", "/out");
+            assert_eq!(off.journal.safe_lock().newest_upload(Path::new("/out/big.bin")), Some(mutation_journal::PendingUpload::Stream));
+            assert!(off.replay(&srv).is_empty(), "{:?}", srv.log());
+            assert_eq!(srv.files(), tree(&[("/out/big.bin", "first last")]));
+        }
+
+        #[test]
+        fn a_journal_written_by_0_1_77_replays_exactly_as_it_did() {
+            // 0.1.77 rewrote every earlier entry into a later rename's names:
+            // `edit a; mv a b` offline was saved as [Put b (a's etag), Rename a→b].
+            // This version replays entries as stored, so such a journal does
+            // what 0.1.77 would have done: the PUT of b is refused (no b with
+            // a's etag) and kept as a conflicted copy, then the MOVE lands.
+            let off = Offline::new();
+            let staging = off.dir.path().join("write_7");
+            std::fs::write(&staging, "A2").unwrap();
+            let old = serde_json::json!([
+                {"seq": 1, "op": {"Put": {"remote_path": "/b", "staging_path": staging, "if_match_etag": "e_a"}}, "created_at_ms": 1, "attempts": 0, "last_error": null},
+                {"seq": 2, "op": {"Rename": {"from": "/a", "to": "/b"}}, "created_at_ms": 2, "attempts": 0, "last_error": null},
+            ]);
+            std::fs::write(off.dir.path().join("mutation_journal.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+            let off = Offline { journal: Arc::new(Mutex::new(MutationJournal::load_or_create(off.dir.path()))), ..off };
+            assert_eq!(off.journal.safe_lock().len(), 2);
+            assert!(off.journal.safe_lock().entries().iter().all(|e| !e.queued_names));
+            // Lookups under the stored name still find it, and a rename made
+            // after the upgrade carries it along.
+            assert_eq!(off.staged("/b").as_deref(), Some("A2"));
+            off.mv("/b", "/c");
+            assert_eq!(off.staged("/c").as_deref(), Some("A2"));
+            assert_eq!(off.staged("/b"), None);
+            let srv = TreeServer::new(&[("/a", "A")], &[]);
+            let conflicts = off.replay(&srv);
+            let log = srv.log();
+            assert_eq!(log[0], "PUT /b if e_a refused");
+            assert!(log[1].starts_with("PUT /b (conflicted copy") && log[2] == "MOVE /a /b" && log[3] == "MOVE /b /c", "{log:?}");
+            assert!(srv.files().iter().any(|(p, b)| p.starts_with("/b (conflicted copy") && b == "A2"), "the edit is never lost");
+            assert!(matches!(conflicts.as_slice(), [mutation_journal::ConflictKind::EditConflict { .. }]));
+        }
+    }
