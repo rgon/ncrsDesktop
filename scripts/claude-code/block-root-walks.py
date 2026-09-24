@@ -67,8 +67,12 @@ REASON = (
 
 def resolve(path: str, cwd: str) -> str:
     p = os.path.expanduser(os.path.expandvars(path))
-    if any(ch in p for ch in "*?["):  # a shell glob walks every match of its parent
-        p = os.path.dirname(p.split("*")[0].split("?")[0].split("[")[0].rstrip("/")) or "/"
+    first_glob = min((p.index(ch) for ch in "*?[" if ch in p), default=None)
+    if first_glob is not None:
+        # A glob walks every match inside the directory holding its first
+        # wildcard segment: `~/*` → ~, `/home/rg*` → /home, `*.rs` → cwd.
+        before = p[:first_glob]
+        p = (before[: before.rfind("/")] or "/") if "/" in before else "."
     return os.path.realpath(os.path.join(cwd, p))
 
 
