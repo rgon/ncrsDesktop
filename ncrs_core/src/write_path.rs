@@ -184,7 +184,7 @@ impl WriteCtx {
     }
 
     fn staging_path_for(&self, fh: u64) -> PathBuf {
-        self.cache_dir.join(format!("write_{}", fh))
+        self.cache_dir.join(mutation_journal::staging_file_name(fh))
     }
 
     /// Picks where a write of `len` bytes at `offset` on `fh` runs. Only a hint
@@ -436,6 +436,12 @@ impl WriteCtx {
     }
 
     /// The staged bytes are on disk once this returns; the reply follows it.
+    ///
+    /// No journal record is written: the file is queued for upload only at
+    /// release. After a crash with the handle still open, the startup sweep
+    /// finds its staging unnamed by the journal and moves it to
+    /// `<cache_dir>/recovered/` (`mutation_journal::quarantine_unreferenced_staging`)
+    /// instead of deleting it, so fsynced bytes survive but are not uploaded.
     pub(crate) fn fsync_answer(&self, fh: u64) {
         let wp = self.open_files.safe_lock().get(&fh).and_then(|of| of.write_path.clone());
         if let Some(Ok(f)) = wp.map(std::fs::File::open) {
