@@ -8693,9 +8693,10 @@ fn prepare_mount_point(mount_point: &Path, cache_dir: &Path) -> Result<Vec<Adopt
     match std::fs::metadata(mount_point) {
         Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {
             log::info!("Detaching stale FUSE mount at {}", mp_str);
-            let _ = std::process::Command::new("fusermount")
-                .args(["-uz", &mp_str])
-                .output();
+            // Lazy is right here: the mount is dead (ENOTCONN), nothing is served by it.
+            if let Err(e) = signals::run_fusermount(&["-uz"], mount_point) {
+                log::warn!("cannot detach the stale mount at {}: {}", mp_str, e);
+            }
         }
         _ => {
             if is_live_fuse_mount(mount_point) {

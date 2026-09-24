@@ -82,36 +82,55 @@ pub fn unblock_shutdown_signals() {
     BLOCKED.store(false, Ordering::SeqCst);
 }
 
+/// Where `fusermount3` (or the older `fusermount`) may be, in order: `PATH`
+/// first, then the usual places, for a service started with a bare `PATH`.
+const FUSERMOUNT: [&str; 6] = [
+    "fusermount3", "/usr/bin/fusermount3", "/bin/fusermount3",
+    "fusermount", "/usr/bin/fusermount", "/bin/fusermount",
+];
+
+/// Runs the first `FUSERMOUNT` that exists with `args` and the mount point.
+/// NotFound when none does.
+pub(crate) fn run_fusermount(args: &[&str], mount_point: &std::path::Path) -> std::io::Result<(&'static str, std::process::Output)> {
+    for bin in FUSERMOUNT {
+        match std::process::Command::new(bin).args(args).arg("--").arg(mount_point).output() {
+            Ok(o) => return Ok((bin, o)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("none of {:?} found", FUSERMOUNT)))
+}
+
 /// What a clean unmount attempt found.
 enum Unmount {
     Done,
     Busy,
     NotMounted,
+    /// No unmount tool could be run.
+    Failed(String),
 }
 
 fn try_unmount(mount_point: &std::path::Path) -> Unmount {
     if !crate::is_live_fuse_mount(mount_point) {
         return Unmount::NotMounted;
     }
-    for bin in ["fusermount3", "fusermount"] {
-        match std::process::Command::new(bin).arg("-u").arg("--").arg(mount_point).output() {
-            Ok(o) if o.status.success() => return Unmount::Done,
-            Ok(o) => {
-                if !crate::is_live_fuse_mount(mount_point) {
-                    return Unmount::NotMounted;
-                }
-                log::info!("signals: {} -u: {}", bin, String::from_utf8_lossy(&o.stderr).trim());
-                return Unmount::Busy;
+    match run_fusermount(&["-u"], mount_point) {
+        Ok((_, o)) if o.status.success() => Unmount::Done,
+        Ok((bin, o)) => {
+            if !crate::is_live_fuse_mount(mount_point) {
+                return Unmount::NotMounted;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                log::warn!("signals: cannot run {}: {}", bin, e);
-                return Unmount::Busy;
-            }
+            log::info!("signals: {} -u: {}", bin, String::from_utf8_lossy(&o.stderr).trim());
+            Unmount::Busy
         }
+        Err(e) => Unmount::Failed(e.to_string()),
     }
-    Unmount::Busy
 }
+
+/// How many seconds in a row an unmount tool may fail to run before the
+/// daemon gives up on a clean unmount, writes the journal and exits.
+const UNMOUNT_TOOL_TRIES: u32 = 10;
 
 /// Waits up to `timeout` for a stop signal; the signal number, or `None`.
 fn wait_signal(set: &libc::sigset_t, timeout: Option<Duration>) -> Option<libc::c_int> {
@@ -248,6 +267,7 @@ pub(crate) fn start_watcher() {
         log::warn!("signals: received signal {} — writing the journal and unmounting {}", sig, mount_point.display());
         mutation_journal::save_synchronously(&journal);
         let mut logged_busy = false;
+        let mut tool_failures = 0;
         loop {
             match try_unmount(&mount_point) {
                 // The session loop returns; mount_ncfs shuts down from there.
@@ -257,6 +277,15 @@ pub(crate) fn start_watcher() {
                     if !logged_busy {
                         log::warn!("signals: {} is busy — still serving, retrying the unmount every {:?}", mount_point.display(), UNMOUNT_RETRY);
                         logged_busy = true;
+                    }
+                }
+                Unmount::Failed(e) => {
+                    tool_failures += 1;
+                    log::error!("signals: cannot unmount {} ({}), try {}/{}", mount_point.display(), e, tool_failures, UNMOUNT_TOOL_TRIES);
+                    if tool_failures >= UNMOUNT_TOOL_TRIES {
+                        // Without a way to unmount, the session never ends: exit
+                        // with the journal written rather than wait for SIGKILL.
+                        flush_and_exit(&journal, &*busy_lanes, "no way to unmount");
                     }
                 }
             }
