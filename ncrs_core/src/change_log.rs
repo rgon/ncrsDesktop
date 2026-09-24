@@ -387,6 +387,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // test scaffolding, not daemon threads
     fn wait_past_wakes_on_append() {
         let log = Arc::new(ChangeLog::new(16));
         let seq = log.head();

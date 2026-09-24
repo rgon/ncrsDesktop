@@ -405,10 +405,13 @@ impl Manager {
     /// ever asks for `INTEGRATIONS`.
     pub fn spawn_refresher(self: &Arc<Self>) {
         let m = self.clone();
-        std::thread::spawn(move || loop {
+        let started = crate::bg::spawn_service("desktop-refresh", move || loop {
             m.refresh();
             std::thread::sleep(std::time::Duration::from_secs(600));
         });
+        if let Err(e) = started {
+            log::error!("could not start the desktop-profile refresher: {} — profiles update on INTEGRATIONS only", e);
+        }
     }
 
     /// The policy the current profile set resolves to.
