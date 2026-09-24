@@ -154,6 +154,17 @@ fn wait_signal(set: &libc::sigset_t, timeout: Option<Duration>) -> Option<libc::
     }
 }
 
+/// How long an exit waits for queued log lines to reach stderr.
+const LOG_FLUSH_WAIT: Duration = Duration::from_millis(300);
+
+/// Ends the process now, once the queued log lines are out (bounded).
+fn exit_now() -> ! {
+    crate::logging::flush(LOG_FLUSH_WAIT);
+    // SAFETY: _exit ends the process without running destructors or atexit
+    // handlers, which may be mid-use on other threads.
+    unsafe { libc::_exit(0) }
+}
+
 fn flush_and_exit(journal: &SharedJournal, busy: &dyn Fn() -> usize, why: &str) -> ! {
     let until = Instant::now() + DRAIN_FOR;
     while busy() > 0 && Instant::now() < until {
@@ -161,9 +172,7 @@ fn flush_and_exit(journal: &SharedJournal, busy: &dyn Fn() -> usize, why: &str) 
     }
     mutation_journal::flush_deferred(journal);
     log::warn!("signals: {} — journal written, exiting", why);
-    // SAFETY: _exit ends the process without running destructors or atexit
-    // handlers, which may be mid-use on other threads.
-    unsafe { libc::_exit(0) }
+    exit_now()
 }
 
 /// Where `mount_ncfs` is, as the `signals` service sees it.
@@ -250,8 +259,7 @@ pub(crate) fn start_watcher() {
                             mutation_journal::flush_deferred(&j);
                         }
                         log::warn!("signals: received signal {} before the mount existed — exiting", sig);
-                        // SAFETY: as in flush_and_exit.
-                        unsafe { libc::_exit(0) }
+                        exit_now()
                     }
                     Phase::Mounting => {
                         *phase = Phase::Mounting;
@@ -263,8 +271,7 @@ pub(crate) fn start_watcher() {
         };
         let Some(journal) = journal() else {
             log::error!("signals: mounted without a journal — exiting");
-            // SAFETY: as in flush_and_exit.
-            unsafe { libc::_exit(0) }
+            exit_now()
         };
         log::warn!("signals: received signal {} — writing the journal and unmounting {}", sig, mount_point.display());
         mutation_journal::save_synchronously(&journal);
