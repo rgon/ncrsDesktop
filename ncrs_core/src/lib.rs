@@ -4527,6 +4527,8 @@ struct LookupHit {
     is_dir: bool,
     is_shared: bool,
     fileid: Option<u64>,
+    /// With `fileid`, which version of the name this is (see `lookup_recheck`).
+    etag: Option<String>,
     detail: ipc::FileDetail,
 }
 
@@ -4540,6 +4542,7 @@ fn lookup_pick(c: &mut FsCache, path: &Path, entry: &RemoteEntry) -> LookupHit {
         is_dir: entry.is_dir,
         is_shared: entry.ext.flag("is_shared"),
         fileid: entry.ext.int("fileid"),
+        etag: entry.change_token.clone(),
         detail: ipc::FileDetail {
             permissions: entry.ext.str("permissions").map(str::to_string),
             owner_id: entry.ext.str("owner_id").map(str::to_string),
@@ -4570,64 +4573,129 @@ enum LookupAnswer {
     Gone,
 }
 
+/// How often a worker's lookup re-picks a name that keeps being replaced
+/// under it before it gives up and answers ENOENT.
+const LOOKUP_REPICKS: usize = 2;
+
 /// The IPC-map side of a lookup (Nautilus' DETAIL queries read these), and
 /// the attributes to answer with. The detail maps are never locked under
 /// `cache`, so this runs after `lookup_pick` released it.
 ///
-/// A lookup answered off the dispatch thread can race unlink or rename,
-/// which run on it: the name may be gone by the time the maps are written.
-/// So the maps are written *first* and the name is checked again after;
-/// unlink marks the name gone in `cache` before it clears the maps, so
-/// either this check sees it gone (and takes the entries back out) or
-/// unlink's clearing runs after these writes. Ghosts are re-checked for the
-/// same reason: the preamble in `lookup` saw them before the wait.
-fn lookup_commit(ctx: &MetaCtx, hit: LookupHit) -> LookupAnswer {
-    let LookupHit { target, mut attr, is_dir, is_shared, fileid, detail } = hit;
-    if let Some(kind) = live_ghost(&ctx.ghost_entries, &target) {
-        return LookupAnswer::Ghost(kind);
+/// A lookup answered off the dispatch thread (`recheck`) can race unlink,
+/// rename and create, which run on it: by the time the maps are written the
+/// name may be gone, or be another file (unlinked and re-created). So the
+/// maps are written *first* and the name is checked again after
+/// (`lookup_recheck`); unlink marks the name gone in `cache` before it
+/// clears the maps, so either this check sees it gone (and takes the entries
+/// back out) or unlink's clearing runs after these writes. A name that is
+/// now another file is picked again, so neither the maps nor the answer
+/// carry the old file's id, details or inode. Ghosts are checked before the
+/// writes (the preamble in `lookup` saw them before the wait) and again
+/// after them, so a ghost added meanwhile takes the entries back out too; one
+/// added after that second check is no different from one added just after
+/// an inline answer. Inline (`!recheck`), on the dispatch thread, nothing can
+/// have run between the pick and here, and none of it is repeated.
+fn lookup_commit(ctx: &MetaCtx, hit: LookupHit, recheck: bool) -> LookupAnswer {
+    let mut hit = hit;
+    let mut repicks = 0;
+    loop {
+        if let Some(kind) = live_ghost(&ctx.ghost_entries, &hit.target) {
+            return LookupAnswer::Ghost(kind);
+        }
+        write_lookup_maps(ctx, &hit);
+        if !recheck {
+            break;
+        }
+        match lookup_recheck(&ctx.cache, &hit) {
+            Recheck::Same => {
+                if let Some(kind) = live_ghost(&ctx.ghost_entries, &hit.target) {
+                    clear_lookup_maps(ctx, &hit.target);
+                    return LookupAnswer::Ghost(kind);
+                }
+                break;
+            }
+            Recheck::Gone => {
+                clear_lookup_maps(ctx, &hit.target);
+                return LookupAnswer::Gone;
+            }
+            Recheck::Replaced(next) => {
+                clear_lookup_maps(ctx, &hit.target);
+                if repicks == LOOKUP_REPICKS {
+                    return LookupAnswer::Gone;
+                }
+                repicks += 1;
+                hit = *next;
+            }
+        }
     }
-    if is_shared {
+    let mut attr = hit.attr;
+    overlay_local_size(ctx, &hit.target, &mut attr);
+    LookupAnswer::Entry(attr)
+}
+
+fn write_lookup_maps(ctx: &MetaCtx, hit: &LookupHit) {
+    let target = &hit.target;
+    if hit.is_shared {
         ctx.shared.safe_write().insert(target.clone());
     }
-    if let Some(fid) = fileid {
+    if let Some(fid) = hit.fileid {
         ctx.fileids.safe_write().insert(target.clone(), fid);
     }
-    ctx.details.safe_write().insert(target.clone(), detail);
+    ctx.details.safe_write().insert(target.clone(), hit.detail.clone());
     if let Some(parent) = target.parent() {
         ctx.children_map.safe_write()
             .entry(parent.to_path_buf())
             .or_insert_with(std::collections::HashSet::new)
             .insert(target.clone());
     }
-    if !is_dir {
+    if !hit.is_dir {
         ctx.status.safe_write().entry(target.clone()).or_insert(FileStatus::Remote);
     }
-    if lookup_target_gone(&ctx.cache, &target) {
-        if let Some(parent) = target.parent() {
-            if let Some(set) = ctx.children_map.safe_write().get_mut(parent) {
-                set.remove(&target);
-            }
-        }
-        ctx.details.safe_write().remove(&target);
-        ctx.status.safe_write().remove(&target);
-        ctx.shared.safe_write().remove(&target);
-        ctx.fileids.safe_write().remove(&target);
-        return LookupAnswer::Gone;
-    }
-    overlay_local_size(ctx, &target, &mut attr);
-    LookupAnswer::Entry(attr)
 }
 
-/// Has `path` been unlinked or renamed away since its lookup resolved? A
-/// resident parent listing is the authority (unlink and rename edit it, and
-/// create adds to it, so a name re-created after an unlink is not gone);
-/// without one, a DELETE still in flight says so.
-fn lookup_target_gone(cache: &Arc<Mutex<FsCache>>, path: &Path) -> bool {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return false };
+fn clear_lookup_maps(ctx: &MetaCtx, target: &Path) {
+    if let Some(parent) = target.parent() {
+        if let Some(set) = ctx.children_map.safe_write().get_mut(parent) {
+            set.remove(target);
+        }
+    }
+    ctx.details.safe_write().remove(target);
+    ctx.status.safe_write().remove(target);
+    ctx.shared.safe_write().remove(target);
+    ctx.fileids.safe_write().remove(target);
+}
+
+/// What a worker's lookup finds when it looks at its name again.
+enum Recheck {
+    /// Still the version that was picked.
+    Same,
+    /// Unlinked or renamed away.
+    Gone,
+    /// Now another file, or another version of it: picked again.
+    Replaced(Box<LookupHit>),
+}
+
+/// Is `hit` still what its name refers to? A resident parent listing is the
+/// authority: unlink and rename edit it, and create adds to it, so a name
+/// re-created after an unlink is there — as a different entry, which the
+/// file id and etag tell apart (a local create has neither yet). Without a
+/// listing, a DELETE still in flight says the name is gone.
+fn lookup_recheck(cache: &Arc<Mutex<FsCache>>, hit: &LookupHit) -> Recheck {
+    let path = hit.target.as_path();
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return Recheck::Same };
     let mut c = cache.safe_lock();
     match c.find_child(dir, name) {
-        Some((_, pos)) => pos.is_none(),
-        None => c.deleting.contains(path),
+        Some((files, Some(i))) => {
+            let now = &files[i];
+            if now.ext.int("fileid") == hit.fileid && now.change_token == hit.etag {
+                Recheck::Same
+            } else {
+                Recheck::Replaced(Box::new(lookup_pick(&mut c, path, now)))
+            }
+        }
+        Some((_, None)) => Recheck::Gone,
+        None if c.deleting.contains(path) => Recheck::Gone,
+        None => Recheck::Same,
     }
 }
 
@@ -5823,8 +5891,11 @@ impl Filesystem for NextCloudFs {
             None => {}
         }
 
-        self.with_child(req.pid(), &full_path, reply, lookup_pick, |_| None, |ctx, _, reply, r| match r {
-            Resolved::Found(hit) => match lookup_commit(ctx, hit) {
+        let meta = self.meta();
+        with_child_within(meta, req.pid(), &full_path, meta.resolve_within, reply, lookup_pick, |_| None, |ctx, _, reply, r, on_worker| match r {
+            // Inline, this thread also runs unlink and rename, so nothing can
+            // have changed since the pick: only a worker's answer is re-checked.
+            Resolved::Found(hit) => match lookup_commit(ctx, hit, on_worker) {
                 LookupAnswer::Entry(attr) => reply.entry(&TTL, &attr, Generation(0)),
                 LookupAnswer::Ghost(GhostKind::VisibleDelete { attr }) => reply.entry(&Duration::ZERO, &attr, Generation(0)),
                 LookupAnswer::Ghost(GhostKind::HiddenAdd) | LookupAnswer::Gone => reply.error(Errno::ENOENT),
