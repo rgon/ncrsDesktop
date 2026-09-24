@@ -3107,6 +3107,57 @@ mod upload_order_tests {
         }
 
         #[test]
+        fn readdir_paths_never_promote_a_stream_whose_result_is_still_in_flight() {
+            let mut c = make_test_cache();
+            let (tx, etx) = start(&mut c, "/r");
+            tx.send(entry_in("/r", "a.txt")).unwrap();
+            drop(tx); // entry stream over, result not sent yet
+            // get_pending_snapshot (readdir) serves what arrived, still pending.
+            let snap = c.get_pending_snapshot(Path::new("/r")).unwrap();
+            assert_eq!(snap.map(|v| v.len()), Some(1));
+            assert!(c.dir_cache.get(Path::new("/r")).is_none(), "promoted before the result arrived");
+            assert!(c.pending_dirs.contains_key(Path::new("/r")));
+            // promote_pending (timeout path, prefetch) refuses too.
+            assert!(matches!(c.promote_pending(Path::new("/r")), Ok(None)));
+            assert!(c.dir_cache.get(Path::new("/r")).is_none());
+            // Once the worker reports a failure, it is surfaced, never cached.
+            etx.send(Err("truncated: body error".into())).unwrap();
+            assert!(c.get_pending_snapshot(Path::new("/r")).is_err());
+            assert!(c.dir_cache.get(Path::new("/r")).is_none());
+        }
+
+        #[test]
+        fn readdir_promotes_a_finished_stream_once_its_result_is_in() {
+            let mut c = make_test_cache();
+            let (tx, etx) = start(&mut c, "/k");
+            tx.send(entry_in("/k", "a.txt")).unwrap();
+            drop(tx);
+            etx.send(Ok(Some("e1".into()))).unwrap();
+            let snap = c.get_pending_snapshot(Path::new("/k")).unwrap();
+            assert_eq!(snap.map(|v| v.len()), Some(1));
+            assert_eq!(c.dir_cache.get(Path::new("/k")).and_then(|e| e.etag.clone()).as_deref(), Some("e1"));
+            assert!(!c.pending_dirs.contains_key(Path::new("/k")));
+        }
+
+        #[test]
+        fn a_kept_copy_is_judged_against_the_version_the_caller_resolved() {
+            let mut c = make_test_cache();
+            let path = PathBuf::from("/docs/a.odt");
+            c.file_cache.insert(path.clone(), FileCacheEntry {
+                local_path: PathBuf::from("/nonexistent/a.odt"),
+                remote_modified: None,
+                etag: Some("e-old".into()),
+                kept: true,
+                size: 3,
+            });
+            // No listing at all: unknown, so assume fresh (offline reads keep working).
+            assert!(c.file_cache_matches_remote(&path));
+            // A freshly resolved entry says the server moved on: stale.
+            assert!(!c.file_cache_matches(&path, Some("e-new"), None));
+            assert!(c.file_cache_matches(&path, Some("e-old"), None));
+        }
+
+        #[test]
         fn an_unresolved_child_is_never_enoent_unless_the_server_said_so() {
             let e = |s: Option<&str>| unknown_child_errno(s).code();
             assert_eq!(e(None), libc::ETIMEDOUT);

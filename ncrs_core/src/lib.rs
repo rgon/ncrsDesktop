@@ -415,9 +415,31 @@ struct PendingDir {
     index: NameIndex,
     // Carried into the dir cache on promotion (see DirCacheEntry::walker).
     walker: bool,
+    // The worker's final result (etag or error) has been taken off `etag_rx`.
+    result_in: bool,
 }
 
 impl PendingDir {
+    /// Takes the worker's final result if it has arrived; false while the entry
+    /// stream has closed but the result is still on its way. The entry channel
+    /// closes a moment before the worker sends the result, and promoting in that
+    /// gap cached a listing that may have broken off mid-stream as complete.
+    fn take_result(&mut self) -> bool {
+        if self.result_in {
+            return true;
+        }
+        match self.etag_rx.try_recv() {
+            Ok(Ok(etag)) => self.etag = etag,
+            Ok(Err(e)) => self.failed = Some(e),
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.failed.get_or_insert_with(|| "listing ended without a result".to_string());
+            }
+        }
+        self.result_in = true;
+        true
+    }
+
     /// Moves whatever the fetch has streamed so far into `entries`. Returns
     /// (anything new arrived, the entry stream has ended).
     fn drain(&mut self) -> (bool, bool) {
@@ -1626,13 +1648,8 @@ impl FsCache {
         // The entry channel closes a moment before the worker sends the result:
         // promoting now would cache a listing that may have broken off
         // mid-stream as complete, and answer "absent" for what never arrived.
-        match p.etag_rx.try_recv() {
-            Ok(Ok(etag)) => p.etag = etag,
-            Ok(Err(e)) => p.failed = Some(e),
-            Err(mpsc::TryRecvError::Empty) => return PendingLookup::Streaming,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                p.failed.get_or_insert_with(|| "listing ended without a result".to_string());
-            }
+        if !p.take_result() {
+            return PendingLookup::Streaming;
         }
         match self.promote_pending(dir) {
             Ok(_) => PendingLookup::Finished,
@@ -1842,6 +1859,7 @@ impl FsCache {
             failed: None,
             index: NameIndex::default(),
             walker: false,
+            result_in: false,
         });
     }
 
@@ -1864,15 +1882,22 @@ impl FsCache {
             .unwrap_or_default()
     }
 
+    /// True once the fetch for `path` has finished *and* its result arrived, so
+    /// promoting it can't cache a broken-off stream as complete.
+    fn promotion_ready(&mut self, path: &Path) -> bool {
+        self.pending_dirs.get_mut(path).is_some_and(|p| p.take_result())
+    }
+
+    /// Moves a finished fetch into the dir cache. Leaves it pending (and
+    /// returns Ok(None)) while its result is still in flight — see
+    /// [`PendingDir::take_result`].
     fn promote_pending(&mut self, path: &Path) -> Result<Option<RemoteEntry>, String> {
+        if !self.promotion_ready(path) {
+            return Ok(None);
+        }
         if let Some(mut pending) = self.pending_dirs.remove(path) {
             while let Ok(entry) = pending.rx.try_recv() {
                 pending.entries.push(entry);
-            }
-            match pending.etag_rx.try_recv() {
-                Ok(Ok(etag)) => pending.etag = etag,
-                Ok(Err(e)) => pending.failed = Some(e),
-                Err(_) => {}
             }
             if let Some(e) = pending.failed {
                 self.pending_notify.1.notify_all();
@@ -1918,6 +1943,9 @@ impl FsCache {
                     got_new = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
+                // Stream over but its result not in yet: still streaming, as far
+                // as a reader is concerned — serve what arrived.
+                Err(mpsc::TryRecvError::Disconnected) if !self.promotion_ready(path) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     return match self.promote_pending(path) {
                         Err(e) => Err(e),
@@ -2021,11 +2049,22 @@ impl FsCache {
     /// what makes a just-edited odt/xlsx look corrupt, so the read fast-paths gate
     /// on this before returning local bytes.
     fn file_cache_matches_remote(&self, path: &Path) -> bool {
+        let entry = self.find_entry(path);
+        self.file_cache_matches(
+            path,
+            entry.and_then(|e| e.change_token.as_deref()),
+            entry.and_then(|e| e.modified),
+        )
+    }
+
+    /// [`file_cache_matches_remote`](Self::file_cache_matches_remote) against a
+    /// server version the caller already holds (e.g. a freshly resolved entry).
+    fn file_cache_matches(&self, path: &Path, remote_etag: Option<&str>, remote_modified: Option<SystemTime>) -> bool {
         match self.file_cache.get(path) {
             None => false,
-            Some(fc) => match (fc.etag.as_deref(), self.remote_etag_for(path).as_deref()) {
+            Some(fc) => match (fc.etag.as_deref(), remote_etag) {
                 (Some(cached), Some(current)) => cached == current,
-                _ => match (fc.remote_modified, self.remote_modified_for(path)) {
+                _ => match (fc.remote_modified, remote_modified) {
                     (Some(cached), Some(current)) => cached == current,
                     _ => true,
                 },
@@ -2891,7 +2930,8 @@ fn list_dir_cached_or_fresh(
             };
             match progress {
                 Some((_, true)) => {
-                    // The stream ended: promote it (or surface its failure).
+                    // The stream ended: promote it (or surface its failure) once
+                    // the worker's result is in; until then keep waiting.
                     c.promote_pending(&path)?;
                 }
                 Some((true, false)) if !was_invalidated => {
@@ -2929,12 +2969,13 @@ fn list_dir_cached_or_fresh(
     //    duplicate fetch while this one sat in the throttle queue, which under
     //    a slow or failing server snowballed into thousands of threads.
     let mut c = cache.safe_lock();
-    let (finished, partial) = if let Some(pending) = c.pending_dirs.get_mut(&path) {
+    let (disconnected, partial) = if let Some(pending) = c.pending_dirs.get_mut(&path) {
         let (_, disconnected) = pending.drain();
         (disconnected, (!pending.entries.is_empty()).then(|| (pending.entries.clone(), pending.self_entry.clone())))
     } else {
         (false, None)
     };
+    let finished = disconnected && c.promotion_ready(&path);
     if finished {
         let se = c.promote_pending(&path)?;
         if let Some((files, _)) = c.get_cached_dir(&path, ttl, max_stale) {
@@ -3808,6 +3849,11 @@ struct OpenEntry {
     perms: Option<String>,
     size: u64,
     content_type: Option<Arc<str>>,
+    modified: Option<SystemTime>,
+    /// Taken from a listing (as opposed to the "nothing known" default), so
+    /// freshness can be judged from this entry itself — the listing it came
+    /// from may be evicted again by the time the open is answered.
+    listed: bool,
 }
 
 impl OpenEntry {
@@ -3817,6 +3863,8 @@ impl OpenEntry {
             perms: e.ext.str("permissions").map(str::to_string),
             size: e.size,
             content_type: e.content_type.clone(),
+            modified: e.modified,
+            listed: true,
         }
     }
 }
@@ -3903,7 +3951,14 @@ fn open_continue(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, reply: ReplyOpen,
     // file_cache_matches_remote() returns false when the file is not cached,
     // and true when offline (no remote etag to compare) so offline reads of a
     // kept copy are never forced into an unsatisfiable re-download.
-    let cache_fresh = ctx.cache.safe_lock().file_cache_matches_remote(&rq.path);
+    let cache_fresh = {
+        let c = ctx.cache.safe_lock();
+        if entry.listed {
+            c.file_cache_matches(&rq.path, entry.etag.as_deref(), entry.modified)
+        } else {
+            c.file_cache_matches_remote(&rq.path)
+        }
+    };
 
     if !rq.writable {
         open_finish(ctx, rq, entry, fh, cache_fresh, None, false, probe_max_read, reply);
@@ -5955,7 +6010,11 @@ impl Filesystem for NextCloudFs {
             // and an O_APPEND or in-place write then uploaded a zero-filled
             // prefix over the real content — with no etag for If-Match to catch
             // it. Resolve the parent first, off the dispatch thread.
-            None if writable => {
+            // A read-only open of a *kept* copy is the other case that needs the
+            // listing: without it there is no etag to compare, and a stale kept
+            // copy was served as fresh. Uncached read-only opens take only hints
+            // from the listing, so they don't wait for one.
+            None if writable || rq.local.is_some() => {
                 self.with_child(
                     rq.pid,
                     &rq.path.clone(),
@@ -5966,8 +6025,12 @@ impl Filesystem for NextCloudFs {
                         Resolved::Found(entry) => open_continue(ctx, rq, entry, reply, false),
                         // Not on the server: nothing to seed from.
                         Resolved::Absent => open_continue(ctx, rq, OpenEntry::default(), reply, false),
-                        // A truncating open discards the content anyway.
-                        Resolved::Unknown(_) if rq.truncating => open_continue(ctx, rq, OpenEntry::default(), reply, false),
+                        // A truncating open discards the content anyway, and a
+                        // read-only open of a kept copy keeps working offline
+                        // (served as before, from the copy we have).
+                        Resolved::Unknown(_) if rq.truncating || !rq.writable => {
+                            open_continue(ctx, rq, OpenEntry::default(), reply, false)
+                        }
                         // Anything else would be the zero-filled upload again.
                         Resolved::Unknown(e) => {
                             log::warn!("open: {} for writing — its parent listing is unavailable, refusing rather than staging it empty", rq.path.display());
