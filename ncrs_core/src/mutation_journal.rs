@@ -1013,14 +1013,33 @@ impl MutationJournal {
 
     /// Every name a queued upload's file has: the one it was queued under
     /// and the one it has now. A purge keeps these files' kept copies.
+    ///
+    /// One pass, oldest first: each upload's name is carried forward through
+    /// the Renames after it as they come (as `forward` does, but for all of
+    /// them at once), not by a walk of the rest of the journal per upload.
     pub fn upload_names(&self) -> std::collections::HashSet<PathBuf> {
         let mut names = std::collections::HashSet::new();
-        for (i, e) in self.entries.iter().enumerate() {
-            if e.op.staging_path().is_some() {
-                names.insert(e.op.path().to_path_buf());
-                names.extend(self.forward(i, e.op.path()));
+        // The names queued uploads' files have so far.
+        let mut live: Vec<PathBuf> = Vec::new();
+        for e in &self.entries {
+            match &e.op {
+                MutationOp::Rename { .. } if !e.queued_names => {}
+                MutationOp::Rename { from, to } => live.retain_mut(|at| match redo_rename(at, from, to) {
+                    Some(after) => {
+                        *at = after;
+                        true
+                    }
+                    None => !at.starts_with(to),
+                }),
+                MutationOp::Unlink { path: gone } | MutationOp::RmDir { path: gone } => live.retain(|at| !at.starts_with(gone)),
+                op if op.staging_path().is_some() => {
+                    names.insert(op.path().to_path_buf());
+                    live.push(op.path().to_path_buf());
+                }
+                _ => {}
             }
         }
+        names.extend(live);
         names
     }
 
@@ -1109,15 +1128,25 @@ impl MutationJournal {
     /// landed: each one is undone, newest to oldest (`mv d e; mv e/f g/f`
     /// puts `/g/f` at `/d/f` on the server). None when no queued Rename
     /// moved it.
+    ///
+    /// The walk stops where the file began, as `walk_history` does: at an
+    /// Unlink or RmDir of its name (before that the name was another file's),
+    /// or a Rename that moved another file away from it (`mv a b; create a`).
     pub fn rename_source_of(&self, path: &Path) -> Option<PathBuf> {
         let mut at = path.to_path_buf();
         let mut moved = false;
         for e in self.entries.iter().rev() {
-            if let MutationOp::Rename { from, to } = &e.op {
-                if let Some(before) = undo_rename(&at, from, to) {
-                    at = before;
-                    moved = true;
+            match &e.op {
+                MutationOp::Rename { from, to } => {
+                    if let Some(before) = undo_rename(&at, from, to) {
+                        at = before;
+                        moved = true;
+                    } else if at.starts_with(from) {
+                        break;
+                    }
                 }
+                MutationOp::Unlink { path: gone } | MutationOp::RmDir { path: gone } if at.starts_with(gone) => break,
+                _ => {}
             }
         }
         moved.then_some(at)
@@ -1154,8 +1183,10 @@ impl MutationJournal {
         let mut drop_seqs = std::collections::HashSet::new();
         let mut moved = false;
         self.walk_history(path, |e, at| {
-            if matches!(e.op, MutationOp::Rename { .. }) {
-                moved = true;
+            // A Rename of the file itself; one of a folder above it moves
+            // it whatever it holds, and the newest upload lands after that.
+            if let MutationOp::Rename { to, .. } = &e.op {
+                moved |= to == at;
             } else if e.seq < newest && !e.in_flight && e.op.is_upload_of(at) && (!moved || e.op.upload_etag().is_some()) {
                 drop_seqs.insert(e.seq);
             }
@@ -1465,9 +1496,12 @@ impl MutationJournal {
             MutationOp::Unlink { path } => {
                 // The file's uploads (under the names it had then): when none
                 // carries an etag, it was created here and never reached the
-                // server, so they can go. Nothing later depends on them but a
-                // Rename of the file, whose MOVE then fails as a
-                // MoveSourceGone for a file that is deleted anyway.
+                // server, so they can go, and with them the Renames of the
+                // file itself queued since its first upload: their MOVEs would
+                // fail as MoveSourceGone conflicts for a file that is deleted
+                // anyway. Not a Rename of a folder above it (other files move
+                // with that), nor one from before its first upload (it moved
+                // something the server has).
                 //
                 // Unless one is claimed: its live worker is sending it, or
                 // waits for older entries to land first and then will. Dropped
@@ -1479,14 +1513,25 @@ impl MutationJournal {
                 // over `b`. Kept, every entry of the file replays in order and
                 // this Unlink deletes on the server what the PUT puts there.
                 let (mut ours, mut on_server, mut claimed) = (std::collections::HashSet::new(), false, false);
+                let mut renames: Vec<(SeqId, bool)> = Vec::new();
                 self.walk_history(path, |e, at| {
                     if e.op.is_upload_of(at) {
                         on_server |= e.op.upload_etag().is_some();
                         claimed |= e.in_flight;
                         ours.insert(e.seq);
+                    } else if let MutationOp::Rename { to, .. } = &e.op {
+                        claimed |= e.in_flight;
+                        renames.push((e.seq, to == at));
                     }
                     false
                 });
+                if let Some(&first) = ours.iter().min() {
+                    // Before its first upload: it was moved there, not created.
+                    if renames.iter().any(|&(seq, _)| seq < first) {
+                        renames.clear();
+                    }
+                    ours.extend(renames.iter().filter(|&&(_, own)| own).map(|&(seq, _)| seq));
+                }
                 if !on_server && !claimed && !ours.is_empty() {
                     let staging_to_delete: Vec<PathBuf> = self.entries.iter()
                         .filter(|e| ours.contains(&e.seq))
@@ -1594,7 +1639,7 @@ pub(crate) fn replay_journal(
             // failure must never silently destroy the user's edit.
             let desc = match &entry.op {
                 MutationOp::Put { staging_path, remote_path, .. } => {
-                    match journal.safe_lock().recover_staging(staging_path, remote_path) {
+                    match journal.safe_lock().recover_staging(staging_path, now_at.as_deref().unwrap_or(remote_path)) {
                         Some(p) => format!("{:?}: {} — local copy preserved at {}", entry.op, last_err, p.display()),
                         None => format!("{:?}: {}", entry.op, last_err),
                     }
@@ -1606,7 +1651,7 @@ pub(crate) fn replay_journal(
                 MutationOp::FinishChunked { remote_path, uploads_base, bytes_confirmed, tail_path, .. } => {
                     let cache_dir = journal.safe_lock().journal_path.parent().map(Path::to_path_buf);
                     let kept = cache_dir.and_then(|d| move_to_recovered_noted(
-                        &d, tail_path, Some(remote_path),
+                        &d, tail_path, Some(now_at.as_deref().unwrap_or(remote_path)),
                         "the end of a streamed upload the server refused to assemble",
                         Some((uploads_base, *bytes_confirmed)),
                     ));
@@ -1654,7 +1699,7 @@ pub(crate) fn replay_journal(
                     if matches!(kind, ConflictKind::EditConflict { .. }) {
                         j.discard_staging(staging_path);
                     } else {
-                        j.recover_staging(staging_path, remote_path);
+                        j.recover_staging(staging_path, now_at.as_deref().unwrap_or(remote_path));
                     }
                 }
                 if let MutationOp::FinishChunked { tail_path, .. } = &entry.op {
@@ -1751,23 +1796,25 @@ fn execute_op(
                 }
                 Err(BackendWriteError::Conflict) => {
                     log::warn!("JOURNAL replay: PUT {} conflict — creating conflicted copy", remote_path.display());
-                    let conflict_name = crate::make_conflict_name(remote_path);
+                    let conflict_name = conflict_name_for(remote_path, now_at);
                     // Only an uploaded copy lets the staging file go (see the
                     // Conflict arm of `replay_journal`).
                     if let Err(e) = ctx.backend.put_file_from_path(&conflict_name, staging_path, None) {
                         log::error!("JOURNAL replay: conflicted copy {} not uploaded: {} — kept queued", conflict_name.display(), e);
                         return conflict_copy_retry(e);
                     }
-                    crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
+                    let shown = now_at.unwrap_or(remote_path);
+                    crate::push_error(error_log, shown.to_path_buf(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                     ReplayResult::Conflict(ConflictKind::EditConflict {
-                        local_path: remote_path.clone(),
+                        local_path: shown.to_path_buf(),
                         conflicted_copy_path: conflict_name,
                     })
                 }
                 Err(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
-                Err(BackendWriteError::Server(404, _)) => {
+                // Nextcloud answers a PUT into a missing folder with 409.
+                Err(BackendWriteError::Server(404 | 409, _)) => {
                     ReplayResult::Conflict(ConflictKind::PermanentFailure {
-                        description: format!("PUT {} failed: parent directory not found", remote_path.display()),
+                        description: format!("PUT {} failed: parent directory not found", now_at.unwrap_or(remote_path).display()),
                     })
                 }
                 Err(e) => ReplayResult::ServerError(e.to_string()),
@@ -1848,22 +1895,23 @@ fn execute_op(
                     // Changed on the server meanwhile: every chunk is already there, so
                     // assemble ours as a conflicted copy instead.
                     log::warn!("JOURNAL replay: streamed upload {} conflict — assembling a conflicted copy", remote_path.display());
-                    let conflict_name = crate::make_conflict_name(remote_path);
+                    let conflict_name = conflict_name_for(remote_path, now_at);
                     let session = crate::backend::ChunkedUploadSession { uploads_base: uploads_base.clone() };
                     if let Err(e) = ctx.backend.finish_chunked_upload(&session, &conflict_name, None) {
                         log::error!("JOURNAL replay: conflicted copy {} not assembled: {} — kept queued", conflict_name.display(), e);
                         return conflict_copy_retry(e);
                     }
-                    crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
+                    let shown = now_at.unwrap_or(remote_path);
+                    crate::push_error(error_log, shown.to_path_buf(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                     ReplayResult::Conflict(ConflictKind::EditConflict {
-                        local_path: remote_path.clone(),
+                        local_path: shown.to_path_buf(),
                         conflicted_copy_path: conflict_name,
                     })
                 }
                 Err(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
                 Err(BackendWriteError::Server(404, _)) => {
                     ReplayResult::Conflict(ConflictKind::PermanentFailure {
-                        description: format!("streamed upload of {} expired on the server — copy the file again", remote_path.display()),
+                        description: format!("streamed upload of {} expired on the server — copy the file again", now_at.unwrap_or(remote_path).display()),
                     })
                 }
                 Err(e) => ReplayResult::ServerError(e.to_string()),
@@ -1911,6 +1959,18 @@ fn upload_landed(
     d.insert(now_at.to_path_buf());
     if remote_path != now_at {
         d.insert(remote_path.to_path_buf());
+    }
+}
+
+/// Where the replay puts the conflicted copy of an upload queued as `queued`:
+/// in the folder it was queued in (the server has that folder at this point
+/// of the replay), named after the file as the user sees it now (`now_at`,
+/// after the Renames queued behind the upload): `b (conflicted copy …)`
+/// next to the `b` a later `mv a b` makes, not an `a (conflicted copy …)`.
+fn conflict_name_for(queued: &Path, now_at: Option<&Path>) -> PathBuf {
+    match now_at.and_then(Path::file_name) {
+        Some(name) => crate::make_conflict_name(&queued.with_file_name(name)),
+        None => crate::make_conflict_name(queued),
     }
 }
 
@@ -2424,6 +2484,58 @@ mod tests {
         assert!(j.claim(mkdir));
         j.enqueue(MutationOp::RmDir { path: PathBuf::from("/d") });
         assert!(j.contains(mkdir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_rename_does_not_keep_a_superseded_create_and_lookups_stop_where_a_file_began() {
+        let dir = temp_dir("supersede_dir_rename");
+        let mut j = MutationJournal::load_or_create(&dir);
+        // Created in d, `mv d e`, saved again: the MOVE moves d whatever it
+        // holds, so only the newest upload has to land.
+        let first = j.enqueue(put_at(&dir, "/d/f", "F1", None));
+        mv(&mut j, "/d", "/e");
+        let newest = j.enqueue(put_at(&dir, "/e/f", "F2", None));
+        j.supersede_uploads(Path::new("/e/f"), newest);
+        assert!(!j.contains(first));
+        // A file-level rename still keeps the create its MOVE needs.
+        let create = j.enqueue(put_at(&dir, "/a", "A1", None));
+        mv(&mut j, "/a", "/b");
+        let newest = j.enqueue(put_at(&dir, "/b", "A2", None));
+        j.supersede_uploads(Path::new("/b"), newest);
+        assert!(j.contains(create));
+        // `mv x p; rm p; create p`: the new p was never x.
+        mv(&mut j, "/x", "/p");
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/p") });
+        assert_eq!(j.rename_source_of(Path::new("/p")), None);
+        // `mv q r; create q`: nor is a new q r's.
+        mv(&mut j, "/q", "/r");
+        assert_eq!(j.rename_source_of(Path::new("/q")), None);
+        assert_eq!(j.rename_source_of(Path::new("/r")).as_deref(), Some(Path::new("/q")));
+        // Every name an upload's file has had, in one pass.
+        let names = j.upload_names();
+        assert_eq!(names, ["/e/f", "/a", "/b"].iter().map(PathBuf::from).collect(), "the superseded /d/f is no name of a queued upload");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_delete_coalesces_the_renames_of_a_file_created_here_but_not_a_folders() {
+        let dir = temp_dir("coalesce_renames");
+        let mut j = MutationJournal::load_or_create(&dir);
+        j.enqueue(put_at(&dir, "/n", "N", None));
+        let own = mv(&mut j, "/n", "/m");
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/m") });
+        assert!(!j.contains(own), "{:?}", j.entries());
+        // In a folder renamed meanwhile: the folder's MOVE stays.
+        j.enqueue(put_at(&dir, "/d/x", "X", None));
+        let folder = mv(&mut j, "/d", "/e");
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/e/x") });
+        assert!(j.contains(folder));
+        // Moved from a file the server has, then written: the MOVE stays.
+        let from_server = mv(&mut j, "/s", "/t");
+        j.enqueue(put_at(&dir, "/t", "T", None));
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/t") });
+        assert!(j.contains(from_server));
         let _ = fs::remove_dir_all(&dir);
     }
 

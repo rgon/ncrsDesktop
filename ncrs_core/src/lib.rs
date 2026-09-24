@@ -1538,6 +1538,22 @@ pub(crate) fn moved_or_given_up(cache: &Arc<Mutex<FsCache>>, to: &Path, seq: mut
     }
 }
 
+/// Drops the `moving` overlays whose Rename left the journal without landing
+/// (coalesced away). Never with both locks held.
+fn prune_moving(journal: &mutation_journal::SharedJournal, cache: &Arc<Mutex<FsCache>>) {
+    let seqs: Vec<mutation_journal::SeqId> = cache.safe_lock().moving.values().map(|&(_, seq)| seq).collect();
+    if seqs.is_empty() {
+        return;
+    }
+    let gone: HashSet<mutation_journal::SeqId> = {
+        let j = journal.safe_lock();
+        seqs.into_iter().filter(|&s| !j.contains(s)).collect()
+    };
+    if !gone.is_empty() {
+        cache.safe_lock().moving.retain(|_, (_, seq)| !gone.contains(seq));
+    }
+}
+
 /// Sends a kernel cache notification from the single notify worker, never the
 /// FUSE dispatch thread (a notify the kernel blocks on would deadlock it).
 pub(crate) fn notify_later(job: impl FnOnce() + Send + 'static) {
@@ -7854,6 +7870,9 @@ impl Filesystem for NextCloudFs {
         let seq = self.journal.safe_lock().enqueue(
             mutation_journal::MutationOp::Unlink { path: remote_path.clone() },
         );
+        // The enqueue may have coalesced away the file's own Renames (created,
+        // renamed, deleted): their MOVEs never land to end their overlays.
+        prune_moving(&self.journal, &self.cache);
 
         if !self.conn.is_offline.load(Ordering::Relaxed) {
             let conn = self.conn.clone();

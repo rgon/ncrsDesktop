@@ -5599,6 +5599,9 @@ mod upload_order_tests {
             sessions: HashMap<String, BTreeMap<u64, Vec<u8>>>,
             /// Every write request, in order.
             log: Vec<String>,
+            /// Paths a write to answers 423 Locked (a desktop client or
+            /// another upload holds them).
+            locked: BTreeSet<PathBuf>,
         }
 
         impl Tree {
@@ -5611,12 +5614,17 @@ mod upload_order_tests {
                 self.dirs.contains(p.parent().unwrap_or(Path::new("/")))
             }
 
+            fn locked(&self, p: &Path) -> Result<(), BackendWriteError> {
+                if self.locked.iter().any(|l| p.starts_with(l)) { Err(BackendWriteError::Locked) } else { Ok(()) }
+            }
+
             fn remove_subtree(&mut self, p: &Path) {
                 self.files.retain(|f, _| !f.starts_with(p));
                 self.dirs.retain(|d| !d.starts_with(p));
             }
 
             fn write(&mut self, path: &Path, body: Vec<u8>, if_match: Option<&str>) -> Result<PutResult, BackendWriteError> {
+                self.locked(path)?;
                 if !self.parent_ok(path) || self.dirs.contains(path) {
                     return Err(BackendWriteError::Server(409, "parent missing".into()));
                 }
@@ -5703,6 +5711,7 @@ mod upload_order_tests {
             fn mkdir(&self, path: &Path) -> Result<(), BackendWriteError> {
                 let mut t = self.t.lock().unwrap();
                 t.log.push(format!("MKCOL {}", path.display()));
+                t.locked(path)?;
                 if !t.parent_ok(path) {
                     return Err(BackendWriteError::Server(409, "parent missing".into()));
                 }
@@ -5712,12 +5721,22 @@ mod upload_order_tests {
             fn delete(&self, path: &Path) -> Result<(), BackendWriteError> {
                 let mut t = self.t.lock().unwrap();
                 t.log.push(format!("DELETE {}", path.display()));
-                t.remove_subtree(path); // a 404 is Ok, as `webdav_ops::delete` maps it
+                t.locked(path)?;
+                // A missing path, its folder missing too or not, is a 404
+                // (`webdav_ops::delete` maps it to Ok; the replay takes either).
+                // A missing folder is a 409 only for PUT, MKCOL and a MOVE's
+                // destination, as on Nextcloud.
+                if !t.files.contains_key(path) && !t.dirs.contains(path) {
+                    return Err(BackendWriteError::Server(404, "not found".into()));
+                }
+                t.remove_subtree(path);
                 Ok(())
             }
             fn rename(&self, from: &Path, to: &Path) -> Result<(), BackendWriteError> {
                 let mut t = self.t.lock().unwrap();
                 t.log.push(format!("MOVE {} {}", from.display(), to.display()));
+                t.locked(from)?;
+                t.locked(to)?;
                 if !t.files.contains_key(from) && !t.dirs.contains(from) {
                     return Err(BackendWriteError::Server(404, "no source".into()));
                 }
@@ -6225,12 +6244,92 @@ mod upload_order_tests {
             let conflicts = off.replay(&srv);
             let log = srv.log();
             assert_eq!(log[0], "PUT /b if e_a refused");
-            assert!(log[1].starts_with("PUT /b (conflicted copy") && log[2] == "MOVE /a /b" && log[3] == "MOVE /b /c", "{log:?}");
-            assert!(srv.files().iter().any(|(p, b)| p.starts_with("/b (conflicted copy") && b == "A2"), "the edit is never lost");
+            // The copy is named after the file as the user sees it now.
+            assert!(log[1].starts_with("PUT /c (conflicted copy") && log[2] == "MOVE /a /b" && log[3] == "MOVE /b /c", "{log:?}");
+            assert!(srv.files().iter().any(|(p, b)| p.starts_with("/c (conflicted copy") && b == "A2"), "the edit is never lost");
             assert!(matches!(conflicts.as_slice(), [
                 mutation_journal::ConflictKind::PermanentFailure { .. },
                 mutation_journal::ConflictKind::EditConflict { .. },
             ]), "the notice about the old journal, then the conflict: {conflicts:?}");
+        }
+
+        #[test]
+        fn a_412_mid_chain_keeps_the_edit_as_a_copy_named_as_the_file_is_now() {
+            // a changed on the server meanwhile (its etag is no longer e_a).
+            let srv = TreeServer::new(&[("/a", "A")], &[]);
+            srv.t.lock().unwrap().files.get_mut(Path::new("/a")).unwrap().1 = "e_other".into();
+            let mut off = Offline::new();
+            off.save("/a", "A1", Some("e_a"));
+            off.mv("/a", "/b");
+            let conflicts = off.replay(&srv);
+            let files = srv.files();
+            assert!(files.contains(&("/b".into(), "A".into())), "the server's version is moved on: {files:?}");
+            assert!(files.iter().any(|(p, b)| p.starts_with("/b (conflicted copy") && b == "A1"), "{files:?}");
+            match conflicts.as_slice() {
+                [mutation_journal::ConflictKind::EditConflict { local_path, .. }] => assert_eq!(local_path, Path::new("/b")),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_move_source_gone_mid_chain_still_keeps_the_later_edit() {
+            // a was deleted on the server meanwhile.
+            let srv = TreeServer::new(&[], &[]);
+            let mut off = Offline::new();
+            off.mv("/a", "/b");
+            off.save("/b", "B2", Some("e_a"));
+            off.mv("/b", "/c");
+            let conflicts = off.replay(&srv);
+            assert!(srv.files().iter().any(|(p, b)| p.starts_with("/c (conflicted copy") && b == "B2"), "{:?}", srv.log());
+            assert!(matches!(conflicts.as_slice(), [
+                mutation_journal::ConflictKind::MoveSourceGone { .. },
+                mutation_journal::ConflictKind::EditConflict { .. },
+                mutation_journal::ConflictKind::MoveSourceGone { .. },
+            ]), "{conflicts:?}");
+        }
+
+        #[test]
+        fn a_permanent_failure_mid_chain_keeps_the_bytes_and_the_rest_replays() {
+            // The folder was deleted on the server: the PUT into it is a 409.
+            let srv = TreeServer::new(&[], &[]);
+            let mut off = Offline::new();
+            off.save("/gone/x", "X", None);
+            off.save("/y", "Y", None);
+            let conflicts = off.replay(&srv);
+            assert_eq!(srv.files(), tree(&[("/y", "Y")]));
+            assert!(matches!(conflicts.as_slice(), [mutation_journal::ConflictKind::PermanentFailure { .. }]), "{conflicts:?}");
+            assert_eq!(std::fs::read_to_string(off.dir.path().join("unsynced/x")).unwrap(), "X", "never discarded");
+        }
+
+        #[test]
+        fn created_renamed_then_deleted_offline_replays_as_nothing() {
+            let srv = TreeServer::new(&[("/keep", "K")], &[]);
+            let mut off = Offline::new();
+            off.save("/n", "N", None);
+            off.mv("/n", "/m");
+            off.rm("/m");
+            let conflicts = off.replay(&srv);
+            assert!(conflicts.is_empty(), "no MoveSourceGone for a file that never reached the server: {conflicts:?}");
+            assert_eq!(srv.log(), ["DELETE /m"]);
+            assert_eq!(srv.files(), tree(&[("/keep", "K")]));
+        }
+
+        #[test]
+        fn a_locked_file_waits_without_costing_attempts() {
+            let srv = TreeServer::new(&[("/l", "L")], &[]);
+            srv.t.lock().unwrap().locked.insert(PathBuf::from("/l"));
+            let mut off = Offline::new();
+            off.save("/l", "L2", Some("e_l"));
+            off.save("/other", "O", None);
+            off.replay_pass(&srv);
+            {
+                let j = off.journal.safe_lock();
+                assert_eq!(j.len(), 2, "stopped at the locked file, in order: {:?}", j.entries());
+                assert_eq!(j.peek_front().unwrap().attempts, 0, "a 423 is transient");
+            }
+            srv.t.lock().unwrap().locked.clear();
+            assert!(off.replay(&srv).is_empty());
+            assert_eq!(srv.files(), tree(&[("/l", "L2"), ("/other", "O")]));
         }
 
         #[test]
