@@ -312,7 +312,7 @@ impl WriteCtx {
             log::error!("write to staging tail file: {}", e);
             return Err(Errno::EIO);
         }
-        let (total_written, existing_session) = {
+        let (total_written, existing_session, remote_path) = {
             let mut files = self.open_files.safe_lock();
             let of = files.get_mut(&fh).ok_or(Errno::EIO)?;
             of.dirty = true;
@@ -321,8 +321,11 @@ impl WriteCtx {
             if !may_graduate || of.total_written - bytes_confirmed < webdav_ops::CHUNK_SIZE as u64 {
                 return Ok(data.len() as u32);
             }
-            (of.total_written, of.chunk_upload.clone())
+            // Where the handle commits now: a rename since the kernel sent this
+            // write moved it, and the session must be opened for that path.
+            (of.total_written, of.chunk_upload.clone(), of.remote_path.clone())
         };
+        let path = remote_path.as_path();
         let had_session = existing_session.is_some();
         // Each chunk the server confirmed is recorded before the tail file is
         // cut down to the leftover bytes: a `stat` reading the tail's length
