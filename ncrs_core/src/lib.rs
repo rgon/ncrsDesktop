@@ -364,6 +364,8 @@ enum PendingLookup {
     Found(RemoteEntry),
     /// Not streamed yet; the fetch is still running.
     Streaming,
+    /// Not in what was looked at, but more has already arrived: ask again now.
+    Backlog,
     /// The fetch just finished and was promoted: ask the dir cache.
     Finished,
     Failed(String),
@@ -411,12 +413,22 @@ impl PendingDir {
     /// Moves whatever the fetch has streamed so far into `entries`. Returns
     /// (anything new arrived, the entry stream has ended).
     fn drain(&mut self) -> (bool, bool) {
-        let mut got_new = false;
+        let (got_new, disconnected, _) = self.drain_at_most(usize::MAX);
+        (got_new, disconnected)
+    }
+
+    /// `drain`, moving at most `max` entries; the third value says more are
+    /// waiting. Bounds how long one caller holds the cache lock on a fast stream.
+    fn drain_at_most(&mut self, max: usize) -> (bool, bool, bool) {
+        let mut moved = 0usize;
         let disconnected = loop {
+            if moved >= max {
+                break false;
+            }
             match self.rx.try_recv() {
                 Ok(entry) => {
                     self.entries.push(entry);
-                    got_new = true;
+                    moved += 1;
                 }
                 Err(mpsc::TryRecvError::Empty) => break false,
                 Err(mpsc::TryRecvError::Disconnected) => break true,
@@ -427,9 +439,13 @@ impl PendingDir {
                 self.self_entry = Some(se);
             }
         }
-        (got_new, disconnected)
+        (moved > 0, disconnected, moved >= max)
     }
 }
+
+/// Stream entries one `pending_find` moves out of the channel, so a lookup
+/// never holds the global cache lock for a whole fast listing's backlog.
+const PENDING_DRAIN_BATCH: usize = 256;
 
 struct FileCacheEntry {
     local_path: PathBuf,
@@ -583,6 +599,9 @@ struct OpenFile {
     unlinked: bool,
     // UploadOrder generation when opened, for etag chaining (see UploadOrder::etag_for).
     opened_gen: u64,
+    // Counted in MetaCtx::open_writers (set by `insert_open_file`), so release
+    // gives back exactly what open took.
+    writer: bool,
 }
 
 /// Ordering and etag bookkeeping shared by the workers that change files on the server.
@@ -1420,7 +1439,10 @@ pub(crate) struct FsCache {
     // Full paths of files whose PUT is in flight. put_dir_cache preserves
     // these entries so a concurrent PROPFIND refresh doesn't evict them
     // before the upload completes, which would cause ENOENT on stat().
-    pub(crate) uploading: HashSet<PathBuf>,
+    // The value is the size being uploaded when known: until the PUT lands, a
+    // refresh can bring back the server's old entry, and attributes must report
+    // what the user wrote rather than that (see `attr_for`).
+    pub(crate) uploading: HashMap<PathBuf, Option<u64>>,
     // Full paths of files whose DELETE is in flight. put_dir_cache filters
     // these out so a racing PROPFIND refresh can't re-add them before the
     // server DELETE completes.
@@ -1540,16 +1562,17 @@ impl FsCache {
     /// next `find_child` gives the complete answer.
     fn pending_find(&mut self, dir: &Path, name: &str) -> PendingLookup {
         let Some(p) = self.pending_dirs.get_mut(dir) else { return PendingLookup::NoFetch };
-        let (got_new, disconnected) = p.drain();
+        let (got_new, disconnected, more) = p.drain_at_most(PENDING_DRAIN_BATCH);
         p.index.extend(&p.entries);
         if let Some(i) = p.index.find(&p.entries, name) {
             return PendingLookup::Found(p.entries[i].clone());
         }
+        // No wake-up for new entries: every waiter drains for itself on its own
+        // tick, and waking all of them on each other's drains turned a wide
+        // stream into a lock storm that stalled the cache-hit path.
+        let _ = got_new;
         if !disconnected {
-            if got_new {
-                self.pending_notify.1.notify_all();
-            }
-            return PendingLookup::Streaming;
+            return if more { PendingLookup::Backlog } else { PendingLookup::Streaming };
         }
         // The entry channel closes a moment before the worker sends the result:
         // promoting now would cache a listing that may have broken off
@@ -1589,7 +1612,7 @@ impl FsCache {
         // that concurrent PROPFIND refreshes don't produce ENOENT on stat().
         if let Some(old) = self.dir_cache.get(&path) {
             for old_entry in old.files.iter() {
-                if self.uploading.contains(&old_entry.path)
+                if self.uploading.contains_key(&old_entry.path)
                     && !files.iter().any(|f| f.path == old_entry.path)
                 {
                     files.push(old_entry.clone());
@@ -1646,7 +1669,7 @@ impl FsCache {
         // file yet — so dropping that listing makes a file the user just created
         // vanish until the upload finishes. `put_dir_cache` re-merges uploads
         // from the old entry, which is exactly what eviction would destroy.
-        let upload_parents: HashSet<&Path> = self.uploading.iter()
+        let upload_parents: HashSet<&Path> = self.uploading.keys()
             .filter_map(|p| p.parent())
             .collect();
         let mut candidates: Vec<(u64, PathBuf)> = self.dir_cache.iter()
@@ -2748,15 +2771,12 @@ fn list_dir_cached_or_fresh(
             // lock for O(entries) per waiter per 50 ms.
             let progress = match c.pending_dirs.get_mut(&path) {
                 Some(p) => {
-                    let (got_new, disconnected) = p.drain();
-                    Some((!p.entries.is_empty(), disconnected, got_new))
+                    let (_, disconnected) = p.drain();
+                    Some((!p.entries.is_empty(), disconnected))
                 }
                 None => None,
             };
-            if progress.is_some_and(|(_, _, got_new)| got_new) {
-                c.pending_notify.1.notify_all();
-            }
-            match progress.map(|(any, done, _)| (any, done)) {
+            match progress {
                 Some((_, true)) => {
                     // The stream ended: promote it (or surface its failure).
                     c.promote_pending(&path)?;
@@ -2870,6 +2890,8 @@ fn resolve_child_slow(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, dir: &P
             match c.pending_find(dir, name) {
                 PendingLookup::Found(e) => return Child::Found(e),
                 PendingLookup::Streaming => {}
+                // More already arrived: look again once the lock is released.
+                PendingLookup::Backlog => continue,
                 PendingLookup::Finished => {
                     return c.resolve_child_cached(dir, name).unwrap_or(Child::Unknown(None));
                 }
@@ -3416,7 +3438,254 @@ struct OpenDir {
     snapshot: Option<Arc<Vec<RemoteEntry>>>,
 }
 
+/// Everything a FUSE request answered off the dispatch thread needs, as
+/// shared handles into the same state `NextCloudFs` holds. Built once at
+/// mount; cloned (a handful of refcount bumps) only when a request misses the
+/// cache and goes to `bg::META`, so a cache hit costs nothing extra.
+#[derive(Clone)]
+struct MetaCtx {
+    conn: Arc<ConnInfo>,
+    cache: Arc<Mutex<FsCache>>,
+    shared: ipc::SharedSet,
+    fileids: ipc::FileIdMap,
+    details: ipc::FileDetailMap,
+    children_map: ipc::ChildrenMap,
+    status: StatusMap,
+    open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+    // Open handles that may hold unsent writes. Zero (the common case) lets a
+    // getattr skip the `open_files` lock entirely (see `overlay_local_size`).
+    open_writers: Arc<AtomicUsize>,
+    // How long a request that has to list its parent may take in all, from
+    // submission: CHILD_RESOLVE_DEADLINE (shorter in tests).
+    resolve_within: Duration,
+}
+
+#[cfg(test)]
+impl MetaCtx {
+    fn for_tests(conn: Arc<ConnInfo>, cache: Arc<Mutex<FsCache>>, resolve_within: Duration) -> Self {
+        MetaCtx {
+            conn,
+            cache,
+            shared: Arc::new(RwLock::new(HashSet::new())),
+            fileids: Arc::new(RwLock::new(HashMap::new())),
+            details: Arc::new(RwLock::new(HashMap::new())),
+            children_map: Arc::new(RwLock::new(HashMap::new())),
+            status: Arc::new(RwLock::new(HashMap::new())),
+            open_files: Arc::new(Mutex::new(HashMap::new())),
+            open_writers: Arc::new(AtomicUsize::new(0)),
+            resolve_within,
+        }
+    }
+}
+
+/// What a child lookup settled on, after the handler picked what it needs out
+/// of the entry.
+enum Resolved<T> {
+    Found(T),
+    Absent,
+    /// See `Child::Unknown`.
+    Unknown(Option<String>),
+}
+
+/// Error a request gets when `bg::META` is full: plain "try again".
+const META_REFUSED: &str = "network: metadata lookups deferred — too many in flight";
+
+/// Slow-path traffic, for the HEALTH line: how often a request had to list its
+/// parent, and how often that ran out of time.
+static META_MISSES: AtomicU64 = AtomicU64::new(0);
+static META_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+
+/// `make_file_attr` plus what the listing cannot know yet: the size of bytes
+/// this daemon holds for the file but the server does not have. A refresh that
+/// lands while a PUT is in flight brings back the server's old entry, and a
+/// `stat` answered from it made a file just written look truncated. Runs under
+/// the cache lock; the open-handle overlay (which needs `open_files`, locked
+/// before `cache` elsewhere) is `overlay_local_size`, applied after.
+fn attr_for(c: &FsCache, ino: u64, path: &Path, entry: &RemoteEntry) -> FileAttr {
+    let mut attr = make_file_attr(ino, entry);
+    if !entry.is_dir {
+        if let Some(Some(size)) = c.uploading.get(path) {
+            set_attr_size(&mut attr, *size);
+        }
+    }
+    attr
+}
+
+fn set_attr_size(attr: &mut FileAttr, size: u64) {
+    attr.size = size;
+    attr.blocks = size.div_ceil(512);
+}
+
+/// Overlays the size of unsent writes held by an open handle on `path`. Free
+/// unless some handle is open for writing.
+fn overlay_local_size(ctx: &MetaCtx, path: &Path, attr: &mut FileAttr) {
+    if attr.kind != FileType::RegularFile || ctx.open_writers.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let local = {
+        let files = ctx.open_files.safe_lock();
+        files.values()
+            .find(|of| of.dirty && of.remote_path == path && of.write_path.is_some())
+            .map(|of| match (&of.chunk_upload, &of.write_path) {
+                // Sent chunks are gone from the tail file; the total is the size.
+                (Some(_), _) => Ok(of.total_written),
+                (None, Some(wp)) => Err(wp.clone()),
+                (None, None) => Ok(of.total_written),
+            })
+    };
+    let size = match local {
+        None => return,
+        Some(Ok(n)) => Some(n),
+        // A local stat, outside the lock.
+        Some(Err(wp)) => std::fs::metadata(&wp).ok().map(|m| m.len()),
+    };
+    if let Some(size) = size {
+        set_attr_size(attr, size);
+    }
+}
+
+/// Answers a request about `path` from its parent's listing, never making
+/// the dispatch thread wait for the server.
+///
+/// A resident listing — or a name an in-flight fetch has already streamed —
+/// is answered inline under one cache lock. Anything else goes to a
+/// `bg::META` worker with the reply, which starts or joins the parent's
+/// listing (`resolve_child_slow`); a full pool answers "try again". Before
+/// this, a lookup or stat whose parent listing had been evicted waited on
+/// the network *on fuser-0* for up to 45 s, and the whole mount froze
+/// behind it (review of 2026-09-24).
+///
+/// `pick` takes what the handler needs out of the entry, under the cache
+/// lock, on whichever thread answers. `inline_miss` may still answer a miss
+/// without the listing (getattr of a directory whose own listing is
+/// cached). `answer` replies; it gets `Resolved::Unknown` for a listing that
+/// could not be completed in time, never a guess.
+fn with_child<R, T, P, A>(
+    meta: &MetaCtx,
+    pid: u32,
+    path: &Path,
+    reply: R,
+    pick: P,
+    inline_miss: impl FnOnce(&mut FsCache) -> Option<T>,
+    answer: A,
+) where
+    R: Send + 'static,
+    T: 'static,
+    P: Fn(&mut FsCache, &Path, &RemoteEntry) -> T + Send + 'static,
+    A: FnOnce(&MetaCtx, &Path, R, Resolved<T>) + Send + 'static,
+{
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        answer(meta, path, reply, Resolved::Absent);
+        return;
+    };
+    let hit = {
+        let mut c = meta.cache.safe_lock();
+        match c.find_child(dir, name) {
+            Some((files, Some(i))) => Some(Resolved::Found(pick(&mut c, path, &files[i]))),
+            Some((_, None)) => Some(Resolved::Absent),
+            // The only inline check against a listing that is not resident:
+            // has a fetch in flight already streamed the name? Never a wait.
+            None => match c.pending_find(dir, name) {
+                PendingLookup::Found(e) if !c.deleting.contains(path) => Some(Resolved::Found(pick(&mut c, path, &e))),
+                _ => inline_miss(&mut c).map(Resolved::Found),
+            },
+        }
+    };
+    if let Some(r) = hit {
+        answer(meta, path, reply, r);
+        return;
+    }
+    META_MISSES.fetch_add(1, Ordering::Relaxed);
+    let ctx = meta.clone();
+    let owned = path.to_path_buf();
+    let submitted = Instant::now();
+    let queued = bg::META.submit_owning((reply, pick, answer), move |(reply, pick, answer)| {
+        let deadline = submitted + ctx.resolve_within;
+        let path = owned.as_path();
+        let (dir, name) = (path.parent().unwrap_or(Path::new("/")), path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+        let resolved = resolve_child_slow(&ctx.conn, &ctx.cache, dir, name, pid, deadline);
+        let r = {
+            // The final answer comes from the cache as it is now. Revalidating
+            // lookups don't hold the parent's lock in the kernel, so the name
+            // can have been renamed or deleted while this worker listed.
+            let mut c = ctx.cache.safe_lock();
+            let now = c.resolve_child_cached(dir, name).unwrap_or(resolved);
+            match now {
+                Child::Found(_) if c.deleting.contains(path) => Resolved::Absent,
+                Child::Found(e) => Resolved::Found(pick(&mut c, path, &e)),
+                Child::Absent => Resolved::Absent,
+                Child::Unknown(e) => {
+                    META_UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+                    Resolved::Unknown(e)
+                }
+            }
+        };
+        answer(&ctx, path, reply, r);
+    });
+    if let Err((_, (reply, _, answer))) = queued {
+        answer(meta, path, reply, Resolved::Unknown(Some(META_REFUSED.to_string())));
+    }
+}
+
+/// What `lookup` hands the kernel and the IPC maps for one found entry.
+struct LookupHit {
+    target: PathBuf,
+    attr: FileAttr,
+    is_dir: bool,
+    is_shared: bool,
+    fileid: Option<u64>,
+    detail: ipc::FileDetail,
+}
+
+/// Inode allocation for a found child plus everything the IPC maps need,
+/// under the cache lock. `lookup_commit` applies it outside that lock.
+fn lookup_pick(c: &mut FsCache, path: &Path, entry: &RemoteEntry) -> LookupHit {
+    let ino = c.allocate_inode(path.to_path_buf());
+    LookupHit {
+        target: path.to_path_buf(),
+        attr: attr_for(c, ino, path, entry),
+        is_dir: entry.is_dir,
+        is_shared: entry.ext.flag("is_shared"),
+        fileid: entry.ext.int("fileid"),
+        detail: ipc::FileDetail {
+            permissions: entry.ext.str("permissions").map(str::to_string),
+            owner_id: entry.ext.str("owner_id").map(str::to_string),
+            owner_display_name: entry.ext.str("owner_display_name").map(str::to_string),
+            size: entry.size,
+            is_dir: entry.is_dir,
+        },
+    }
+}
+
+/// The IPC-map side of a lookup (Nautilus' DETAIL queries read these), and
+/// the attributes to answer with. The detail maps are never locked under
+/// `cache`, so this runs after `lookup_pick` released it.
+fn lookup_commit(ctx: &MetaCtx, hit: LookupHit) -> FileAttr {
+    let LookupHit { target, mut attr, is_dir, is_shared, fileid, detail } = hit;
+    if is_shared {
+        ctx.shared.safe_write().insert(target.clone());
+    }
+    if let Some(fid) = fileid {
+        ctx.fileids.safe_write().insert(target.clone(), fid);
+    }
+    ctx.details.safe_write().insert(target.clone(), detail);
+    if let Some(parent) = target.parent() {
+        ctx.children_map.safe_write()
+            .entry(parent.to_path_buf())
+            .or_insert_with(std::collections::HashSet::new)
+            .insert(target.clone());
+    }
+    overlay_local_size(ctx, &target, &mut attr);
+    if !is_dir {
+        ctx.status.safe_write().entry(target).or_insert(FileStatus::Remote);
+    }
+    attr
+}
+
 pub struct NextCloudFs {
+    // Shared handles for requests answered off the dispatch thread; the same
+    // Arcs as the fields below.
+    meta: MetaCtx,
     cache: Arc<Mutex<FsCache>>,
     status: StatusMap,
     dirty: ipc::DirtySet,
@@ -3679,27 +3948,42 @@ impl NextCloudFs {
             walkers: conn.walkers.clone(),
         });
 
+        let cache = {
+            let c = Arc::new(Mutex::new(FsCache {
+                inodes,
+                paths,
+                next_inode: 2,
+                dir_cache: HashMap::new(),
+                dir_cache_max_dirs: options.dir_cache_max_dirs,
+                pending_dirs: HashMap::new(),
+                file_cache: HashMap::new(),
+                cache_dir,
+                kept_dir,
+                auto_cache_dir,
+                pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
+                uploading: HashMap::new(),
+                deleting: HashSet::new(),
+                trackerignore_hidden: false,
+            }));
+            load_dir_cache(&c);
+            c
+        };
+        let open_files: Arc<Mutex<HashMap<u64, OpenFile>>> = Arc::new(Mutex::new(HashMap::new()));
+        let meta = MetaCtx {
+            conn: conn.clone(),
+            cache: cache.clone(),
+            shared: shared.clone(),
+            fileids: fileids.clone(),
+            details: details.clone(),
+            children_map: children_map.clone(),
+            status: status.clone(),
+            open_files: open_files.clone(),
+            open_writers: Arc::new(AtomicUsize::new(0)),
+            resolve_within: CHILD_RESOLVE_DEADLINE,
+        };
         Ok(NextCloudFs {
-            cache: {
-                let c = Arc::new(Mutex::new(FsCache {
-                    inodes,
-                    paths,
-                    next_inode: 2,
-                    dir_cache: HashMap::new(),
-                    dir_cache_max_dirs: options.dir_cache_max_dirs,
-                    pending_dirs: HashMap::new(),
-                    file_cache: HashMap::new(),
-                    cache_dir,
-                    kept_dir,
-                    auto_cache_dir,
-                    pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
-                    uploading: HashSet::new(),
-                    deleting: HashSet::new(),
-                    trackerignore_hidden: false,
-                }));
-                load_dir_cache(&c);
-                c
-            },
+            meta,
+            cache,
             status,
             dirty,
             shared,
@@ -3707,7 +3991,7 @@ impl NextCloudFs {
             details,
             children_map,
             conn,
-            open_files: Arc::new(Mutex::new(HashMap::new())),
+            open_files,
             uploads: UploadOrder::default(),
             io_modes: Mutex::new(iomode::InodeIoModes::default()),
             open_dirs: Arc::new(Mutex::new(HashMap::new())),
@@ -4152,7 +4436,7 @@ impl NextCloudFs {
             return Ok(());
         }
         self.status.safe_write().insert(remote_path.clone(), FileStatus::Uploading);
-        self.cache.safe_lock().uploading.insert(remote_path.clone());
+        self.cache.safe_lock().uploading.insert(remote_path.clone(), Some(total_len));
 
         let conn = self.conn.clone();
         let cache = self.cache.clone();
@@ -4323,7 +4607,7 @@ impl NextCloudFs {
 
             // Guard this path in the uploading set so put_dir_cache doesn't
             // evict it from a concurrent PROPFIND refresh before the PUT lands.
-            self.cache.safe_lock().uploading.insert(remote_path.clone());
+            self.cache.safe_lock().uploading.insert(remote_path.clone(), Some(upload_size));
             let uploads = self.uploads.clone();
             let ticket = uploads.ticket_entry(&remote_path);
 
@@ -4471,12 +4755,32 @@ impl NextCloudFs {
         Ok(())
     }
 
-    /// `name` in `dir`: from the resident listing, else by listing `dir`.
-    fn child_blocking(&self, pid: u32, dir: &Path, name: &str) -> Child {
-        if let Some(child) = self.cache.safe_lock().resolve_child_cached(dir, name) {
-            return child;
+    /// See [`with_child`].
+    fn with_child<R, T, P, A>(
+        &self,
+        pid: u32,
+        path: &Path,
+        reply: R,
+        pick: P,
+        inline_miss: impl FnOnce(&mut FsCache) -> Option<T>,
+        answer: A,
+    ) where
+        R: Send + 'static,
+        T: 'static,
+        P: Fn(&mut FsCache, &Path, &RemoteEntry) -> T + Send + 'static,
+        A: FnOnce(&MetaCtx, &Path, R, Resolved<T>) + Send + 'static,
+    {
+        with_child(&self.meta, pid, path, reply, pick, inline_miss, answer)
+    }
+
+    /// Registers an open handle. A writable one is counted so `getattr` knows
+    /// to overlay the size of its unsent writes (`overlay_local_size`).
+    fn insert_open_file(&self, fh: u64, mut of: OpenFile) {
+        of.writer = of.write_path.is_some();
+        if of.writer {
+            self.meta.open_writers.fetch_add(1, Ordering::Relaxed);
         }
-        resolve_child_slow(&self.conn, &self.cache, dir, name, pid, Instant::now() + CHILD_RESOLVE_DEADLINE)
+        self.open_files.safe_lock().insert(fh, of);
     }
 
     fn readdir_common(&self, pid: u32, ino: INodeNo, fh: u64, offset: u64, reply: DirReply) {
@@ -4988,7 +5292,7 @@ impl NextCloudFs {
 }
 
 impl Filesystem for NextCloudFs {
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let (parent_path, name_str) = {
             let c = self.cache.safe_lock();
             match (c.get_path(parent.0), name.to_str()) {
@@ -5019,46 +5323,16 @@ impl Filesystem for NextCloudFs {
             ghosts.remove(&full_path);
         }
 
-        let entry = match self.child_blocking(_req.pid(), &parent_path, &name_str) {
-            Child::Found(e) => e,
-            Child::Absent => { reply.error(Errno::ENOENT); return; }
+        self.with_child(req.pid(), &full_path, reply, lookup_pick, |_| None, |ctx, _, reply, r| match r {
+            Resolved::Found(hit) => reply.entry(&TTL, &lookup_commit(ctx, hit), Generation(0)),
+            Resolved::Absent => reply.error(Errno::ENOENT),
             // We don't know the parent's contents, so we can't say the name is
             // absent: a walker told ENOENT believes it, while EAGAIN says "ask later".
-            Child::Unknown(e) => { reply.error(unknown_child_errno(e.as_deref())); return; }
-        };
-
-        {
-            let entry = &entry;
-            let target_path = parent_path.join(&name_str);
-            let ino = self.cache.safe_lock().allocate_inode(target_path.clone());
-            let attr = make_file_attr(ino, entry);
-            if entry.ext.flag("is_shared") {
-                self.shared.safe_write().insert(target_path.clone());
-            }
-            if let Some(fid) = entry.ext.int("fileid") {
-                self.fileids.safe_write().insert(target_path.clone(), fid);
-            }
-            self.details.safe_write().insert(target_path.clone(), ipc::FileDetail {
-                permissions: entry.ext.str("permissions").map(str::to_string),
-                owner_id: entry.ext.str("owner_id").map(str::to_string),
-                owner_display_name: entry.ext.str("owner_display_name").map(str::to_string),
-                size: entry.size,
-                is_dir: entry.is_dir,
-            });
-            if let Some(parent) = target_path.parent() {
-                self.children_map.safe_write()
-                    .entry(parent.to_path_buf())
-                    .or_insert_with(std::collections::HashSet::new)
-                    .insert(target_path.clone());
-            }
-            if !entry.is_dir {
-                self.status.safe_write().entry(target_path).or_insert(FileStatus::Remote);
-            }
-            reply.entry(&TTL, &attr, Generation(0));
-        }
+            Resolved::Unknown(e) => reply.error(unknown_child_errno(e.as_deref())),
+        });
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino.0 == 1 {
             reply.attr(&TTL, &root_attr());
             return;
@@ -5084,48 +5358,32 @@ impl Filesystem for NextCloudFs {
             }
         }
 
-        let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-
-        let cached = {
-            let c = self.cache.safe_lock();
-            match c.get_cached_dir_readonly(&parent) {
-                Some(files) => Some(files),
-                None => {
-                    if c.dir_cache.contains_key(&path) || path == Path::new("/") {
-                        drop(c);
-                        reply.attr(&TTL, &make_dir_attr(ino.0));
-                        return;
-                    }
-                    None
-                }
-            }
-            // Arc is cloned by get_cached_dir_readonly; guard drops here.
-        };
         // A missing parent listing does not mean the file is gone: the dir cache
         // is bounded, so the listing this inode was born from may simply have
-        // been evicted. Re-list before answering — `lookup` does the same.
-        // Reporting ENOENT here instead made a directory whose parent had aged
-        // out fail every stat(), which a file manager renders as an empty folder.
-        let entries = match cached {
-            Some(files) => files,
-            None => match self.child_blocking(_req.pid(), &parent, &file_name) {
-                Child::Found(entry) => { reply.attr(&TTL, &make_file_attr(ino.0, &entry)); return; }
-                Child::Absent => { reply.error(Errno::ENOENT); return; }
-                Child::Unknown(e) => { reply.error(unknown_child_errno(e.as_deref())); return; }
+        // been evicted. `with_child` re-lists it off the dispatch thread.
+        // Reporting ENOENT instead made a directory whose parent had aged out
+        // fail every stat(), which a file manager renders as an empty folder.
+        let ino = ino.0;
+        self.with_child(
+            req.pid(),
+            &path,
+            reply,
+            move |c, p, e| attr_for(c, ino, p, e),
+            // A directory whose own listing is resident exists, whatever became
+            // of its parent's.
+            |c| c.dir_cache.contains_key(&path).then(|| make_dir_attr(ino)),
+            |ctx, p, reply, r| match r {
+                Resolved::Found(mut attr) => {
+                    overlay_local_size(ctx, p, &mut attr);
+                    reply.attr(&TTL, &attr);
+                }
+                Resolved::Absent => reply.error(Errno::ENOENT),
+                Resolved::Unknown(e) => reply.error(unknown_child_errno(e.as_deref())),
             },
-        };
-
-        for entry in entries.iter() {
-            if entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == file_name {
-                reply.attr(&TTL, &make_file_attr(ino.0, entry));
-                return;
-            }
-        }
-        reply.error(Errno::ENOENT);
+        );
     }
 
-    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         // The MIME-type xattr a toolkit checks before sniffing (GLib:
         // `user.xdg.mime.type`), served while that toolkit's probe is declared
         // by an enabled profile (desktop::sniff).
@@ -5137,58 +5395,52 @@ impl Filesystem for NextCloudFs {
             Some(p) => p,
             None => { reply.error(Errno::ENOENT); return; }
         };
-        let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
         // An evicted parent listing must not turn into ENODATA: without
         // user.xdg.mime.type GLib falls back to magic-byte sniffing, which
-        // downloads the file just to identify it.
-        let ct = match self.child_blocking(_req.pid(), &parent, &file_name) {
-            Child::Found(e) => e.content_type,
-            Child::Absent | Child::Unknown(_) => None,
-        };
-        match ct {
-            Some(ct) => {
-                let bytes = ct.as_bytes().to_vec();
-                if size == 0 {
-                    reply.size(bytes.len() as u32);
-                } else if size as usize >= bytes.len() {
-                    reply.data(&bytes);
-                } else {
-                    reply.error(Errno::ERANGE);
+        // downloads the file just to identify it. A listing we cannot get in
+        // time (or a full pool) still answers ENODATA, as it always has.
+        self.with_child(req.pid(), &path, reply, |_, _, e| e.content_type.clone(), |_| None, move |_, _, reply, r| {
+            match r {
+                Resolved::Found(Some(ct)) => {
+                    let bytes = ct.as_bytes();
+                    if size == 0 {
+                        reply.size(bytes.len() as u32);
+                    } else if size as usize >= bytes.len() {
+                        reply.data(bytes);
+                    } else {
+                        reply.error(Errno::ERANGE);
+                    }
                 }
+                _ => reply.error(Errno::ENODATA),
             }
-            None => reply.error(Errno::ENODATA),
-        }
+        });
     }
 
-    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let path = match self.cache.safe_lock().get_path(ino.0) {
             Some(p) => p,
             None => { reply.error(Errno::ENOENT); return; }
         };
-        let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        let has_ct = match self.child_blocking(_req.pid(), &parent, &file_name) {
-            Child::Found(e) => e.content_type.is_some(),
-            Child::Absent | Child::Unknown(_) => false,
-        };
-        let mut list: Vec<u8> = Vec::new();
-        if has_ct {
-            for name in desktop::policy().sniff_probes.iter().filter_map(|p| p.xattr) {
-                if !list.split(|b| *b == 0).any(|n| n == name.as_bytes()) {
-                    list.extend_from_slice(name.as_bytes());
-                    list.push(0);
+        self.with_child(req.pid(), &path, reply, |_, _, e| e.content_type.is_some(), |_| None, move |_, _, reply, r| {
+            let has_ct = matches!(r, Resolved::Found(true));
+            let mut list: Vec<u8> = Vec::new();
+            if has_ct {
+                for name in desktop::policy().sniff_probes.iter().filter_map(|p| p.xattr) {
+                    if !list.split(|b| *b == 0).any(|n| n == name.as_bytes()) {
+                        list.extend_from_slice(name.as_bytes());
+                        list.push(0);
+                    }
                 }
             }
-        }
-        let list = list.as_slice();
-        if size == 0 {
-            reply.size(list.len() as u32);
-        } else if size as usize >= list.len() {
-            reply.data(list);
-        } else {
-            reply.error(Errno::ERANGE);
-        }
+            let list = list.as_slice();
+            if size == 0 {
+                reply.size(list.len() as u32);
+            } else if size as usize >= list.len() {
+                reply.data(list);
+            } else {
+                reply.error(Errno::ERANGE);
+            }
+        });
     }
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
@@ -5386,7 +5638,7 @@ impl Filesystem for NextCloudFs {
             _ => {}
         }
 
-        self.open_files.safe_lock().insert(
+        self.insert_open_file(
             fh,
             OpenFile {
                 remote_path: path,
@@ -5411,6 +5663,7 @@ impl Filesystem for NextCloudFs {
                 created: false,
                 unlinked: false,
                 opened_gen: self.uploads.generation(),
+                writer: false,
             },
         );
         // io_modes keeps the BackingId alive until the inode's last passthrough
@@ -5837,7 +6090,7 @@ impl Filesystem for NextCloudFs {
                             if let Some(total) = server_total {
                                 let stale = {
                                     let c = cache.safe_lock();
-                                    !c.uploading.contains(&path) && file_total_size != total
+                                    !c.uploading.contains_key(&path) && file_total_size != total
                                 };
                                 if stale && cache.safe_lock().set_entry_size(&path, total) {
                                     log::info!("read: reconciled {} size {} → {} (server-side change)", path.display(), file_total_size, total);
@@ -6086,6 +6339,9 @@ impl Filesystem for NextCloudFs {
             reply.ok();
             return;
         };
+        if of.writer {
+            self.meta.open_writers.fetch_sub(1, Ordering::Relaxed);
+        }
         self.io_modes.safe_lock().release(of.ino, of.io_kind);
         reply.ok();
 
@@ -6264,33 +6520,25 @@ impl Filesystem for NextCloudFs {
                     of.dirty = true;
                 }
             }
-            let path = self.cache.safe_lock().get_path(ino.0);
-            let lookup_entry = |p: &Path| -> Option<RemoteEntry> {
-                let parent = p.parent().unwrap_or(Path::new("/")).to_path_buf();
-                self.cache.safe_lock().get_cached_dir_readonly(&parent)
-                    .and_then(|files| files.iter().find(|e| e.path == *p).cloned())
+            let Some(path) = self.cache.safe_lock().get_path(ino.0) else {
+                reply.attr(&TTL, &make_unknown_file_attr(ino.0, new_size));
+                return;
             };
-            let entry = path.as_ref().and_then(|p| {
-                // The parent listing can have been evicted since this inode was
-                // handed out; re-list rather than answer from nothing.
-                lookup_entry(p).or_else(|| {
-                    let parent = p.parent().unwrap_or(Path::new("/"));
-                    let name = p.file_name().and_then(|n| n.to_str())?;
-                    match self.child_blocking(_req.pid(), parent, name) {
-                        Child::Found(e) => Some(e),
-                        _ => None,
-                    }
-                })
+            // The parent listing can have been evicted since this inode was
+            // handed out; `with_child` re-lists it rather than answering from
+            // nothing, off the dispatch thread.
+            let ino = ino.0;
+            self.with_child(_req.pid(), &path, reply, move |c, p, e| attr_for(c, ino, p, e), |_| None, move |_, _, reply, r| {
+                let mut attr = match r {
+                    Resolved::Found(attr) => attr,
+                    // This branch only runs for a size change, i.e. a truncate of a
+                    // regular file: a directory attr here would tell the writer its
+                    // own file is a directory.
+                    Resolved::Absent | Resolved::Unknown(_) => make_unknown_file_attr(ino, new_size),
+                };
+                set_attr_size(&mut attr, new_size);
+                reply.attr(&TTL, &attr);
             });
-            let mut attr = match entry {
-                Some(ref e) => make_file_attr(ino.0, e),
-                // This branch only runs for a size change, i.e. a truncate of a
-                // regular file: a directory attr here would tell the writer its
-                // own file is a directory.
-                None => make_unknown_file_attr(ino.0, new_size),
-            };
-            attr.size = new_size;
-            reply.attr(&TTL, &attr);
         } else {
             self.getattr(_req, ino, None, reply);
         }
@@ -6553,6 +6801,7 @@ impl Filesystem for NextCloudFs {
                                     created: false,
                                     unlinked: false,
                                     opened_gen: self.uploads.generation(),
+                                    writer: false,
                                 });
                                 log::info!("ghost create: {} (inotify trigger)", full_path.display());
                                 reply.created(&TTL, &attr, Generation(0), FileHandle(fh), plain_open_flags(io_kind));
@@ -6612,11 +6861,11 @@ impl Filesystem for NextCloudFs {
             }
             // Guard against concurrent PROPFIND refreshes evicting this entry
             // before flush() adds it to uploading (same logic as put_dir_cache).
-            c.uploading.insert(remote_path.clone());
+            c.uploading.insert(remote_path.clone(), None);
         }
 
         let io_kind = self.io_modes.safe_lock().acquire_plain(ino);
-        self.open_files.safe_lock().insert(
+        self.insert_open_file(
             fh,
             OpenFile {
                 remote_path,
@@ -6639,6 +6888,7 @@ impl Filesystem for NextCloudFs {
                 created: true,
                 unlinked: false,
                 opened_gen: self.uploads.generation(),
+                writer: false,
             },
         );
 
@@ -6898,7 +7148,7 @@ impl Filesystem for NextCloudFs {
                 // already dispatched by flush() lives in the `uploading` guard, so wait on
                 // that too — same drain the live MOVE uses for its source.
                 let pending = || {
-                    cache.safe_lock().uploading.contains(&remote_path)
+                    cache.safe_lock().uploading.contains_key(&remote_path)
                         || journal.safe_lock().has_pending_put(&remote_path)
                 };
                 if pending() {
@@ -7230,8 +7480,8 @@ impl Filesystem for NextCloudFs {
         if uncommitted_source && !self.journal.safe_lock().has_pending_put(&from) {
             log::info!("rename {} → {}: source not uploaded yet — retargeted, no MOVE needed", from.display(), to.display());
             let mut c = self.cache.safe_lock();
-            if c.uploading.remove(&from) {
-                c.uploading.insert(to.clone());
+            if let Some(size) = c.uploading.remove(&from) {
+                c.uploading.insert(to.clone(), size);
             }
             return;
         }
@@ -7266,7 +7516,7 @@ impl Filesystem for NextCloudFs {
                 // journal check is what stops the MOVE from racing ahead of a queued PUT and
                 // getting a 404 for a source that was never uploaded yet.
                 let source_pending = || {
-                    cache.safe_lock().uploading.contains(&from)
+                    cache.safe_lock().uploading.contains_key(&from)
                         || journal.safe_lock().has_pending_put(&from)
                 };
                 if source_pending() {

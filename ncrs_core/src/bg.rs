@@ -225,6 +225,16 @@ impl Pool {
 pub static READDIR: Pool = Pool::new("readdir", READDIR_WORKERS, 512);
 pub const READDIR_WORKERS: usize = 24;
 
+/// FUSE requests about one name — lookup, getattr, setattr, getxattr,
+/// listxattr, open — whose parent listing is not cached. A cache hit is still
+/// answered on the dispatch thread; only a miss comes here, with its reply.
+/// Separate from `READDIR` because both wait on the same slow listings: a
+/// crawl's readdirs must not starve a `stat` of the file the user just opened,
+/// or the other way round. Every job carries one deadline (about
+/// `PROPFIND_TIMEOUT` from submission), so a worker is never held longer.
+pub static META: Pool = Pool::new("meta", META_WORKERS, 1024);
+pub const META_WORKERS: usize = 16;
+
 /// FUSE read-path waiters: range streams and read-ahead waits.
 pub static READ: Pool = Pool::new("read", READ_WORKERS, 2048);
 pub const READ_WORKERS: usize = 32;
@@ -274,7 +284,7 @@ pub const THUMB_WORKERS: usize = 2;
 pub static USER: Pool = Pool::new("user", USER_WORKERS, 4096);
 pub const USER_WORKERS: usize = 4;
 
-pub static POOLS: [&Pool; 10] = [&READDIR, &READ, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER];
+pub static POOLS: [&Pool; 11] = [&READDIR, &META, &READ, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER];
 
 /// Named long-lived threads: the FUSE session, connectivity monitor, push
 /// watcher, IPC accept loop, savers, cleanup. Fixed in number.
@@ -311,8 +321,9 @@ pub const MAX_THREADS: usize = {
 /// fixed handful (metadata, transfers, previews, push). Generous upper bound.
 pub const MAX_HTTP_CLIENT_THREADS: usize = 8;
 
-const POOL_SIZES: [usize; 10] = [
+const POOL_SIZES: [usize; 11] = [
     READDIR_WORKERS,
+    META_WORKERS,
     READ_WORKERS,
     LISTING_WORKERS,
     BACKGROUND_WORKERS,

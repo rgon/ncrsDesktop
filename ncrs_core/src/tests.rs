@@ -18,7 +18,7 @@
             kept_dir: PathBuf::from("/tmp/ncrs-test-cache/kept"),
             auto_cache_dir: PathBuf::from("/tmp/ncrs-test-cache/cache"),
             pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
-            uploading: HashSet::new(),
+            uploading: HashMap::new(),
             deleting: HashSet::new(),
             trackerignore_hidden: false,
         }
@@ -1435,7 +1435,7 @@
             c.put_dir_cache(d, None, None, f);
         }
         let pinned = PathBuf::from("/d0");
-        c.uploading.insert(pinned.join("d0-0.txt"));
+        c.uploading.insert(pinned.join("d0-0.txt"), None);
 
         c.dir_cache_max_dirs = 4;
         let (d, f) = dir_with("fresh", 1);
@@ -2970,6 +2970,16 @@ mod upload_order_tests {
             (tx, etx)
         }
 
+        /// `pending_find`, past the batches a large backlog is drained in.
+        fn settled(c: &mut FsCache, dir: &str, name: &str) -> PendingLookup {
+            loop {
+                match c.pending_find(Path::new(dir), name) {
+                    PendingLookup::Backlog => continue,
+                    other => return other,
+                }
+            }
+        }
+
         #[test]
         fn pending_find_sees_streamed_names_and_never_calls_a_partial_listing_complete() {
             let mut c = make_test_cache();
@@ -2977,20 +2987,20 @@ mod upload_order_tests {
             for e in names("/s", 400) {
                 tx.send(e).unwrap();
             }
-            assert!(matches!(c.pending_find(Path::new("/s"), "f399.txt"), PendingLookup::Found(e) if e.path == Path::new("/s/f399.txt")));
-            assert!(matches!(c.pending_find(Path::new("/s"), "late.txt"), PendingLookup::Streaming));
+            assert!(matches!(settled(&mut c, "/s", "f399.txt"), PendingLookup::Found(e) if e.path == Path::new("/s/f399.txt")));
+            assert!(matches!(settled(&mut c, "/s", "late.txt"), PendingLookup::Streaming));
             tx.send(entry_in("/s", "late.txt")).unwrap();
-            assert!(matches!(c.pending_find(Path::new("/s"), "late.txt"), PendingLookup::Found(_)));
+            assert!(matches!(settled(&mut c, "/s", "late.txt"), PendingLookup::Found(_)));
             // The entry stream ends a moment before the result is sent: until it
             // is, the listing may have broken off, so nothing is absent yet.
             drop(tx);
-            assert!(matches!(c.pending_find(Path::new("/s"), "never.txt"), PendingLookup::Streaming));
+            assert!(matches!(settled(&mut c, "/s", "never.txt"), PendingLookup::Streaming));
             assert!(c.dir_cache.get(Path::new("/s")).is_none());
             etx.send(Ok(Some("etag".into()))).unwrap();
-            assert!(matches!(c.pending_find(Path::new("/s"), "never.txt"), PendingLookup::Finished));
+            assert!(matches!(settled(&mut c, "/s", "never.txt"), PendingLookup::Finished));
             assert!(matches!(c.resolve_child_cached(Path::new("/s"), "never.txt"), Some(Child::Absent)));
             assert!(matches!(c.resolve_child_cached(Path::new("/s"), "late.txt"), Some(Child::Found(_))));
-            assert!(matches!(c.pending_find(Path::new("/s"), "x"), PendingLookup::NoFetch));
+            assert!(matches!(settled(&mut c, "/s", "x"), PendingLookup::NoFetch));
         }
 
         #[test]
@@ -3023,7 +3033,11 @@ mod upload_order_tests {
         struct FakeDir {
             entries: Vec<RemoteEntry>,
             before_first: Duration,
+            /// Pause after every `every`-th entry (every entry when 0).
             between: Duration,
+            every: usize,
+            /// Pause after the last entry, before the listing completes.
+            hold: Duration,
             fail: Option<u16>,
         }
 
@@ -3055,10 +3069,13 @@ mod upload_order_tests {
                 self.lists.fetch_add(1, Ordering::SeqCst);
                 let d = self.dirs.lock().unwrap().get(path).cloned().ok_or(backend::BackendReadError::NotFound)?;
                 std::thread::sleep(d.before_first);
-                for e in d.entries {
+                for (i, e) in d.entries.into_iter().enumerate() {
                     let _ = tx.send(e);
-                    std::thread::sleep(d.between);
+                    if d.every == 0 || i % d.every == d.every - 1 {
+                        std::thread::sleep(d.between);
+                    }
                 }
+                std::thread::sleep(d.hold);
                 match d.fail {
                     Some(code) => Err(backend::BackendReadError::Server(code, "fake".into())),
                     None => Ok(Some("etag".into())),
@@ -3163,6 +3180,82 @@ mod upload_order_tests {
             match child {
                 Child::Unknown(Some(e)) => assert_eq!(unknown_child_errno(Some(&e)).code(), libc::EAGAIN, "{e}"),
                 other => panic!("expected Unknown with the error, got {other:?}"),
+            }
+        }
+
+        // ── with_child: hits inline, misses on bg::META ─────────────────────
+
+        fn ask(meta: &MetaCtx, path: &str) -> mpsc::Receiver<(Resolved<u64>, String)> {
+            let (tx, rx) = mpsc::channel();
+            with_child(meta, 0, Path::new(path), tx, |_, _, e| e.size, |_| None, |_, _, tx, r| {
+                let _ = tx.send((r, std::thread::current().name().unwrap_or("").to_string()));
+            });
+            rx
+        }
+
+        #[test]
+        fn with_child_answers_a_hit_inline_and_a_miss_from_a_meta_worker() {
+            let cold = FakeDir { entries: names("/cold", 3), before_first: Duration::from_millis(100), ..Default::default() };
+            let (_, conn, cache) = setup(vec![("/cold", cold)]);
+            cache.safe_lock().put_dir_cache(PathBuf::from("/hot"), None, None, names("/hot", 10));
+            let meta = MetaCtx::for_tests(conn, cache, Duration::from_secs(5));
+
+            let (r, on) = ask(&meta, "/hot/f3.txt").try_recv().expect("a hit is answered before with_child returns");
+            assert!(matches!(r, Resolved::Found(100)));
+            assert_ne!(on, "ncrs-meta");
+            assert!(matches!(ask(&meta, "/hot/none.txt").try_recv(), Ok((Resolved::Absent, _))));
+
+            let rx = ask(&meta, "/cold/f2.txt");
+            assert!(rx.try_recv().is_err(), "a miss must not be answered on the caller's thread");
+            let (r, on) = rx.recv_timeout(Duration::from_secs(5)).expect("the worker answers");
+            assert!(matches!(r, Resolved::Found(100)));
+            assert_eq!(on, "ncrs-meta");
+            // The listing is resident now: the next miss is a hit.
+            assert!(matches!(ask(&meta, "/cold/f0.txt").try_recv(), Ok((Resolved::Found(_), _))));
+        }
+
+        #[test]
+        fn the_fast_path_stays_fast_while_slow_resolvers_wait_on_a_wide_stream() {
+            // 100k entries trickling in over ~2 s, and a listing that then hangs
+            // past every resolver's deadline.
+            let big = FakeDir {
+                entries: names("/big", 100_000),
+                between: Duration::from_millis(1),
+                every: 50,
+                hold: Duration::from_secs(30),
+                ..Default::default()
+            };
+            let (_, conn, cache) = setup(vec![("/big", big)]);
+            cache.safe_lock().put_dir_cache(PathBuf::from("/hot"), None, None, names("/hot", 2000));
+            let meta = MetaCtx::for_tests(conn, cache, Duration::from_secs(3));
+
+            let slow: Vec<_> = (0..16).map(|i| ask(&meta, &format!("/big/never-{i}.txt"))).collect();
+            let mut lat = Vec::with_capacity(3000);
+            let t_end = Instant::now() + Duration::from_millis(2500);
+            let mut i = 0usize;
+            while Instant::now() < t_end {
+                let t = Instant::now();
+                let r = ask(&meta, &format!("/hot/f{}.txt", i % 2000)).try_recv().expect("inline");
+                lat.push(t.elapsed());
+                assert!(matches!(r.0, Resolved::Found(_)));
+                i += 1;
+                std::thread::sleep(Duration::from_micros(500));
+            }
+            lat.sort();
+            let p99 = lat[lat.len() * 99 / 100];
+            let max = *lat.last().unwrap();
+            eprintln!("fast path over {} lookups: p50 {:?} p99 {:?} max {:?}", lat.len(), lat[lat.len() / 2], p99, max);
+            // The 1 ms bound is for the optimised build the daemon ships as
+            // (`cargo test --release`). An unoptimised build moves stream entries
+            // ~10x slower under the lock, so it gets a looser bound — still far
+            // below what cloning the partial listing per waiter used to cost.
+            let bound = if cfg!(debug_assertions) { Duration::from_millis(10) } else { Duration::from_millis(1) };
+            assert!(p99 < bound, "p99 {p99:?} (bound {bound:?})");
+
+            for rx in slow {
+                let (r, on) = rx.recv_timeout(Duration::from_secs(10)).expect("every slow resolver is answered by its deadline");
+                assert_eq!(on, "ncrs-meta");
+                assert!(matches!(r, Resolved::Unknown(None)), "a name not streamed by the deadline is unknown, never absent");
             }
         }
     }
