@@ -20,6 +20,7 @@
             pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
             uploading: HashMap::new(),
             deleting: HashSet::new(),
+            moving: HashMap::new(),
             trackerignore_hidden: false,
             pins: HashMap::new(),
             tombstones: tombstones::Tombstones::default(),
@@ -1041,6 +1042,60 @@
         cache.put_dir_cache(path.clone(), None, None, vec![make_dav_entry("c.txt", None)]);
         assert!(!cache.dir_cache.get(&path).unwrap().hard_expired);
         assert!(cache.get_cached_dir(&path, DIR_CACHE_TTL, Some(max_stale)).is_some());
+    }
+
+    #[test]
+    fn a_refresh_keeps_a_queued_rename_under_its_new_name_and_a_new_file_under_the_old() {
+        // vim's save while the MOVE waits for the replay: `mv f f~`, then a
+        // new f. The server still has f (the old one) and no f~.
+        let mut c = make_test_cache();
+        let d = PathBuf::from("/d");
+        c.put_dir_cache(d.clone(), None, None, vec![make_dav_entry_in("/d", "f", Some(1))]);
+        c.allocate_inode(PathBuf::from("/d/f"));
+        let open_files: Arc<Mutex<HashMap<u64, OpenFile>>> = Arc::default();
+        rename_in_cache(&mut c, &open_files, Path::new("/d/f"), Path::new("/d/f~"), &d, &d);
+        c.moving.insert(PathBuf::from("/d/f~"), (PathBuf::from("/d/f"), 7));
+        let mut new_f = make_dav_entry_in("/d", "f", None);
+        new_f.change_token = None;
+        new_f.size = 3;
+        {
+            let dir = c.dir_cache.get_mut(&d).unwrap();
+            let mut files = (*dir.files).clone();
+            files.push(new_f);
+            dir.files = Arc::new(files);
+        }
+        c.uploading.insert(PathBuf::from("/d/f"), None);
+        c.put_dir_cache(d.clone(), None, None, vec![make_dav_entry_in("/d", "f", Some(1))]);
+        let listed = |c: &FsCache| -> Vec<(String, Option<String>, u64)> {
+            let mut v: Vec<_> = c.dir_cache[&d].files.iter().map(|e| (e.path.display().to_string(), e.change_token.clone(), e.size)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(listed(&c), [
+            ("/d/f".to_string(), None, 3),
+            ("/d/f~".to_string(), Some("etag1".to_string()), 100),
+        ], "the new f and the renamed old one, not the server's old f");
+        // Once the MOVE landed the server's listing is right again.
+        c.moving.clear();
+        c.put_dir_cache(d.clone(), None, None, vec![make_dav_entry_in("/d", "f~", Some(1))]);
+        assert_eq!(listed(&c).len(), 2, "{:?}", listed(&c));
+    }
+
+    #[test]
+    fn an_upload_guard_follows_its_file_through_renames() {
+        let mut c = make_test_cache();
+        let open_files: Arc<Mutex<HashMap<u64, OpenFile>>> = Arc::default();
+        c.uploading.insert(PathBuf::from("/d/x"), Some(5));
+        rename_in_cache(&mut c, &open_files, Path::new("/d"), Path::new("/e"), Path::new("/"), Path::new("/"));
+        assert_eq!(c.uploading.get(Path::new("/e/x")), Some(&Some(5)));
+        assert!(!c.uploading.contains_key(Path::new("/d/x")));
+        // A file renamed over another takes the name; the other's guard goes.
+        c.allocate_inode(PathBuf::from("/t"));
+        c.allocate_inode(PathBuf::from("/e/x"));
+        c.uploading.insert(PathBuf::from("/t"), Some(9));
+        rename_in_cache(&mut c, &open_files, Path::new("/e/x"), Path::new("/t"), Path::new("/e"), Path::new("/"));
+        assert_eq!(c.uploading.get(Path::new("/t")), Some(&Some(5)));
+        assert_eq!(c.uploading.len(), 1);
     }
 
     #[test]
@@ -6018,6 +6073,47 @@ mod upload_order_tests {
                 assert!(ran.duration_since(landed) < Duration::from_millis(500), "{:?}", ran.duration_since(landed));
                 off.journal.safe_lock().remove(put);
             }
+        }
+
+        #[test]
+        fn the_replay_ends_the_overlays_that_kept_queued_changes_listed() {
+            // Offline: create n, `mv n m`, then an edit of p left to the
+            // replay behind a newer edit of it.
+            let srv = TreeServer::new(&[("/p", "P")], &[]);
+            let mut off = Offline::new();
+            off.save("/n", "N", None);
+            off.mv("/n", "/m");
+            let mv = off.journal.safe_lock().entries().back().unwrap().seq;
+            let cache = Arc::new(Mutex::new(make_test_cache()));
+            {
+                let mut c = cache.safe_lock();
+                c.uploading.insert(PathBuf::from("/m"), Some(1));
+                c.moving.insert(PathBuf::from("/m"), (PathBuf::from("/n"), mv));
+                c.uploading.insert(PathBuf::from("/p"), Some(2));
+            }
+            let p1 = off.save("/p", "P1", Some("e_p"));
+            assert!(off.journal.safe_lock().claim(p1), "running live: not superseded");
+            off.save("/p", "P2", None);
+            off.journal.safe_lock().mark_waiting(p1);
+            let status: ipc::StatusMap = Arc::new(RwLock::new(HashMap::new()));
+            let ctx = mutation_journal::ReplayContext { backend: srv.clone(), status };
+            let dirty: ipc::DirtySet = Arc::new(Mutex::new(HashSet::new()));
+            let elog: ErrorLog = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+            // Stop before the newer edit of p: its guard is still needed.
+            let last = off.journal.safe_lock().entries().back().unwrap().seq;
+            off.journal.safe_lock().claim(last);
+            mutation_journal::replay_journal(&off.journal, &ctx, &cache, &dirty, &elog);
+            {
+                let c = cache.safe_lock();
+                assert!(c.moving.is_empty(), "the MOVE landed");
+                assert!(!c.uploading.contains_key(Path::new("/m")), "n landed and is m now");
+                assert!(c.uploading.contains_key(Path::new("/p")), "a newer upload of p is still queued");
+            }
+            off.journal.safe_lock().mark_waiting(last);
+            mutation_journal::replay_journal(&off.journal, &ctx, &cache, &dirty, &elog);
+            assert!(cache.safe_lock().uploading.is_empty());
+            assert!(off.journal.safe_lock().is_empty());
+            assert_eq!(srv.files(), tree(&[("/m", "N"), ("/p", "P2")]), "{:?}", srv.log());
         }
 
         #[test]

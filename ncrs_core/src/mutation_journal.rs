@@ -1016,6 +1016,18 @@ impl MutationJournal {
         found
     }
 
+    /// Whether an upload of the file called `path` now, queued after `seq`, is
+    /// still queued: that one's worker (or the replay) clears the file's
+    /// `uploading` guard, not `seq`'s.
+    pub fn upload_after(&self, seq: SeqId, path: &Path) -> bool {
+        let mut found = false;
+        self.walk_history(path, |e, at| {
+            found = e.seq > seq && e.op.is_upload_of(at);
+            found || e.seq <= seq
+        });
+        found
+    }
+
     /// Staging file of the newest queued upload of `path` when that upload is a
     /// whole-file Put. Reads of a locally-written-but-not-yet-uploaded file can
     /// be served from here instead of streaming from a server that does not
@@ -1540,10 +1552,14 @@ pub(crate) fn replay_journal(
             if let MutationOp::Unlink { path } | MutationOp::RmDir { path } = &entry.op {
                 cache.safe_lock().deleting.remove(path);
             }
+            drop(j);
+            settle_local(journal, cache, &entry, now_at.as_deref());
             continue;
         }
 
-        match execute_op(&entry, now_at.as_deref(), ctx, cache, dirty, error_log) {
+        let result = execute_op(&entry, now_at.as_deref(), ctx, cache, dirty, error_log);
+        let settled = matches!(result, ReplayResult::Ok | ReplayResult::Conflict(_) | ReplayResult::Idempotent);
+        match result {
             ReplayResult::Ok => {
                 let mut j = journal.safe_lock();
                 if let Some(staging_path) = entry.op.staging_path() {
@@ -1599,6 +1615,27 @@ pub(crate) fn replay_journal(
                 }
             }
         }
+        if settled {
+            settle_local(journal, cache, &entry, now_at.as_deref());
+        }
+    }
+}
+
+/// The overlays that kept a queued change visible before the server had it,
+/// ended once `entry` left the journal for good: an upload's `uploading`
+/// guard (under the file's name now, `now_at`; a newer queued upload of the
+/// file keeps it), a Rename's `moving` entry.
+fn settle_local(journal: &SharedJournal, cache: &Arc<Mutex<crate::FsCache>>, entry: &JournalEntry, now_at: Option<&Path>) {
+    use crate::MutexExt;
+    match &entry.op {
+        MutationOp::Put { .. } | MutationOp::FinishChunked { .. } => {
+            let Some(now) = now_at else { return };
+            if !journal.safe_lock().upload_after(entry.seq, now) {
+                cache.safe_lock().uploading.remove(now);
+            }
+        }
+        MutationOp::Rename { to, .. } => crate::moved_or_given_up(cache, to, entry.seq),
+        _ => {}
     }
 }
 

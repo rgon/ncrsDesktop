@@ -1506,6 +1506,29 @@ fn claim_in_order(journal: &mutation_journal::SharedJournal, seq: mutation_journ
     }
 }
 
+/// Clears the `uploading` guard of the upload `seq`, queued as `queued`, once
+/// it landed or was given up: under the name the file has now (guards move
+/// with renames), unless a newer queued upload of that file still needs it.
+/// Called while `seq` is still queued, so its name now can be worked out.
+pub(crate) fn drop_upload_guard(journal: &mutation_journal::SharedJournal, cache: &Arc<Mutex<FsCache>>, seq: mutation_journal::SeqId, queued: &Path) {
+    let name = {
+        let j = journal.safe_lock();
+        j.current_name(seq, queued).filter(|now| !j.upload_after(seq, now))
+    };
+    if let Some(name) = name {
+        cache.safe_lock().uploading.remove(&name);
+    }
+}
+
+/// Ends the `moving` overlay of the Rename `seq` onto `to`: its MOVE landed or
+/// was given up, and the server's listing is right again.
+pub(crate) fn moved_or_given_up(cache: &Arc<Mutex<FsCache>>, to: &Path, seq: mutation_journal::SeqId) {
+    let mut c = cache.safe_lock();
+    if c.moving.get(to).is_some_and(|(_, s)| *s == seq) {
+        c.moving.remove(to);
+    }
+}
+
 /// Sends a kernel cache notification from the single notify worker, never the
 /// FUSE dispatch thread (a notify the kernel blocks on would deadlock it).
 pub(crate) fn notify_later(job: impl FnOnce() + Send + 'static) {
@@ -1624,11 +1647,19 @@ pub(crate) struct FsCache {
     // The value is the size being uploaded when known: until the PUT lands, a
     // refresh can bring back the server's old entry, and attributes must report
     // what the user wrote rather than that (see `attr_for`).
+    // Keyed by the file's name now (rename() carries a guard along), and held
+    // until the upload lands, live or from the replay (`drop_upload_guard`).
     pub(crate) uploading: HashMap<PathBuf, Option<u64>>,
     // Full paths of files whose DELETE is in flight. put_dir_cache filters
     // these out so a racing PROPFIND refresh can't re-add them before the
     // server DELETE completes.
     pub(crate) deleting: HashSet<PathBuf>,
+    // Renames left to the replay (new name → old name) until their MOVE
+    // lands: put_dir_cache keeps the new name, which the server does not
+    // have yet, and hides the old one, which it still has.
+    // Each with the Rename's journal entry, so one that left the journal
+    // without landing (coalesced away) can be told apart.
+    pub(crate) moving: HashMap<PathBuf, (PathBuf, mutation_journal::SeqId)>,
     // Set once the user unlinks the synthetic `.trackerignore` overlay entry
     // (see trackerignore_entry()). While set, put_dir_cache stops re-adding it
     // to the root listing — mirrors the old real-file semantics ("stays opted
@@ -1839,20 +1870,32 @@ impl FsCache {
     }
 
     fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, self_entry: Option<RemoteEntry>, mut files: Vec<RemoteEntry>) {
-        // Re-merge any in-flight uploads missing from the server listing so
-        // that concurrent PROPFIND refreshes don't produce ENOENT on stat().
+        // Filter out files whose DELETE is still in flight: a racing PROPFIND
+        // that completes before the server DELETE must not re-surface them.
+        // Likewise the old name of a rename whose MOVE is left to the replay.
+        if !self.deleting.is_empty() || !self.moving.is_empty() {
+            let moved_away: HashSet<&Path> = self.moving.values().map(|(from, _)| from.as_path()).collect();
+            files.retain(|f| !self.deleting.contains(&f.path) && !moved_away.contains(f.path.as_path()));
+        }
+        // Re-merge any uploads (or renames) not on the server yet so that
+        // concurrent PROPFIND refreshes don't produce ENOENT on stat(). After
+        // the filter: a new file under a name being deleted or moved away
+        // (`rm f` or vim's `mv f f~`, then a new f) is this daemon's.
+        // A rename's new name can be one the server has for the file the
+        // MOVE is to replace: the entry is the renamed file's, from here.
         if let Some(old) = self.dir_cache.get(&path) {
             for old_entry in old.files.iter() {
-                if self.uploading.contains_key(&old_entry.path)
-                    && !files.iter().any(|f| f.path == old_entry.path)
-                {
-                    files.push(old_entry.clone());
+                let moved_here = self.moving.contains_key(&old_entry.path);
+                if !moved_here && !self.uploading.contains_key(&old_entry.path) {
+                    continue;
+                }
+                match files.iter().position(|f| f.path == old_entry.path) {
+                    Some(i) if moved_here => files[i] = old_entry.clone(),
+                    Some(_) => {}
+                    None => files.push(old_entry.clone()),
                 }
             }
         }
-        // Filter out files whose DELETE is still in flight: a racing PROPFIND
-        // that completes before the server DELETE must not re-surface them.
-        files.retain(|f| !self.deleting.contains(&f.path));
         // A refresh does not make a crawler's listing one someone uses.
         let walker = self.dir_cache.get(&path).is_some_and(|e| e.walker);
         // Overlay the synthetic `.trackerignore` marker onto every fresh root
@@ -5474,6 +5517,7 @@ impl NextCloudFs {
                 pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
                 uploading: HashMap::new(),
                 deleting: HashSet::new(),
+                moving: HashMap::new(),
                 trackerignore_hidden: false,
                 pins: HashMap::new(),
                 tombstones: tombstones::Tombstones::default(),
@@ -7751,6 +7795,9 @@ impl Filesystem for NextCloudFs {
             // Guard against racing PROPFIND refreshes re-surfacing this file
             // before the server DELETE completes (mirrors the `uploading` guard).
             c.deleting.insert(remote_path.clone());
+            // Its upload no longer keeps it listed: nothing would clear that
+            // guard once the file has no name.
+            c.uploading.remove(&remote_path);
             // Evict cached bytes immediately so a re-inserted dir entry can't serve stale content.
             c.file_cache.remove(&remote_path);
             ino
@@ -8096,22 +8143,23 @@ impl Filesystem for NextCloudFs {
         // Handles open under the source were retargeted above. One made by create() means
         // the server has no copy of the source yet, so there is nothing to MOVE.
         if uncommitted_source && !self.journal.safe_lock().has_pending_put(&from) {
+            // Its create() guard moved with it (`rename_in_cache`).
             log::info!("rename {} → {}: source not uploaded yet — retargeted, no MOVE needed", from.display(), to.display());
-            let mut c = self.cache.safe_lock();
-            if let Some(size) = c.uploading.remove(&from) {
-                c.uploading.insert(to.clone(), size);
-            }
             return;
         }
 
         let seq = self.journal.safe_lock().enqueue(
             mutation_journal::MutationOp::Rename { from: from.clone(), to: to.clone() },
         );
+        // Until the MOVE lands (live or from the replay) a refresh of the
+        // parent must show the file under its new name, not its old one.
+        self.cache.safe_lock().moving.insert(to.clone(), (from.clone(), seq));
 
         if !self.conn.is_offline.load(Ordering::Relaxed) {
             let conn = self.conn.clone();
             let journal = self.journal.clone();
             let elog = self.error_log.clone();
+            let cache = self.cache.clone();
             let uploads = self.uploads.clone();
             let root = Path::new("/");
             let ticket = uploads.seq.ticket(&[
@@ -8138,6 +8186,7 @@ impl Filesystem for NextCloudFs {
                     Ok(()) => {
                         log::info!("MOVE {} → {}", from.display(), to.display());
                         uploads.moved(&from, &to);
+                        moved_or_given_up(&cache, &to, seq);
                         journal.safe_lock().remove(seq);
                     }
                     Err(backend::BackendWriteError::Server(404, _)) => {
@@ -8151,6 +8200,8 @@ impl Filesystem for NextCloudFs {
                             to: to.clone(),
                         });
                         j.remove(seq);
+                        drop(j);
+                        moved_or_given_up(&cache, &to, seq);
                     }
                     Err(e) => {
                         log::error!("MOVE {} → {} failed (journaled): {}", from.display(), to.display(), e);
@@ -8205,6 +8256,18 @@ fn rename_in_cache(
     let displaced = c.get_inode(to).filter(|&d| c.get_inode(from) != Some(d));
     if let Some(ino) = displaced {
         c.tombstones.record(ino);
+        // Its upload's guard would keep the name listed after that upload
+        // lands: the upload no longer has a name to clear it under.
+        c.uploading.remove(to);
+    }
+    // An upload's guard goes with its file, so it keeps the file listed
+    // under the name it has now until the upload lands (see `uploading`).
+    let guarded: Vec<PathBuf> = c.uploading.keys().filter(|p| p.starts_with(from)).cloned().collect();
+    for p in guarded {
+        if let (Some(size), Ok(rest)) = (c.uploading.remove(&p), p.strip_prefix(from)) {
+            let at = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
+            c.uploading.insert(at, size);
+        }
     }
     c.move_inode(from, to);
     // Before the reply: once it is out, a write under the new path
