@@ -6,7 +6,10 @@
 # Env (defaults in docker-compose.yml): DAV_URL, PROXY, WALK_SECS, WALK_REPEAT
 # (1 = keep re-walking the already-cached tree until WALK_SECS), WALK_FINDS
 # (concurrent finds, default 2), IDLE_SECS, SAMPLE_SECS, MAX_THREADS,
-# IDLE_MAX_THREADS, IDLE_MAX_CPU, OPTIMISTIC_LISTING, DIR_CACHE_MAX_STALE_MINS.
+# IDLE_MAX_THREADS, IDLE_MAX_CPU, OPTIMISTIC_LISTING, DIR_CACHE_MAX_STALE_MINS,
+# DIR_CACHE_MAX_DIRS (empty = the daemon's default), SCENARIO (nofreeze = also
+# run nofreeze.py's hot-file probes against a stalled listing; pair it with the
+# proxy's SLOW_PATH_SUBSTR=slowdir and a small DIR_CACHE_MAX_DIRS).
 set -uo pipefail
 
 URL="${DAV_URL:-http://faultproxy:8080/remote.php/dav/files/testuser/}"
@@ -48,6 +51,7 @@ optimistic_listing: ${OPTIMISTIC_LISTING:-false}
 auto_keep_cached_files: false
 dir_cache_max_stale_mins: ${DIR_CACHE_MAX_STALE_MINS:-15}
 CFG
+[ -n "${DIR_CACHE_MAX_DIRS:-}" ] && echo "dir_cache_max_dirs: ${DIR_CACHE_MAX_DIRS}" >> "$HOME/.config/ncrs/config.yaml"
 
 say "mounting"
 RUST_LOG="${RUST_LOG:-info}" ncrs --config "$HOME/.config/ncrs/config.yaml" >"$LOG" 2>&1 &
@@ -100,12 +104,26 @@ walk() {
     grep 'Resource temporarily unavailable\|Input/output error' "$err" | head -5 >> "$RES/walk_${name}.txt"
 }
 
+NOFREEZE=""
+if [ "${SCENARIO:-}" = "nofreeze" ]; then
+    python3 /walker/nofreeze.py "$MOUNT" "$RES" "$DONE" & NOFREEZE=$!
+    sleep 2   # let it warm and pin the hot directory before the crawl starts
+fi
+# The no-freeze crawl stays out of probe/: FUSE_PARALLEL_DIROPS is off, so the
+# kernel serialises lookups in a directory behind a readdir of it, and walkers
+# reading the stalled probe/slowdir would hold the slow stat's lookup for one
+# full listing timeout each — a kernel ordering, not a daemon freeze.
+WALK_ROOTS=("$MOUNT")
+if [ "${SCENARIO:-}" = "nofreeze" ]; then
+    WALK_ROOTS=()
+    for e in "$MOUNT"/*; do [ "$e" != "$MOUNT/probe" ] && WALK_ROOTS+=("$e"); done
+fi
 T_WALK=$(date +%s)
 WALKERS=""
 for i in $(seq 1 "$WALK_FINDS"); do
-    walk "find$i" find "$MOUNT" -name no-such-file & WALKERS="$WALKERS $!"
+    walk "find$i" find "${WALK_ROOTS[@]}" -name no-such-file & WALKERS="$WALKERS $!"
 done
-walk "lsR" ls -R "$MOUNT" & WALKERS="$WALKERS $!"
+walk "lsR" ls -R "${WALK_ROOTS[@]}" & WALKERS="$WALKERS $!"
 wait $WALKERS
 WALKERS=""
 WALK_ELAPSED=$(( $(date +%s) - T_WALK ))
@@ -113,6 +131,7 @@ touch "$DONE"
 say "walk finished after ${WALK_ELAPSED}s; idling ${IDLE_SECS:-60}s"
 for f in "$RES"/walk_*.txt; do say "  $(basename "$f" .txt): $(head -1 "$f")"; done
 wait "$SAMPLER"
+[ -n "$NOFREEZE" ] && { timeout 30 tail --pid="$NOFREEZE" -f /dev/null; kill "$NOFREEZE" 2>/dev/null; }
 
 # ---- end-of-run facts -------------------------------------------------------
 responsive=false; detail=""
