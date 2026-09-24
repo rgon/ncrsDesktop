@@ -56,6 +56,10 @@ struct Cli {
 }
 
 fn main() {
+    // First, before any thread exists, so every thread inherits the mask: a
+    // stop signal is then handled by the `signals` service (journal flush,
+    // clean unmount) instead of killing the daemon mid-save.
+    ncrs_core::signals::block_shutdown_signals();
     // The GUI spawns the daemon without RUST_LOG; bare env_logger::init() would then log nothing.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = Cli::parse();
@@ -66,6 +70,7 @@ fn main() {
     }
 
     if cli.dump_mime_magic {
+        ncrs_core::signals::unblock_shutdown_signals();
         use std::io::BufRead;
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };

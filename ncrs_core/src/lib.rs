@@ -25,6 +25,7 @@ pub mod propfind;
 pub mod remote_wipe;
 pub mod search;
 mod seccomp_harden;
+pub mod signals;
 pub mod webdav_ops;
 mod write_path;
 
@@ -8191,6 +8192,13 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     *notifier_slot.safe_lock() = Some(session.notifier());
     log::info!("FUSE notifier ready");
+
+    // The `ncrs` binary's stop signals: flush the journal, then a clean
+    // unmount that ends the session below (no-op for library callers).
+    {
+        let lanes = shutdown_lanes.clone();
+        signals::start_watcher(options.mount_point.clone(), shutdown_journal.clone(), move || lanes.busy_count());
+    }
 
     let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;
 
