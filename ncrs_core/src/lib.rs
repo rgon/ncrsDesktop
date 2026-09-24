@@ -1609,6 +1609,20 @@ impl FsCache {
         })
     }
 
+    /// Keeps the inode-to-path map consistent with a rename. Without this,
+    /// getattr(ino) resolves the inode to the old source path, finds nothing in
+    /// dir_cache, and returns ENOENT — causing the renamed file to disappear.
+    fn move_inode(&mut self, from: &Path, to: &Path) {
+        if let Some(ino) = self.paths.remove(from) {
+            self.inodes.insert(ino, to.to_path_buf());
+            if let Some(displaced) = self.paths.insert(to.to_path_buf(), ino) {
+                if displaced != ino {
+                    self.inodes.remove(&displaced);
+                }
+            }
+        }
+    }
+
     /// Position of `name` in the resident listing of `dir`: `None` when the
     /// listing is not cached, `Some((files, None))` when it is and lacks the
     /// name. Counts as an access for LRU, like `get_cached_dir_readonly`, and
@@ -3909,9 +3923,94 @@ fn next_fh(ctx: &MetaCtx) -> u64 {
     fh
 }
 
+/// What open() needs from its reply. A trait so the open logic can be driven
+/// from tests, where fuser's `ReplyOpen` cannot be built.
+trait OpenAnswer: Send + 'static {
+    fn error(self, e: Errno);
+    fn opened(self, fh: u64, grant: iomode::IoGrant<BackingId>);
+    /// Registers `f` as the passthrough backing file of the open being answered.
+    fn open_backing(&self, f: std::fs::File) -> std::io::Result<BackingId>;
+}
+
+impl OpenAnswer for ReplyOpen {
+    fn error(self, e: Errno) {
+        ReplyOpen::error(self, e)
+    }
+
+    fn opened(self, fh: u64, grant: iomode::IoGrant<BackingId>) {
+        // io_modes keeps the BackingId alive until the inode's last passthrough
+        // handle is released (the crate warns dropping it right after replying
+        // can make the kernel return EIO).
+        match grant {
+            iomode::IoGrant::Passthrough(id) => self.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &id),
+            iomode::IoGrant::Cached => ReplyOpen::opened(self, FileHandle(fh), FopenFlags::empty()),
+            iomode::IoGrant::DirectIo => ReplyOpen::opened(self, FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
+        }
+    }
+
+    fn open_backing(&self, f: std::fs::File) -> std::io::Result<BackingId> {
+        ReplyOpen::open_backing(self, f)
+    }
+}
+
+/// open() of a file whose parent listing is not resident. A writable open
+/// stages the file's current content, so it has to know the file's size and
+/// etag: assuming "empty" left the staging file unseeded, and an O_APPEND or
+/// in-place write then uploaded a zero-filled prefix over the real content —
+/// with no etag for If-Match to catch it. A read-only open of a *kept* copy
+/// needs the listing too: without it there is no etag to compare, and a stale
+/// kept copy was served as fresh. Both resolve the parent first, off the
+/// dispatch thread. Uncached read-only opens take only hints from the listing,
+/// so they don't wait for one.
+fn open_unlisted<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, reply: R) {
+    if !rq.writable && rq.local.is_none() {
+        // A read-only open takes only hints from the listing (the sniffing
+        // content type falls back to octet-stream), as before.
+        open_continue(ctx, rq, OpenEntry::default(), reply, false);
+        return;
+    }
+    let path = rq.path.clone();
+    with_child(ctx, rq.pid, &path, (reply, rq), |_, _, e| OpenEntry::of(e), |_| None, |ctx, _, (reply, rq), r| match r {
+        Resolved::Found(entry) => open_continue(ctx, rq, entry, reply, false),
+        // Not on the server: nothing to seed from.
+        Resolved::Absent => open_continue(ctx, rq, OpenEntry::default(), reply, false),
+        // A truncating open discards the content anyway, and a read-only open
+        // of a kept copy keeps working offline (served as before, from the copy
+        // we have).
+        Resolved::Unknown(_) if rq.truncating || !rq.writable => open_continue(ctx, rq, OpenEntry::default(), reply, false),
+        Resolved::Unknown(e) => match offline_seed(ctx, &rq) {
+            // Offline, a kept copy is the newest version we can know of: edit
+            // it, as before the parent had to be resolved, and carry its etag
+            // so the replayed upload still detects a server-side change.
+            Some(entry) => open_continue(ctx, rq, entry, reply, false),
+            // Anything else would be the zero-filled upload again.
+            None => {
+                log::warn!("open: {} for writing — its parent listing is unavailable, refusing rather than staging it empty", rq.path.display());
+                reply.error(unknown_child_errno(e.as_deref()));
+            }
+        },
+    });
+}
+
+/// The version a writable open of a kept copy may be seeded from when its
+/// parent listing cannot be had: only while offline, and only if the copy is
+/// all we know of (`file_cache_matches_remote`). Online, a listing that timed
+/// out says nothing about whether the server has moved on, so that is refused.
+fn offline_seed(ctx: &MetaCtx, rq: &OpenReq) -> Option<OpenEntry> {
+    if rq.local.is_none() || !ctx.conn.is_offline.load(Ordering::Relaxed) {
+        return None;
+    }
+    let c = ctx.cache.safe_lock();
+    if !c.file_cache_matches_remote(&rq.path) {
+        return None;
+    }
+    let fc = c.file_cache.get(&rq.path)?;
+    Some(OpenEntry { etag: fc.etag.clone(), modified: fc.remote_modified, size: fc.size, ..OpenEntry::default() })
+}
+
 /// Everything open() decides once it knows the entry. `on_worker` is true on a
 /// META worker, where the process classifiers may read any /proc file.
-fn open_continue(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, reply: ReplyOpen, on_worker: bool) {
+fn open_continue<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, reply: R, on_worker: bool) {
     if rq.writable && entry.perms.is_some() && perms_to_mode(entry.perms.as_deref(), false) & 0o200 == 0 {
         reply.error(Errno::EACCES);
         return;
@@ -3937,15 +4036,25 @@ fn open_continue(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, reply: ReplyOpen,
                 None => None,
             }
         };
-        let Some((thumbnailer, probe)) = verdict else {
-            let worker_ctx = ctx.clone();
-            let queued = bg::META.submit_owning((reply, rq, entry), move |(reply, rq, entry)| {
-                open_continue(&worker_ctx, rq, entry, reply, true);
-            });
-            if let Err((_, (reply, _, _))) = queued {
-                reply.error(Errno::EAGAIN);
+        let (thumbnailer, probe) = match verdict {
+            Some(v) => v,
+            None => {
+                let worker_ctx = ctx.clone();
+                let queued = bg::META.submit_owning((reply, rq, entry), move |(reply, rq, entry)| {
+                    open_continue(&worker_ctx, rq, entry, reply, true);
+                });
+                match queued {
+                    Ok(()) => return,
+                    // A full pool must not fail a plain `cat` (an undecided
+                    // CmdlineContains matcher sends every uncached read-only
+                    // open here). Proceed as open() did before these checks
+                    // moved off the dispatch thread: no thumbnailer, no probe.
+                    Err((_, (r, q, e))) => {
+                        open_continue_classified(ctx, q, e, r, None);
+                        return;
+                    }
+                }
             }
-            return;
         };
         // A desktop thumbnailer opening an uncached file would download all of
         // it just to render a preview the server already renders. Refuse it —
@@ -3966,7 +4075,12 @@ fn open_continue(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, reply: ReplyOpen,
         }
         probe_max_read = probe;
     }
+    open_continue_classified(ctx, rq, entry, reply, probe_max_read);
+}
 
+/// open() once the caller is classified: allocates the handle, and stages the
+/// current content for a writable open.
+fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, reply: R, probe_max_read: Option<usize>) {
     let fh = next_fh(ctx);
 
     // Pin the cached-copy freshness for this handle's lifetime (see OpenFile).
@@ -4012,32 +4126,76 @@ fn open_continue(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, reply: ReplyOpen,
         open_finish(ctx, rq, entry, fh, cache_fresh, Some(wp), false, None, reply);
         return;
     };
+    // Register the handle *before* staging, on this thread. The kernel does not
+    // hold the parent's lock across ->open, so an unlink or rename of the file
+    // can run while it is being downloaded; both only update handles they find
+    // in `open_files`. Registered afterwards (what this did), the handle missed
+    // them: release then PUT a deleted file back, or wrote to the old path. The
+    // handle is safe to expose early: it is not dirty, so no size overlay or
+    // commit reads the half-filled staging file, and no read, write or release
+    // can name it before the kernel gets the reply.
+    let path = rq.path.clone();
+    let undo = OpenUndo { ctx: ctx.clone(), fh, wp: wp.clone(), armed: true };
+    let grant = open_register(ctx, rq, entry, fh, cache_fresh, Some(wp.clone()), true, None, &reply);
     // Downloading can take DOWNLOAD_TIMEOUT and copying a large kept file is
     // disk-bound: either way, not on the dispatch thread.
     let worker_ctx = ctx.clone();
-    let queued = bg::READ.submit_owning((reply, rq, entry, wp), move |(reply, rq, entry, wp)| {
+    let queued = bg::READ.submit_owning((undo, reply, grant), move |(mut undo, reply, grant)| {
         let staged = match seed_from {
             Some(local) => std::fs::copy(&local, &wp).map(|_| ()).map_err(|e| e.to_string()),
             None => std::fs::File::create(&wp)
                 .map_err(|e| e.to_string())
-                .and_then(|dest| open_file_timeout(&worker_ctx.conn, rq.path.clone(), dest, Some(worker_ctx.transfer_map.clone()))),
+                .and_then(|dest| open_file_timeout(&worker_ctx.conn, path.clone(), dest, Some(worker_ctx.transfer_map.clone()))),
         };
         if let Err(e) = staged {
-            log::error!("open: cannot stage current content of {} for writing: {}", rq.path.display(), e);
-            let _ = std::fs::remove_file(&wp);
+            log::error!("open: cannot stage current content of {} for writing: {}", path.display(), e);
+            drop(undo);
             reply.error(Errno::EIO);
             return;
         }
-        open_finish(&worker_ctx, rq, entry, fh, cache_fresh, Some(wp), true, None, reply);
+        undo.armed = false;
+        reply.opened(fh, grant);
     });
-    if let Err((_, (reply, _, _, _))) = queued {
+    if let Err((_, (undo, reply, _))) = queued {
+        drop(undo);
         reply.error(Errno::EAGAIN);
+    }
+}
+
+/// Takes back a handle registered for an open that is then not answered with
+/// it (staging failed, the pool refused the job, or the job panicked): the
+/// entry in `open_files`, the writer count, the parent pin, the io mode and
+/// the staging file. Disarmed once the kernel has been given the handle, after
+/// which release() does all of this.
+struct OpenUndo {
+    ctx: MetaCtx,
+    fh: u64,
+    wp: PathBuf,
+    armed: bool,
+}
+
+impl Drop for OpenUndo {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let removed = self.ctx.open_files.safe_lock().remove(&self.fh);
+        if let Some(of) = removed {
+            if of.writer {
+                self.ctx.open_writers.fetch_sub(1, Ordering::Relaxed);
+            }
+            if let Some(ref parent) = of.pinned_parent {
+                self.ctx.cache.safe_lock().unpin_dir(parent);
+            }
+            self.ctx.io_modes.safe_lock().release(of.ino, of.io_kind);
+        }
+        let _ = std::fs::remove_file(&self.wp);
     }
 }
 
 /// Registers the handle and answers the kernel.
 #[allow(clippy::too_many_arguments)]
-fn open_finish(
+fn open_finish<R: OpenAnswer>(
     ctx: &MetaCtx,
     rq: OpenReq,
     entry: OpenEntry,
@@ -4046,8 +4204,26 @@ fn open_finish(
     write_path: Option<PathBuf>,
     seeded: bool,
     probe_max_read: Option<usize>,
-    reply: ReplyOpen,
+    reply: R,
 ) {
+    let grant = open_register(ctx, rq, entry, fh, cache_fresh, write_path, seeded, probe_max_read, &reply);
+    reply.opened(fh, grant);
+}
+
+/// Decides the handle's I/O mode and registers it in `open_files`; the caller
+/// answers the kernel with the grant.
+#[allow(clippy::too_many_arguments)]
+fn open_register<R: OpenAnswer>(
+    ctx: &MetaCtx,
+    rq: OpenReq,
+    entry: OpenEntry,
+    fh: u64,
+    cache_fresh: bool,
+    write_path: Option<PathBuf>,
+    seeded: bool,
+    probe_max_read: Option<usize>,
+    reply: &R,
+) -> iomode::IoGrant<BackingId> {
     // Intercept GLib 2.80+ magic-byte detection opens. See the doc-comment on
     // mime_magic_bytes() for the full explanation. Summary: GLib opens files with
     // O_NOATIME when it cannot determine the MIME type from the extension alone.
@@ -4092,7 +4268,6 @@ fn open_finish(
             && ctx.conn.passthrough_enabled.load(Ordering::Relaxed)
             && ctx.conn.passthrough_capable.load(Ordering::Relaxed)
         {
-            let reply = &reply;
             rq.local.as_ref().and_then(|lp| {
                 let file = iomode::FileId::of(&std::fs::metadata(lp).ok()?);
                 Some((file, move || std::fs::File::open(lp).and_then(|f| reply.open_backing(f))))
@@ -4152,31 +4327,81 @@ fn open_finish(
             pinned_parent: None,
         },
     );
-    // io_modes keeps the BackingId alive until the inode's last passthrough
-    // handle is released (the crate warns dropping it right after replying
-    // can make the kernel return EIO).
-    match grant {
-        iomode::IoGrant::Passthrough(id) => reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &id),
-        iomode::IoGrant::Cached => reply.opened(FileHandle(fh), FopenFlags::empty()),
-        iomode::IoGrant::DirectIo => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
-    }
+    grant
 }
 
 /// Registers an open handle. A writable one is counted so `getattr` knows to
 /// overlay the size of its unsent writes (`overlay_local_size`), and its
 /// parent listing is pinned against eviction until release.
+///
+/// May run on a worker while rename() runs on the dispatch thread, so the
+/// handle is inserted first and only then checked against where the inode
+/// lives now: a rename that already moved the inode is picked up here, and
+/// one that has not reached `open_files` yet finds the handle there. The
+/// two locks are taken one after the other, never nested — rename nests
+/// `cache` → `open_files` and write nests the other way round, and a worker
+/// holding either while taking the other could deadlock against them.
 fn insert_open_file(ctx: &MetaCtx, fh: u64, mut of: OpenFile) {
     of.writer = of.write_path.is_some();
     if of.writer {
         ctx.open_writers.fetch_add(1, Ordering::Relaxed);
     }
+    let (ino, opened_as) = (of.ino, of.remote_path.clone());
+    ctx.open_files.safe_lock().insert(fh, of);
     // Keep the parent listing resident while the file is open: every stat,
     // write-size overlay and re-open resolves against it.
-    if let Some(parent) = of.remote_path.parent() {
-        ctx.cache.safe_lock().pin_dir(parent);
-        of.pinned_parent = Some(parent.to_path_buf());
+    let now_at = {
+        let mut c = ctx.cache.safe_lock();
+        let now_at = c.get_path(ino).unwrap_or_else(|| opened_as.clone());
+        if let Some(parent) = now_at.parent() {
+            c.pin_dir(parent);
+        }
+        now_at
+    };
+    let mut files = ctx.open_files.safe_lock();
+    match files.get_mut(&fh) {
+        Some(of) => {
+            // Changed meanwhile means rename() already retargeted the handle.
+            if of.remote_path == opened_as {
+                of.remote_path = now_at.clone();
+            }
+            of.pinned_parent = now_at.parent().map(Path::to_path_buf);
+        }
+        None => {
+            drop(files);
+            if let Some(parent) = now_at.parent() {
+                ctx.cache.safe_lock().unpin_dir(parent);
+            }
+        }
     }
-    ctx.open_files.safe_lock().insert(fh, of);
+}
+
+/// unlink() of `path`: a handle still open on it must not re-create the file
+/// when it is released.
+fn mark_unlinked(open_files: &Mutex<HashMap<u64, OpenFile>>, path: &Path) {
+    for of in open_files.safe_lock().values_mut() {
+        if of.remote_path == path {
+            of.unlinked = true;
+        }
+    }
+}
+
+/// rename() of `from` to `to`: handles open under the source now commit to the
+/// destination. True if one of them was made by create() and not uploaded
+/// yet, i.e. the server has no copy of the source to MOVE.
+fn retarget_open_files(open_files: &Mutex<HashMap<u64, OpenFile>>, from: &Path, to: &Path) -> bool {
+    let mut uncommitted_source = false;
+    for of in open_files.safe_lock().values_mut() {
+        if let Ok(suffix) = of.remote_path.strip_prefix(from) {
+            if suffix.as_os_str().is_empty() {
+                uncommitted_source |= of.created && !of.unlinked;
+                of.remote_path = to.to_path_buf();
+            } else {
+                of.remote_path = to.join(suffix);
+            }
+        }
+    }
+    uncommitted_source
 }
 
 /// What `lookup` hands the kernel and the IPC maps for one found entry.
@@ -6026,44 +6251,8 @@ impl Filesystem for NextCloudFs {
         let rq = OpenReq { ino: ino.0, flags: flags.0, pid: req.pid(), writable, truncating, path, local };
         match listed {
             Some(entry) => open_continue(&self.meta(), rq, entry, reply, false),
-            // The parent listing was evicted. A writable open stages the file's
-            // current content, so it has to know the file's size and etag:
-            // assuming "empty" (what this did) left the staging file unseeded,
-            // and an O_APPEND or in-place write then uploaded a zero-filled
-            // prefix over the real content — with no etag for If-Match to catch
-            // it. Resolve the parent first, off the dispatch thread.
-            // A read-only open of a *kept* copy is the other case that needs the
-            // listing: without it there is no etag to compare, and a stale kept
-            // copy was served as fresh. Uncached read-only opens take only hints
-            // from the listing, so they don't wait for one.
-            None if writable || rq.local.is_some() => {
-                self.with_child(
-                    rq.pid,
-                    &rq.path.clone(),
-                    (reply, rq),
-                    |_, _, e| OpenEntry::of(e),
-                    |_| None,
-                    |ctx, _, (reply, rq), r| match r {
-                        Resolved::Found(entry) => open_continue(ctx, rq, entry, reply, false),
-                        // Not on the server: nothing to seed from.
-                        Resolved::Absent => open_continue(ctx, rq, OpenEntry::default(), reply, false),
-                        // A truncating open discards the content anyway, and a
-                        // read-only open of a kept copy keeps working offline
-                        // (served as before, from the copy we have).
-                        Resolved::Unknown(_) if rq.truncating || !rq.writable => {
-                            open_continue(ctx, rq, OpenEntry::default(), reply, false)
-                        }
-                        // Anything else would be the zero-filled upload again.
-                        Resolved::Unknown(e) => {
-                            log::warn!("open: {} for writing — its parent listing is unavailable, refusing rather than staging it empty", rq.path.display());
-                            reply.error(unknown_child_errno(e.as_deref()));
-                        }
-                    },
-                );
-            }
-            // A read-only open takes only hints from the listing (the sniffing
-            // content type falls back to octet-stream), as before.
-            None => open_continue(&self.meta(), rq, OpenEntry::default(), reply, false),
+            // The parent listing was evicted (see `open_unlisted`).
+            None => open_unlisted(&self.meta(), rq, reply),
         }
     }
 
@@ -7527,11 +7716,7 @@ impl Filesystem for NextCloudFs {
         }
 
         // A handle still open on the deleted file must not re-create it when it is released.
-        for of in self.open_files.safe_lock().values_mut() {
-            if of.remote_path == remote_path {
-                of.unlinked = true;
-            }
-        }
+        mark_unlinked(&self.open_files, &remote_path);
 
         let seq = self.journal.safe_lock().enqueue(
             mutation_journal::MutationOp::Unlink { path: remote_path.clone() },
@@ -7805,9 +7990,11 @@ impl Filesystem for NextCloudFs {
                 // flush() does its synchronous update — which may not have run yet.  Read
                 // the staging file's actual size so the optimistic update shows the right
                 // byte count immediately.
+                // Only a handle that changed the file: a clean one's staging file
+                // holds the server's content, possibly still being downloaded.
                 let staged_size = self.open_files.safe_lock()
                     .values()
-                    .find(|of| of.remote_path == from)
+                    .find(|of| of.remote_path == from && (of.dirty || of.created))
                     .and_then(|of| of.write_path.as_ref())
                     .and_then(|wp| std::fs::metadata(wp).ok())
                     .map(|m| m.len());
@@ -7823,17 +8010,7 @@ impl Filesystem for NextCloudFs {
                     dir.files = Arc::new(files);
                 }
             }
-            // Keep the inode-to-path map consistent with the rename. Without this,
-            // getattr(ino) resolves the inode to the old source path, finds nothing in
-            // dir_cache, and returns ENOENT — causing the renamed file to disappear.
-            if let Some(ino) = c.paths.remove(&from) {
-                c.inodes.insert(ino, to.clone());
-                if let Some(displaced) = c.paths.insert(to.clone(), ino) {
-                    if displaced != ino {
-                        c.inodes.remove(&displaced);
-                    }
-                }
-            }
+            c.move_inode(&from, &to);
         }
         // Keep in-memory maps consistent with the rename so DETAILDIR/STATUS reflect the new
         // path immediately, without waiting for the next readdir of either directory.
@@ -7870,20 +8047,7 @@ impl Filesystem for NextCloudFs {
 
         // Handles still open under the source now commit to the destination. One made by
         // create() means the server has no copy of the source yet, so there is nothing to MOVE.
-        let mut uncommitted_source = false;
-        {
-            let mut files = self.open_files.safe_lock();
-            for of in files.values_mut() {
-                if let Ok(suffix) = of.remote_path.strip_prefix(&from) {
-                    if suffix.as_os_str().is_empty() {
-                        uncommitted_source |= of.created && !of.unlinked;
-                        of.remote_path = to.clone();
-                    } else {
-                        of.remote_path = to.join(suffix);
-                    }
-                }
-            }
-        }
+        let uncommitted_source = retarget_open_files(&self.open_files, &from, &to);
         if uncommitted_source && !self.journal.safe_lock().has_pending_put(&from) {
             log::info!("rename {} → {}: source not uploaded yet — retargeted, no MOVE needed", from.display(), to.display());
             let mut c = self.cache.safe_lock();
