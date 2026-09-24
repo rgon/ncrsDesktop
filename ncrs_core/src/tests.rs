@@ -4242,6 +4242,88 @@ mod upload_order_tests {
             let _ = child.wait();
         }
 
+        #[test]
+        fn staging_follows_a_rename_and_skips_an_unlinked_file() {
+            let (fake, meta, _tmp, ino) = open_setup(vec![], true);
+            fake.files.lock().unwrap().insert(PathBuf::from("/e/a.txt"), (b"moved".to_vec(), Duration::ZERO));
+            // Renamed while open() resolved it: registered at, and staged from, the new path.
+            meta.cache.safe_lock().move_inode(Path::new("/d/a.txt"), Path::new("/e/a.txt"));
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            {
+                let files = meta.open_files.safe_lock();
+                assert_eq!(std::fs::read(files[&fh].write_path.as_ref().unwrap()).unwrap(), b"moved", "staged the old path's content");
+            }
+            release_bookkeeping(&meta, fh);
+            // Its MOVE has not reached the server yet: staged from where it was.
+            meta.cache.safe_lock().move_inode(Path::new("/e/a.txt"), Path::new("/f/a.txt"));
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            {
+                let files = meta.open_files.safe_lock();
+                assert_eq!(files[&fh].remote_path, PathBuf::from("/f/a.txt"));
+                assert_eq!(std::fs::read(files[&fh].write_path.as_ref().unwrap()).unwrap(), b"hello");
+            }
+            release_bookkeeping(&meta, fh);
+            meta.cache.safe_lock().move_inode(Path::new("/f/a.txt"), Path::new("/d/a.txt"));
+
+            // Unlinked while open() resolved it: the resident listing no longer has
+            // the name. The handle is born unlinked (release will not PUT it back),
+            // and there is nothing to download.
+            meta.cache.safe_lock().dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(vec![]);
+            fake.files.lock().unwrap().clear();
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            {
+                let files = meta.open_files.safe_lock();
+                assert!(files[&fh].unlinked, "release would re-create the deleted file");
+                assert_eq!(std::fs::metadata(files[&fh].write_path.as_ref().unwrap()).unwrap().len(), 0);
+            }
+            release_bookkeeping(&meta, fh);
+
+            // A name whose upload is in flight is not gone, even if a refresh
+            // dropped it from the listing.
+            meta.cache.safe_lock().uploading.insert(PathBuf::from("/d/a.txt"), None);
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY, None), listed(0), r, false);
+            let fh = fh_of(rx.try_recv().expect("inline"));
+            assert!(!meta.open_files.safe_lock()[&fh].unlinked);
+            release_bookkeeping(&meta, fh);
+            assert_all_given_back(&meta, ino);
+        }
+
+        #[test]
+        fn a_rename_between_pinning_and_registering_moves_the_pin_with_the_handle() {
+            let (_, meta, tmp, ino) = open_setup(vec![], true);
+            let (r, _rx) = reply();
+            let _ = open_register(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY, None), listed(0), 7, false, Some(tmp.path().join("w7")), false, None, &r);
+            // Replay insert_open_file's steps with rename() running in its window,
+            // where the handle is in `open_files` but has no pin yet.
+            meta.open_files.safe_lock().get_mut(&7).unwrap().pinned_parent = None;
+            meta.cache.safe_lock().unpin_dir(Path::new("/d"));
+            let (now_at, gone) = pin_where_it_lives(&meta, ino, Path::new("/d/a.txt"));
+            assert_eq!((now_at.as_path(), gone), (Path::new("/d/a.txt"), false));
+            {
+                let mut c = meta.cache.safe_lock();
+                c.move_inode(Path::new("/d/a.txt"), Path::new("/e/a.txt"));
+                retarget_open_files(&mut c, &meta.open_files, Path::new("/d/a.txt"), Path::new("/e/a.txt"));
+            }
+            adopt_pin(&meta, 7, Path::new("/d/a.txt"), &now_at, gone);
+            {
+                let files = meta.open_files.safe_lock();
+                assert_eq!(files[&7].remote_path, PathBuf::from("/e/a.txt"));
+                assert_eq!(files[&7].pinned_parent.as_deref(), Some(Path::new("/e")));
+            }
+            let pins = meta.cache.safe_lock().pins.clone();
+            assert_eq!(pins.get(Path::new("/e")), Some(&1), "{pins:?}");
+            assert_eq!(pins.get(Path::new("/d")), None, "the old parent stays pinned: {pins:?}");
+            release_bookkeeping(&meta, 7);
+            assert_all_given_back(&meta, ino);
+        }
+
         // ── Size overlays ───────────────────────────────────────────────────
 
         fn writer(meta: &MetaCtx, fh: u64, path: &str, bytes: usize, unlinked: bool) {
