@@ -93,11 +93,25 @@ are never faulted), `FAULT_DEPTHS` (`1`; `0,1` also fails etag probes),
 `FAULT_PATH_SUBSTR`, `FAULT_ROOT=1`, `FAULT_ARMED=0` (hold faults off until the
 mount is up — needed with `FAULT_ROOT=1`, since a 500 on the mount-time root
 probe makes the daemon exit), `LATENCY_MS`. Gates:
-`MAX_THREADS` (200 = the static `bg::MAX_THREADS` bound + 1, any sample), `IDLE_MAX_THREADS` (60, after idle),
+`MAX_THREADS` (200, any sample; the static `bg::MAX_THREADS` bound is higher), `IDLE_MAX_THREADS` (60, after idle),
 `IDLE_MAX_CPU` (5 %, last 30 s), mount answers `timeout 10 ls`, daemon alive.
 PROPFINDs per unique dir is reported, not gated. Exit 0 = pass. Walk errors are split by errno (ENOENT / EAGAIN / EIO) and the
 summary counts `LIST_BACKOFF`, `SERVER_BREAKER`, `WALKER`, `HEALTH`, `pool full`
 and `CONNECTIVITY lost` log lines.
+
+**Scenario "no-freeze"** (`SCENARIO=nofreeze`): cache misses must never stall the
+FUSE dispatch thread. With a small dir cache (`DIR_CACHE_MAX_DIRS=50`) the crawl
+evicts listings constantly, while `nofreeze.py` holds `probe/hot` open (pinning
+its listing), stats `probe/slowdir/present.txt` in a loop — a directory the proxy
+holds for `SLOW_MS` (`SLOW_PATH_SUBSTR=slowdir`) — and probes the hot file every
+100 ms (stat, a 64 KiB read, `ls`). Extra gates: probe p99 < `PROBE_P99_MS`
+(200), max < `PROBE_MAX_MS` (1000), no probe errors, the slow stat returns
+within `SLOW_STAT_MAX_S` (17 = `PROPFIND_TIMEOUT` + 2 s) and is never ENOENT.
+
+```sh
+NCRS_BIN=target/release/ncrs SCENARIO=nofreeze DIR_CACHE_MAX_DIRS=50 \
+    SLOW_PATH_SUBSTR=slowdir SLOW_MS=20000 WALK_SECS=120 scripts/e2e-walker.sh nofreeze
+```
 
 Results land in `docker/e2e/walker/results/<stamp>-<label>/` (gitignored):
 `timeseries.csv`, `samples.jsonl`, `summary.json`, `faultproxy.log`,

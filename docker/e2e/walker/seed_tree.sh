@@ -107,6 +107,19 @@ while made < target and frontier:
     if not frontier and made < target:
         frontier.append("tree")  # widen the top level again
 
+# 6. Outside the DIRS budget: what the "no-freeze" scenario probes (nofreeze.py).
+#    probe/hot holds a file read every 100 ms; probe/slowdir is the directory
+#    the proxy stalls (SLOW_PATH_SUBSTR=slowdir), holding a file that exists.
+for d in ("probe/hot", "probe/slowdir"):
+    os.makedirs(os.path.join(root, d), exist_ok=True)
+with open(os.path.join(root, "probe/hot/hot.bin"), "wb") as f:
+    f.write(rng.randbytes(256 * 1024))
+for i in range(20):
+    with open(os.path.join(root, "probe/hot/f%02d.txt" % i), "wb") as f:
+        f.write(b"hot %d\n" % i)
+with open(os.path.join(root, "probe/slowdir/present.txt"), "wb") as f:
+    f.write(b"present\n")
+
 with open(os.path.join(root, ".walker-seed"), "w") as f:
     f.write("%s/%s/%s/%s" % (os.environ["DIRS"], os.environ["MAX_DEPTH"], os.environ["FILES_PER_DIR"], os.environ["SEED"]))
 print(f"[seed] created {made} dirs ({made * fpd} files) in {time.time() - t0:.1f}s under {root}")

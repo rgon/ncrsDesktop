@@ -28,6 +28,10 @@ Env:
                     like /tree stay listable and a hash-mode walk still reaches
                     the bulk of the tree; 0 = any depth)
   LATENCY_MS        delay added before every proxied reply (default 0)
+  SLOW_PATH_SUBSTR  PROPFINDs whose path contains this are held SLOW_MS before
+                    being forwarded (a listing the server takes forever on; the
+                    "no-freeze" scenario stats into one while probing a hot file)
+  SLOW_MS           hold for SLOW_PATH_SUBSTR matches (default 20000)
   FAULT_ARMED       1 (default) = faults active from the start; 0 = no faults
                     until POST /__arm (run_walker.sh arms after the mount is up,
                     so FAULT_ROOT=1 tests a *running* daemon, not mount-time)
@@ -62,6 +66,8 @@ FAULT_ROOT = os.environ.get("FAULT_ROOT", "0") == "1"
 FAULT_DEPTHS = {d.strip() for d in os.environ.get("FAULT_DEPTHS", "1").split(",") if d.strip()}
 FAULT_MIN_DEPTH = int(os.environ.get("FAULT_MIN_DEPTH", "2") or 0)
 LATENCY_MS = float(os.environ.get("LATENCY_MS", "0") or 0)
+SLOW_PATH_SUBSTR = os.environ.get("SLOW_PATH_SUBSTR", "")
+SLOW_MS = float(os.environ.get("SLOW_MS", "20000") or 0)
 ROOT_PREFIX = os.environ.get("ROOT_PREFIX", "/remote.php/dav/files/testuser")
 QUIET = os.environ.get("QUIET", "0") == "1"
 ARMED = {"on": os.environ.get("FAULT_ARMED", "1") == "1", "at": time.time()}
@@ -91,6 +97,7 @@ class Stats:
             self.inflight = 0
             self.max_inflight = 0
             self.upstream_errors = 0
+            self.slowed = 0
 
     def begin(self, method):
         with self.lock:
@@ -122,10 +129,12 @@ class Stats:
                 "inflight": self.inflight,
                 "max_inflight": self.max_inflight,
                 "upstream_errors": self.upstream_errors,
+                "slowed": self.slowed,
                 "config": {
                     "fault_rate": FAULT_RATE, "fault_mode": FAULT_MODE,
                     "fault_path_substr": FAULT_PATH_SUBSTR, "fault_root": FAULT_ROOT,
                     "latency_ms": LATENCY_MS, "fault_min_depth": FAULT_MIN_DEPTH,
+                    "slow_path_substr": SLOW_PATH_SUBSTR, "slow_ms": SLOW_MS,
                     "fault_depths": sorted(FAULT_DEPTHS), "armed": ARMED["on"], "burst_secs": BURST_SECS,
                     "burst_rate": BURST_RATE,
                 },
@@ -273,6 +282,10 @@ class Handler(BaseHTTPRequestHandler):
                 status = 500
                 self._send_simple(500, "injected fault\n")
                 return
+            if SLOW_PATH_SUBSTR and method == "PROPFIND" and SLOW_PATH_SUBSTR in path:
+                with STATS.lock:
+                    STATS.slowed += 1
+                time.sleep(SLOW_MS / 1000.0)
             status = self._forward(method)
         finally:
             STATS.end(status)

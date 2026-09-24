@@ -230,6 +230,14 @@ def summarize(results, facts_path):
          facts.get("mount_responsive_detail")),
         ("daemon alive at end", bool(facts.get("daemon_alive")), facts.get("daemon_alive")),
     ]
+    nofreeze = None
+    nf_path = os.path.join(results, "nofreeze.json")
+    if os.path.exists(nf_path):
+        with open(nf_path) as f:
+            nofreeze = json.load(f)
+        crit += [("no-freeze: " + n, ok, v) for n, ok, v in nofreeze["criteria"]]
+    elif os.environ.get("SCENARIO") == "nofreeze":
+        crit.append(("no-freeze: nofreeze.json written", False, None))
     passed = all(ok for _, ok, _ in crit)
     walk = facts.get("walk") or {}
     elapsed = walk.get("elapsed_s") or 0
@@ -255,6 +263,7 @@ def summarize(results, facts_path):
         "seeded_dirs": seeded,
         "walk": facts.get("walk"),
         "log_counts": facts.get("log_counts"),
+        "nofreeze": nofreeze,
     }
     with open(os.path.join(results, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
@@ -286,6 +295,11 @@ def summarize(results, facts_path):
     print("  -- top PROPFIND paths")
     for e in (ps.get("top_propfind_paths") or [])[:10]:
         print("    %6d  %s" % (e["count"], e["path"]))
+    if nofreeze:
+        print("  no-freeze probes    : n=%s p50=%sms p99=%sms max=%sms errors=%s; slow stats n=%s max=%ss %s"
+              % (nofreeze["probes"], nofreeze["probe_p50_ms"], nofreeze["probe_p99_ms"], nofreeze["probe_max_ms"],
+                 nofreeze["probe_errors"], nofreeze["slow_stats"], nofreeze["slow_stat_max_s"],
+                 json.dumps(nofreeze["slow_stat_outcomes"])))
     print("  -- criteria")
     for n, ok, v in crit:
         print("    [%s] %s  (value: %s)" % ("PASS" if ok else "FAIL", n, v))
