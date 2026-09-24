@@ -672,9 +672,16 @@ impl MutationJournal {
     pub fn enqueue(&mut self, op: MutationOp) -> SeqId {
         self.coalesce_before_enqueue(&op);
 
+        // Earlier uploads and directory changes follow the file to its new
+        // name. Earlier Renames do not: each is a MOVE the server has yet to
+        // make, in the names of its own time. Rewritten, `mv a b; mv b c`
+        // replayed as MOVE a→c then b→c (404), and `mv d/f e/f; mv e k`
+        // moved into a /k that did not exist yet.
         if let MutationOp::Rename { ref from, ref to } = op {
             for entry in &mut self.entries {
-                entry.op.update_path_prefix(from, to);
+                if !matches!(entry.op, MutationOp::Rename { .. }) {
+                    entry.op.update_path_prefix(from, to);
+                }
             }
         }
 
@@ -742,16 +749,22 @@ impl MutationJournal {
     }
 
     /// Where the server still has what this mount renamed to `path`, itself
-    /// or with a directory above it: the source of the oldest queued Rename
-    /// ending at `path` or at one of its ancestors (a later rename rewrote an
-    /// earlier one's destination, so the oldest names the server's path).
+    /// or with a directory above it, while none of the queued Renames has
+    /// landed: each one is undone, newest to oldest (`mv d e; mv e/f g/f`
+    /// puts `/g/f` at `/d/f` on the server). None when no queued Rename
+    /// moved it.
     pub fn rename_source_of(&self, path: &Path) -> Option<PathBuf> {
-        self.entries.iter().find_map(|e| match &e.op {
-            MutationOp::Rename { from, to } => path.strip_prefix(to).ok().map(|rest| {
-                if rest.as_os_str().is_empty() { from.clone() } else { from.join(rest) }
-            }),
-            _ => None,
-        })
+        let mut at = path.to_path_buf();
+        let mut moved = false;
+        for e in self.entries.iter().rev() {
+            if let MutationOp::Rename { from, to } = &e.op {
+                if let Ok(rest) = at.strip_prefix(to) {
+                    at = if rest.as_os_str().is_empty() { from.clone() } else { from.join(rest) };
+                    moved = true;
+                }
+            }
+        }
+        moved.then_some(at)
     }
 
     pub fn len(&self) -> usize {
@@ -1775,6 +1788,29 @@ mod tests {
         assert_eq!(j.pending_put_staging(Path::new("/f.txt")), Some(staging2));
         assert_ne!(j.pending_put_staging(Path::new("/f.txt")), Some(staging));
         assert!(j.contains(stream));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rename_source_is_found_across_every_queued_rename() {
+        let dir = temp_dir("rename_hops");
+        let mut j = MutationJournal::load_or_create(&dir);
+        let mv = |j: &mut MutationJournal, a: &str, b: &str| j.enqueue(MutationOp::Rename { from: PathBuf::from(a), to: PathBuf::from(b) });
+        // A directory, then a file out of it.
+        mv(&mut j, "/d", "/e");
+        mv(&mut j, "/e/f", "/g/f");
+        assert_eq!(j.rename_source_of(Path::new("/g/f")), Some(PathBuf::from("/d/f")));
+        assert_eq!(j.rename_source_of(Path::new("/e/h")), Some(PathBuf::from("/d/h")));
+        assert_eq!(j.rename_source_of(Path::new("/x")), None);
+        // A file renamed twice; its first MOVE keeps its own names.
+        mv(&mut j, "/a", "/b");
+        mv(&mut j, "/b", "/c");
+        assert_eq!(j.rename_source_of(Path::new("/c")), Some(PathBuf::from("/a")));
+        assert!(j.entries().iter().any(|e| matches!(&e.op, MutationOp::Rename { from, to } if from == Path::new("/a") && to == Path::new("/b"))));
+        // A file renamed inside a directory that is then renamed.
+        mv(&mut j, "/p/f", "/p/g");
+        mv(&mut j, "/p", "/q");
+        assert_eq!(j.rename_source_of(Path::new("/q/g")), Some(PathBuf::from("/p/f")));
         let _ = fs::remove_dir_all(&dir);
     }
 
