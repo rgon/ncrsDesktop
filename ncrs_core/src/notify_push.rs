@@ -16,7 +16,7 @@ const CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(10);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const REFRESH_DEBOUNCE: Duration = Duration::from_secs(3);
 /// How many directories a notify-push event refreshes concurrently.
-const PROACTIVE_REFRESH_WIDTH: usize = 4;
+const PROACTIVE_REFRESH_WIDTH: usize = crate::bg::REFRESH_SCOPE_WIDTH;
 pub(crate) const REFRESH_DEBOUNCE_NO_CHANGE: Duration = Duration::from_secs(30);
 
 pub(crate) fn debounce_cooldown(had_changes: bool) -> Duration {

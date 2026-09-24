@@ -209,8 +209,11 @@ pub fn search_filtered(
 
     let mut results: Vec<SearchResultGroup> = Vec::new();
 
+    // At most SEARCH_WIDTH providers at once: a server can register a dozen or
+    // more, and one scoped thread each per keystroke is not a bounded fan-out.
+    for batch in providers.chunks(crate::bg::SEARCH_WIDTH) {
     std::thread::scope(|s| {
-        let handles: Vec<_> = providers
+        let handles: Vec<_> = batch
             .iter()
             .map(|p| {
                 let pid = p.id.clone();
@@ -266,6 +269,7 @@ pub fn search_filtered(
             }
         }
     });
+    }
 
     Ok(results)
 }

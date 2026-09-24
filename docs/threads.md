@@ -2,7 +2,7 @@
 
 Every OS thread the daemon creates comes from [`ncrs_core/src/bg.rs`](../ncrs_core/src/bg.rs). It is either a worker of one of the fixed pools below or one of the named long-lived services. `std::thread::spawn` is banned everywhere else by `ncrs_core/clippy.toml`, and CI enforces this with `clippy -D clippy::disallowed_methods`. `std::thread::scope` stays allowed, because it joins its threads before returning.
 
-This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps + `MAX_SERVICES` (24) + the main thread + reqwest's runtime threads (≤ 8), which is **199**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
+This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (166) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 50) + the main thread + reqwest's runtime threads (≤ 8), which is **249**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
 
 Why this matters: 0.1.76 spawned a detached thread per FUSE request and per background revalidation, and took its concurrency permit *inside* the thread. During a `find /` over a server answering 500, 9,800 of those threads parked on a 10-slot throttle. The daemon reached 10,160 threads and ~900 load average (2026-09-24; see `docs/plans/2026-09-24-thread-leak-5xx-walker.md`).
 
@@ -58,6 +58,16 @@ graph LR
 | `health-log` | `mount_ncfs` | shutdown |
 | `ipc-state` | `ipc::start_ipc_server` | process exit |
 | `ipc-accept` | `ipc::start_ipc_server` | process exit |
+
+## Scoped fan-outs (`std::thread::scope`, joined before returning)
+
+| Where | Width | Bound |
+|---|---|---|
+| thumbnail batch (`preview.rs`) | `THUMB_SCOPE_WIDTH` 8 | per `thumb` worker → 16 |
+| keep a folder offline (`keep_locally_recursive`) | `KEEP_SCOPE_WIDTH` 2 | per `user` worker → 8 |
+| boot file-cache validation (`bg::run_chunked`) | `BOOT_SCOPE_WIDTH` 16 | once at mount |
+| notify-push proactive refresh (`bg::run_chunked`) | `REFRESH_SCOPE_WIDTH` 4 | one event at a time |
+| unified search providers (`search.rs`) | `SEARCH_WIDTH` 6 | per search |
 
 ## Rules
 

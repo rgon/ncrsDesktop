@@ -70,7 +70,7 @@ const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 // Server-cached previews (has_preview=true) are pre-generated JPEGs served as static
 // files — cheap for the server. Fetch up to 8 concurrently with only a tiny gap
 // between batches so we race ahead of Nautilus's per-file thumbnail checks.
-const THUMB_BATCH: usize = 8;
+const THUMB_BATCH: usize = crate::bg::THUMB_SCOPE_WIDTH;
 const THUMB_BATCH_GAP_MS: u64 = 100;
 // On-demand RAW preview generation (nc:has-preview=false) is expensive server-side
 // (ImageMagick decoding). Process one at a time and pause between requests so the
