@@ -1437,7 +1437,7 @@ enum InOrder {
     /// Claimed, and nothing older about its files is queued: run it now.
     Run,
     /// Gone (superseded, coalesced away, done) or already claimed, by the
-    /// replay or another worker.
+    /// replay or another worker; also when the entry leaves while it waits.
     Skip,
     /// Older entries of its files were still queued when the wait ran out:
     /// the claim is given back, and the FIFO replay runs it after them.
@@ -1460,6 +1460,14 @@ fn claim_in_order(journal: &mutation_journal::SharedJournal, seq: mutation_journ
     let deadline = Instant::now() + within;
     let mut logged = false;
     loop {
+        // Its entry can leave while it waits (the claim keeps a supersede or
+        // coalesce from dropping it, but not a GUI-side replace): then there
+        // is nothing to run, and `earlier_related` of a missing entry would
+        // say nothing older is left and run it anyway, out of order.
+        if !journal.safe_lock().contains(seq) {
+            log::debug!("{} {}: its queued entry is gone — nothing to send", what, paths[0].display());
+            return InOrder::Skip;
+        }
         let waiting = busy() || journal.safe_lock().earlier_related(seq, paths);
         if !waiting {
             return InOrder::Run;
