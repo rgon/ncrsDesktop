@@ -5917,7 +5917,7 @@ mod upload_order_tests {
             let put = off.save("/a", "A2", None);
             let (r, ran, landed) = std::thread::scope(|sc| {
                 let worker = sc.spawn(|| {
-                    let r = claim_in_order(&off.journal, put, &[Path::new("/a")], || false, "PUT", Duration::from_secs(10));
+                    let r = claim_in_order(&off.journal, put, &[Path::new("/a")], "PUT", Duration::from_secs(10));
                     (r, Instant::now())
                 });
                 std::thread::sleep(Duration::from_millis(300));
@@ -5933,14 +5933,91 @@ mod upload_order_tests {
             // Unrelated older entries do not hold it up.
             off.rm("/other");
             let b = off.save("/b", "B", None);
-            assert_eq!(claim_in_order(&off.journal, b, &[Path::new("/b")], || false, "PUT", Duration::from_secs(10)), InOrder::Run);
+            assert_eq!(claim_in_order(&off.journal, b, &[Path::new("/b")], "PUT", Duration::from_secs(10)), InOrder::Run);
             // Still blocked when the wait runs out: given back to the replay.
             off.rm("/c");
             let c = off.save("/c", "C", None);
-            assert_eq!(claim_in_order(&off.journal, c, &[Path::new("/c")], || false, "PUT", Duration::from_millis(150)), InOrder::Deferred);
+            assert_eq!(claim_in_order(&off.journal, c, &[Path::new("/c")], "PUT", Duration::from_millis(150)), InOrder::Deferred);
             assert!(off.journal.safe_lock().claim(c), "claimable again, by the replay");
             // Gone or claimed elsewhere: skipped.
-            assert_eq!(claim_in_order(&off.journal, c, &[Path::new("/c")], || false, "PUT", Duration::from_secs(1)), InOrder::Skip);
+            assert_eq!(claim_in_order(&off.journal, c, &[Path::new("/c")], "PUT", Duration::from_secs(1)), InOrder::Skip);
+        }
+
+        #[test]
+        fn a_change_held_up_by_a_server_backoff_is_left_to_the_replay_at_once() {
+            // The DELETE of s was rejected: the replay retries it in a minute.
+            let mut off = Offline::new();
+            off.rm("/s");
+            let rejected = off.journal.safe_lock().peek_front().unwrap().seq;
+            off.journal.safe_lock().mark_failed(rejected, "403".into());
+            let put = off.save("/s", "S", None);
+            let t = Instant::now();
+            assert_eq!(claim_in_order(&off.journal, put, &[Path::new("/s")], "PUT", Duration::from_secs(10)), InOrder::Deferred);
+            assert!(t.elapsed() < Duration::from_secs(1), "held a worker for {:?}", t.elapsed());
+            {
+                let j = off.journal.safe_lock();
+                let e = j.entries().iter().find(|e| e.seq == put).unwrap();
+                assert!(!e.in_flight && e.left_to_replay);
+                assert_eq!(e.last_error, None, "a wait is not an error");
+            }
+            // Behind an unrelated entry backing off: the replay cannot reach
+            // the older DELETE of b either.
+            let mut off = Offline::new();
+            off.mv("/x", "/y");
+            let head = off.journal.safe_lock().peek_front().unwrap().seq;
+            off.journal.safe_lock().mark_failed(head, "403".into());
+            off.rm("/b");
+            let put = off.save("/b", "B", None);
+            let t = Instant::now();
+            assert_eq!(claim_in_order(&off.journal, put, &[Path::new("/b")], "PUT", Duration::from_secs(10)), InOrder::Deferred);
+            assert!(t.elapsed() < Duration::from_secs(1));
+            // Once it lands and the entry left to the replay is at the head,
+            // the replay is asked for.
+            off.journal.safe_lock().remove(head);
+            let delete = off.journal.safe_lock().peek_front().unwrap().seq;
+            let _ = mutation_journal::take_replay_kick();
+            off.journal.safe_lock().remove(delete);
+            assert!(mutation_journal::take_replay_kick(), "the entry left to the replay is at the head: kicked");
+        }
+
+        #[test]
+        fn a_vim_save_and_an_rm_then_create_never_wait_on_the_new_file() {
+            // vim: `mv f f~`, then a new f is written; and `rm g`, then a new
+            // g. The MOVE and the DELETE run at once (the new file's create
+            // guard is no older change of it), and the new file's PUT runs
+            // as soon as they land.
+            let mut off = Offline::new();
+            let last = |off: &Offline| off.journal.safe_lock().entries().back().unwrap().seq;
+            off.mv("/f", "/f~");
+            let mv = last(&off);
+            let put_f = off.save("/f", "F2", None);
+            off.rm("/g");
+            let rm = last(&off);
+            let put_g = off.save("/g", "G2", None);
+            let cases: [(u64, Vec<&Path>, u64, &str); 2] = [
+                (mv, vec![Path::new("/f"), Path::new("/f~")], put_f, "/f"),
+                (rm, vec![Path::new("/g")], put_g, "/g"),
+            ];
+            for (first, paths, put, file) in cases {
+                let t = Instant::now();
+                assert_eq!(claim_in_order(&off.journal, first, &paths, "first", Duration::from_secs(10)), InOrder::Run);
+                assert!(t.elapsed() < Duration::from_millis(500), "the change before the new {file} waited {:?}", t.elapsed());
+                let (r, landed, ran) = std::thread::scope(|sc| {
+                    let worker = sc.spawn(|| {
+                        let r = claim_in_order(&off.journal, put, &[Path::new(file)], "PUT", Duration::from_secs(10));
+                        (r, Instant::now())
+                    });
+                    std::thread::sleep(Duration::from_millis(200));
+                    assert!(!worker.is_finished(), "the new {file} ran ahead of the change before it");
+                    let landed = Instant::now();
+                    off.journal.safe_lock().remove(first);
+                    let (r, ran) = worker.join().unwrap();
+                    (r, landed, ran)
+                });
+                assert_eq!(r, InOrder::Run);
+                assert!(ran.duration_since(landed) < Duration::from_millis(500), "{:?}", ran.duration_since(landed));
+                off.journal.safe_lock().remove(put);
+            }
         }
 
         #[test]
@@ -5950,7 +6027,7 @@ mod upload_order_tests {
             let put = off.save("/x", "X", None);
             let (r, gone, done) = std::thread::scope(|sc| {
                 let worker = sc.spawn(|| {
-                    let r = claim_in_order(&off.journal, put, &[Path::new("/x")], || false, "PUT", Duration::from_secs(10));
+                    let r = claim_in_order(&off.journal, put, &[Path::new("/x")], "PUT", Duration::from_secs(10));
                     (r, Instant::now())
                 });
                 std::thread::sleep(Duration::from_millis(200));
@@ -5975,7 +6052,7 @@ mod upload_order_tests {
             off.mv("/a", "/b");
             let put = off.save("/a", "N", None);
             std::thread::scope(|sc| {
-                let worker = sc.spawn(|| claim_in_order(&off.journal, put, &[Path::new("/a")], || false, "PUT", Duration::from_secs(10)));
+                let worker = sc.spawn(|| claim_in_order(&off.journal, put, &[Path::new("/a")], "PUT", Duration::from_secs(10)));
                 std::thread::sleep(Duration::from_millis(200));
                 off.mv("/a", "/c");
                 off.rm("/c");

@@ -1445,45 +1445,64 @@ enum InOrder {
 }
 
 /// Claims a live worker's own journal entry `seq`, then waits until no
-/// older entry about `paths` is queued (`MutationJournal::earlier_related`)
-/// and `busy()` is false. The replay is FIFO; a live worker is not, and ran
-/// ahead of an offline backlog: `rm a` queued offline, then a live PUT of a
-/// new `a` whose replayed DELETE removed it, or a live MOVE onto a name the
-/// backlog still deletes. The claim keeps the replay from running the entry
-/// a second time while the worker waits (the replay stops at a claimed
-/// entry). Woken by journal changes; `busy` (an `uploading` guard, not
-/// journal state) is looked at every 50 ms and never under the journal lock.
-fn claim_in_order(journal: &mutation_journal::SharedJournal, seq: mutation_journal::SeqId, paths: &[&Path], busy: impl Fn() -> bool, what: &str, within: Duration) -> InOrder {
+/// older entry about `paths` is queued (`MutationJournal::older_state`).
+/// The replay is FIFO; a live worker is not, and ran ahead of an offline
+/// backlog: `rm a` queued offline, then a live PUT of a new `a` whose
+/// replayed DELETE removed it, or a live MOVE onto a name the backlog still
+/// deletes. The claim keeps the replay from running the entry a second time
+/// while the worker waits (the replay stops at a claimed entry).
+///
+/// Only the journal is looked at: every upload this daemon committed is an
+/// older journal entry until it lands, so a file's `uploading` guard adds
+/// nothing, and it also guards the new file of the same name (vim's
+/// `mv f f~` then a new `f`: the MOVE waited on the new f's guard while
+/// that file's PUT waited on the MOVE, 30 s each). Waits only while the
+/// older entry can land soon; one held up by a server backoff leaves this
+/// entry to the replay at once instead of holding a pool thread for 30 s.
+/// A change left to the replay kicks it, so it runs as soon as it can.
+fn claim_in_order(journal: &mutation_journal::SharedJournal, seq: mutation_journal::SeqId, paths: &[&Path], what: &str, within: Duration) -> InOrder {
+    use mutation_journal::Older;
     if !journal.safe_lock().claim(seq) {
         return InOrder::Skip;
     }
     let deadline = Instant::now() + within;
     let mut logged = false;
+    let mut j = journal.safe_lock();
     loop {
         // Its entry can leave while it waits (the claim keeps a supersede or
         // coalesce from dropping it, but not a GUI-side replace): then there
-        // is nothing to run, and `earlier_related` of a missing entry would
-        // say nothing older is left and run it anyway, out of order.
-        if !journal.safe_lock().contains(seq) {
+        // is nothing to run, and an older-entry check of a missing entry
+        // would say nothing older is left and run it anyway, out of order.
+        if !j.contains(seq) {
             log::debug!("{} {}: its queued entry is gone — nothing to send", what, paths[0].display());
             return InOrder::Skip;
         }
-        let waiting = busy() || journal.safe_lock().earlier_related(seq, paths);
-        if !waiting {
-            return InOrder::Run;
-        }
         let now = Instant::now();
-        if now >= deadline {
-            log::warn!("{} {}: older changes of it are still queued after {:?} — left to the replay, which runs them in order", what, paths[0].display(), within);
-            journal.safe_lock().mark_deferred(seq, "waiting for older queued changes".into());
-            return InOrder::Deferred;
+        match j.older_state(seq, paths) {
+            Older::None => return InOrder::Run,
+            Older::Stuck => {
+                log::info!("{} {}: an older queued change of it waits out a server backoff — left to the replay, which runs them in order", what, paths[0].display());
+                j.mark_waiting(seq);
+                return InOrder::Deferred;
+            }
+            Older::Moving if now >= deadline => {
+                log::warn!("{} {}: older changes of it are still queued after {:?} — left to the replay, which runs them in order", what, paths[0].display(), within);
+                j.mark_waiting(seq);
+                drop(j);
+                mutation_journal::kick_replay();
+                return InOrder::Deferred;
+            }
+            Older::Moving => {}
         }
         if !logged {
             log::info!("{} {}: waiting for older queued changes of it to reach the server", what, paths[0].display());
             logged = true;
+            // The older entry may be one nobody is sending (left over from
+            // a replay that stopped at a transient failure).
+            mutation_journal::kick_replay();
         }
-        let j = journal.safe_lock();
-        drop(mutation_journal::MutationJournal::wait_changed(j, (deadline - now).min(Duration::from_millis(50))));
+        // Woken by every journal change; the cap only bounds a missed one.
+        j = mutation_journal::MutationJournal::wait_changed(j, (deadline - now).min(Duration::from_secs(1)));
     }
 }
 
@@ -7626,7 +7645,7 @@ impl Filesystem for NextCloudFs {
             submit_mutation(move || {
                 ticket.wait();
                 // After an older queued RMDIR of the name, or the MKCOL of a parent.
-                if claim_in_order(&journal, seq, &[&remote_path], || false, "MKCOL", LIVE_ORDER_WAIT) != InOrder::Run {
+                if claim_in_order(&journal, seq, &[&remote_path], "MKCOL", LIVE_ORDER_WAIT) != InOrder::Run {
                     return;
                 }
                 let _permit = conn.throttle.acquire();
@@ -7794,10 +7813,11 @@ impl Filesystem for NextCloudFs {
                 // (and similar apps) create a lock file, then delete it a moment later;
                 // its PUT may still be in flight, and Nextcloud's transactional locking
                 // holds the file locked during upload, so a racing DELETE comes back 423.
-                // The enqueue above already coalesced away a still-queued Put, but a Put
-                // already dispatched by flush() lives in the `uploading` guard, so wait on
-                // that too — and on every older queued change of the file (a MOVE onto it).
-                let in_order = claim_in_order(&journal, seq, &[&remote_path], || cache.safe_lock().uploading.contains_key(&remote_path), "DELETE", LIVE_ORDER_WAIT);
+                // The enqueue above coalesced away a Put nobody claimed; one a worker is
+                // sending (or waits to) stays queued until it lands, an older entry like
+                // every other queued change of the file (a MOVE onto it) this waits for.
+                // Not the `uploading` guard: a new file of the same name has one too.
+                let in_order = claim_in_order(&journal, seq, &[&remote_path], "DELETE", LIVE_ORDER_WAIT);
                 if in_order != InOrder::Run {
                     return;
                 }
@@ -7928,7 +7948,7 @@ impl Filesystem for NextCloudFs {
             submit_mutation(move || {
                 ticket.wait();
                 // After every older queued change inside the folder.
-                if claim_in_order(&journal, seq, &[&remote_path], || false, "RMDIR", LIVE_ORDER_WAIT) != InOrder::Run {
+                if claim_in_order(&journal, seq, &[&remote_path], "RMDIR", LIVE_ORDER_WAIT) != InOrder::Run {
                     return;
                 }
                 let _permit = conn.throttle.acquire();
@@ -8092,7 +8112,6 @@ impl Filesystem for NextCloudFs {
             let conn = self.conn.clone();
             let journal = self.journal.clone();
             let elog = self.error_log.clone();
-            let cache = self.cache.clone();
             let uploads = self.uploads.clone();
             let root = Path::new("/");
             let ticket = uploads.seq.ticket(&[
@@ -8104,11 +8123,12 @@ impl Filesystem for NextCloudFs {
             submit_mutation(move || {
                 // Runs after every earlier change to either path, e.g. the source's upload.
                 ticket.wait();
-                // The source may exist on the server only once its upload lands: one
-                // started live holds the `uploading` guard, one behind a backlog (or
-                // queued offline) is an older journal entry, like any other queued
-                // change of either name (a DELETE of `to` must not run after this).
-                let in_order = claim_in_order(&journal, seq, &[&from, &to], || cache.safe_lock().uploading.contains_key(&from), "MOVE", LIVE_ORDER_WAIT);
+                // The source may exist on the server only once its upload lands, and
+                // that upload is an older journal entry until then (live, behind a
+                // backlog or queued offline), like any other queued change of either
+                // name (a DELETE of `to` must not run after this). Not the `uploading`
+                // guard of `from`: vim's `mv f f~` then a new f guards the new file.
+                let in_order = claim_in_order(&journal, seq, &[&from, &to], "MOVE", LIVE_ORDER_WAIT);
                 if in_order != InOrder::Run {
                     return;
                 }
@@ -8571,6 +8591,8 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                         // OFFLINE_READ_GRACE window, and every read and uncached listing
                         // waiting out the blip then times out before the first re-probe.
                         if !currently_offline && offline.load(Ordering::Relaxed) { break; }
+                        // A live change left to the replay (`mutation_journal::kick_replay`).
+                        if !currently_offline && mutation_journal::take_replay_kick() { break; }
                         thread::sleep(Duration::from_secs(1));
                         slept += Duration::from_secs(1);
                     }

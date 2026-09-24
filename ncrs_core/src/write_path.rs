@@ -686,7 +686,7 @@ impl WriteCtx {
         let ticket = uploads.ticket_entry(&remote_path);
         submit_mutation(move || {
             ticket.wait();
-            match crate::claim_in_order(&journal, seq, &[&remote_path], || false, "streamed finish", crate::LIVE_ORDER_WAIT) {
+            match crate::claim_in_order(&journal, seq, &[&remote_path], "streamed finish", crate::LIVE_ORDER_WAIT) {
                 crate::InOrder::Run => {}
                 crate::InOrder::Skip => {
                     log::debug!("streamed finish of {} skipped — superseded or replayed", remote_path.display());
@@ -857,7 +857,7 @@ impl WriteCtx {
 
             submit_mutation(move || {
                 ticket.wait();
-                match crate::claim_in_order(&journal, seq, &[&remote_path], || false, "PUT", crate::LIVE_ORDER_WAIT) {
+                match crate::claim_in_order(&journal, seq, &[&remote_path], "PUT", crate::LIVE_ORDER_WAIT) {
                     crate::InOrder::Run => {}
                     crate::InOrder::Skip => {
                         log::debug!("PUT {} skipped — superseded or replayed", remote_path.display());
