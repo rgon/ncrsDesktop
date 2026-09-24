@@ -7794,7 +7794,7 @@ impl Filesystem for NextCloudFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: RenameFlags,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         if let Err(e) = filename_validation::validate(newname) {
@@ -7835,6 +7835,12 @@ impl Filesystem for NextCloudFs {
         let from = old_parent_path.join(&old_name);
         let to = new_parent_path.join(&new_name);
 
+        if let Some(e) = rename_flags_refusal(flags, || rename_target_exists(&self.cache.safe_lock(), &to)) {
+            log::info!("rename {} → {} refused for flags {:?}: {:?}", from.display(), to.display(), flags, e);
+            reply.error(e);
+            return;
+        }
+
         {
             let mut ghosts = self.ghost_entries.safe_lock();
             let matched = {
@@ -7860,48 +7866,7 @@ impl Filesystem for NextCloudFs {
             }
         }
 
-        let uncommitted_source;
-        {
-            let mut c = self.cache.safe_lock();
-            let mut moved_entry = None;
-            if let Some(dir) = c.dir_cache.get_mut(&old_parent_path) {
-                let (keep, removed): (Vec<_>, Vec<_>) = dir.files.iter().cloned().partition(|e| e.path != from);
-                dir.files = Arc::new(keep);
-                moved_entry = removed.into_iter().next();
-            }
-            if let Some(mut entry) = moved_entry {
-                // rename() can arrive at the FUSE dispatcher concurrently with flush() or
-                // even before it (multi-threaded fuser dispatches ops in parallel).  When
-                // the source was just created via create(), its dir-cache size is 0 until
-                // flush() does its synchronous update — which may not have run yet.  Read
-                // the staging file's actual size so the optimistic update shows the right
-                // byte count immediately.
-                if let Some(sz) = staged_size(&self.open_files, &from) {
-                    entry.size = sz;
-                }
-                entry.path = to.clone();
-                if let Some(dir) = c.dir_cache.get_mut(&new_parent_path) {
-                    let mut files = (*dir.files).clone();
-                    // Remove any existing entry for the target path (overwrite semantics).
-                    files.retain(|f| f.path != to);
-                    files.push(entry);
-                    dir.files = Arc::new(files);
-                }
-            }
-            // A file the rename replaces is gone, like an unlinked one: its
-            // open handles must not bring it back over the renamed file.
-            let displaced = c.get_inode(&to).filter(|&d| c.get_inode(&from) != Some(d));
-            if let Some(ino) = displaced {
-                c.tombstones.record(ino);
-            }
-            c.move_inode(&from, &to);
-            // Before the reply: once it is out, a write under the new path
-            // resolves its inode there, and its handle must commit there too.
-            uncommitted_source = retarget_open_files(&mut c, &self.open_files, &from, &to);
-            if let Some(ino) = displaced {
-                mark_unlinked(&self.open_files, &to, Some(ino));
-            }
-        }
+        let uncommitted_source = rename_in_cache(&mut self.cache.safe_lock(), &self.open_files, &from, &to, &old_parent_path, &new_parent_path);
         // Keep in-memory maps consistent with the rename so DETAILDIR/STATUS reflect the new
         // path immediately, without waiting for the next readdir of either directory.
         {
@@ -8021,6 +7986,87 @@ impl Filesystem for NextCloudFs {
                 }
             });
         }
+    }
+}
+
+/// The cache half of rename(), under the cache lock: moves the listing entry
+/// and the inode, records a replaced file as removed and marks its handles
+/// unlinked, and retargets the source's handles. True when one of those was
+/// made by create(), i.e. the server has no copy of the source yet.
+fn rename_in_cache(
+    c: &mut FsCache,
+    open_files: &Arc<Mutex<HashMap<u64, OpenFile>>>,
+    from: &Path,
+    to: &Path,
+    old_parent_path: &Path,
+    new_parent_path: &Path,
+) -> bool {
+    let mut moved_entry = None;
+    if let Some(dir) = c.dir_cache.get_mut(old_parent_path) {
+        let (keep, removed): (Vec<_>, Vec<_>) = dir.files.iter().cloned().partition(|e| e.path != from);
+        dir.files = Arc::new(keep);
+        moved_entry = removed.into_iter().next();
+    }
+    if let Some(mut entry) = moved_entry {
+        // rename() can arrive at the FUSE dispatcher concurrently with flush() or
+        // even before it (multi-threaded fuser dispatches ops in parallel).  When
+        // the source was just created via create(), its dir-cache size is 0 until
+        // flush() does its synchronous update — which may not have run yet.  Read
+        // the staging file's actual size so the optimistic update shows the right
+        // byte count immediately.
+        if let Some(sz) = staged_size(open_files, from) {
+            entry.size = sz;
+        }
+        entry.path = to.to_path_buf();
+        if let Some(dir) = c.dir_cache.get_mut(new_parent_path) {
+            let mut files = (*dir.files).clone();
+            // Remove any existing entry for the target path (overwrite semantics).
+            files.retain(|f| f.path != to);
+            files.push(entry);
+            dir.files = Arc::new(files);
+        }
+    }
+    // A file the rename replaces is gone, like an unlinked one: its
+    // open handles must not bring it back over the renamed file.
+    let displaced = c.get_inode(to).filter(|&d| c.get_inode(from) != Some(d));
+    if let Some(ino) = displaced {
+        c.tombstones.record(ino);
+    }
+    c.move_inode(from, to);
+    // Before the reply: once it is out, a write under the new path
+    // resolves its inode there, and its handle must commit there too.
+    let uncommitted_source = retarget_open_files(c, open_files, from, to);
+    if let Some(ino) = displaced {
+        mark_unlinked(open_files, to, Some(ino));
+    }
+    uncommitted_source
+}
+
+/// What rename() answers for its `flags` before it changes anything, or None
+/// to go ahead. `RENAME_EXCHANGE` is refused: swapping two files needs two
+/// MOVEs the server cannot make atomically, and treating it as a plain
+/// replace deleted `to` on the server. `RENAME_NOREPLACE` is honored against
+/// what this mount knows of `to`. Any other flag (`RENAME_WHITEOUT`, unknown
+/// bits) is refused.
+fn rename_flags_refusal(flags: RenameFlags, to_exists: impl FnOnce() -> bool) -> Option<Errno> {
+    let noreplace = RenameFlags::RENAME_NOREPLACE.bits();
+    if flags.bits() & !noreplace != 0 {
+        return Some(Errno::EINVAL);
+    }
+    if flags.bits() & noreplace != 0 && to_exists() {
+        return Some(Errno::EEXIST);
+    }
+    None
+}
+
+/// Whether this mount knows `to` to exist: its resident listing has it, or,
+/// with no listing resident, it has an inode.
+fn rename_target_exists(c: &FsCache, to: &Path) -> bool {
+    let parent = to.parent().unwrap_or(Path::new("/"));
+    if c.dir_cache.contains_key(parent) {
+        c.find_entry(to).is_some()
+    } else {
+        c.get_inode(to).is_some()
     }
 }
 
