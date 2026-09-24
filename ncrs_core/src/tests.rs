@@ -4307,7 +4307,7 @@ mod upload_order_tests {
                 let e = c.find_child(Path::new("/d"), name).and_then(|(f, i)| i.map(|i| f[i].clone())).unwrap();
                 lookup_pick(&mut c, &Path::new("/d").join(name), &e)
             };
-            assert!(matches!(lookup_commit(&meta, hit(&meta, "f0.txt")), LookupAnswer::Entry(_)));
+            assert!(matches!(lookup_commit(&meta, hit(&meta, "f0.txt"), true), LookupAnswer::Entry(_)));
             assert!(meta.details.safe_read().contains_key(Path::new("/d/f0.txt")));
 
             // Picked, then unlink() edits the listing before the commit.
@@ -4318,7 +4318,7 @@ mod upload_order_tests {
                 c.dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(files);
                 c.deleting.insert(PathBuf::from("/d/f1.txt"));
             }
-            assert!(matches!(lookup_commit(&meta, h), LookupAnswer::Gone));
+            assert!(matches!(lookup_commit(&meta, h, true), LookupAnswer::Gone));
             assert!(!meta.details.safe_read().contains_key(Path::new("/d/f1.txt")));
             assert!(!meta.status.safe_read().contains_key(Path::new("/d/f1.txt")));
             assert!(!meta.children_map.safe_read().get(Path::new("/d")).is_some_and(|s| s.contains(Path::new("/d/f1.txt"))));
@@ -4328,8 +4328,48 @@ mod upload_order_tests {
             meta.ghost_entries.safe_lock().insert(PathBuf::from("/d/f2.txt"), GhostEntry {
                 kind: GhostKind::HiddenAdd, created_at: Instant::now(), rename_pair_id: None,
             });
-            assert!(matches!(lookup_commit(&meta, h), LookupAnswer::Ghost(GhostKind::HiddenAdd)));
+            assert!(matches!(lookup_commit(&meta, h, true), LookupAnswer::Ghost(GhostKind::HiddenAdd)));
             assert!(!meta.details.safe_read().contains_key(Path::new("/d/f2.txt")));
+        }
+
+        #[test]
+        fn a_lookup_committed_after_its_name_was_recreated_answers_the_new_file() {
+            let (_, conn, cache) = setup(vec![]);
+            let with_id = |name: &str, fid: u64, etag: &str| {
+                let mut e = entry_in("/d", name);
+                e.ext.set_int("fileid", fid);
+                e.change_token = Some(etag.into());
+                e
+            };
+            cache.safe_lock().put_dir_cache(PathBuf::from("/d"), None, None, vec![with_id("f.txt", 1, "old")]);
+            let meta = MetaCtx::for_tests(conn, cache, Duration::from_secs(5));
+            let pick = |meta: &MetaCtx| {
+                let mut c = meta.cache.safe_lock();
+                let e = c.find_child(Path::new("/d"), "f.txt").and_then(|(f, i)| i.map(|i| f[i].clone())).unwrap();
+                lookup_pick(&mut c, Path::new("/d/f.txt"), &e)
+            };
+            let h = pick(&meta);
+            let old_ino = h.attr.ino.0;
+            // unlink + re-create between the pick and the commit: a new inode, and
+            // (once uploaded) a new file id and etag.
+            {
+                let mut c = meta.cache.safe_lock();
+                c.paths.remove(Path::new("/d/f.txt"));
+                c.inodes.remove(&old_ino);
+                c.dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(vec![with_id("f.txt", 2, "new")]);
+            }
+            let new_ino = meta.cache.safe_lock().allocate_inode(PathBuf::from("/d/f.txt"));
+            match lookup_commit(&meta, h, true) {
+                LookupAnswer::Entry(attr) => assert_eq!(attr.ino.0, new_ino, "answered with the deleted file's inode"),
+                _ => panic!("the name exists"),
+            }
+            assert_eq!(meta.fileids.safe_read().get(Path::new("/d/f.txt")), Some(&2), "the old file id was published for the new file");
+
+            // Inline (the dispatch thread, which also runs unlink and create) the
+            // pick is final: nothing is looked up again.
+            let h = pick(&meta);
+            meta.cache.safe_lock().dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(vec![]);
+            assert!(matches!(lookup_commit(&meta, h, false), LookupAnswer::Entry(_)));
         }
 
         #[test]
