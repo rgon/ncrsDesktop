@@ -35,6 +35,22 @@ This makes the server generate thumbnails during idle time rather than on-demand
 
 We avoid local thumbnail generation so that entire files don't have to be downloaded for the local thumbnailer to run.
 
+## Note for coding agent users (Claude Code, Codex, Cursor, …)
+Coding agents are not polite to network filesystems. To find a binary or a config file they happily run `find / -name protoc`, `rg pattern ~` or `du -sh ~/*`. Those commands walk into `~/Nextcloud`, and every directory they enter becomes a WebDAV request to your server. Claude Code does not kill a long command: after 2 minutes it moves it to the background, where a single `find /` can crawl your whole Nextcloud for hours (we measured ~20 listings/s and 20,000 folders in 20 minutes). Such a crawl can overload the server into returning `500` errors. ncrs throttles and backs off, but the cheapest request is the one never sent.
+
+Keep agents off the mount by adding the bundled guard hook to your **user-level** Claude Code settings. It refuses `find`/`rg`/`grep -r`/`du`/`fd`/`ls -R`/`tree` walks, and Glob/Grep tool searches, that would descend into the mount from `/` or `~`. It allows them when they stay on one filesystem (`find / -xdev`, `rg --one-file-system`, `du -x`), prune the mount, or target a narrower directory. The refusal message tells the agent how to rewrite the command.
+
+```bash
+mkdir -p ~/.claude/hooks
+curl -fsSLo ~/.claude/hooks/block-root-walks.py \
+  https://raw.githubusercontent.com/rgon/ncrsDesktop/master/scripts/claude-code/block-root-walks.py
+# Merge the hook into ~/.claude/settings.json (keeps your existing settings):
+jq '.hooks.PreToolUse = ((.hooks.PreToolUse // []) + [{"matcher":"Bash|Glob|Grep","hooks":[{"type":"command","command":"python3 ~/.claude/hooks/block-root-walks.py","timeout":10}]}])' \
+  ~/.claude/settings.json > /tmp/claude-settings.json && mv /tmp/claude-settings.json ~/.claude/settings.json
+```
+
+The hook guards `~/Nextcloud` by default. To guard other mount points, set `NCRS_WALK_GUARD_MOUNTS=/path/one:/path/two`. Also consider adding a line like "never recurse from `/` or `~` without `-xdev`; `~/Nextcloud` is a network mount" to your `~/.claude/CLAUDE.md`. Other agents need their own equivalent, such as a command deny-list or rules file.
+
 ## Usage
 Download and install the .deb file from the [/releases](https://github.com/rgon/ncrsDesktop/releases) page. You may simply double click the `.deb` to install it with your OS's package manager.
 
