@@ -4,6 +4,18 @@ Incident: installed ncrs 0.1.76 (pid 1166451) ran 15h42m, reached **10,160 threa
 (9,800 `fuser-0`), ~950 MB RSS, 52% CPU, load avg ~900. It was killed at 10:46 CEST.
 The snapshot is in the session scratchpad (`cpu_incident/`), and the forensics are in `forensics/`.
 
+## Status — implemented on `fix/thread-bounds-5xx-walkers`
+
+| Phase | State | Where |
+|---|---|---|
+| 0 — stop the trigger | done: user-level PreToolUse hook installed; README "Note for coding agent users"; hook shipped in `scripts/claude-code/` | `README.md`, `scripts/claude-code/block-root-walks.py` |
+| 1 — repro harness | done: fault proxy + 20k-dir tree + walker + /proc sampler. 0.1.76 peaks at **1,401 threads** (1,304 `fuser-0` in futex) under burst 500s + repeated walks, and 487 with no faults | `docker/e2e/walker/`, `scripts/e2e-walker.sh` |
+| 2 — bounded threads | done: `bg.rs` pools/services, `bg::MAX_THREADS` = 249, clippy ban + CI, `docs/threads.md` + CI check; revalidation single-flight + failure debounce; streaming-list orphan fixed; no sleep-poll permits; notifier calls on one worker | `ncrs_core/src/bg.rs`, `lib.rs`, `notify_push.rs`, `preview.rs`, `ipc.rs` |
+| 3 — error semantics | done: typed `PropfindError` → `BackendReadError::{Server,Truncated,…}`; errno from the type (no path substring matching); 5xx never offline (500/429/507 on the probe = reachable); no foreground 5xx retry; per-path cooldown + server breaker; stale served on 5xx; lookup/getattr return EAGAIN not ENOENT; partial listings never cached as complete; quieter per-folder reporting | `propfind.rs`, `nextcloud.rs`, `backend.rs`, `backoff.rs`, `lib.rs` |
+| 4 — walkers | done: pid → `comm←parent` chain, per-pid token bucket for uncached listings (burst 50, 10/s; `NCRS_WALKER_LIMIT=off` to observe only), `WALKER` warning, `HEALTH` IPC + minutely log | `walkers.rs`, `lib.rs`, `ipc.rs` |
+
+Not done, deliberately: moving `lookup`'s rare slow path (parent listing evicted) off `fuser-0` — cooldown answers are now instant, but a first-time slow re-list still blocks dispatch up to 15 s; the body-idle vs total request timeout split; trimming PROPFIND props. Open question 2 (are the 500s deterministic?) needs the server's `nextcloud.log`.
+
 ## 1. What happened (evidence-based)
 
 | Layer | Finding | Evidence |
