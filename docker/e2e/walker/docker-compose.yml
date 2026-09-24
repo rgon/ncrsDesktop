@@ -42,6 +42,9 @@ services:
       LATENCY_MS: ${LATENCY_MS:-0}
       SLOW_PATH_SUBSTR: ${SLOW_PATH_SUBSTR:-}
       SLOW_MS: ${SLOW_MS:-20000}
+      CHUNKING: ${CHUNKING:-0}
+      PUT_BPS: ${PUT_BPS:-0}
+      PUT_LATENCY_MS: ${PUT_LATENCY_MS:-0}
       QUIET: ${PROXY_QUIET:-1}
 
   ncrs:
@@ -67,6 +70,7 @@ services:
       PROBE_P99_MS: ${PROBE_P99_MS:-200}
       PROBE_MAX_MS: ${PROBE_MAX_MS:-1000}
       SLOW_STAT_MAX_S: ${SLOW_STAT_MAX_S:-17}
+      UPLOAD_MB: ${UPLOAD_MB:-200}
       SEEDED_DIRS: ${DIRS:-20000}
       RUN_LABEL: ${RUN_LABEL:-}
     devices:
