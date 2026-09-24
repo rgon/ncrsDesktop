@@ -3722,6 +3722,9 @@ struct MetaCtx {
     // How long a request that has to list its parent may take in all, from
     // submission: CHILD_RESOLVE_DEADLINE (shorter in tests).
     resolve_within: Duration,
+    // Where lookups and opens go when they cannot be answered inline:
+    // `bg::META` (in tests, possibly a pool that refuses every job).
+    meta_pool: &'static bg::Pool,
 }
 
 #[cfg(test)]
@@ -3744,6 +3747,7 @@ impl MetaCtx {
             transfer_map: Arc::new(Mutex::new(HashMap::new())),
             thumbnail: Arc::new(|_| false),
             resolve_within,
+            meta_pool: &bg::META,
         }
     }
 }
@@ -3854,8 +3858,33 @@ fn with_child<R, T, P, A>(
     P: Fn(&mut FsCache, &Path, &RemoteEntry) -> T + Send + 'static,
     A: FnOnce(&MetaCtx, &Path, R, Resolved<T>) + Send + 'static,
 {
+    with_child_within(meta, pid, path, meta.resolve_within, reply, pick, inline_miss, move |ctx, path, reply, r, _| {
+        answer(ctx, path, reply, r)
+    })
+}
+
+/// [`with_child`] with its own bound on a miss (`within`, from submission),
+/// whose `answer` also learns where it runs: `true` on a META worker, after a
+/// wait the dispatch thread did not serialize; `false` inline, on the
+/// caller's thread (a hit, or a refused job).
+#[allow(clippy::too_many_arguments)]
+fn with_child_within<R, T, P, A>(
+    meta: &MetaCtx,
+    pid: u32,
+    path: &Path,
+    within: Duration,
+    reply: R,
+    pick: P,
+    inline_miss: impl FnOnce(&mut FsCache) -> Option<T>,
+    answer: A,
+) where
+    R: Send + 'static,
+    T: 'static,
+    P: Fn(&mut FsCache, &Path, &RemoteEntry) -> T + Send + 'static,
+    A: FnOnce(&MetaCtx, &Path, R, Resolved<T>, bool) + Send + 'static,
+{
     let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
-        answer(meta, path, reply, Resolved::Absent);
+        answer(meta, path, reply, Resolved::Absent, false);
         return;
     };
     let hit = {
@@ -3872,15 +3901,15 @@ fn with_child<R, T, P, A>(
         }
     };
     if let Some(r) = hit {
-        answer(meta, path, reply, r);
+        answer(meta, path, reply, r, false);
         return;
     }
     META_MISSES.fetch_add(1, Ordering::Relaxed);
     let ctx = meta.clone();
     let owned = path.to_path_buf();
     let submitted = Instant::now();
-    let queued = bg::META.submit_owning((reply, pick, answer), move |(reply, pick, answer)| {
-        let deadline = submitted + ctx.resolve_within;
+    let queued = meta.meta_pool.submit_owning((reply, pick, answer), move |(reply, pick, answer)| {
+        let deadline = submitted + within;
         let path = owned.as_path();
         let (dir, name) = (path.parent().unwrap_or(Path::new("/")), path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
         let resolved = resolve_child_slow(&ctx.conn, &ctx.cache, dir, name, pid, deadline);
@@ -3900,10 +3929,10 @@ fn with_child<R, T, P, A>(
                 }
             }
         };
-        answer(&ctx, path, reply, r);
+        answer(&ctx, path, reply, r, true);
     });
     if let Err((_, (reply, _, answer))) = queued {
-        answer(meta, path, reply, Resolved::Unknown(Some(META_REFUSED.to_string())));
+        answer(meta, path, reply, Resolved::Unknown(Some(META_REFUSED.to_string())), false);
     }
 }
 
@@ -4079,17 +4108,13 @@ fn open_continue<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, re
             Some(v) => v,
             None => {
                 let worker_ctx = ctx.clone();
-                let queued = bg::META.submit_owning((reply, rq, entry), move |(reply, rq, entry)| {
+                let queued = ctx.meta_pool.submit_owning((reply, rq, entry), move |(reply, rq, entry)| {
                     open_continue(&worker_ctx, rq, entry, reply, true);
                 });
                 match queued {
                     Ok(()) => return,
-                    // A full pool must not fail a plain `cat` (an undecided
-                    // CmdlineContains matcher sends every uncached read-only
-                    // open here). Proceed as open() did before these checks
-                    // moved off the dispatch thread: no thumbnailer, no probe.
-                    Err((_, (r, q, e))) => {
-                        open_continue_classified(ctx, q, e, r, None);
+                    Err((_, (r, q, _))) => {
+                        open_unclassified(q, r);
                         return;
                     }
                 }
@@ -4115,6 +4140,25 @@ fn open_continue<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: OpenEntry, re
         probe_max_read = probe;
     }
     open_continue_classified(ctx, rq, entry, reply, probe_max_read);
+}
+
+/// open() of an uncached file whose caller could not be classified: the
+/// dispatch thread could not decide it (see `desktop::process::lock_free`)
+/// and `bg::META` refused the job. Getting here means a thumbnailer matcher
+/// or a sniff probe matching these flags (GLib's O_NOATIME) was undecided —
+/// every other open is decided inline — so a plain read would be exactly the
+/// full download the probe and the thumbnailer guard exist to prevent, once
+/// per file of a listing storm that is filling the pool. "Try again" instead:
+/// GLib falls back to the extension-based type, a thumbnailer fails that one
+/// file. Never synthetic bytes: `rsync --open-noatime` and `tar` send the
+/// same flag and must get real content or an error.
+///
+/// Before this, the refusal opened the file as a plain read: not what open()
+/// did before the checks moved off the dispatch thread (then they always ran,
+/// inline), and it brought the per-file downloads back.
+fn open_unclassified<R: OpenAnswer>(rq: OpenReq, reply: R) {
+    log::debug!("open {}: caller not classified (meta pool full) — try again", rq.path.display());
+    reply.error(Errno::EAGAIN);
 }
 
 /// open() once the caller is classified: allocates the handle, and stages the
@@ -5213,6 +5257,7 @@ impl NextCloudFs {
             transfer_map: self.transfer_map.clone(),
             thumbnail: self.thumbnail_callback(),
             resolve_within: CHILD_RESOLVE_DEADLINE,
+            meta_pool: &bg::META,
         })
     }
 
