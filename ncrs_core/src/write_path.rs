@@ -34,6 +34,9 @@ pub(crate) struct WriteCtx {
     pub(crate) auto_keep_locally_modified_files: bool,
     // Where staging files live; fixed for the mount, so no `cache` lock.
     pub(crate) cache_dir: PathBuf,
+    // `bg::UPLOAD` and `bg::DISK`; tests swap in pools that refuse.
+    pub(crate) upload_pool: &'static bg::Pool,
+    pub(crate) disk_pool: &'static bg::Pool,
 }
 
 impl std::ops::Deref for WriteCtx {
@@ -94,6 +97,16 @@ fn seed_staging(local: Option<&Path>, wp: &Path) -> std::io::Result<()> {
 impl WriteCtx {
     /// `write()`: inline when the lane is idle and the write is a plain pwrite
     /// or append, else queued on the handle's lane with its reply.
+    ///
+    /// Only a write classified `Graduate` and running on `upload_pool` may PUT
+    /// a chunk. Any other write that takes the tail past a chunk (it was
+    /// classified before the offline flag or the handle's state changed, or
+    /// the pool refused it and it runs on the caller, possibly `fuser-0`) just
+    /// appends, and the handle's next write, which `write_cost` then classifies
+    /// `Graduate`, sends every full chunk the tail holds. If no write follows,
+    /// release commits the longer tail as the last chunk. So a refusal costs a
+    /// little extra staging disk, never a network wait on the dispatch thread
+    /// and never an error to the writer.
     pub(crate) fn dispatch_write(
         &self,
         fh: u64,
@@ -102,18 +115,20 @@ impl WriteCtx {
         data: &[u8],
         reply: impl FnOnce(Result<u32, Errno>) + Send + 'static,
     ) {
-        let pool: &'static bg::Pool = match self.write_cost(fh, offset, data.len()) {
+        let cost = self.write_cost(fh, offset, data.len());
+        let pool: &'static bg::Pool = match cost {
             WriteCost::Inline => match self.lanes.claim(fh) {
-                Some(_lane) => return reply(self.write_answer(fh, &path, offset, data)),
+                Some(_lane) => return reply(self.write_answer(fh, &path, offset, data, false)),
                 // Behind this handle's work in flight.
-                None => &bg::DISK,
+                None => self.disk_pool,
             },
-            WriteCost::Seed => &bg::DISK,
-            WriteCost::Graduate => &bg::UPLOAD,
+            WriteCost::Seed => self.disk_pool,
+            WriteCost::Graduate => self.upload_pool,
         };
         let (c, data) = (self.clone(), data.to_vec());
-        self.lanes.run(fh, pool, move || {
-            let r = c.write_answer(fh, &path, offset, &data);
+        self.lanes.run(fh, pool, move |ran| {
+            let may_graduate = cost == WriteCost::Graduate && ran == fh_lane::Ran::OnPool;
+            let r = c.write_answer(fh, &path, offset, &data, may_graduate);
             move || reply(r)
         });
     }
@@ -132,7 +147,7 @@ impl WriteCtx {
         }
         // Seeding copies the whole kept file, or the handle has work in flight.
         let c = self.clone();
-        self.lanes.run(fh, &bg::DISK, move || {
+        self.lanes.run(fh, self.disk_pool, move |_| {
             let r = c.truncate_answer(fh, new_size);
             move || then(&c.meta, r)
         });
@@ -148,7 +163,7 @@ impl WriteCtx {
             }
         }
         let c = self.clone();
-        self.lanes.run(fh, &bg::DISK, move || {
+        self.lanes.run(fh, self.disk_pool, move |_| {
             c.flush_answer(fh);
             reply
         });
@@ -162,7 +177,7 @@ impl WriteCtx {
             }
         }
         let c = self.clone();
-        self.lanes.run(fh, &bg::DISK, move || {
+        self.lanes.run(fh, self.disk_pool, move |_| {
             c.fsync_answer(fh);
             reply
         });
@@ -177,7 +192,7 @@ impl WriteCtx {
             return self.release_answer(fh, reply);
         }
         let c = self.clone();
-        self.lanes.run(fh, &bg::DISK, move || {
+        self.lanes.run(fh, self.disk_pool, move |_| {
             c.release_answer(fh, reply);
             || {}
         });
@@ -187,8 +202,10 @@ impl WriteCtx {
         self.cache_dir.join(mutation_journal::staging_file_name(fh))
     }
 
-    /// Picks where a write of `len` bytes at `offset` on `fh` runs. Only a hint
-    /// for choosing a thread: `write_answer` decides again on what it finds.
+    /// Picks where a write of `len` bytes at `offset` on `fh` runs. Decided
+    /// once: `write_answer` may find the handle changed (the offline flag, or a
+    /// write queued ahead of it), but only ever graduates a chunk when this
+    /// said `Graduate` and it runs on the upload pool.
     pub(crate) fn write_cost(&self, fh: u64, offset: u64, len: usize) -> WriteCost {
         let files = self.open_files.safe_lock();
         let Some(of) = files.get(&fh) else { return WriteCost::Inline };
@@ -228,7 +245,10 @@ impl WriteCtx {
     /// Everything `write()` does, on whichever thread its lane runs it. The
     /// handle's state is updated before this returns, so the reply that
     /// follows never reports a write the next request can't see.
-    pub(crate) fn write_answer(&self, fh: u64, path: &Path, offset: u64, data: &[u8]) -> Result<u32, Errno> {
+    ///
+    /// `may_graduate` is false unless this runs on the upload pool: a write
+    /// that fills a chunk without it only appends (see `dispatch_write`).
+    pub(crate) fn write_answer(&self, fh: u64, path: &Path, offset: u64, data: &[u8], may_graduate: bool) -> Result<u32, Errno> {
         let wp = self.ensure_staging(fh, "write")?;
 
         // Bounded chunked streaming: a freshly-written file, written purely
@@ -298,7 +318,7 @@ impl WriteCtx {
             of.dirty = true;
             of.total_written += data.len() as u64;
             let bytes_confirmed = of.chunk_upload.as_ref().map_or(0, |c| c.bytes_confirmed);
-            if of.total_written - bytes_confirmed < webdav_ops::CHUNK_SIZE as u64 {
+            if !may_graduate || of.total_written - bytes_confirmed < webdav_ops::CHUNK_SIZE as u64 {
                 return Ok(data.len() as u32);
             }
             (of.total_written, of.chunk_upload.clone())
