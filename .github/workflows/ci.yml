@@ -80,6 +80,8 @@ jobs:
       - name: Install Rust stable
         if: steps.binary-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Install pnpm
         if: steps.binary-cache.outputs.cache-hit != 'true'
@@ -130,7 +132,7 @@ jobs:
 
       # Thread-creation guard: every ncrs_core thread must come from src/bg.rs
       # (bounded pools). Only this lint is fatal; see ncrs_core/clippy.toml.
-      - name: Check thread creation goes through bg::
+      - name: "Check thread creation goes through bg::"
         if: steps.binary-cache.outputs.cache-hit != 'true'
         env:
           RUSTC_WRAPPER: sccache
