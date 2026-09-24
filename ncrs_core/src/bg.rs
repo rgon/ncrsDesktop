@@ -280,8 +280,23 @@ pub static POOLS: [&Pool; 10] = [&READDIR, &READ, &LISTING, &BACKGROUND, &MUTATI
 /// watcher, IPC accept loop, savers, cleanup. Fixed in number.
 pub const MAX_SERVICES: usize = 24;
 
-/// Every thread the daemon can ever have: pool workers + services + the main
-/// thread + reqwest's internal runtime threads (one per blocking client).
+/// Width of the one-shot `std::thread::scope` fan-outs, which join before
+/// returning and so never outlive their caller:
+pub const THUMB_SCOPE_WIDTH: usize = 8; // per `thumb` worker (preview.rs THUMB_BATCH)
+pub const KEEP_SCOPE_WIDTH: usize = 2; // per `user` worker (keep_locally_recursive)
+pub const BOOT_SCOPE_WIDTH: usize = 16; // boot file-cache validation, once
+pub const REFRESH_SCOPE_WIDTH: usize = 4; // notify-push proactive refresh, one at a time
+pub const SEARCH_WIDTH: usize = 6; // unified-search providers per search
+
+/// Upper bound on scoped threads alive at once (assuming one search at a time).
+pub const MAX_SCOPED_THREADS: usize = THUMB_WORKERS * THUMB_SCOPE_WIDTH
+    + USER_WORKERS * KEEP_SCOPE_WIDTH
+    + BOOT_SCOPE_WIDTH
+    + REFRESH_SCOPE_WIDTH
+    + SEARCH_WIDTH;
+
+/// Every thread the daemon can ever have: pool workers + services + scoped
+/// fan-outs + the main thread + reqwest's internal runtime threads.
 pub const MAX_THREADS: usize = {
     let mut n = 0;
     let mut i = 0;
@@ -289,7 +304,7 @@ pub const MAX_THREADS: usize = {
         n += POOL_SIZES[i];
         i += 1;
     }
-    n + MAX_SERVICES + 1 + MAX_HTTP_CLIENT_THREADS
+    n + MAX_SERVICES + MAX_SCOPED_THREADS + 1 + MAX_HTTP_CLIENT_THREADS
 };
 
 /// reqwest's blocking client runs one runtime thread per client; ncrs builds a
@@ -561,6 +576,6 @@ mod tests {
     #[test]
     fn max_threads_adds_up() {
         let pools: usize = POOLS.iter().map(|p| p.max_workers()).sum();
-        assert_eq!(MAX_THREADS, pools + MAX_SERVICES + 1 + MAX_HTTP_CLIENT_THREADS);
+        assert_eq!(MAX_THREADS, pools + MAX_SERVICES + MAX_SCOPED_THREADS + 1 + MAX_HTTP_CLIENT_THREADS);
     }
 }

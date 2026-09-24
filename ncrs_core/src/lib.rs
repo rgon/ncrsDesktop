@@ -2716,7 +2716,7 @@ fn keep_locally_recursive(
         }
     }
 
-    for chunk in files.chunks(2) {
+    for chunk in files.chunks(bg::KEEP_SCOPE_WIDTH) {
         std::thread::scope(|s| {
             for path in chunk {
                 s.spawn(|| {
@@ -7524,7 +7524,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let file_shutdown = filesystem.shutdown_flag();
             start_service("boot-files", move || {
                 let total = saved_etags.len();
-                let conn_throttle_width = boot_conn.throttle.max;
+                let conn_throttle_width = boot_conn.throttle.max.min(bg::BOOT_SCOPE_WIDTH);
                 log::info!("FILE_CACHE boot validation: checking {} files in parallel", total);
                 let stale = Arc::new(AtomicUsize::new(0));
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = saved_etags.into_iter().map(|(remote_path, entry)| {
