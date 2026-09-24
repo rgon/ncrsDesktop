@@ -1117,6 +1117,39 @@ sleep 3
     && ok "b stays the new a once the replay is done" \
     || no "b changed after the replay (a later MOVE overwrote it) — data loss"
 
+echo "→ 31. vim-style save (mv f f~; new f; rm f~) and rm g; new g land promptly"
+# The live MOVE of f waited on the new f's upload guard while the new f's PUT
+# waited on the MOVE: 30 s each, then both were left to the next replay tick.
+# Same for a DELETE and the new file's guard.
+mkdir -p "$MOUNT/vim31"
+O31="old $(date +%s%N)"
+printf '%s' "$O31" > "$MOUNT/vim31/f"
+printf '%s' "$O31" > "$MOUNT/vim31/g"
+wait_dav_sha vim31/f "$(printf '%s' "$O31" | sha)" 60 || no "baseline vim31/f never synced (setup failed)"
+wait_dav_sha vim31/g "$(printf '%s' "$O31" | sha)" 60 || no "baseline vim31/g never synced (setup failed)"
+t31=$(date +%s)
+mv "$MOUNT/vim31/f" "$MOUNT/vim31/f~"
+N31="new $(date +%s%N)"
+printf '%s' "$N31" > "$MOUNT/vim31/f"
+rm "$MOUNT/vim31/f~"
+rm "$MOUNT/vim31/g"
+printf '%s' "$N31" > "$MOUNT/vim31/g"
+W31="$(printf '%s' "$N31" | sha)"
+if wait_dav_sha vim31/f "$W31" 40 && wait_dav_sha vim31/g "$W31" 40; then
+    e31=$(( $(date +%s) - t31 ))
+    [ "$e31" -lt 20 ] \
+        && ok "both saves reached the server in ${e31}s" \
+        || no "the saves took ${e31}s to reach the server (a live change waited on the new file)"
+else
+    no "the new f / g never reached the server — data loss"
+fi
+wait_dav_gone "vim31/f~" 30 \
+    && ok "the backup f~ is gone from the server" \
+    || no "the backup f~ is still on the server"
+[ "$(fuse_sha vim31/f)" = "$W31" ] && [ "$(fuse_sha vim31/g)" = "$W31" ] \
+    && ok "the mount reads the new f and g" \
+    || no "the mount does not read the new f / g"
+
 stuck=0
 for w in /sys/fs/fuse/connections/*/waiting; do
     [ -r "$w" ] && [ "$(cat "$w")" != 0 ] && stuck=$((stuck + $(cat "$w")))
