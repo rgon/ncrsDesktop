@@ -387,23 +387,43 @@ pub(crate) fn move_to_recovered(cache_dir: &Path, src: &Path, remote_path: Optio
 
 /// Where the startup sweep keeps staging files no journal entry names.
 pub(crate) const RECOVERED_DIR: &str = "recovered";
-const RECOVERED_KEEP_FILES: usize = 64;
-const RECOVERED_KEEP_BYTES: u64 = 2 << 30;
+/// How long `recovered/` keeps a file. Only age evicts: a count or size bound
+/// deleted the oldest kept edit to make room, which could be its only copy.
+const RECOVERED_KEEP_FOR: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// `<staging>.tail`: marks a streamed upload's staging file once the first
+/// chunk has left it, i.e. once it no longer starts at the file's first byte.
+/// Such a tail is worth nothing alone: its earlier chunks are in a server
+/// session only the lost process knew. The startup sweep deletes one it finds
+/// unnamed instead of keeping it in `recovered/`. A staging file whose first
+/// chunk has not been cut from it holds every byte written, and is kept.
+pub(crate) fn tail_marker(staging: &Path) -> PathBuf {
+    staging.with_extension("tail")
+}
 
 /// Startup sweep of `cache_dir`: staging files left by an earlier process
 /// that `journal` does not name. They used to be deleted, but a crash can
 /// leave real edits there — a written file never closed, bytes an `fsync`
 /// made durable (fsync writes no journal record), an upload whose journal
-/// save the crash beat. Non-empty ones are moved to `recovered/` (bounded,
-/// newest kept) and reported once as a conflict; empty ones and partial
-/// temp files carry nothing and are deleted. Returns how many were moved.
+/// save the crash beat. Non-empty ones are moved to `recovered/`, each with a
+/// `.json` note (`RecoveredSidecar`), and reported once as a conflict; empty
+/// ones, partial temp files and streamed-upload tails (`tail_marker`) carry
+/// nothing usable and are deleted. `recovered/` is pruned by age first, so
+/// nothing this sweep adds is evicted by it. Returns how many were moved.
 pub(crate) fn quarantine_unreferenced_staging(journal: &mut MutationJournal, cache_dir: &Path) -> usize {
+    let recovered_dir = cache_dir.join(RECOVERED_DIR);
+    prune_recovered(&recovered_dir, SystemTime::now());
     let named: std::collections::HashSet<PathBuf> =
         journal.entries().iter().filter_map(|e| e.op.staging_path().map(Path::to_path_buf)).collect();
-    let recovered_dir = cache_dir.join(RECOVERED_DIR);
-    let (mut moved, mut deleted) = (Vec::new(), 0usize);
     let Ok(dir_entries) = std::fs::read_dir(cache_dir) else { return 0 };
-    for entry in dir_entries.flatten() {
+    let dir_entries: Vec<_> = dir_entries.flatten().collect();
+    let tails: std::collections::HashSet<PathBuf> = dir_entries.iter()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "tail"))
+        .map(|p| p.with_extension(""))
+        .collect();
+    let (mut moved, mut deleted) = (Vec::new(), 0usize);
+    for entry in dir_entries {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
         let kind = parse_staging_name(&name);
         let temp = kind.is_none() && name.starts_with("write_");
@@ -415,62 +435,79 @@ pub(crate) fn quarantine_unreferenced_staging(journal: &mut MutationJournal, cac
             continue;
         }
         let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if tails.contains(&path) && len > 0 {
+            log::warn!("startup: {} ({} bytes) is the end of a streamed upload that never finished — deleted; the copy must be repeated", name, len);
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
         if temp || len == 0 {
             if std::fs::remove_file(&path).is_ok() {
                 deleted += 1;
             }
             continue;
         }
-        if std::fs::create_dir_all(&recovered_dir).is_err() {
-            log::error!("startup: cannot create {} — leaving {} in place", recovered_dir.display(), path.display());
-            continue;
-        }
-        let mut dest = recovered_dir.join(&name);
-        if dest.exists() {
-            dest = recovered_dir.join(format!("{}.{}", name, now_ms()));
-        }
-        match std::fs::rename(&path, &dest) {
-            Ok(()) => {
-                log::warn!("startup: staging {} ({} bytes) is in no pending upload — kept at {}", name, len, dest.display());
-                moved.push(dest);
-            }
-            Err(e) => log::error!("startup: cannot move {} to {}: {}", path.display(), dest.display(), e),
+        if let Some(dest) = move_to_recovered(cache_dir, &path, None, "written by a session that ended before it was queued for upload") {
+            log::warn!("startup: staging {} ({} bytes) is in no pending upload — kept at {}", name, len, dest.display());
+            moved.push(dest);
         }
     }
     if deleted > 0 {
         log::info!("startup: removed {} empty or partial staging file(s)", deleted);
     }
     if !moved.is_empty() {
-        prune_recovered(&recovered_dir);
         journal.add_conflict(ConflictKind::PermanentFailure {
             description: format!(
-                "{} locally written file(s) from an interrupted session were not queued for upload; their bytes are kept in {}",
+                "{} locally written file(s) from an interrupted session were not queued for upload; their bytes are kept in {} (each with a .json note), for {} days",
                 moved.len(),
                 recovered_dir.display(),
+                RECOVERED_KEEP_FOR.as_secs() / 86_400,
             ),
         });
     }
     moved.len()
 }
 
-/// Keeps the newest files of `recovered/` within the count and size bounds.
-fn prune_recovered(dir: &Path) {
+/// Deletes what `recovered/` has kept for longer than `RECOVERED_KEEP_FOR`,
+/// by the time its note records. A file without a note (kept by an older
+/// version) gets one dated now instead: never deleted the first time it is
+/// seen. A note whose file is gone goes too.
+fn prune_recovered(dir: &Path, now: SystemTime) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
-    let mut files: Vec<(SystemTime, u64, PathBuf)> = rd
-        .flatten()
-        .filter_map(|e| {
-            let m = e.metadata().ok().filter(|m| m.is_file())?;
-            Some((m.modified().unwrap_or(UNIX_EPOCH), m.len(), e.path()))
-        })
-        .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
-    let mut bytes = 0u64;
-    for (i, (_, len, path)) in files.iter().enumerate() {
-        bytes = bytes.saturating_add(*len);
-        // The newest one is always kept, however large.
-        if i > 0 && (i >= RECOVERED_KEEP_FILES || bytes > RECOVERED_KEEP_BYTES) {
-            log::warn!("startup: {} over its bounds — deleting the oldest recovered file {}", RECOVERED_DIR, path.display());
-            let _ = std::fs::remove_file(path);
+    let now_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let keep_ms = RECOVERED_KEEP_FOR.as_millis() as u64;
+    for e in rd.flatten() {
+        let path = e.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else { continue };
+        if let Some(of) = name.strip_suffix(".json") {
+            if !dir.join(of).exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let note = dir.join(format!("{name}.json"));
+        match std::fs::read(&note).ok().and_then(|b| serde_json::from_slice::<RecoveredSidecar>(&b).ok()) {
+            Some(s) if now_ms.saturating_sub(s.recovered_at_ms) > keep_ms => {
+                log::warn!("startup: deleting {} from {}, kept since {} days ago ({:?})", name, RECOVERED_DIR, now_ms.saturating_sub(s.recovered_at_ms) / 86_400_000, s.remote_path);
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(&note);
+            }
+            Some(_) => {}
+            None => {
+                let s = RecoveredSidecar {
+                    remote_path: None,
+                    size: meta.len(),
+                    recovered_at_ms: now_ms,
+                    reason: "kept by an earlier version".into(),
+                    staging_name: name.clone(),
+                };
+                if let Ok(b) = serde_json::to_vec_pretty(&s) {
+                    let _ = std::fs::write(&note, b);
+                }
+            }
         }
     }
 }
@@ -1482,20 +1519,56 @@ mod tests {
         assert!(dir.join(adopted_file_name(1)).exists(), "this process's adoptions are journaled right after");
         assert!(dir.join("other.bin").exists());
         assert_eq!(j.unresolved_conflicts().len(), 1);
+        let note: RecoveredSidecar = serde_json::from_slice(&fs::read(rec.join("write_3.json")).unwrap()).unwrap();
+        assert_eq!((note.size, note.staging_name.as_str(), note.remote_path), (12, "write_3", None));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn recovered_keeps_the_newest_files_within_bounds() {
+    fn the_startup_sweep_deletes_a_streamed_tail_but_keeps_a_stream_that_never_lost_a_chunk() {
+        let dir = temp_dir("quarantine_tails");
+        // Its first chunk left: only the end of the file, useless alone.
+        fs::write(dir.join("write_9"), "end of a copy").unwrap();
+        fs::write(tail_marker(&dir.join("write_9")), "").unwrap();
+        // A stream whose session opened but whose first chunk never went: every byte.
+        fs::write(dir.join("write_10"), "the whole file").unwrap();
+        let mut j = MutationJournal::load_or_create(&dir);
+        assert_eq!(quarantine_unreferenced_staging(&mut j, &dir), 1);
+        let rec = dir.join(RECOVERED_DIR);
+        assert!(!dir.join("write_9").exists() && !rec.join("write_9").exists());
+        assert!(!tail_marker(&dir.join("write_9")).exists());
+        assert_eq!(fs::read_to_string(rec.join("write_10")).unwrap(), "the whole file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovered_evicts_only_by_age_and_never_what_this_sweep_added() {
         let dir = temp_dir("recovered_prune");
-        for i in 0..(RECOVERED_KEEP_FILES + 3) {
-            fs::write(dir.join(format!("f{i}")), "x").unwrap();
-            let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + i as u64);
-            fs::File::options().write(true).open(dir.join(format!("f{i}"))).unwrap().set_modified(t).unwrap();
+        let rec = dir.join(RECOVERED_DIR);
+        // Many and large is no reason to delete anything.
+        for i in 0..100 {
+            let src = dir.join(format!("write_{i}"));
+            fs::write(&src, "x").unwrap();
+            move_to_recovered(&dir, &src, None, "test").unwrap();
         }
-        prune_recovered(&dir);
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), RECOVERED_KEEP_FILES);
-        assert!(!dir.join("f0").exists() && dir.join(format!("f{}", RECOVERED_KEEP_FILES + 2)).exists());
+        let old = rec.join("write_0");
+        let mut note: RecoveredSidecar = serde_json::from_slice(&fs::read(rec.join("write_0.json")).unwrap()).unwrap();
+        note.recovered_at_ms = now_ms() - 31 * 86_400_000;
+        fs::write(rec.join("write_0.json"), serde_json::to_vec(&note).unwrap()).unwrap();
+        // Kept by an older version, without a note, and with an ancient mtime.
+        fs::write(rec.join("legacy"), "y").unwrap();
+        fs::File::options().write(true).open(rec.join("legacy")).unwrap().set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000)).unwrap();
+        fs::write(rec.join("gone.json"), "{}").unwrap();
+        // A staging file as old as can be, swept in by this very run.
+        fs::write(dir.join("write_1790000000000p1_1"), "new edit").unwrap();
+        fs::File::options().write(true).open(dir.join("write_1790000000000p1_1")).unwrap().set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000)).unwrap();
+        let mut j = MutationJournal::load_or_create(&dir);
+        quarantine_unreferenced_staging(&mut j, &dir);
+        assert!(!old.exists() && !rec.join("write_0.json").exists(), "older than 30 days");
+        assert!(rec.join("write_99").exists());
+        assert!(rec.join("legacy").exists() && rec.join("legacy.json").exists(), "first seen: dated now, kept");
+        assert!(!rec.join("gone.json").exists());
+        assert_eq!(fs::read_to_string(rec.join("write_1790000000000p1_1")).unwrap(), "new edit");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -484,6 +484,10 @@ impl WriteCtx {
             reply();
             return;
         };
+        if let (Some(_), Some(wp)) = (&of.chunk_upload, &of.write_path) {
+            // Journaled below, or given up: no longer a crash's leftover.
+            let _ = std::fs::remove_file(mutation_journal::tail_marker(wp));
+        }
         if of.writer {
             self.open_writers.fetch_sub(1, Ordering::Relaxed);
         }
@@ -498,7 +502,11 @@ impl WriteCtx {
             // would publish an incomplete file), or the file was deleted while open
             // (committing would re-create it). Tear any session down instead.
             if let Some(ref wp) = of.write_path {
-                self.drop_unlinked_staging(fh, &of, wp);
+                if of.unlinked.is() {
+                    self.drop_unlinked_staging(fh, &of, wp);
+                } else {
+                    self.drop_failed_stream_staging(fh, &of, wp);
+                }
             }
             self.cache.safe_lock().uploading.remove(&of.remote_path);
             if let Some(cs) = of.chunk_upload {
@@ -559,6 +567,24 @@ impl WriteCtx {
                 }
                 let _ = std::fs::remove_file(wp);
             }
+        }
+    }
+
+    /// The staging file of a streamed upload that failed mid-copy (the writer
+    /// got EIO). Once a chunk has left it, it is only the end of the file and
+    /// goes; before that it still holds every byte written, which are kept in
+    /// `recovered/`.
+    fn drop_failed_stream_staging(&self, fh: u64, of: &OpenFile, wp: &Path) {
+        if of.chunk_upload.as_ref().is_some_and(|cs| cs.bytes_confirmed > 0) {
+            let _ = std::fs::remove_file(wp);
+            return;
+        }
+        if std::fs::metadata(wp).map_or(true, |m| m.len() == 0) {
+            let _ = std::fs::remove_file(wp);
+            return;
+        }
+        if let Some(p) = mutation_journal::move_to_recovered(&self.cache_dir, wp, Some(&of.remote_path), "a streamed upload failed before any chunk reached the server; the writer got an error") {
+            log::warn!("release: fh {} of {} failed to upload — the written bytes are kept at {}", fh, of.remote_path.display(), p.display());
         }
     }
 
@@ -1045,6 +1071,13 @@ fn graduate_chunk(
 
         shrink_tail_file(wp, webdav_ops::CHUNK_SIZE as u64)
             .map_err(|e| (format!("tail rewrite: {}", e), state.clone()))?;
+        if state.as_ref().is_some_and(|s| s.next_index == 1) {
+            // From here on the staging file lacks the file's start; see
+            // `mutation_journal::tail_marker`.
+            if let Err(e) = std::fs::File::create(mutation_journal::tail_marker(wp)) {
+                log::debug!("cannot mark {} as a streamed tail: {}", wp.display(), e);
+            }
+        }
     }
 }
 
