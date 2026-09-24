@@ -48,16 +48,26 @@ echo "→ Control metadata"
 CONTROL="$(dpkg-deb -f "$DEB")"
 check "Package is ncrs"            grep -q '^Package: ncrs$' <<<"$CONTROL"
 check "Depends on fuse3"           grep -q '^Depends: .*fuse3' <<<"$CONTROL"
-check "Depends on nautilus ext"    grep -q 'python3-nautilus' <<<"$CONTROL"
+check "Suggests python3-nautilus"  grep -q '^Suggests: .*python3-nautilus' <<<"$CONTROL"
+check "Enhances nautilus, dolphin" grep -q '^Enhances: nautilus, dolphin' <<<"$CONTROL"
+# Desktop-specific packages must stay soft: a hard Depends on python3-nautilus
+# drags Nautilus upgrades onto every install, and KDE bindings onto GNOME.
+if grep -qE '^Depends: .*(nautilus|exiftool|lib(kf[56]|qt[56]))' <<<"$CONTROL"; then
+    fail "Depends has no desktop-specific packages"
+else
+    pass "Depends has no desktop-specific packages"
+fi
 if ! $SKIP_GUI; then
     check "Depends on webkit2gtk"  grep -q 'libwebkit2gtk' <<<"$CONTROL"
 fi
 
 echo "→ Maintainer scripts"
 CTRL_FILES="$(dpkg-deb --ctrl-tarfile "$DEB" | tar -t)"
-for s in postinst prerm postrm; do
+for s in postinst prerm postrm triggers; do
     check "$s present" grep -qx "\./$s" <<<"$CTRL_FILES"
 done
+check "triggers on the nautilus-python loader dir" \
+    sh -c "dpkg-deb --ctrl-tarfile '$DEB' | tar -xO ./triggers | grep -q '^interest-noawait /usr/lib/.*/nautilus/extensions-4$'"
 # The GUI autostarts via /etc/xdg/autostart; the headless service must stay opt-in.
 if dpkg-deb --ctrl-tarfile "$DEB" | tar -xO ./postinst 2>/dev/null | grep -q 'systemctl --global enable'; then
     fail "postinst must not globally enable ncrs.service"
@@ -100,16 +110,10 @@ for f in "${REQUIRED[@]}"; do
     check "$f" grep -qx "$f" <<<"$CONTENTS"
 done
 
-# One package carries the Dolphin plugin for both Plasma 5 and Plasma 6. Its
-# Qt/KF libraries must stay out of Depends, or GNOME installs would pull in KDE.
+# One package carries the Dolphin plugin for both Plasma 5 and Plasma 6.
 if ! $SKIP_DOLPHIN; then
     check "Dolphin plugin (KF6)" grep -q '/qt6/plugins/kf6/overlayicon/ncrsoverlayplugin\.so$' <<<"$CONTENTS"
     check "Dolphin plugin (KF5)" grep -q '/qt5/plugins/kf5/overlayicon/ncrsoverlayplugin\.so$' <<<"$CONTENTS"
-fi
-if grep -qiE '^Depends: .*lib(kf[56]|qt[56])' <<<"$CONTROL"; then
-    fail "Depends lists no Qt/KF libraries"
-else
-    pass "Depends lists no Qt/KF libraries"
 fi
 
 # A GUI binary built without tauri's custom-protocol feature embeds no
@@ -186,6 +190,10 @@ if $CONTAINER; then
             test -x /usr/bin/ncrs-ctl || { echo 'FAIL: ncrs-ctl missing'; exit 1; }
             test -f /usr/share/nautilus-python/extensions/ncrs-syncstate.py || { echo 'FAIL: nautilus extension missing'; exit 1; }
             ! dpkg -l 'libkf5*' 'libkf6*' 2>/dev/null | grep -q '^ii' || { echo 'FAIL: installing ncrs pulled in KDE Frameworks'; exit 1; }
+            ! dpkg -l python3-nautilus nautilus 2>/dev/null | grep -q '^ii' || { echo 'FAIL: installing ncrs pulled in Nautilus'; exit 1; }
+            # Installing the Suggested loader afterwards fires ncrs's trigger.
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends python3-nautilus > /tmp/naut.log 2>&1 || { cat /tmp/naut.log; echo 'FAIL: python3-nautilus install'; exit 1; }
+            grep -q 'Processing triggers for ncrs' /tmp/naut.log || { cat /tmp/naut.log; echo 'FAIL: ncrs trigger did not fire'; exit 1; }
             test -f /usr/share/doc/ncrs/config.yaml.example || { echo 'FAIL: example config missing'; exit 1; }
             ! ls /etc/systemd/user/default.target.wants/ncrs.service >/dev/null 2>&1 || { echo 'FAIL: ncrs.service globally enabled'; exit 1; }
             /usr/bin/ncrs --print-default-config | grep -q 'ncRS Desktop configuration' || { echo 'FAIL: ncrs --print-default-config'; exit 1; }

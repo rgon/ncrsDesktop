@@ -143,9 +143,13 @@ fn run(cli: Cli) -> Result<(), String> {
                 };
                 let adapter = if p.get("adapter_client_ids").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty()) {
                     format!(
-                        " adapter={}{}",
+                        " adapter={}{}{}",
                         if b("adapter_installed") { "installed" } else { "missing" },
-                        if b("adapter_connected") { ",connected" } else { "" }
+                        if b("adapter_connected") { ",connected" } else { "" },
+                        p.get("adapter_needs_package")
+                            .and_then(|v| v.as_str())
+                            .map(|pkg| format!(",needs:{pkg}"))
+                            .unwrap_or_default()
                     )
                 } else {
                     String::new()

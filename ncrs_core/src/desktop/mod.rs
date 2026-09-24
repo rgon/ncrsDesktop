@@ -212,6 +212,8 @@ pub struct ProfileStatus {
     pub required_by: Vec<&'static str>,
     pub adapter_client_ids: &'static [&'static str],
     pub adapter_installed: bool,
+    /// System package the adapter still needs before it can load.
+    pub adapter_needs_package: Option<&'static str>,
     pub adapter_connected: bool,
 }
 
@@ -378,6 +380,7 @@ impl Manager {
                 required_by: self.required_by(&st, p),
                 adapter_client_ids: p.adapter.client_ids,
                 adapter_installed: p.adapter.is_installed(&self.env),
+                adapter_needs_package: p.adapter.missing_package(&self.env),
                 adapter_connected: p.adapter.client_ids.iter().any(|id| is_connected(id)),
             })
             .collect()

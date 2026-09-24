@@ -1,6 +1,24 @@
 #!/bin/sh
 set -e
 
+# Reload Nautilus so the extension is picked up immediately. Only quits
+# instances that are already running; reads each process's own D-Bus address
+# so this works correctly from a root postinst.
+reload_nautilus() {
+    if command -v nautilus >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
+        for user in $(who | awk '{print $1}' | sort -u); do
+            uid=$(id -u "$user" 2>/dev/null) || continue
+            pid=$(pgrep -u "$uid" -x nautilus 2>/dev/null | head -1) || true
+            [ -n "$pid" ] || continue
+            dbus=$(grep -z DBUS_SESSION_BUS_ADDRESS /proc/"$pid"/environ 2>/dev/null \
+                   | tr '\0' '\n' | grep '^DBUS_SESSION_BUS_ADDRESS=' \
+                   | sed 's/^DBUS_SESSION_BUS_ADDRESS=//') || true
+            [ -n "$dbus" ] || continue
+            DBUS_SESSION_BUS_ADDRESS="$dbus" runuser -u "$user" -- nautilus -q 2>/dev/null || true
+        done
+    fi
+}
+
 case "$1" in
     configure)
         # ncrs.service is no longer enabled by default (the GUI tray app
@@ -39,21 +57,12 @@ case "$1" in
         if command -v gtk-update-icon-cache >/dev/null 2>&1; then
             gtk-update-icon-cache -q /usr/share/icons/hicolor || true
         fi
-        # Reload Nautilus so the updated extension is picked up immediately.
-        # Only quits instances that are already running; reads each process's
-        # own D-Bus address so this works correctly from a root postinst.
-        if command -v nautilus >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
-            for user in $(who | awk '{print $1}' | sort -u); do
-                uid=$(id -u "$user" 2>/dev/null) || continue
-                pid=$(pgrep -u "$uid" -x nautilus 2>/dev/null | head -1) || true
-                [ -n "$pid" ] || continue
-                dbus=$(grep -z DBUS_SESSION_BUS_ADDRESS /proc/"$pid"/environ 2>/dev/null \
-                       | tr '\0' '\n' | grep '^DBUS_SESSION_BUS_ADDRESS=' \
-                       | sed 's/^DBUS_SESSION_BUS_ADDRESS=//') || true
-                [ -n "$dbus" ] || continue
-                DBUS_SESSION_BUS_ADDRESS="$dbus" runuser -u "$user" -- nautilus -q 2>/dev/null || true
-            done
-        fi
+        reload_nautilus
+        ;;
+    triggered)
+        # python3-nautilus (Suggests) installed its loader after ncrs, or
+        # Nautilus itself was upgraded: reload so the extension loads now.
+        reload_nautilus
         ;;
 esac
 

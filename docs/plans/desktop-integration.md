@@ -22,8 +22,14 @@ pending measurement). Based on `master` @ `a190f75`. Line references point at th
   dirs). The plugin's Qt/KF libraries stay out of `Depends`, since only Dolphin
   loads it and Dolphin brings them. CI builds KF5 on the jammy runner and KF6 in
   `debian:trixie`. The ServiceMenu goes to `kio/servicemenus` for both, which
-  KF5 >= 5.85 also reads. With no separate package there is no "install the
-  adapter" hint in the GUI.
+  KF5 >= 5.85 also reads.
+- **Desktop packages are soft relationships.** `Depends` is only `fuse3` and libssl
+  (plus the GUI's libraries). The GNOME helpers' packages are `Recommends`,
+  `python3-nautilus` is `Suggests`, and the package `Enhances: nautilus, dolphin`.
+  Debian has no "install X if Y is present" dependency, so the service fills the
+  gap: the Nautilus adapter reports `adapter_needs_package: python3-nautilus` until
+  the loader exists, and the GUI shows the install command. A dpkg trigger on the
+  loader dir reloads Nautilus once it is installed.
 
 ## Goal
 
