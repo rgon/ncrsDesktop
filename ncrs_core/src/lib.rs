@@ -436,6 +436,19 @@ struct PendingDir {
     walker: bool,
     // The worker's final result (etag or error) has been taken off `etag_rx`.
     result_in: bool,
+    #[cfg(test)]
+    probe: PendingProbe,
+}
+
+/// What `pending_find` did under the cache lock, for tests that must show the
+/// lock is held briefly without timing it.
+#[cfg(test)]
+#[derive(Default, Debug, Clone, Copy)]
+struct PendingProbe {
+    // Calls, i.e. times a waiter took the cache lock to look in the stream.
+    finds: u64,
+    // Most stream entries one call moved and indexed.
+    most_per_find: usize,
 }
 
 impl PendingDir {
@@ -1860,7 +1873,14 @@ impl FsCache {
     fn pending_find(&mut self, dir: &Path, name: &str) -> PendingLookup {
         let Some(p) = self.pending_dirs.get_mut(dir) else { return PendingLookup::NoFetch };
         let (got_new, disconnected, more) = p.drain_at_most(PENDING_DRAIN_BATCH);
+        #[cfg(test)]
+        let indexed_before = p.index.indexed;
         p.index.extend(&p.entries);
+        #[cfg(test)]
+        {
+            p.probe.finds += 1;
+            p.probe.most_per_find = p.probe.most_per_find.max(p.entries.len() - indexed_before);
+        }
         if let Some(i) = p.index.find(&p.entries, name) {
             return PendingLookup::Found(p.entries[i].clone());
         }
@@ -2098,6 +2118,8 @@ impl FsCache {
             index: NameIndex::default(),
             walker: false,
             result_in: false,
+            #[cfg(test)]
+            probe: PendingProbe::default(),
         });
     }
 
