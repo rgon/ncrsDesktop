@@ -1087,6 +1087,36 @@ else
     no "daemon did not remount after the immediate SIGKILL"
 fi
 
+echo "→ 30. SERVER DOWN — rm a; create a; mv a b replays to b holding the new a"
+# The journal used to rewrite the queued DELETE and PUT into the rename's
+# names while they still replayed before its MOVE: DELETE b, PUT b (the new
+# a), then MOVE a→b put the deleted a over it. Every op now replays under the
+# name it had when it was queued.
+mkdir -p "$MOUNT/mv30"
+A30="old a $(date +%s%N)"
+printf '%s' "$A30" > "$MOUNT/mv30/a"
+wait_dav_sha mv30/a "$(printf '%s' "$A30" | sha)" 60 || no "baseline mv30/a never synced (setup failed)"
+server_down
+rm "$MOUNT/mv30/a"
+N30="new a $(date +%s%N)"
+printf '%s' "$N30" > "$MOUNT/mv30/a"
+mv "$MOUNT/mv30/a" "$MOUNT/mv30/b"
+W30="$(printf '%s' "$N30" | sha)"
+wait_fuse_sha mv30/b "$W30" 15 \
+    && ok "the renamed new file reads back while the server is down" \
+    || no "the renamed new file is not readable while the server is down"
+server_up
+wait_dav_sha mv30/b "$W30" 120 \
+    && ok "after the replay b on the server is the new a" \
+    || no "b on the server is not the new a after the replay (has $(dav_sha mv30/b | cut -c1-12)) — data loss"
+wait_dav_gone mv30/a 30 \
+    && ok "the deleted a did not come back" \
+    || no "the deleted a is back on the server"
+sleep 3
+[ "$(dav_sha mv30/b)" = "$W30" ] \
+    && ok "b stays the new a once the replay is done" \
+    || no "b changed after the replay (a later MOVE overwrote it) — data loss"
+
 stuck=0
 for w in /sys/fs/fuse/connections/*/waiting; do
     [ -r "$w" ] && [ "$(cat "$w")" != 0 ] && stuck=$((stuck + $(cat "$w")))
