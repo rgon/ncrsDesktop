@@ -1,20 +1,34 @@
 //! The write path of an open file (write, truncate, flush, fsync, release),
-//! arranged so the FUSE dispatch thread never waits on the network or on a big
-//! local copy or fsync (step 8 of the 2026-09-24 review).
+//! arranged so the FUSE dispatch thread never waits on the network or on the
+//! disk (step 8 of the 2026-09-24 review, and the inline staging write found
+//! after it).
 //!
 //! Before, `write()` PUT each filled 10 MB chunk of a streamed upload inline,
 //! with retries and backoff sleeps, so every other request on the mount (a
 //! `stat` of an unrelated cached file included) queued behind the upload; and
 //! `flush`/`fsync`/`release` fsynced whole staging files and the journal there.
 //! Now each handle's work goes through its lane (`fh_lane.rs`), which keeps it
-//! in the order the kernel sent it. What is cheap (a pwrite or append to the
-//! staging file) still runs on the dispatch thread when the lane is idle; a
-//! chunk graduation runs on `bg::UPLOAD`, and seeding a staging file from a
-//! kept copy, `flush` and `fsync` run on `bg::DISK`, each owning its reply. The
-//! handle's state is updated before the reply goes out, and RELEASE (which the
-//! kernel sends only after the handle's last write was answered) queues behind
-//! anything still in flight, so it always commits the finished file, once.
-//! Release's own fsyncs moved into the journal's group commit.
+//! in the order the kernel sent it. Every write, however small, runs on
+//! `bg::DISK` (a chunk graduation on `bg::UPLOAD`), as do a truncate and the
+//! `flush`/`fsync` of a dirty handle, each owning its reply: a pwrite of a few
+//! bytes still updates the file's mtime, and on a slow host disk that waits for
+//! the ext4 journal (`jbd2`), which parked `fuser-0` in D state for seconds
+//! (2026-09-25). What stays on the dispatch thread does no staging-file I/O:
+//! the flush/fsync of a clean handle, and release, whose commit is in memory
+//! (the journal saves on its own thread) and whose staging-file deletes and
+//! moves go to `bg::DISK` after the reply. The handle's state is updated before
+//! the reply goes out, and RELEASE (which the kernel sends only after the
+//! handle's last write was answered) queues behind anything still in flight,
+//! so it always commits the finished file, once. Release's own fsyncs moved
+//! into the journal's group commit.
+//!
+//! Why `bg::DISK` never refuses (its queue is unbounded): every job on it is a
+//! lane step, which owns a kernel request's reply, or a released handle's
+//! staging cleanup. A lane submits one step at a time, so the queue never holds
+//! more steps than the kernel has requests outstanding on distinct handles.
+//! Refusing instead would mean running the step on `fuser-0` (the disk wait
+//! this module exists to avoid) or answering EAGAIN, which `write(2)` hands to
+//! the application: `cp` would fail a copy under load.
 //!
 //! Lock order: never `cache` while holding `open_files` (rename nests them the
 //! other way round on the dispatch thread while this runs on a worker).
@@ -34,12 +48,13 @@ pub(crate) struct WriteCtx {
     pub(crate) auto_keep_locally_modified_files: bool,
     // Where staging files live; fixed for the mount, so no `cache` lock.
     pub(crate) cache_dir: PathBuf,
-    // `bg::UPLOAD` and `bg::DISK`; tests swap in pools that refuse.
+    // `bg::UPLOAD` and `bg::DISK`; tests swap in pools that refuse or stall.
     pub(crate) upload_pool: &'static bg::Pool,
     pub(crate) disk_pool: &'static bg::Pool,
     // Where a graduation goes when `upload_pool` refuses it and the tail
     // already holds `TAIL_CAP_CHUNKS` chunks: `bg::MUTATION`, which never
-    // refuses (see `dispatch_write`).
+    // refuses (see `dispatch_write`). Also where staging cleanup goes if
+    // `disk_pool` cannot take it.
     pub(crate) spill_pool: &'static bg::Pool,
 }
 
@@ -72,14 +87,14 @@ pub(crate) fn truncate_reply(meta: &MetaCtx, pid: u32, ino: u64, new_size: u64, 
     });
 }
 
-/// Where a `write()` runs.
+/// Where a `write()` runs. Never on the dispatch thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteCost {
-    /// A pwrite or append to the staging file: the dispatch thread, if the lane is idle.
-    Inline,
-    /// The staging file has to be seeded from the kept copy first (`bg::DISK`).
-    Seed,
-    /// This write fills a chunk of a streamed upload, which is then PUT (`bg::UPLOAD`).
+    /// A pwrite or append to the staging file, seeding it from the kept copy
+    /// first if this is the handle's first write (`bg::DISK`).
+    Stage,
+    /// This write fills a chunk of a streamed upload, which is then PUT
+    /// (`bg::UPLOAD`; refused, it only appends, on `bg::DISK`).
     Graduate,
     /// As `Graduate`, with `TAIL_CAP_CHUNKS` chunks already waiting in the tail:
     /// a refusal must not grow it further (see `dispatch_write`).
@@ -90,10 +105,41 @@ pub(crate) enum WriteCost {
 /// graduation stops appending on the caller and waits for a worker instead.
 pub(crate) const TAIL_CAP_CHUNKS: u64 = 2;
 
+#[cfg(test)]
+thread_local! {
+    // Set by tests on the thread that stands in for `fuser-0`.
+    static DISPATCH_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with this thread marked as the FUSE dispatch thread: any
+/// staging-file I/O `f` does on it panics (see `staging_io`).
+#[cfg(test)]
+pub(crate) fn as_dispatch_thread<T>(f: impl FnOnce() -> T) -> T {
+    struct Unmark(bool);
+    impl Drop for Unmark {
+        fn drop(&mut self) {
+            DISPATCH_THREAD.with(|d| d.set(self.0));
+        }
+    }
+    let _unmark = Unmark(DISPATCH_THREAD.with(|d| d.replace(true)));
+    f()
+}
+
+/// Marks a staging-file write, truncate, fsync, create, copy, move or delete.
+/// None may run on the dispatch thread; tests check it here.
+#[inline]
+fn staging_io(what: &str) {
+    #[cfg(test)]
+    assert!(!DISPATCH_THREAD.with(|d| d.get()), "staging-file I/O ({what}) on the dispatch thread");
+    #[cfg(not(test))]
+    let _ = what;
+}
+
 /// Seeds a staging file with the kept copy (or empty), via a temp file, so a
 /// copy that fails halfway never leaves a staging file a later write would
 /// take as already seeded.
 fn seed_staging(local: Option<&Path>, wp: &Path) -> std::io::Result<()> {
+    staging_io("seed");
     let Some(local) = local else {
         return std::fs::File::create(wp).map(|_| ());
     };
@@ -106,22 +152,23 @@ fn seed_staging(local: Option<&Path>, wp: &Path) -> std::io::Result<()> {
 }
 
 impl WriteCtx {
-    /// `write()`: inline when the lane is idle and the write is a plain pwrite
-    /// or append, else queued on the handle's lane with its reply.
+    /// `write()`: always a step on the handle's lane, owning its reply, on
+    /// `disk_pool` (or `upload_pool` for a graduation). Nothing here touches
+    /// the staging file on the calling thread.
     ///
-    /// Only a write classified `Graduate` and running on `upload_pool` may PUT
-    /// a chunk. Any other write that takes the tail past a chunk (it was
-    /// classified before the offline flag or the handle's state changed, or
-    /// the pool refused it and it runs on the caller, possibly `fuser-0`) just
-    /// appends, and the handle's next write, which `write_cost` then classifies
-    /// `Graduate`, sends every full chunk the tail holds. If no write follows,
-    /// release commits the longer tail as the last chunk. So a refusal costs a
-    /// little extra staging disk, never a network wait on the dispatch thread
-    /// and never an error to the writer.
+    /// Only a write classified `Graduate` and running on `upload_pool` (or a
+    /// `GraduateCapped` one on its spill pool) may PUT a chunk. Any other
+    /// write that takes the tail past a chunk (it was classified before the
+    /// offline flag or the handle's state changed, or `upload_pool` refused it
+    /// and it runs on `disk_pool`) just appends, and the handle's next write,
+    /// which `write_cost` then classifies `Graduate`, sends every full chunk
+    /// the tail holds. If no write follows, release commits the longer tail as
+    /// the last chunk. So a refusal costs a little extra staging disk, never a
+    /// network wait on the dispatch thread and never an error to the writer.
     ///
     /// Only a little: once the tail holds `TAIL_CAP_CHUNKS` chunks, a refused
     /// graduation goes to `spill_pool` (`bg::MUTATION`, which never refuses)
-    /// instead of the caller. The lane waits for it there like anywhere else,
+    /// and graduates there. The lane waits for it there like anywhere else,
     /// so the handle's later writes stay in order behind it, and the writer is
     /// slowed to the upload's pace rather than filling the disk.
     pub(crate) fn dispatch_write(
@@ -132,38 +179,34 @@ impl WriteCtx {
         data: &[u8],
         reply: impl FnOnce(Result<u32, Errno>) + Send + 'static,
     ) {
-        let cost = self.write_cost(fh, offset, data.len());
-        let pool: &'static bg::Pool = match cost {
-            WriteCost::Inline => match self.lanes.claim(fh) {
-                Some(_lane) => return reply(self.write_answer(fh, &path, offset, data, false)),
-                // Behind this handle's work in flight.
-                None => self.disk_pool,
-            },
-            WriteCost::Seed => self.disk_pool,
-            WriteCost::Graduate | WriteCost::GraduateCapped => self.upload_pool,
+        let cost = self.classify_write(fh, offset, data.len());
+        let (pool, spill) = match cost {
+            // `disk_pool` never refuses (see the module doc).
+            WriteCost::Stage => (self.disk_pool, None),
+            // Refused, it only appends: the next write catches up.
+            WriteCost::Graduate => (self.upload_pool, Some(self.disk_pool)),
+            WriteCost::GraduateCapped => (self.upload_pool, Some(self.spill_pool)),
         };
-        let spill = (cost == WriteCost::GraduateCapped).then_some(self.spill_pool);
         let (c, data) = (self.clone(), data.to_vec());
         self.lanes.run_or_spill(fh, pool, spill, move |ran| {
-            let may_graduate = matches!(cost, WriteCost::Graduate | WriteCost::GraduateCapped) && ran == fh_lane::Ran::OnPool;
+            let may_graduate = match cost {
+                WriteCost::Stage => false,
+                WriteCost::Graduate => ran == fh_lane::Ran::OnPool,
+                WriteCost::GraduateCapped => ran != fh_lane::Ran::OnCaller,
+            };
             let r = c.write_answer(fh, &path, offset, &data, may_graduate);
             move || reply(r)
         });
     }
 
-    /// The handle's side of a size-changing `setattr`; `then` answers it.
+    /// The handle's side of a size-changing `setattr`; `then` answers it. On
+    /// `disk_pool`: it resizes (and may first seed) the staging file.
     pub(crate) fn dispatch_truncate(
         &self,
         fh: u64,
         new_size: u64,
         then: impl FnOnce(&MetaCtx, Result<(), Errno>) + Send + 'static,
     ) {
-        if !self.truncate_needs_seed(fh) {
-            if let Some(_lane) = self.lanes.claim(fh) {
-                return then(&self.meta, self.truncate_answer(fh, new_size));
-            }
-        }
-        // Seeding copies the whole kept file, or the handle has work in flight.
         let c = self.clone();
         self.lanes.run(fh, self.disk_pool, move |_| {
             let r = c.truncate_answer(fh, new_size);
@@ -171,9 +214,10 @@ impl WriteCtx {
         });
     }
 
-    /// `flush()`: a clean handle (most closes) is answered inline; a dirty one
-    /// fsyncs its staging file after anything in flight on it. close() waits
-    /// for this reply; the dispatch thread doesn't.
+    /// `flush()`: a clean handle (most closes) is answered inline, which does
+    /// no I/O; a dirty one fsyncs its staging file on `disk_pool` after
+    /// anything in flight on it. close() waits for this reply; the dispatch
+    /// thread doesn't.
     pub(crate) fn dispatch_flush(&self, fh: u64, reply: impl FnOnce() + Send + 'static) {
         if let Some(_lane) = self.lanes.claim(fh) {
             if !self.flush_has_work(fh) {
@@ -187,7 +231,8 @@ impl WriteCtx {
         });
     }
 
-    /// `fsync()`: answered only once the staged bytes are on disk.
+    /// `fsync()`: answered only once the staged bytes are on disk; inline
+    /// only when there is no staging file to sync.
     pub(crate) fn dispatch_fsync(&self, fh: u64, reply: impl FnOnce() + Send + 'static) {
         if let Some(_lane) = self.lanes.claim(fh) {
             if !self.fsync_has_work(fh) {
@@ -201,10 +246,13 @@ impl WriteCtx {
         });
     }
 
-    /// `release()`: inline when nothing is in flight on the handle. The kernel
-    /// sends RELEASE only after the handle's last write was answered, so
-    /// anything still in flight is writeback of a shared mapping: queue behind
-    /// it, so the commit is of the finished file and happens once.
+    /// `release()`: inline when nothing is in flight on the handle, which does
+    /// no staging-file I/O here (see `release_answer`). Kept on the dispatch
+    /// thread so every request the kernel sends after it (an open of the same
+    /// file, a rename) finds the commit journaled. The kernel sends RELEASE
+    /// only after the handle's last write was answered, so anything still in
+    /// flight is writeback of a shared mapping: queue behind it, so the commit
+    /// is of the finished file and happens once.
     pub(crate) fn dispatch_release(&self, fh: u64, reply: impl FnOnce() + Send + 'static) {
         if let Some(_lane) = self.lanes.claim(fh) {
             return self.release_answer(fh, reply);
@@ -220,27 +268,56 @@ impl WriteCtx {
         self.cache_dir.join(mutation_journal::staging_file_name(fh))
     }
 
+    /// `classify_write` without recording the write (tests).
+    #[cfg(test)]
+    pub(crate) fn write_cost(&self, fh: u64, offset: u64, len: usize) -> WriteCost {
+        let files = self.open_files.safe_lock();
+        match files.get(&fh) {
+            Some(of) => self.cost_of(of, offset, len),
+            None => WriteCost::Stage,
+        }
+    }
+
     /// Picks where a write of `len` bytes at `offset` on `fh` runs. Decided
     /// once: `write_answer` may find the handle changed (the offline flag, or a
     /// write queued ahead of it), but only ever graduates a chunk when this
     /// said `Graduate` and it runs on the upload pool.
-    pub(crate) fn write_cost(&self, fh: u64, offset: u64, len: usize) -> WriteCost {
-        let files = self.open_files.safe_lock();
-        let Some(of) = files.get(&fh) else { return WriteCost::Inline };
-        if of.local.is_some() && of.write_path.as_ref().map_or(true, |wp| !wp.exists()) {
-            return WriteCost::Seed;
+    ///
+    /// Judged against the handle as it will be once every write already
+    /// dispatched on it has run (`OpenFile::dispatched_end`), not as it is
+    /// now: overlapping writes (writeback of a shared mapping) all queue on
+    /// the lane before the first has appended anything, and judged by
+    /// `total_written` none of them would ever fill a chunk, so the tail
+    /// would grow without bound. The confirmed bytes lag too, which only makes
+    /// a write `Graduate` that then finds less than a chunk and just appends.
+    ///
+    /// Records the write as dispatched. Reads only the handle's state: this
+    /// runs on the dispatch thread.
+    fn classify_write(&self, fh: u64, offset: u64, len: usize) -> WriteCost {
+        let mut files = self.open_files.safe_lock();
+        let Some(of) = files.get_mut(&fh) else { return WriteCost::Stage };
+        let cost = self.cost_of(of, offset, len);
+        let end = of.dispatched_end.max(of.total_written);
+        if offset == end {
+            of.dispatched_end = end + len as u64;
         }
+        cost
+    }
+
+    fn cost_of(&self, of: &OpenFile, offset: u64, len: usize) -> WriteCost {
         let blocked_by_offline = of.chunk_upload.is_none() && self.conn.is_offline.load(Ordering::Relaxed);
         let confirmed = of.chunk_upload.as_ref().map_or(0, |c| c.bytes_confirmed);
-        if of.stream_eligible && offset == of.total_written && !blocked_by_offline
-            && of.total_written + len as u64 - confirmed >= webdav_ops::CHUNK_SIZE as u64
+        // `total_written` too: a write run without `dispatch_write` (tests).
+        let end = of.dispatched_end.max(of.total_written);
+        if of.stream_eligible && offset == end && !blocked_by_offline
+            && end + len as u64 - confirmed >= webdav_ops::CHUNK_SIZE as u64
         {
-            if of.total_written - confirmed >= TAIL_CAP_CHUNKS * webdav_ops::CHUNK_SIZE as u64 {
+            if end - confirmed >= TAIL_CAP_CHUNKS * webdav_ops::CHUNK_SIZE as u64 {
                 return WriteCost::GraduateCapped;
             }
             return WriteCost::Graduate;
         }
-        WriteCost::Inline
+        WriteCost::Stage
     }
 
     /// Creates `fh`'s staging file if this is its first write or truncate.
@@ -318,6 +395,7 @@ impl WriteCtx {
             }
         };
 
+        staging_io("write");
         if !stream {
             let written = std::fs::OpenOptions::new().write(true).create(true).open(&wp)
                 .map_err(|e| log::error!("open staging file: {}", e))
@@ -387,13 +465,6 @@ impl WriteCtx {
         Ok(data.len() as u32)
     }
 
-    /// Whether a truncate of `fh` has to seed its staging file from the kept copy first.
-    pub(crate) fn truncate_needs_seed(&self, fh: u64) -> bool {
-        self.open_files.safe_lock().get(&fh).is_some_and(|of| {
-            of.chunk_upload.is_none() && of.local.is_some() && of.write_path.as_ref().map_or(true, |wp| !wp.exists())
-        })
-    }
-
     /// The open-handle half of a size-changing `setattr` on `fh`.
     pub(crate) fn truncate_answer(&self, fh: u64, new_size: u64) -> Result<(), Errno> {
         {
@@ -422,6 +493,7 @@ impl WriteCtx {
             of.stream_eligible = false;
         }
         let wp = self.ensure_staging(fh, "setattr")?;
+        staging_io("truncate");
         match std::fs::OpenOptions::new().write(true).open(&wp) {
             Ok(f) => {
                 if let Err(e) = f.set_len(new_size) {
@@ -456,6 +528,7 @@ impl WriteCtx {
             of.write_path.clone().map(|wp| (wp, of.remote_path.clone(), streamed_size))
         });
         let Some((wp, remote_path, streamed_size)) = staged else { return };
+        staging_io("flush");
         if let Ok(f) = std::fs::File::open(&wp) {
             if let Err(e) = f.sync_all() {
                 log::warn!("flush: fsync staging {} failed: {}", wp.display(), e);
@@ -480,6 +553,9 @@ impl WriteCtx {
     /// instead of deleting it, so fsynced bytes survive but are not uploaded.
     pub(crate) fn fsync_answer(&self, fh: u64) {
         let wp = self.open_files.safe_lock().get(&fh).and_then(|of| of.write_path.clone());
+        if wp.is_some() {
+            staging_io("fsync");
+        }
         if let Some(Ok(f)) = wp.map(std::fs::File::open) {
             if let Err(e) = f.sync_all() {
                 log::warn!("fsync: staging {} failed: {}", fh, e);
@@ -490,6 +566,14 @@ impl WriteCtx {
     /// Everything `release()` does. `reply` is sent once the handle is gone and
     /// before its commit starts, as before: RELEASE is the last request on a
     /// handle, so nothing waits on the commit.
+    ///
+    /// Runs on the dispatch thread when the lane is idle, so it writes nothing
+    /// to disk there: the commit only journals (saved on the journal's
+    /// thread) and hands the upload to `bg::MUTATION`, and a staging file that
+    /// goes (never written, a failed stream, an unlinked file) is deleted or
+    /// moved to `recovered/` by `off_dispatch`. What it still reads is the
+    /// staging file's length (`metadata`), as `getattr` does: an in-memory
+    /// inode, no journal access.
     pub(crate) fn release_answer(&self, fh: u64, reply: impl FnOnce()) {
         self.publish_released_size(fh);
         // Reserved before the handle leaves `open_files`, released once the
@@ -499,7 +583,7 @@ impl WriteCtx {
         if let Some(ref wp) = staging {
             self.journal.safe_lock().reserve_staging(wp);
         }
-        let _unreserve = staging.map(|wp| Unreserve { journal: self.journal.clone(), wp });
+        let unreserve = staging.map(|wp| Unreserve { journal: self.journal.clone(), wp });
         // The last close of the handle: the only point where no further write can arrive.
         let Some(of) = self.open_files.safe_lock().remove(&fh) else {
             reply();
@@ -518,18 +602,28 @@ impl WriteCtx {
             // A write already returned EIO after chunks reached the server (assembling them
             // would publish an incomplete file), or the file was deleted while open
             // (committing would re-create it). Tear any session down instead.
-            if let Some(ref wp) = of.write_path {
-                if of.unlinked.is() {
-                    self.drop_unlinked_staging(fh, &of, wp);
-                } else {
-                    self.drop_failed_stream_staging(fh, &of, wp);
-                }
-            }
             self.cache.safe_lock().uploading.remove(&of.remote_path);
-            if let Some(cs) = of.chunk_upload {
+            let session = of.chunk_upload.clone();
+            let remote_path = of.remote_path.clone();
+            if of.write_path.is_some() {
+                // Still reserved until it is gone: a purge meanwhile must not
+                // delete bytes this is about to keep in `recovered/`.
+                let c = self.clone();
+                self.off_dispatch(move || {
+                    let _unreserve = unreserve;
+                    if let Some(ref wp) = of.write_path {
+                        if of.unlinked.is() {
+                            c.drop_unlinked_staging(fh, &of, wp);
+                        } else {
+                            c.drop_failed_stream_staging(fh, &of, wp);
+                        }
+                    }
+                });
+            }
+            if let Some(cs) = session {
                 log::warn!(
                     "release: fh {} streamed upload of {} failed mid-copy ({}) — abandoning it, the copy must be retried",
-                    fh, of.remote_path.display(), cs.uploads_base,
+                    fh, remote_path.display(), cs.uploads_base,
                 );
                 // On the mutation pool, which never refuses: a dropped abort
                 // leaks the session's chunks on the server.
@@ -541,17 +635,39 @@ impl WriteCtx {
             return;
         }
         if !of.dirty {
-            if let Some(ref wp) = of.write_path {
+            if let Some(wp) = of.write_path {
                 // Opened writable but never written — discard the staging copy and the
-                // create() guard; no PUT will follow.
-                let _ = std::fs::remove_file(wp);
+                // create() guard; no PUT will follow. Its name is this handle's
+                // alone (`next_fh` never repeats), so a late delete hits nothing else.
                 self.cache.safe_lock().uploading.remove(&of.remote_path);
+                self.off_dispatch(move || {
+                    staging_io("discard");
+                    let _ = std::fs::remove_file(wp);
+                });
             }
             return;
         }
         if let Err(e) = self.commit_released(FileHandle(fh), of) {
             log::warn!("release: commit of fh {} failed: {:?}", fh, e);
         }
+        drop(unreserve);
+    }
+
+    /// Runs `job`, which touches the disk and answers nobody, off the calling
+    /// thread: on `disk_pool`, which never refuses; failing that (the OS
+    /// could not start a worker) on `spill_pool`; only if that fails too, here.
+    fn off_dispatch(&self, job: impl FnOnce() + Send + 'static) {
+        type Job = Box<dyn FnOnce() + Send>;
+        let job: Job = Box::new(job);
+        let job = match self.disk_pool.submit_owning(job, |j: Job| j()) {
+            Ok(()) => return,
+            Err((_, j)) => j,
+        };
+        let job = match self.spill_pool.submit_owning(job, |j: Job| j()) {
+            Ok(()) => return,
+            Err((_, j)) => j,
+        };
+        job();
     }
 
     /// The staging file of a released handle whose file was deleted while it
@@ -561,6 +677,7 @@ impl WriteCtx {
     /// streamed handle's staging is only the unsent end of the file, which
     /// is worth nothing alone.
     fn drop_unlinked_staging(&self, fh: u64, of: &OpenFile, wp: &Path) {
+        staging_io("drop unlinked");
         match of.unlinked {
             Unlinked::No => {}
             Unlinked::Unverified if of.dirty && of.chunk_upload.is_none() => {
@@ -594,6 +711,7 @@ impl WriteCtx {
     /// was saved, and keeping it in `recovered/` kept up to `TAIL_CAP_CHUNKS`
     /// chunks of every failed copy there, unasked.
     fn drop_failed_stream_staging(&self, fh: u64, of: &OpenFile, wp: &Path) {
+        staging_io("drop failed stream");
         let len = std::fs::metadata(wp).map_or(0, |m| m.len());
         let _ = mutation_journal::remove_staging_file(wp);
         if len > 0 {

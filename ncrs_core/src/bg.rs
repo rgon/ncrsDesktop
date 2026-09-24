@@ -209,6 +209,10 @@ impl Pool {
         }
     }
 
+    pub const fn queue_cap(&self) -> usize {
+        self.queue_cap
+    }
+
     pub const fn max_workers(&self) -> usize {
         self.max_workers
     }
@@ -291,11 +295,17 @@ pub const USER_WORKERS: usize = 4;
 pub static UPLOAD: Pool = Pool::new("upload", UPLOAD_WORKERS, 1024);
 pub const UPLOAD_WORKERS: usize = 4;
 
-/// Local-disk work that used to run on the dispatch thread: seeding a
-/// staging file from a kept copy on the first write or truncate, `flush` and
-/// `fsync` of a staging file (the reply travels with the job). A handle has
-/// at most one job in flight (its lane), so the queue stays short.
-pub static DISK: Pool = Pool::new("disk", DISK_WORKERS, 4096);
+/// Staging-file I/O, none of which may run on the dispatch thread: every
+/// `write()` (a pwrite or append, seeding the staging file from a kept copy on
+/// the first one), a truncate, `flush` and `fsync` of a dirty handle (the
+/// reply travels with the job), and deleting a released handle's staging file.
+///
+/// Never refused, like `MUTATION`: a handle has at most one step submitted at
+/// a time (its lane, `fh_lane.rs`), and each step owns a kernel request's
+/// reply, so the queue is bounded by the requests the kernel has outstanding,
+/// not by anything the daemon could shed. A refusal would have to run the
+/// step on `fuser-0` or answer EAGAIN, which `write(2)` passes to the writer.
+pub static DISK: Pool = Pool::new("disk", DISK_WORKERS, usize::MAX);
 pub const DISK_WORKERS: usize = 4;
 
 /// The journal's group commit (`mutation_journal::DeferredSaves`): one saver
