@@ -11,27 +11,30 @@
 //! enforced here rather than assumed.
 //!
 //! A lane exists while its handle has work queued or running. A step is either
-//! done right away under a [`LaneGuard`] (the lane was idle and the step is
-//! cheap) or handed to a pool; the next step starts only once the previous one
-//! has finished, on whichever thread finished it.
+//! done right away under a [`LaneGuard`] (the lane was idle and the step does
+//! no I/O at all) or handed to a pool; the next step starts only once the
+//! previous one has finished, on whichever thread finished it.
 //!
-//! A step the pool refuses runs on the thread that tried to start it, so
-//! nothing is dropped or reordered. That thread can be the FUSE dispatch
-//! thread (a `run` on an idle lane, or a [`LaneGuard`] dropped there), so the
-//! step is told where it runs ([`Ran`]) and a step that would touch the
-//! network must do only its local part on the caller: the write path defers a
-//! refused chunk graduation to the handle's next write, and the release
-//! commit only journals and hands the upload to `bg::MUTATION`, which never
-//! refuses. Pool-full is therefore never an error for the kernel, and never a
-//! network wait on `fuser-0`.
+//! A step the pool refuses goes to its spill pool if it has one, and is told
+//! which of the two it runs on ([`Ran`]). The write path gives every step that
+//! touches the disk a pool that never refuses at the end of that chain
+//! (`bg::DISK` and `bg::MUTATION` have unbounded queues), so no staging-file
+//! I/O runs on the FUSE dispatch thread. Only when both refuse, which for
+//! those pools means the OS could not start a worker thread for either, does
+//! the step run on the thread that tried to start it, as the
+//! last resort that still drops and reorders nothing; that thread can be the
+//! FUSE dispatch thread (a `run` on an idle lane, or a [`LaneGuard`] dropped
+//! there), so a step that would touch the network does only its local part
+//! there. Pool-full is therefore never an error for the kernel.
 //!
 //! A step's reply goes out after the lane has moved on when nothing waits
 //! behind it (the lane is retired first), and before the next step starts when
 //! something does, so replies leave in the order the requests came in. The
 //! kernel sends a handle's next write, or its FLUSH and RELEASE, only after
-//! that reply, so a plain sequential writer always finds the lane idle and is
-//! answered on the dispatch thread; only the steps that really overlap
-//! (writeback of a shared mapping) queue. Steps queued behind one another are
+//! that reply, so a plain sequential writer always finds the lane idle: its
+//! write goes straight to a pool worker with nothing ahead of it, and only the
+//! steps that really overlap (writeback of a shared mapping) queue in the
+//! lane. Steps queued behind one another are
 //! started in a loop, never by recursion, however many are refused in a row.
 
 use std::collections::{HashMap, VecDeque};
@@ -45,7 +48,9 @@ use crate::bg::Pool;
 pub(crate) enum Ran {
     /// On a worker of the pool it was queued for.
     OnPool,
-    /// The pool refused it, so on the thread that started it, which may be the
+    /// The pool refused it, so on a worker of its spill pool.
+    OnSpill,
+    /// Both refused it, so on the thread that started it, which may be the
     /// FUSE dispatch thread: no network here.
     OnCaller,
 }
@@ -156,23 +161,23 @@ impl FhLanes {
     // its pool refuses, on this thread, in order.
     fn start(self: &Arc<Self>, fh: u64, mut step: Step) {
         loop {
-            let on_pool = |lanes: Arc<Self>| move |job: Job| {
-                if let Some(next) = lanes.finish_step(fh, job, Ran::OnPool) {
+            let on_pool = |lanes: Arc<Self>, ran: Ran| move |job: Job| {
+                if let Some(next) = lanes.finish_step(fh, job, ran) {
                     lanes.start(fh, next);
                 }
             };
-            let job = match step.pool.submit_owning(step.job, on_pool(self.clone())) {
+            let job = match step.pool.submit_owning(step.job, on_pool(self.clone(), Ran::OnPool)) {
                 Ok(()) => return,
                 Err((_, job)) => job,
             };
             let job = match step.spill {
-                Some(spill) => match spill.submit_owning(job, on_pool(self.clone())) {
+                Some(spill) => match spill.submit_owning(job, on_pool(self.clone(), Ran::OnSpill)) {
                     Ok(()) => return,
                     Err((_, job)) => job,
                 },
                 None => job,
             };
-            // The pool is full: run it here rather than drop or reorder it.
+            // Nothing would take it: run it here rather than drop or reorder it.
             match self.finish_step(fh, job, Ran::OnCaller) {
                 Some(next) => step = next,
                 None => return,

@@ -618,6 +618,10 @@ struct OpenFile {
     // Bytes actually appended so far via the streaming fast path in write().
     // Also doubles as "expected next offset" for detecting a sequential write.
     total_written: u64,
+    // `total_written` once every write dispatched so far has run, if each
+    // appends: what `WriteCtx::classify_write` judges a new write against, since
+    // writes queued on the handle's lane have not appended yet.
+    dispatched_end: u64,
     // Candidate for chunked streaming: starts true only when there is no
     // pre-existing content to seed from, and is permanently cleared on the
     // first non-sequential write or explicit truncate.
@@ -4905,6 +4909,7 @@ fn open_register<R: OpenAnswer>(
             next_expected_off: 0,
             read_ahead_window: READ_AHEAD_INITIAL,
             total_written: 0,
+            dispatched_end: 0,
             // Only an empty staging file can stream from offset 0.
             stream_eligible: !seeded,
             chunk_upload: None,
@@ -7522,6 +7527,7 @@ impl Filesystem for NextCloudFs {
                                     next_expected_off: 0,
                                     read_ahead_window: READ_AHEAD_INITIAL,
                                     total_written: 0,
+                                    dispatched_end: 0,
                                     stream_eligible: false,
                                     chunk_upload: None,
                                     ino,
@@ -7610,6 +7616,7 @@ impl Filesystem for NextCloudFs {
                 next_expected_off: 0,
                 read_ahead_window: READ_AHEAD_INITIAL,
                 total_written: 0,
+                dispatched_end: 0,
                 stream_eligible: true,
                 chunk_upload: None,
                 ino,

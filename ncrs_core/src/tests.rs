@@ -223,6 +223,7 @@
                     next_expected_off: 0,
                     read_ahead_window: READ_AHEAD_INITIAL,
                     total_written: 0,
+                    dispatched_end: 0,
                     chunk_upload: None,
                     ino: 100 + fh,
                     io_kind: iomode::IoKind::Cached,
@@ -236,15 +237,27 @@
                 self.ctx.open_files.safe_lock().insert(fh, of);
             }
 
+            // Each dispatch runs on this thread as if it were `fuser-0`: any
+            // staging-file I/O it does here panics (`write_path::staging_io`).
             fn write(&self, fh: u64, remote: &str, offset: u64, data: &[u8]) -> Receiver<Result<u32, i32>> {
                 let (tx, rx) = channel();
-                self.ctx.dispatch_write(fh, PathBuf::from(remote), offset, data, move |r| tx.send(r.map_err(|e| e.code())).unwrap());
+                crate::write_path::as_dispatch_thread(|| {
+                    self.ctx.dispatch_write(fh, PathBuf::from(remote), offset, data, move |r| tx.send(r.map_err(|e| e.code())).unwrap())
+                });
                 rx
             }
 
             fn empty(&self, fh: u64, op: fn(&WriteCtx, u64, Box<dyn FnOnce() + Send>)) -> Receiver<()> {
                 let (tx, rx) = channel();
-                op(&self.ctx, fh, Box::new(move || tx.send(()).unwrap()));
+                crate::write_path::as_dispatch_thread(|| op(&self.ctx, fh, Box::new(move || tx.send(()).unwrap())));
+                rx
+            }
+
+            fn truncate(&self, fh: u64, size: u64) -> Receiver<Result<(), i32>> {
+                let (tx, rx) = channel();
+                crate::write_path::as_dispatch_thread(|| {
+                    self.ctx.dispatch_truncate(fh, size, move |_, res| tx.send(res.map_err(|e| e.code())).unwrap())
+                });
                 rx
             }
 
@@ -493,19 +506,19 @@
             std::fs::write(&kept, &original).unwrap();
 
             r.open(6, "/k.bin", Some(kept.clone()));
-            assert_eq!(r.ctx.write_cost(6, MIB as u64, 4), crate::write_path::WriteCost::Seed);
+            assert_eq!(r.ctx.write_cost(6, MIB as u64, 4), crate::write_path::WriteCost::Stage);
             assert_eq!(recv(&r.write(6, "/k.bin", MIB as u64, b"EDIT"), "write"), Ok(4));
             let wp = r.of(6, |of| of.write_path.clone().unwrap());
             let mut expect = original.clone();
             expect[MIB..MIB + 4].copy_from_slice(b"EDIT");
             assert!(std::fs::read(&wp).unwrap() == expect, "an in-place edit keeps the rest of the file");
-            assert_eq!(r.ctx.write_cost(6, 0, 4), crate::write_path::WriteCost::Inline, "seeded once");
+            assert_eq!(recv(&r.write(6, "/k.bin", 0, b"ED"), "write"), Ok(2));
+            expect[..2].copy_from_slice(b"ED");
+            assert!(std::fs::read(&wp).unwrap() == expect, "seeded once: a later write must not seed over the first");
             assert!(!wp.with_extension("seed").exists());
 
             r.open(7, "/k.bin", Some(kept));
-            let (tx, rx) = channel();
-            r.ctx.dispatch_truncate(7, 1000, move |_, res| tx.send(res.map_err(|e| e.code())).unwrap());
-            assert_eq!(recv(&rx, "truncate"), Ok(()));
+            assert_eq!(recv(&r.truncate(7, 1000), "truncate"), Ok(()));
             let wp = r.of(7, |of| of.write_path.clone().unwrap());
             assert!(std::fs::read(&wp).unwrap() == original[..1000]);
             assert!(r.of(7, |of| of.dirty && of.total_written == 1000));
@@ -517,42 +530,107 @@
         }
 
         #[test]
-        fn a_refused_graduation_never_puts_on_the_caller_and_the_next_write_catches_up() {
+        fn a_refused_graduation_only_appends_on_the_disk_pool_and_the_next_write_catches_up() {
             let mut r = rig("refused", ChunkServer::default());
             r.ctx.upload_pool = refusing_pool();
-            r.ctx.disk_pool = refusing_pool();
-            // Not even the spill: this is the path of last resort.
-            r.ctx.spill_pool = refusing_pool();
             r.open(10, "/r.bin", None);
-            let data = pattern(26 * MIB, 10);
-            let (first, last) = data.split_at(25 * MIB);
+            // Below the tail's cap, so no graduation is spilled to `mutate`.
+            let data = pattern(21 * MIB, 10);
+            let (first, last) = data.split_at(20 * MIB);
             for (i, piece) in first.chunks(MIB).enumerate() {
-                let rx = r.write(10, "/r.bin", (i * MIB) as u64, piece);
-                // Refused, so it ran on this (the "dispatch") thread, before dispatch returned.
-                assert_eq!(rx.try_recv().expect("answered on the caller"), Ok(MIB as u32), "a refusal is never an error");
+                // `write` panics if the append ran on this ("dispatch") thread.
+                assert_eq!(recv(&r.write(10, "/r.bin", (i * MIB) as u64, piece), "write"), Ok(MIB as u32), "a refusal is never an error");
             }
-            assert!(r.server.net_threads.lock().unwrap().is_empty(), "a refused step went to the network on the caller");
+            assert!(r.server.net_threads.lock().unwrap().is_empty(), "a refused graduation went to the network");
             let wp = r.of(10, |of| {
-                assert!(of.chunk_upload.is_none() && of.stream_eligible && of.total_written == 25 * MIB as u64);
+                assert!(of.chunk_upload.is_none() && of.stream_eligible && of.total_written == 20 * MIB as u64);
                 of.write_path.clone().unwrap()
             });
-            assert_eq!(std::fs::metadata(&wp).unwrap().len(), 25 * MIB as u64, "the deferred chunks wait in the tail");
+            assert_eq!(std::fs::metadata(&wp).unwrap().len(), 20 * MIB as u64, "the deferred chunks wait in the tail");
 
             // Room again: the next write sends every full chunk the tail holds, off this thread.
             r.ctx.upload_pool = &bg::UPLOAD;
-            r.ctx.disk_pool = &bg::DISK;
-            r.ctx.spill_pool = &bg::MUTATION;
-            assert_eq!(r.ctx.write_cost(10, 25 * MIB as u64, MIB), crate::write_path::WriteCost::GraduateCapped, "past the cap");
-            assert_eq!(recv(&r.write(10, "/r.bin", 25 * MIB as u64, last), "write"), Ok(MIB as u32));
+            assert_eq!(r.ctx.write_cost(10, 20 * MIB as u64, MIB), crate::write_path::WriteCost::GraduateCapped, "at the cap");
+            assert_eq!(recv(&r.write(10, "/r.bin", 20 * MIB as u64, last), "write"), Ok(MIB as u32));
             let cs = r.of(10, |of| of.chunk_upload.clone().unwrap());
             assert_eq!((cs.next_index, cs.bytes_confirmed), (2, 20 * MIB as u64));
-            assert_eq!(std::fs::metadata(&wp).unwrap().len(), 6 * MIB as u64);
+            assert_eq!(std::fs::metadata(&wp).unwrap().len(), MIB as u64);
             let me = std::thread::current().id();
             assert!(r.server.net_threads.lock().unwrap().iter().all(|t| *t != me), "a chunk went out on the caller");
 
             recv(&r.release(10), "release");
             wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
             assert!(r.server.finished.lock().unwrap()[0].1 == data, "the assembled file is what was written");
+        }
+
+        #[test]
+        #[should_panic(expected = "on the dispatch thread")]
+        fn the_dispatch_thread_marker_catches_staging_io() {
+            // What makes every `Rig` dispatch a check that no staging I/O ran on
+            // the caller: the same write, run inline, trips it.
+            let r = rig("marker", ChunkServer::default());
+            r.open(20, "/m.txt", None);
+            let _ = crate::write_path::as_dispatch_thread(|| r.ctx.write_answer(20, Path::new("/m.txt"), 0, b"x", false));
+        }
+
+        #[test]
+        fn the_disk_pool_never_refuses_so_a_stalled_disk_queues_writes_without_holding_the_dispatcher() {
+            // The policy: `bg::DISK` has no queue cap. A refusal would either
+            // run the write on `fuser-0` or answer EAGAIN to the writer.
+            assert_eq!(bg::DISK.queue_cap(), usize::MAX);
+
+            // A disk pool whose only worker is stuck, as on a host disk parked
+            // in the ext4 journal. More handles than the old 4096-deep queue.
+            let stalled: &'static bg::Pool = Box::leak(Box::new(bg::Pool::new("t-disk-stalled", 1, usize::MAX)));
+            let (open_gate, gate) = channel::<()>();
+            stalled.submit(move || { let _ = gate.recv(); }).unwrap();
+            let mut r = rig("stalled_disk", ChunkServer::default());
+            r.ctx.disk_pool = stalled;
+            const HANDLES: u64 = 4200;
+            // (handle, step) in the order the replies left.
+            let log = Arc::new(Mutex::new(Vec::<(u64, u8)>::new()));
+            let t = Instant::now();
+            for fh in 1..=HANDLES {
+                r.open(fh, &format!("/s{fh}.txt"), None);
+            }
+            crate::write_path::as_dispatch_thread(|| {
+                for fh in 1..=HANDLES {
+                    // Three overlapping writes (shared-mapping writeback) and a
+                    // truncate: all queue in the handle's lane. (No flush: 4200
+                    // fsyncs would time this test, not the dispatcher.)
+                    for (step, (off, piece)) in [(0u64, &b"aaaa"[..]), (4, b"bbbb"), (8, b"cc")].into_iter().enumerate() {
+                        let log = log.clone();
+                        r.ctx.dispatch_write(fh, PathBuf::from(format!("/s{fh}.txt")), off, piece, move |res| {
+                            assert!(res.is_ok(), "fh {fh}: {res:?}");
+                            log.lock().unwrap().push((fh, step as u8));
+                        });
+                    }
+                    let l = log.clone();
+                    r.ctx.dispatch_truncate(fh, 9, move |_, res| {
+                        assert!(res.is_ok());
+                        l.lock().unwrap().push((fh, 3));
+                    });
+                }
+            });
+            let dispatched_in = t.elapsed();
+            // Returning at all proves no dispatch waited on the stuck worker.
+            assert!(log.lock().unwrap().is_empty(), "a step was answered while the disk was stalled");
+            assert_eq!(stalled.stats().rejected, 0);
+            eprintln!("{} steps dispatched onto a stalled disk pool in {dispatched_in:?}", HANDLES * 4);
+
+            open_gate.send(()).unwrap();
+            wait_for("every reply", || log.lock().unwrap().len() == HANDLES as usize * 4);
+            let mut seen = HashMap::<u64, Vec<u8>>::new();
+            for (fh, step) in log.lock().unwrap().iter() {
+                seen.entry(*fh).or_default().push(*step);
+            }
+            for fh in 1..=HANDLES {
+                assert_eq!(seen[&fh], vec![0, 1, 2, 3], "fh {fh}: replies out of request order");
+                let wp = r.of(fh, |of| of.write_path.clone().unwrap());
+                assert_eq!(std::fs::read(&wp).unwrap(), b"aaaabbbbc", "fh {fh}: the steps landed out of order");
+            }
+            assert_eq!(stalled.stats().rejected, 0, "the queue held every step");
+            assert!(stalled.stats().peak_queued as u64 >= HANDLES, "one step per handle waited in the pool's queue");
         }
 
         #[test]
@@ -578,7 +656,7 @@
         }
 
         #[test]
-        fn a_write_classified_inline_never_graduates_even_if_online_returns_before_it_runs() {
+        fn a_write_classified_stage_never_graduates_even_if_online_returns_before_it_runs() {
             let r = rig("classify", ChunkServer::default());
             r.open(11, "/c.bin", None);
             let data = pattern(11 * MIB, 11);
@@ -588,12 +666,12 @@
             // The write that fills the chunk is classified while offline...
             r.ctx.conn.is_offline.store(true, Ordering::SeqCst);
             let cost = r.ctx.write_cost(11, 9 * MIB as u64, MIB);
-            assert_eq!(cost, crate::write_path::WriteCost::Inline);
-            // ...and runs, as dispatch_write runs an Inline write, once it is back.
+            assert_eq!(cost, crate::write_path::WriteCost::Stage);
+            // ...and runs, as dispatch_write runs a Stage write, once it is back.
             r.ctx.conn.is_offline.store(false, Ordering::SeqCst);
             let piece = &data[9 * MIB..10 * MIB];
             assert_eq!(r.ctx.write_answer(11, Path::new("/c.bin"), 9 * MIB as u64, piece, false).map_err(|e| e.code()), Ok(MIB as u32));
-            assert!(r.server.net_threads.lock().unwrap().is_empty(), "an Inline write reached the server");
+            assert!(r.server.net_threads.lock().unwrap().is_empty(), "a Stage write reached the server");
             assert!(r.of(11, |of| of.chunk_upload.is_none() && of.stream_eligible && of.total_written == 10 * MIB as u64));
             // The next write graduates the chunk the last one filled.
             assert_eq!(r.ctx.write_cost(11, 10 * MIB as u64, MIB), crate::write_path::WriteCost::Graduate);
@@ -5305,6 +5383,12 @@ mod upload_order_tests {
             let (tx, rx) = mpsc::channel();
             w.dispatch_release(fh, Box::new(move || tx.send(()).unwrap()));
             rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The move to `recovered/` runs on `bg::DISK`, after the reply.
+            let t = Instant::now();
+            while meta.journal.safe_lock().unresolved_conflicts().is_empty() {
+                assert!(t.elapsed() < Duration::from_secs(10), "the bytes were never moved to recovered/");
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let recovered = tmp.path().join(mutation_journal::RECOVERED_DIR);
             let kept: Vec<_> = std::fs::read_dir(&recovered).unwrap().flatten().map(|e| e.path()).collect();
             let data = kept.iter().find(|p| p.extension().is_none_or(|x| x != "json")).expect("bytes kept");
