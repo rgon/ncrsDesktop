@@ -580,7 +580,9 @@ impl WriteCtx {
             }
             Unlinked::Local | Unlinked::Unverified => {
                 if of.dirty {
-                    log::info!("release: fh {} of {} was deleted while open — dropping its writes", fh, of.remote_path.display());
+                    // POSIX: writes to a removed file (unlinked, or renamed
+                    // over) go with it. Loud, since they are the user's bytes.
+                    log::warn!("release: fh {} of {} was removed by this mount while open (unlink or rename over it) — dropping its writes", fh, of.remote_path.display());
                 }
                 let _ = mutation_journal::remove_staging_file(wp);
             }
