@@ -219,7 +219,9 @@ pub(crate) fn mount_failed() {
 
 /// Starts the `signals` service when [`block_shutdown_signals`] ran; a no-op
 /// for library callers. Called first thing in `mount_ncfs` (right after the
-/// seccomp filter, which must precede every thread), so a stop signal is
+/// seccomp filter, which spawns nothing and must precede every thread), and
+/// so the process's first spawned thread: if it cannot start, the calling
+/// thread unblocks the signals before any other exists. A stop signal is
 /// never left pending through a slow startup: before the mount exists it
 /// writes the journal, if loaded, and exits. The signals are kept blocked
 /// from `main` on rather than unblocked until the session exists: a thread
@@ -299,6 +301,15 @@ pub(crate) fn start_watcher() {
         }
     });
     if let Err(e) = started {
-        log::error!("signals: cannot start the signal watcher: {}", e);
+        // Nothing would ever take the blocked signals: a stop would stay
+        // pending and the daemon would only die to SIGKILL, with no journal
+        // flush at all. Unblocked on this thread (the daemon's main thread,
+        // which runs `mount_ncfs` until the end), a stop is delivered here
+        // with its default action, and every thread spawned from here on —
+        // this is the first `mount_ncfs` spawns — inherits the unblocked
+        // mask. A thread an earlier library call may have started keeps its
+        // blocked mask, which only means it is never the one picked.
+        log::error!("signals: cannot start the signal watcher: {} — stop signals unblocked; a stop kills the daemon without flushing the journal", e);
+        unblock_shutdown_signals();
     }
 }
