@@ -269,9 +269,11 @@
             assert_eq!(total, 25 * MIB as u64);
             assert_eq!((cs.next_index, cs.bytes_confirmed), (2, 20 * MIB as u64));
             assert_eq!(std::fs::metadata(&wp).unwrap().len(), 5 * MIB as u64, "the tail holds only the unsent bytes");
+            assert!(mutation_journal::tail_marker(&wp).exists(), "a crash now must not keep the tail as a recovered file");
 
             recv(&r.flush(1), "flush");
             recv(&r.release(1), "release");
+            assert!(!mutation_journal::tail_marker(&wp).exists(), "journaled now");
             wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
             std::thread::sleep(Duration::from_millis(200));
             let finished = r.server.finished.lock().unwrap();
@@ -408,6 +410,9 @@
             wait_for("the abort", || r.server.aborts.load(Ordering::SeqCst) == 1);
             assert!(r.ctx.journal.safe_lock().is_empty(), "nothing is committed");
             assert!(r.server.finished.lock().unwrap().is_empty());
+            // No chunk left the staging file, so it is every byte written: kept.
+            let kept = r.dir.join(mutation_journal::RECOVERED_DIR).join(mutation_journal::staging_file_name(4));
+            assert!(std::fs::read(&kept).unwrap() == data, "the written bytes were dropped");
         }
 
         #[test]
