@@ -3678,6 +3678,8 @@ struct MetaCtx {
     details: ipc::FileDetailMap,
     children_map: ipc::ChildrenMap,
     status: StatusMap,
+    // Locked after `cache` when both are needed, never while holding it.
+    ghost_entries: GhostMap,
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     // Open handles that may hold unsent writes. Zero (the common case) lets a
     // getattr skip the `open_files` lock entirely (see `overlay_local_size`).
@@ -3704,6 +3706,7 @@ impl MetaCtx {
             details: Arc::new(RwLock::new(HashMap::new())),
             children_map: Arc::new(RwLock::new(HashMap::new())),
             status: Arc::new(RwLock::new(HashMap::new())),
+            ghost_entries: Arc::new(Mutex::new(HashMap::new())),
             open_files: Arc::new(Mutex::new(HashMap::new())),
             open_writers: Arc::new(AtomicUsize::new(0)),
             next_fh: Arc::new(Mutex::new(1)),
@@ -3759,27 +3762,34 @@ fn set_attr_size(attr: &mut FileAttr, size: u64) {
 
 /// Overlays the size of unsent writes held by an open handle on `path`. Free
 /// unless some handle is open for writing.
+///
+/// A handle whose file was unlinked holds bytes that will never be uploaded,
+/// so it is skipped. When several handles have written, the largest size
+/// wins: without knowing which will be released last, the largest is the one
+/// that does not make a file look truncated while its writes are pending.
 fn overlay_local_size(ctx: &MetaCtx, path: &Path, attr: &mut FileAttr) {
     if attr.kind != FileType::RegularFile || ctx.open_writers.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let local = {
+    let local: Vec<Result<u64, PathBuf>> = {
         let files = ctx.open_files.safe_lock();
         files.values()
-            .find(|of| of.dirty && of.remote_path == path && of.write_path.is_some())
+            .filter(|of| of.dirty && !of.unlinked && of.remote_path == path && of.write_path.is_some())
             .map(|of| match (&of.chunk_upload, &of.write_path) {
                 // Sent chunks are gone from the tail file; the total is the size.
                 (Some(_), _) => Ok(of.total_written),
                 (None, Some(wp)) => Err(wp.clone()),
                 (None, None) => Ok(of.total_written),
             })
+            .collect()
     };
-    let size = match local {
-        None => return,
-        Some(Ok(n)) => Some(n),
-        // A local stat, outside the lock.
-        Some(Err(wp)) => std::fs::metadata(&wp).ok().map(|m| m.len()),
-    };
+    // Local stats, outside the lock.
+    let size = local.into_iter()
+        .filter_map(|l| match l {
+            Ok(n) => Some(n),
+            Err(wp) => std::fs::metadata(&wp).ok().map(|m| m.len()),
+        })
+        .max();
     if let Some(size) = size {
         set_attr_size(attr, size);
     }
@@ -4434,11 +4444,42 @@ fn lookup_pick(c: &mut FsCache, path: &Path, entry: &RemoteEntry) -> LookupHit {
     }
 }
 
+/// A ghost entry for `path` that is still live (see `GhostKind`); an expired
+/// one is dropped on the way.
+fn live_ghost(ghosts: &GhostMap, path: &Path) -> Option<GhostKind> {
+    let mut ghosts = ghosts.safe_lock();
+    let kind = ghosts.get(path).filter(|g| g.created_at.elapsed() < GHOST_TTL).map(|g| g.kind);
+    if kind.is_none() {
+        ghosts.remove(path);
+    }
+    kind
+}
+
+/// How a lookup that found its entry is answered.
+enum LookupAnswer {
+    Entry(FileAttr),
+    /// A ghost appeared while the lookup was resolved (see `live_ghost`).
+    Ghost(GhostKind),
+    /// Unlinked or renamed away while the lookup was resolved.
+    Gone,
+}
+
 /// The IPC-map side of a lookup (Nautilus' DETAIL queries read these), and
 /// the attributes to answer with. The detail maps are never locked under
 /// `cache`, so this runs after `lookup_pick` released it.
-fn lookup_commit(ctx: &MetaCtx, hit: LookupHit) -> FileAttr {
+///
+/// A lookup answered off the dispatch thread can race unlink or rename,
+/// which run on it: the name may be gone by the time the maps are written.
+/// So the maps are written *first* and the name is checked again after;
+/// unlink marks the name gone in `cache` before it clears the maps, so
+/// either this check sees it gone (and takes the entries back out) or
+/// unlink's clearing runs after these writes. Ghosts are re-checked for the
+/// same reason: the preamble in `lookup` saw them before the wait.
+fn lookup_commit(ctx: &MetaCtx, hit: LookupHit) -> LookupAnswer {
     let LookupHit { target, mut attr, is_dir, is_shared, fileid, detail } = hit;
+    if let Some(kind) = live_ghost(&ctx.ghost_entries, &target) {
+        return LookupAnswer::Ghost(kind);
+    }
     if is_shared {
         ctx.shared.safe_write().insert(target.clone());
     }
@@ -4452,11 +4493,36 @@ fn lookup_commit(ctx: &MetaCtx, hit: LookupHit) -> FileAttr {
             .or_insert_with(std::collections::HashSet::new)
             .insert(target.clone());
     }
-    overlay_local_size(ctx, &target, &mut attr);
     if !is_dir {
-        ctx.status.safe_write().entry(target).or_insert(FileStatus::Remote);
+        ctx.status.safe_write().entry(target.clone()).or_insert(FileStatus::Remote);
     }
-    attr
+    if lookup_target_gone(&ctx.cache, &target) {
+        if let Some(parent) = target.parent() {
+            if let Some(set) = ctx.children_map.safe_write().get_mut(parent) {
+                set.remove(&target);
+            }
+        }
+        ctx.details.safe_write().remove(&target);
+        ctx.status.safe_write().remove(&target);
+        ctx.shared.safe_write().remove(&target);
+        ctx.fileids.safe_write().remove(&target);
+        return LookupAnswer::Gone;
+    }
+    overlay_local_size(ctx, &target, &mut attr);
+    LookupAnswer::Entry(attr)
+}
+
+/// Has `path` been unlinked or renamed away since its lookup resolved? A
+/// resident parent listing is the authority (unlink and rename edit it, and
+/// create adds to it, so a name re-created after an unlink is not gone);
+/// without one, a DELETE still in flight says so.
+fn lookup_target_gone(cache: &Arc<Mutex<FsCache>>, path: &Path) -> bool {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return false };
+    let mut c = cache.safe_lock();
+    match c.find_child(dir, name) {
+        Some((_, pos)) => pos.is_none(),
+        None => c.deleting.contains(path),
+    }
 }
 
 pub struct NextCloudFs {
@@ -5512,6 +5578,7 @@ impl NextCloudFs {
             details: self.details.clone(),
             children_map: self.children_map.clone(),
             status: self.status.clone(),
+            ghost_entries: self.ghost_entries.clone(),
             open_files: self.open_files.clone(),
             open_writers: Arc::new(AtomicUsize::new(0)),
             next_fh: self.next_fh.clone(),
@@ -6079,22 +6146,18 @@ impl Filesystem for NextCloudFs {
             reply.error(Errno::ENOENT);
             return;
         }
-        {
-            let mut ghosts = self.ghost_entries.safe_lock();
-            if let Some(kind) = ghosts.get(&full_path)
-                .filter(|g| g.created_at.elapsed() < GHOST_TTL)
-                .map(|g| g.kind)
-            {
-                match kind {
-                    GhostKind::HiddenAdd => { reply.error(Errno::ENOENT); return; }
-                    GhostKind::VisibleDelete { attr } => { reply.entry(&Duration::ZERO, &attr, Generation(0)); return; }
-                }
-            }
-            ghosts.remove(&full_path);
+        match live_ghost(&self.ghost_entries, &full_path) {
+            Some(GhostKind::HiddenAdd) => { reply.error(Errno::ENOENT); return; }
+            Some(GhostKind::VisibleDelete { attr }) => { reply.entry(&Duration::ZERO, &attr, Generation(0)); return; }
+            None => {}
         }
 
         self.with_child(req.pid(), &full_path, reply, lookup_pick, |_| None, |ctx, _, reply, r| match r {
-            Resolved::Found(hit) => reply.entry(&TTL, &lookup_commit(ctx, hit), Generation(0)),
+            Resolved::Found(hit) => match lookup_commit(ctx, hit) {
+                LookupAnswer::Entry(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                LookupAnswer::Ghost(GhostKind::VisibleDelete { attr }) => reply.entry(&Duration::ZERO, &attr, Generation(0)),
+                LookupAnswer::Ghost(GhostKind::HiddenAdd) | LookupAnswer::Gone => reply.error(Errno::ENOENT),
+            },
             Resolved::Absent => reply.error(Errno::ENOENT),
             // We don't know the parent's contents, so we can't say the name is
             // absent: a walker told ENOENT believes it, while EAGAIN says "ask later".
