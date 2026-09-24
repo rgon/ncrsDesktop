@@ -4287,36 +4287,53 @@ mod upload_order_tests {
             };
             let (_, conn, cache) = setup(vec![("/big", big)]);
             cache.safe_lock().put_dir_cache(PathBuf::from("/hot"), None, None, names("/hot", 2000));
-            let meta = MetaCtx::for_tests(conn, cache, Duration::from_secs(3));
+            let deadline = Duration::from_secs(3);
+            let meta = MetaCtx::for_tests(conn, cache.clone(), deadline);
 
+            let started = Instant::now();
             let slow: Vec<_> = (0..16).map(|i| ask(&meta, &format!("/big/never-{i}.txt"))).collect();
             let mut lat = Vec::with_capacity(3000);
             let t_end = Instant::now() + Duration::from_millis(2500);
             let mut i = 0usize;
             while Instant::now() < t_end {
                 let t = Instant::now();
-                let r = ask(&meta, &format!("/hot/f{}.txt", i % 2000)).try_recv().expect("inline");
+                let r = ask(&meta, &format!("/hot/f{}.txt", i % 2000)).try_recv().expect("a hit is answered inline, never queued behind the stream");
                 lat.push(t.elapsed());
                 assert!(matches!(r.0, Resolved::Found(_)));
                 i += 1;
                 std::thread::sleep(Duration::from_micros(500));
             }
             lat.sort();
-            let p99 = lat[lat.len() * 99 / 100];
-            let max = *lat.last().unwrap();
-            eprintln!("fast path over {} lookups: p50 {:?} p99 {:?} max {:?}", lat.len(), lat[lat.len() / 2], p99, max);
-            // The 1 ms bound is for the optimised build the daemon ships as
-            // (`cargo test --release`). An unoptimised build moves stream entries
-            // ~10x slower under the lock, so it gets a looser bound — still far
-            // below what cloning the partial listing per waiter used to cost.
-            let bound = if cfg!(debug_assertions) { Duration::from_millis(10) } else { Duration::from_millis(1) };
-            assert!(p99 < bound, "p99 {p99:?} (bound {bound:?})");
+            eprintln!("fast path over {} lookups: p50 {:?} p99 {:?} max {:?}", lat.len(), lat[lat.len() / 2], lat[lat.len() * 99 / 100], lat.last().unwrap());
 
             for rx in slow {
                 let (r, on) = rx.recv_timeout(Duration::from_secs(10)).expect("every slow resolver is answered by its deadline");
                 assert_eq!(on, "ncrs-meta");
                 assert!(matches!(r, Resolved::Unknown(None)), "a name not streamed by the deadline is unknown, never absent");
             }
+            let waited = started.elapsed();
+
+            // What keeps the hit path fast is how the waiters use the one lock
+            // it needs, so that is what is asserted, by count rather than by
+            // the clock (wall-clock bounds failed under parallel test load).
+            // The listing still hangs, so its pending state is still there.
+            let (probe, streamed) = {
+                let c = cache.safe_lock();
+                let p = &c.pending_dirs[Path::new("/big")];
+                (p.probe, p.entries.len())
+            };
+            eprintln!("{probe:?}, {streamed} entries streamed, waiters done in {waited:?}");
+            assert!(streamed > PENDING_DRAIN_BATCH * 4, "the stream never got wide ({streamed} entries): the test proved nothing");
+            // 1. One look holds the lock for at most one batch of the stream,
+            //    never the whole backlog and never a copy of the partial listing.
+            assert!(probe.most_per_find <= PENDING_DRAIN_BATCH, "one lookup moved {} entries under the cache lock", probe.most_per_find);
+            // 2. No wake-up storm: each waiter looks once per 50 ms tick, plus
+            //    once per full batch it drains. A waiter woken by every other
+            //    waiter's drain (what stalled the hit path before) looks tens
+            //    of thousands of times.
+            let ticks = waited.as_millis() as u64 / 50 + 2;
+            let bound = 16 * ticks + (streamed / PENDING_DRAIN_BATCH) as u64 + 16;
+            assert!(probe.finds <= bound, "{} lookups into the stream (bound {bound}): the waiters are waking each other", probe.finds);
         }
 
         // ── open(): registration, staging, and the evicted-parent cases ─────
