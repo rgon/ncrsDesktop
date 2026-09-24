@@ -20,7 +20,13 @@ PASS="${WEBDAV_PASS:-testpass}"
 PROXY="${PROXY:-http://faultproxy:8080}"
 MOUNT=/mnt/ncrs
 RES=/results
-LOG=/tmp/ncrs.log
+# On the compose file's tmpfs, not the container's disk: the daemon logs from
+# fuser-0 (the one FUSE dispatch thread) with a synchronous write, and on a
+# busy host disk an ext4 journal commit parks that write for seconds, which the
+# probes then report as a daemon freeze (the 2026-09-25 A/B, both builds).
+LOG_DIR=/var/log/ncrs
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/ncrs.log"
 WALK_SECS="${WALK_SECS:-300}"
 WALK_REPEAT="${WALK_REPEAT:-0}"
 WALK_FINDS="${WALK_FINDS:-2}"
