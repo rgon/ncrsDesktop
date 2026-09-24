@@ -60,6 +60,8 @@
             conflict_copy_fails: AtomicBool,
             // ... or 403: a share with edit but no create permission.
             conflict_copy_forbidden: AtomicBool,
+            // How long a whole-file PUT takes.
+            put_delay: Duration,
         }
 
         impl ChunkServer {
@@ -96,6 +98,7 @@
                 Err(not_here())
             }
             fn put_file(&self, path: &Path, body: Vec<u8>, _: Option<&str>) -> Result<backend::PutResult, backend::BackendWriteError> {
+                std::thread::sleep(self.put_delay);
                 if let Some(e) = self.refuse(path) {
                     return Err(e);
                 }
@@ -599,6 +602,30 @@
             recv(&r.release(11), "release");
             wait_for("the streamed finish", || !r.server.finished.lock().unwrap().is_empty());
             assert!(r.server.finished.lock().unwrap()[0].1 == data);
+        }
+
+        #[test]
+        fn an_upload_renamed_while_it_ran_lands_under_the_new_name() {
+            // A browser download: `x.crdownload` is written, closed, and
+            // renamed to `x` while its PUT is still running.
+            let r = rig("renamed_mid_put", ChunkServer { put_delay: Duration::from_millis(400), ..Default::default() });
+            r.ctx.cache.safe_lock().put_dir_cache(PathBuf::from("/"), None, None, vec![make_dav_entry("x.crdownload", None)]);
+            r.open(30, "/x.crdownload", None);
+            assert!(recv(&r.write(30, "/x.crdownload", 0, b"downloaded"), "write").is_ok());
+            recv(&r.release(30), "release");
+            wait_for("the PUT to start", || r.ctx.journal.safe_lock().entries().iter().any(|e| e.in_flight));
+            let (from, to) = (Path::new("/x.crdownload"), Path::new("/x"));
+            // What rename() does.
+            rename_in_cache(&mut r.ctx.cache.safe_lock(), &r.ctx.open_files, from, to, Path::new("/"), Path::new("/"));
+            r.ctx.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: from.into(), to: to.into() });
+            r.ctx.uploads.moved(from, to);
+            wait_for("the PUT to land", || r.ctx.journal.safe_lock().len() == 1);
+            assert_eq!(r.ctx.uploads.etag_for(to, 0, None).as_deref(), Some("put"), "the next edit of x sends the etag the upload got");
+            assert_eq!(r.ctx.uploads.etag_for(from, 0, None), None);
+            let c = r.ctx.cache.safe_lock();
+            let listed = c.dir_cache[Path::new("/")].files.iter().find(|e| e.path == to).cloned().unwrap();
+            assert_eq!((listed.change_token.as_deref(), listed.size), (Some("put"), 10));
+            assert!(!c.uploading.contains_key(to), "landed: the guard went with it");
         }
 
         #[test]
@@ -3703,6 +3730,11 @@ mod upload_order_tests {
         assert_eq!(u.etag_for(Path::new("/a"), g, None), None);
         u.forget(Path::new("/b"));
         assert_eq!(u.etag_for(Path::new("/b"), g, None), None);
+        // A folder's rename carries the etags of what is in it.
+        u.record(Path::new("/d/y"), Some("f".into()));
+        u.moved(Path::new("/d"), Path::new("/e"));
+        assert_eq!(u.etag_for(Path::new("/e/y"), g, None), Some("f".into()));
+        assert_eq!(u.etag_for(Path::new("/d/y"), g, None), None);
     }
 }
 

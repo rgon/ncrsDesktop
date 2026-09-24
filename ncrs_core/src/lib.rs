@@ -702,10 +702,19 @@ impl UploadOrder {
         self.committed.safe_lock().insert(path.to_path_buf(), (g, etag));
     }
 
+    /// The file (or directory) `from` is called `to` now: the etags of it
+    /// and of everything under it go along. At rename() time, not when the
+    /// MOVE lands: an upload that lands meanwhile records under the name the
+    /// file has then (`MutationJournal::current_name`), and a MOVE left to
+    /// the replay never lands here at all.
     fn moved(&self, from: &Path, to: &Path) {
         let mut c = self.committed.safe_lock();
-        if let Some(v) = c.remove(from) {
-            c.insert(to.to_path_buf(), v);
+        let under: Vec<PathBuf> = c.keys().filter(|p| p.starts_with(from)).cloned().collect();
+        for p in under {
+            if let (Some(v), Ok(rest)) = (c.remove(&p), p.strip_prefix(from)) {
+                let at = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
+                c.insert(at, v);
+            }
         }
     }
 
@@ -8140,6 +8149,8 @@ impl Filesystem for NextCloudFs {
         }
         reply.ok();
 
+        self.uploads.moved(&from, &to);
+
         // Handles open under the source were retargeted above. One made by create() means
         // the server has no copy of the source yet, so there is nothing to MOVE.
         if uncommitted_source && !self.journal.safe_lock().has_pending_put(&from) {
@@ -8185,7 +8196,6 @@ impl Filesystem for NextCloudFs {
                 match conn.backend.rename(&from, &to) {
                     Ok(()) => {
                         log::info!("MOVE {} → {}", from.display(), to.display());
-                        uploads.moved(&from, &to);
                         moved_or_given_up(&cache, &to, seq);
                         journal.safe_lock().remove(seq);
                     }

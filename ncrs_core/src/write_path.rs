@@ -715,22 +715,16 @@ impl WriteCtx {
             match result {
                 Ok(result) => {
                     log::info!("PUT (streamed) {} → new etag {:?}", remote_path.display(), result.new_change_token);
-                    uploads.record(&remote_path, result.new_change_token.clone());
-                    {
-                        let mut c = cache.safe_lock();
-                        if let Some(dir) = c.dir_cache.get_mut(&parent) {
-                            let mut files = (*dir.files).clone();
-                            if let Some(entry) = files.iter_mut().find(|e| e.path == remote_path) {
-                                entry.change_token = result.new_change_token;
-                                entry.size = total_len;
-                                entry.modified = Some(SystemTime::now());
-                            }
-                            dir.files = Arc::new(files);
-                            dir.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
+                    // Under the name the file has now: renamed while this ran,
+                    // its etag and listing entry went with it (see `landed_as`).
+                    if let Some(here) = journal.safe_lock().current_name(seq, &remote_path) {
+                        landed_as(&cache, &uploads, &here, result.new_change_token, total_len);
+                        // The tail is only the end of the file, so it can never become a kept copy.
+                        smap.safe_write().insert(here.clone(), FileStatus::Synced);
+                        if here != remote_path {
+                            dirty.safe_lock().insert(here);
                         }
                     }
-                    // The tail is only the end of the file, so it can never become a kept copy.
-                    smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
                     crate::drop_upload_guard(&journal, &cache, seq, &remote_path);
                     journal.safe_lock().remove_discarding(seq, &tail_path);
                 }
@@ -894,51 +888,40 @@ impl WriteCtx {
                         tmap.safe_lock().remove(&remote_path);
                         crate::drop_upload_guard(&journal, &cache, seq, &remote_path);
                         log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_change_token);
-                        uploads.record(&remote_path, result.new_change_token.clone());
-                        let new_size = upload_size;
-                        {
-                            let mut c = cache.safe_lock();
-                            let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
-                            if let Some(dir) = c.dir_cache.get_mut(&parent) {
-                                let mut files = (*dir.files).clone();
-                                if let Some(entry) = files.iter_mut().find(|e| e.path == remote_path) {
-                                    entry.change_token = result.new_change_token.clone();
-                                    entry.size = new_size;
-                                    entry.modified = Some(SystemTime::now());
-                                }
-                                dir.files = Arc::new(files);
-                                // Expire the cache so the next readdir triggers a PROPFIND
-                                // and populates NC-assigned properties (permissions, fileid, owner).
-                                dir.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
-                            }
-                        }
                         if let Some(of) = open_files.safe_lock().get_mut(&fh.0) {
                             of.dirty = false;
                             of.original_etag = result.new_change_token.clone();
                         }
-                        if auto_keep {
-                            let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
-                            let keep_path = cache.safe_lock().kept_dir.join(rel);
+                        // Under the name the file has now: renamed while this ran (a
+                        // browser's `x.crdownload` → `x`), its etag and listing entry
+                        // went with it, and left under the old name the next edit of
+                        // the new one sent a stale If-Match: a false 412 and a
+                        // conflicted copy. None once the file was deleted or replaced.
+                        if let Some(here) = journal.safe_lock().current_name(seq, &remote_path) {
+                            landed_as(&cache, &uploads, &here, result.new_change_token.clone(), upload_size);
                             let mut kept = false;
-                            if let Some(parent) = keep_path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
+                            if auto_keep {
+                                let rel = here.strip_prefix("/").unwrap_or(&here);
+                                let keep_path = cache.safe_lock().kept_dir.join(rel);
+                                if let Some(parent) = keep_path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                if std::fs::copy(&write_path, &keep_path).is_ok() {
+                                    cache.safe_lock().file_cache.insert(here.clone(), FileCacheEntry {
+                                        local_path: keep_path,
+                                        remote_modified: Some(SystemTime::now()),
+                                        etag: result.new_change_token,
+                                        kept: true,
+                                        size: upload_size,
+                                    });
+                                    kept = true;
+                                }
                             }
-                            if std::fs::copy(&write_path, &keep_path).is_ok() {
-                                cache.safe_lock().file_cache.insert(remote_path.clone(), FileCacheEntry {
-                                    local_path: keep_path,
-                                    remote_modified: Some(SystemTime::now()),
-                                    etag: result.new_change_token,
-                                    kept: true,
-                                    size: upload_size,
-                                });
-                                smap.safe_write().insert(remote_path.clone(), FileStatus::Kept);
-                                kept = true;
+                            smap.safe_write().insert(here.clone(), if kept { FileStatus::Kept } else { FileStatus::Synced });
+                            if here != remote_path {
+                                dirty.safe_lock().insert(here.parent().unwrap_or(Path::new("/")).to_path_buf());
+                                dirty.safe_lock().insert(here);
                             }
-                            if !kept {
-                                smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
-                            }
-                        } else {
-                            smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
                         }
                         dirty.safe_lock().insert(remote_path.clone());
                         dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
@@ -1022,6 +1005,24 @@ impl WriteCtx {
         Ok(())
     }
 
+}
+
+/// An upload of the file called `here` now landed with `etag`: this daemon's
+/// etag for it, and its listing entry (expired, so the next readdir fetches
+/// what the server assigned: permissions, fileid, owner).
+fn landed_as(cache: &Arc<Mutex<FsCache>>, uploads: &crate::UploadOrder, here: &Path, etag: Option<String>, size: u64) {
+    uploads.record(here, etag.clone());
+    let mut c = cache.safe_lock();
+    if let Some(dir) = c.dir_cache.get_mut(here.parent().unwrap_or(Path::new("/"))) {
+        let mut files = (*dir.files).clone();
+        if let Some(entry) = files.iter_mut().find(|e| e.path == here) {
+            entry.change_token = etag;
+            entry.size = size;
+            entry.modified = Some(SystemTime::now());
+        }
+        dir.files = Arc::new(files);
+        dir.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
+    }
 }
 
 /// Sets `path`'s size in its parent's resident listing, if any.
