@@ -73,6 +73,10 @@ services:
       UPLOAD_MB: ${UPLOAD_MB:-200}
       SEEDED_DIRS: ${DIRS:-20000}
       RUN_LABEL: ${RUN_LABEL:-}
+    # The daemon log (run_walker.sh): kept off the host disk, whose stalls
+    # would otherwise show up as dispatch-thread latency.
+    tmpfs:
+      - /var/log/ncrs:size=1g
     devices:
       - /dev/fuse
     cap_add:
