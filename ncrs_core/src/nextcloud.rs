@@ -128,14 +128,24 @@ impl NextcloudBackend {
     }
 }
 
-fn str_to_read_error(e: String) -> BackendReadError {
-    if e.contains("404") || e.contains("Not Found") {
-        BackendReadError::NotFound
-    } else if e.contains("timeout") || e.contains("Timeout") {
-        BackendReadError::Timeout
-    } else {
-        BackendReadError::Network(e)
+fn propfind_to_read_error(e: propfind::PropfindError) -> BackendReadError {
+    use propfind::PropfindError;
+    match e {
+        PropfindError::Status { code: 404, .. } => BackendReadError::NotFound,
+        PropfindError::Status { code, .. } => BackendReadError::Server(code, e.to_string()),
+        PropfindError::Transport { timed_out: true, .. } => BackendReadError::Timeout,
+        PropfindError::Transport { .. } => BackendReadError::Network(e.to_string()),
+        PropfindError::Body(msg) => BackendReadError::Truncated(msg),
     }
+}
+
+/// A probe status that proves the Nextcloud app itself answered, just badly: a
+/// 500 (PHP error, DB lock), 507 or 429. Going offline on those would hide a
+/// reachable server behind the cache and suppress live sync; the listing path
+/// backs off from 5xx on its own. 502/503/504 stay "unreachable": that is a
+/// reverse proxy reporting the app behind it down, which is a real outage.
+fn answered_while_overloaded(code: u16) -> bool {
+    matches!(code, 429 | 500 | 507)
 }
 
 // -- CloudBackend implementation ----------------------------------------------
@@ -153,7 +163,7 @@ impl CloudBackend for NextcloudBackend {
             path,
             timeout,
         )
-        .map_err(str_to_read_error)?;
+        .map_err(propfind_to_read_error)?;
         Ok((
             etag,
             self_entry.map(RemoteEntry::from),
@@ -177,7 +187,7 @@ impl CloudBackend for NextcloudBackend {
             entry_tx,
             self_tx,
         )
-        .map_err(str_to_read_error)
+        .map_err(propfind_to_read_error)
     }
 
     fn dir_change_token(
@@ -192,7 +202,7 @@ impl CloudBackend for NextcloudBackend {
             path,
             timeout,
         )
-        .map_err(str_to_read_error)
+        .map_err(propfind_to_read_error)
     }
 
     fn download_file(
@@ -400,6 +410,10 @@ impl CloudBackend for NextcloudBackend {
         match probe(&self.clients.get()) {
             Ok(()) => ReachabilityStatus::Reachable,
             Err(code) if code == 401 || code == 403 => ReachabilityStatus::AuthRejected(code),
+            Err(code) if answered_while_overloaded(code) => {
+                log::warn!("CONNECTIVITY probe: server answered {} — reachable but struggling, staying online", code);
+                ReachabilityStatus::Reachable
+            }
             Err(_) => ReachabilityStatus::Unreachable,
         }
     }

@@ -26,6 +26,53 @@ const PROPFIND_ETAG_BODY: &str = r#"<?xml version="1.0"?>
   </d:prop>
 </d:propfind>"#;
 
+/// Why a PROPFIND failed, kept structured so callers classify on the variant
+/// and never on the rendered message (which embeds the path: a directory named
+/// `2404` or `timeout` must not read as a 404 or a timeout).
+#[derive(Debug)]
+pub enum PropfindError {
+    /// The server answered, with something other than 207/2xx.
+    Status { op: &'static str, path: PathBuf, code: u16, reason: String },
+    /// No answer: connect/TLS/reset failure, or the request timed out before
+    /// the response headers arrived.
+    Transport { op: &'static str, path: PathBuf, timed_out: bool, msg: String },
+    /// The server answered 207 but the body broke off or did not parse.
+    Body(String),
+}
+
+impl std::fmt::Display for PropfindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status { op, path, code, reason } => {
+                write!(f, "{} {} returned {} {}", op, path.display(), code, reason)
+            }
+            Self::Transport { op, path, msg, .. } => write!(f, "{} {}: {}", op, path.display(), msg),
+            Self::Body(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl From<String> for PropfindError {
+    fn from(msg: String) -> Self {
+        Self::Body(msg)
+    }
+}
+
+impl PropfindError {
+    fn transport(op: &'static str, path: &std::path::Path, e: reqwest::Error) -> Self {
+        Self::Transport { op, path: path.to_path_buf(), timed_out: e.is_timeout(), msg: e.to_string() }
+    }
+
+    fn status(op: &'static str, path: &std::path::Path, status: reqwest::StatusCode) -> Self {
+        Self::Status {
+            op,
+            path: path.to_path_buf(),
+            code: status.as_u16(),
+            reason: status.canonical_reason().unwrap_or("").to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DavEntry {
     pub path: PathBuf,
@@ -48,7 +95,7 @@ pub fn propfind_list(
     creds: &crate::auth::Credentials,
     path: &std::path::Path,
     timeout: Duration,
-) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), String> {
+) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), PropfindError> {
     let url = build_url(webdav_url, path);
     let t0 = Instant::now();
     log::info!("PROPFIND {} start", path.display());
@@ -60,19 +107,19 @@ pub fn propfind_list(
         .header("Content-Type", "application/xml"))
         .body(PROPFIND_BODY)
         .send()
-        .map_err(|e| format!("PROPFIND {}: {}", path.display(), e))?;
+        .map_err(|e| PropfindError::transport("PROPFIND", path, e))?;
 
     log::info!("PROPFIND {} response {} in {:?}", path.display(), resp.status(), t0.elapsed());
 
     let status = resp.status();
     if status != reqwest::StatusCode::MULTI_STATUS && !status.is_success() {
-        return Err(format!("PROPFIND {} returned {}", path.display(), status));
+        return Err(PropfindError::status("PROPFIND", path, status));
     }
 
     let reader = std::io::BufReader::new(resp);
     let result = parse_multistatus_stream(reader, webdav_url);
     log::info!("PROPFIND {} parsed in {:?}", path.display(), t0.elapsed());
-    result
+    Ok(result?)
 }
 
 pub fn propfind_status(
@@ -106,7 +153,7 @@ pub fn propfind_etag(
     creds: &crate::auth::Credentials,
     path: &std::path::Path,
     timeout: Duration,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, PropfindError> {
     let url = build_url(webdav_url, path);
     log::debug!("PROPFIND_ETAG {}", url);
 
@@ -117,11 +164,11 @@ pub fn propfind_etag(
         .header("Content-Type", "application/xml"))
         .body(PROPFIND_ETAG_BODY)
         .send()
-        .map_err(|e| format!("PROPFIND_ETAG {}: {}", path.display(), e))?;
+        .map_err(|e| PropfindError::transport("PROPFIND_ETAG", path, e))?;
 
     let status = resp.status();
     if status != reqwest::StatusCode::MULTI_STATUS && !status.is_success() {
-        return Err(format!("PROPFIND_ETAG {} returned {}", path.display(), status));
+        return Err(PropfindError::status("PROPFIND_ETAG", path, status));
     }
 
     let reader = std::io::BufReader::new(resp);
@@ -328,7 +375,7 @@ pub fn propfind_list_streaming<E: From<DavEntry> + Send>(
     timeout: Duration,
     tx: std::sync::mpsc::Sender<E>,
     self_tx: std::sync::mpsc::Sender<E>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, PropfindError> {
     let url = build_url(webdav_url, path);
     let t0 = Instant::now();
     log::info!("PROPFIND_STREAM {} start", path.display());
@@ -340,13 +387,13 @@ pub fn propfind_list_streaming<E: From<DavEntry> + Send>(
         .header("Content-Type", "application/xml"))
         .body(PROPFIND_BODY)
         .send()
-        .map_err(|e| format!("PROPFIND {}: {}", path.display(), e))?;
+        .map_err(|e| PropfindError::transport("PROPFIND", path, e))?;
 
     log::info!("PROPFIND_STREAM {} response {} in {:?}", path.display(), resp.status(), t0.elapsed());
 
     let status = resp.status();
     if status != reqwest::StatusCode::MULTI_STATUS && !status.is_success() {
-        return Err(format!("PROPFIND {} returned {}", path.display(), status));
+        return Err(PropfindError::status("PROPFIND", path, status));
     }
 
     let reader = std::io::BufReader::new(resp);

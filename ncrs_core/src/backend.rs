@@ -273,10 +273,23 @@ impl std::fmt::Display for BackendWriteError {
 #[derive(Debug)]
 pub enum BackendReadError {
     NotFound,
+    /// The server could not be reached (connect/TLS/reset).
     Network(String),
     Timeout,
+    /// The server answered with this HTTP status. An answer, not an outage: it
+    /// must never flip the mount offline, and a 5xx is not worth retrying in the
+    /// foreground (see `lib.rs::is_server_error`).
     Server(u16, String),
+    /// The server started a listing and the body broke off mid-stream.
+    Truncated(String),
 }
+
+/// Rendered prefix of [`BackendReadError::Server`]. Error strings cross the
+/// daemon as `String`s, and classifiers match on this prefix rather than on
+/// digits anywhere in a message that also carries the path.
+pub const SERVER_ERROR_PREFIX: &str = "server error ";
+/// Rendered prefix of [`BackendReadError::Truncated`].
+pub const TRUNCATED_PREFIX: &str = "truncated: ";
 
 impl std::fmt::Display for BackendReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -284,9 +297,15 @@ impl std::fmt::Display for BackendReadError {
             Self::NotFound => write!(f, "not found"),
             Self::Network(e) => write!(f, "network: {}", e),
             Self::Timeout => write!(f, "timeout"),
-            Self::Server(code, msg) => write!(f, "server error {}: {}", code, msg),
+            Self::Server(code, msg) => write!(f, "{}{}: {}", SERVER_ERROR_PREFIX, code, msg),
+            Self::Truncated(e) => write!(f, "{}{}", TRUNCATED_PREFIX, e),
         }
     }
+}
+
+/// The HTTP status of a rendered [`BackendReadError::Server`], if `e` is one.
+pub fn server_error_code(e: &str) -> Option<u16> {
+    e.strip_prefix(SERVER_ERROR_PREFIX)?.get(..3)?.parse().ok()
 }
 
 #[derive(Debug, Clone, PartialEq)]
