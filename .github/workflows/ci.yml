@@ -128,6 +128,14 @@ jobs:
             bash scripts/build-dolphin-plugin.sh --test
             chown -R $(id -u):$(id -g) dist"
 
+      # Thread-creation guard: every ncrs_core thread must come from src/bg.rs
+      # (bounded pools). Only this lint is fatal; see ncrs_core/clippy.toml.
+      - name: Check thread creation goes through bg::
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        env:
+          RUSTC_WRAPPER: sccache
+        run: cargo clippy --release -p ncrs_core --lib --tests -- -A clippy::all -D clippy::disallowed_methods
+
       - name: Build .deb
         if: steps.binary-cache.outputs.cache-hit != 'true'
         run: bash scripts/build-deb.sh --skip-build --require-dolphin

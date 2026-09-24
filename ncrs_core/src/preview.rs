@@ -89,29 +89,38 @@ const ON_DEMAND_PREVIEWABLE_INTERVAL_MS: u64 = 300;
 // number of simultaneous requests and starves the server of PHP workers for
 // ordinary FUSE/sync traffic.
 const MAX_CONCURRENT_PREVIEW_FETCHES: usize = 6;
-static INFLIGHT_PREVIEW_FETCHES: AtomicUsize = AtomicUsize::new(0);
+static INFLIGHT_PREVIEW_FETCHES: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static PREVIEW_SLOT_FREED: std::sync::Condvar = std::sync::Condvar::new();
+/// How long a fetch waits for a slot before giving up on this thumbnail. A
+/// Condvar wait, not the 20 ms sleep-poll this used to be: thousands of
+/// pollers waking 50×/s is load in its own right.
+const PREVIEW_SLOT_WAIT: Duration = Duration::from_secs(10);
 
 struct FetchPermit;
 
 impl FetchPermit {
-    fn acquire() -> Self {
-        loop {
-            let cur = INFLIGHT_PREVIEW_FETCHES.load(Ordering::Acquire);
-            if cur < MAX_CONCURRENT_PREVIEW_FETCHES
-                && INFLIGHT_PREVIEW_FETCHES
-                    .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-            {
-                return FetchPermit;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+    fn acquire_timeout(wait: Duration) -> Option<Self> {
+        let n = INFLIGHT_PREVIEW_FETCHES.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut n, _) = PREVIEW_SLOT_FREED
+            .wait_timeout_while(n, wait, |n| *n >= MAX_CONCURRENT_PREVIEW_FETCHES)
+            .unwrap_or_else(|e| e.into_inner());
+        if *n >= MAX_CONCURRENT_PREVIEW_FETCHES {
+            return None;
         }
+        *n += 1;
+        Some(FetchPermit)
+    }
+
+    #[cfg(test)]
+    fn in_flight() -> usize {
+        *INFLIGHT_PREVIEW_FETCHES.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 impl Drop for FetchPermit {
     fn drop(&mut self) {
-        INFLIGHT_PREVIEW_FETCHES.fetch_sub(1, Ordering::AcqRel);
+        *INFLIGHT_PREVIEW_FETCHES.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        PREVIEW_SLOT_FREED.notify_one();
     }
 }
 
@@ -260,7 +269,9 @@ fn fetch_preview_bytes(
     fileid: u64,
     px: u32,
 ) -> Result<Vec<u8>, String> {
-    let _permit = FetchPermit::acquire();
+    let Some(_permit) = FetchPermit::acquire_timeout(PREVIEW_SLOT_WAIT) else {
+        return Err("preview fetch skipped: no free preview slot".to_string());
+    };
     let t0 = std::time::Instant::now();
     let url = format!("{}/core/preview", base);
     let size = px.to_string();
@@ -614,17 +625,13 @@ mod tests {
         // Drain the global permit pool down to zero, confirm acquiring one more blocks
         // until a permit is released.
         let mut permits: Vec<FetchPermit> = (0..MAX_CONCURRENT_PREVIEW_FETCHES)
-            .map(|_| FetchPermit::acquire())
+            .map(|_| FetchPermit::acquire_timeout(Duration::from_secs(5)).expect("free slot"))
             .collect();
-        assert_eq!(
-            INFLIGHT_PREVIEW_FETCHES.load(Ordering::Acquire),
-            MAX_CONCURRENT_PREVIEW_FETCHES
-        );
+        assert_eq!(FetchPermit::in_flight(), MAX_CONCURRENT_PREVIEW_FETCHES);
+        // Full: a bounded wait gives up instead of blocking forever.
+        assert!(FetchPermit::acquire_timeout(Duration::from_millis(30)).is_none());
         permits.pop(); // release one permit
-        let _p = FetchPermit::acquire(); // must not block now
-        assert_eq!(
-            INFLIGHT_PREVIEW_FETCHES.load(Ordering::Acquire),
-            MAX_CONCURRENT_PREVIEW_FETCHES
-        );
+        let _p = FetchPermit::acquire_timeout(Duration::from_secs(5)).expect("freed slot");
+        assert_eq!(FetchPermit::in_flight(), MAX_CONCURRENT_PREVIEW_FETCHES);
     }
 }

@@ -433,7 +433,7 @@ impl CloudBackend for NextcloudBackend {
         let paused_ret = paused.clone();
         let generation_ret = generation.clone();
 
-        std::thread::spawn(move || {
+        let started = crate::bg::spawn_service("push-socket", move || {
             watcher_loop(
                 &clients,
                 &base_url,
@@ -446,6 +446,9 @@ impl CloudBackend for NextcloudBackend {
                 &callback,
             );
         });
+        if let Err(e) = started {
+            log::error!("could not start the notify_push watcher: {} — changes arrive by polling only", e);
+        }
 
         Box::new(NcChangeWatcher {
             connected: connected_ret,

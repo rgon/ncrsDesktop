@@ -2454,6 +2454,7 @@ password: "pass"
     /// connection, in order, then stops accepting. `Connection: close` forces
     /// the client to dial fresh for every request, so each probe consumes the
     /// next script entry.
+    #[allow(clippy::disallowed_methods)] // test scaffolding, not daemon threads
     fn scripted_server(statuses: &'static [u16]) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2541,10 +2542,25 @@ password: "pass"
     #[test]
     fn two_consecutive_failed_probes_mark_unreachable() {
         use crate::backend::{CloudBackend, ReachabilityStatus};
-        let url = scripted_server(&[207, 500, 500]);
+        // 503: the reverse proxy says the app behind it is down — a real outage.
+        let url = scripted_server(&[207, 503, 503]);
         let backend = scripted_backend(&url);
         let status = backend.check_reachability(Duration::from_secs(5));
         assert_eq!(status, ReachabilityStatus::Unreachable);
+    }
+
+    #[test]
+    fn a_server_answering_500_stays_online() {
+        use crate::backend::{CloudBackend, ReachabilityStatus};
+        // A 500 is Nextcloud itself answering, badly (PHP error, DB lock under
+        // load). Going offline would hide a reachable server behind the cache;
+        // the listing path backs off from 5xx on its own.
+        for code in [&[207u16, 500, 500][..], &[207, 429, 429], &[207, 507, 507]] {
+            let url = scripted_server(code);
+            let backend = scripted_backend(&url);
+            let status = backend.check_reachability(Duration::from_secs(5));
+            assert_eq!(status, ReachabilityStatus::Reachable, "script {:?}", code);
+        }
     }
 
     #[test]
@@ -2583,7 +2599,7 @@ password: "pass"
         // demoted by a runtime failure — cannot be scripted without a real
         // QUIC listener, but it holds by construction: check_reachability no
         // longer references demote() at all.
-        let url = scripted_server(&[207, 500, 500]);
+        let url = scripted_server(&[207, 503, 503]);
         let clients = test_clients(true);
         let backend = crate::nextcloud::NextcloudBackend::new(
             url.clone(),
@@ -2745,6 +2761,7 @@ mod refresh_lock_tests {
     // Regression: a refresh that moved or evicted a cached file re-locked `cache`
     // (via save_file_cache) while still holding it, freezing every FUSE getattr.
     #[test]
+    #[allow(clippy::disallowed_methods)] // test scaffolding, not daemon threads
     fn refresh_that_moves_and_evicts_cached_files_releases_the_cache_lock() {
         let dir = std::env::temp_dir().join(format!("ncrs-refresh-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2827,3 +2844,70 @@ mod upload_order_tests {
         assert_eq!(u.etag_for(Path::new("/b"), g, None), None);
     }
 }
+
+    // ── Error classification (2026-09-24 incident) ───────────────────────────
+    //
+    // Errors cross the daemon as strings that embed the path. Classification
+    // must come from the typed prefix, never from digits or words that happen
+    // to be in a directory name.
+
+    fn errno_of(e: &str) -> i32 {
+        error_to_errno(e).code()
+    }
+
+    #[test]
+    fn a_5xx_listing_is_try_again_whatever_the_path_says() {
+        for path in ["/Music/2404", "/Photos/401k", "/x/403 Forbidden", "/Not Found", "/timeout"] {
+            let e = backend::BackendReadError::Server(500, format!("PROPFIND {} returned 500 Internal Server Error", path)).to_string();
+            assert_eq!(errno_of(&e), libc::EAGAIN, "{e}");
+            assert!(!is_transient_network_err(&e), "a 5xx is an answer, not a transport failure: {e}");
+            assert!(!is_timeout_err(&e), "{e}");
+            assert!(!read_err_is_network_down(&e), "a 5xx must never flip the mount offline: {e}");
+            assert!(is_unreachable_listing_error(&e), "a stale listing beats a 5xx: {e}");
+        }
+    }
+
+    #[test]
+    fn server_status_codes_map_to_their_errno() {
+        let e = |code| backend::BackendReadError::Server(code, "PROPFIND /Music/500 returned".into()).to_string();
+        assert_eq!(errno_of(&e(401)), libc::EACCES);
+        assert_eq!(errno_of(&e(403)), libc::EACCES);
+        assert_eq!(errno_of(&e(404)), libc::ENOENT);
+        assert_eq!(errno_of(&e(507)), libc::ENOSPC);
+        assert_eq!(errno_of(&e(429)), libc::EAGAIN);
+        assert_eq!(errno_of(&e(502)), libc::EAGAIN);
+        assert_eq!(errno_of(&e(418)), libc::EIO);
+        assert!(!is_unreachable_listing_error(&e(404)), "a 404 is an answer about the directory");
+    }
+
+    #[test]
+    fn transport_failures_are_try_again_whatever_the_path_says() {
+        let e = backend::BackendReadError::Network("PROPFIND /a/2404/401: error sending request".into()).to_string();
+        assert_eq!(errno_of(&e), libc::EAGAIN);
+        assert!(is_transient_network_err(&e));
+        let t = backend::BackendReadError::Truncated("XML parse: I/O error: request or response body error".into()).to_string();
+        assert_eq!(errno_of(&t), libc::EAGAIN);
+        assert!(is_transient_network_err(&t), "a broken-off body is worth one retry");
+        assert!(!is_server_error(&t));
+    }
+
+    #[test]
+    fn timeouts_still_read_as_timeouts() {
+        for e in ["timeout", "PROPFIND timeout for /Music", "WebDAV download timeout", "network: operation timed out", OFFLINE_READ_ERR] {
+            assert_eq!(errno_of(e), libc::ETIMEDOUT, "{e}");
+        }
+        assert!(!is_timeout_err("network: PROPFIND /backups/timeout: connection refused"));
+    }
+
+    #[test]
+    fn not_found_is_enoent() {
+        assert_eq!(errno_of(&backend::BackendReadError::NotFound.to_string()), libc::ENOENT);
+    }
+
+    #[test]
+    fn server_error_code_parses_only_the_typed_prefix() {
+        assert_eq!(backend::server_error_code("server error 503: x"), Some(503));
+        assert_eq!(backend::server_error_code("network: server error 503: x"), None);
+        assert_eq!(backend::server_error_code("PROPFIND /server error 500"), None);
+        assert_eq!(backend::server_error_code("server error x"), None);
+    }

@@ -167,6 +167,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // test scaffolding, not daemon threads
     fn crossing_multi_path_tickets_never_deadlock() {
         let seq = Arc::new(PathSeq::default());
         let t1 = seq.ticket(&[(p("/a"), Exclusive), (p("/b"), Exclusive)]);

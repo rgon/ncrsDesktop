@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,8 @@ use fuser::INodeNo;
 const CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(10);
 const PROPFIND_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const REFRESH_DEBOUNCE: Duration = Duration::from_secs(3);
+/// How many directories a notify-push event refreshes concurrently.
+const PROACTIVE_REFRESH_WIDTH: usize = 4;
 pub(crate) const REFRESH_DEBOUNCE_NO_CHANGE: Duration = Duration::from_secs(30);
 
 pub(crate) fn debounce_cooldown(had_changes: bool) -> Duration {
@@ -247,11 +249,14 @@ pub(crate) fn invalidate_all_dirs(
         }
     }
 
-    if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
-        for ino in inodes {
-            let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+    let slot = Arc::clone(notifier_slot);
+    crate::notify_later(move || {
+        if let Some(notifier) = slot.safe_lock().as_ref() {
+            for ino in inodes {
+                let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+            }
         }
-    }
+    });
 }
 
 // -- Dir diff -----------------------------------------------------------------
@@ -441,10 +446,16 @@ fn invalidate_dirs_by_path(
         }
     }
 
-    if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
-        for ino in &invalidated_inodes {
-            let _ = notifier.inval_inode(INodeNo(*ino), 0, 0);
-        }
+    if !invalidated_inodes.is_empty() {
+        let slot = Arc::clone(notifier_slot);
+        let inodes = invalidated_inodes.clone();
+        crate::notify_later(move || {
+            if let Some(notifier) = slot.safe_lock().as_ref() {
+                for ino in &inodes {
+                    let _ = notifier.inval_inode(INodeNo(*ino), 0, 0);
+                }
+            }
+        });
     }
 
     if !invalidated.is_empty() || debounced > 0 {
@@ -481,10 +492,16 @@ pub(crate) fn revalidate_dir_on_read(
     debounce: &DebounceMap,
     ghost_entries: &GhostMap,
     file_change_queue: &FileChangeQueue,
+    health: &ServerHealth,
 ) {
     // Same guard as handle_change_event: don't perturb active streaming reads.
     // The next readdir after the stream ends revalidates.
     if active_streams.load(Ordering::Relaxed) > 0 {
+        return;
+    }
+    // A server that is failing requests gets no speculative ones from us.
+    let now = Instant::now();
+    if health.breaker.is_open(now) || health.backoff.blocked(dir_path, now).is_some() {
         return;
     }
 
@@ -511,6 +528,14 @@ pub(crate) fn revalidate_dir_on_read(
         OldDirSnapshot::of(&entry.files)
     };
 
+    // One revalidation per directory at a time. Every readdir of a cached
+    // listing lands here, and while the server was failing, the debounce below
+    // was never written — so each readdir started another thread. The claim is
+    // released when the job ends, or when a full pool drops it unrun.
+    let Some(claim) = RevalidationClaim::take(dir_path) else {
+        return;
+    };
+
     let dir_path = dir_path.to_path_buf();
     let backend = Arc::clone(backend);
     let cache = Arc::clone(cache);
@@ -520,10 +545,63 @@ pub(crate) fn revalidate_dir_on_read(
     let debounce = Arc::clone(debounce);
     let ghosts = Arc::clone(ghost_entries);
     let fcq = Arc::clone(file_change_queue);
-    std::thread::spawn(move || {
+    let health = health.clone();
+    let _ = crate::bg::BACKGROUND.submit(move || {
+        let _claim = claim;
         refresh_one_dir(dir_path, old_snap, backend, cache, dirty, throttle,
-                        notifier_slot, debounce, ghosts, fcq);
+                        notifier_slot, debounce, ghosts, fcq, Some(&health));
     });
+}
+
+/// The breaker and per-path backoff, handed to the revalidation paths so they
+/// can both respect and feed them.
+#[derive(Clone)]
+pub(crate) struct ServerHealth {
+    pub breaker: Arc<crate::backoff::ServerBreaker>,
+    pub backoff: Arc<crate::backoff::PathBackoff>,
+}
+
+impl ServerHealth {
+    fn note(&self, dir: &Path, outcome: Result<(), &crate::backend::BackendReadError>) {
+        let now = Instant::now();
+        match outcome {
+            Ok(()) => {
+                self.breaker.record(false, now);
+                self.backoff.clear(dir);
+            }
+            Err(crate::backend::BackendReadError::Server(code, _)) if crate::backoff::is_struggling(*code) => {
+                self.breaker.record(true, now);
+                self.backoff.record_failure(dir, *code, now);
+            }
+            Err(crate::backend::BackendReadError::Server(..) | crate::backend::BackendReadError::NotFound) => {
+                self.breaker.record(false, now)
+            }
+            Err(crate::backend::BackendReadError::Truncated(_)) => self.breaker.record(true, now),
+            Err(_) => {}
+        }
+    }
+}
+
+/// Directories with a revalidation queued or running.
+static REVALIDATING: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+/// Proof that this caller owns the (single) revalidation of a directory.
+struct RevalidationClaim(PathBuf);
+
+impl RevalidationClaim {
+    fn take(dir: &Path) -> Option<Self> {
+        let mut set = REVALIDATING.lock().unwrap_or_else(|e| e.into_inner());
+        set.get_or_insert_with(HashSet::new).insert(dir.to_path_buf()).then(|| RevalidationClaim(dir.to_path_buf()))
+    }
+}
+
+impl Drop for RevalidationClaim {
+    fn drop(&mut self) {
+        let mut set = REVALIDATING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = set.as_mut() {
+            set.remove(&self.0);
+        }
+    }
 }
 
 // -- Proactive refresh --------------------------------------------------------
@@ -539,6 +617,7 @@ fn refresh_one_dir(
     debounce: DebounceMap,
     ghost_entries: GhostMap,
     file_change_queue: FileChangeQueue,
+    health: Option<&ServerHealth>,
 ) {
     let now = Instant::now();
     {
@@ -552,9 +631,31 @@ fn refresh_one_dir(
         }
     }
 
+    // A failure is remembered like a no-change refresh: without this, a
+    // directory the server keeps failing was revalidated on every readdir.
+    let note_failure = |debounce: &DebounceMap, dir: &Path| {
+        debounce.safe_lock().insert(dir.to_path_buf(), DebounceState {
+            last_refresh: Instant::now(),
+            had_changes: false,
+        });
+    };
+
     let cached_etag = cache.safe_lock().cached_dir_etag(&dir_path);
     if cached_etag.is_some() {
-        match backend.dir_change_token(&dir_path, Duration::from_secs(15)) {
+        // The probe takes a request slot like any other request; it used to
+        // bypass the throttle entirely.
+        let probe = match throttle.acquire_timeout(PROPFIND_TIMEOUT) {
+            Some(_permit) => backend.dir_change_token(&dir_path, Duration::from_secs(15)),
+            None => {
+                log::debug!("proactive_refresh {}: no request slot, skipping", dir_path.display());
+                note_failure(&debounce, &dir_path);
+                return;
+            }
+        };
+        if let Some(h) = health {
+            h.note(&dir_path, probe.as_ref().map(|_| ()));
+        }
+        match probe {
             Ok(current_etag) if current_etag == cached_etag => {
                 log::debug!("proactive_refresh {}: change_token unchanged {:?}, skipping", dir_path.display(), cached_etag);
                 cache.safe_lock().touch_dir_cache(&dir_path);
@@ -567,14 +668,27 @@ fn refresh_one_dir(
             Ok(ref current_etag) => {
                 log::debug!("proactive_refresh {}: change_token changed {:?} → {:?}, proceeding", dir_path.display(), cached_etag, current_etag);
             }
+            Err(crate::backend::BackendReadError::Server(code, _)) if crate::backoff::is_struggling(code) => {
+                // The server is failing this directory; a full listing would too.
+                log::debug!("proactive_refresh {}: server answered {}, backing off", dir_path.display(), code);
+                note_failure(&debounce, &dir_path);
+                return;
+            }
             Err(e) => {
                 log::debug!("proactive_refresh {}: change_token check failed ({}), proceeding", dir_path.display(), e);
             }
         }
     }
 
-    let _permit = throttle.acquire();
+    let Some(_permit) = throttle.acquire_timeout(PROPFIND_TIMEOUT) else {
+        log::debug!("proactive_refresh {}: no request slot, skipping", dir_path.display());
+        note_failure(&debounce, &dir_path);
+        return;
+    };
     let result = backend.list_dir(&dir_path, PROPFIND_TIMEOUT);
+    if let Some(h) = health {
+        h.note(&dir_path, result.as_ref().map(|_| ()));
+    }
 
     match result {
         Ok((etag, self_entry, fresh_files)) => {
@@ -608,16 +722,21 @@ fn refresh_one_dir(
                 }
             }
 
-            if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
-                if listing_changed {
-                    let _ = notifier.inval_inode(INodeNo(parent_ino), 0, 0);
-                }
-                for (child_ino, name) in &delete_targets {
-                    let _ = notifier.delete(INodeNo(parent_ino), INodeNo(*child_ino), OsStr::new(name));
-                }
-                for ino in &modified_inodes {
-                    let _ = notifier.inval_inode(INodeNo(*ino), 0, 0);
-                }
+            if listing_changed || !delete_targets.is_empty() || !modified_inodes.is_empty() {
+                let slot = Arc::clone(&notifier_slot);
+                crate::notify_later(move || {
+                    if let Some(notifier) = slot.safe_lock().as_ref() {
+                        if listing_changed {
+                            let _ = notifier.inval_inode(INodeNo(parent_ino), 0, 0);
+                        }
+                        for (child_ino, name) in &delete_targets {
+                            let _ = notifier.delete(INodeNo(parent_ino), INodeNo(*child_ino), OsStr::new(name));
+                        }
+                        for ino in &modified_inodes {
+                            let _ = notifier.inval_inode(INodeNo(*ino), 0, 0);
+                        }
+                    }
+                });
             }
 
             dirty.safe_lock().insert(dir_path.clone());
@@ -627,7 +746,8 @@ fn refresh_one_dir(
             });
         }
         Err(e) => {
-            log::warn!("proactive_refresh: {} failed: {}", dir_path.display(), e);
+            log::info!("proactive_refresh: {} failed: {}", dir_path.display(), e);
+            note_failure(&debounce, &dir_path);
         }
     }
 }
@@ -788,7 +908,7 @@ fn proactive_refresh(
     let n = dirs.len();
     log::info!("proactive_refresh: starting {} dirs in parallel", n);
     let t_pr = Instant::now();
-    let handles: Vec<_> = dirs.into_iter().map(|(dir_path, old_snap)| {
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = dirs.into_iter().map(|(dir_path, old_snap)| {
         let backend = Arc::clone(backend);
         let cache = Arc::clone(cache);
         let dirty = Arc::clone(dirty);
@@ -797,12 +917,14 @@ fn proactive_refresh(
         let debounce = Arc::clone(debounce);
         let ghosts = Arc::clone(ghost_entries);
         let fcq = Arc::clone(file_change_queue);
-        std::thread::spawn(move || {
+        Box::new(move || {
             refresh_one_dir(dir_path, old_snap, backend, cache, dirty, throttle,
-                            notifier_slot, debounce, ghosts, fcq);
-        })
+                            notifier_slot, debounce, ghosts, fcq, None);
+        }) as Box<dyn FnOnce() + Send>
     }).collect();
-    for h in handles { let _ = h.join(); }
+    // One thread per changed directory used to start at once; each needs a
+    // request slot anyway, so run no more than the throttle admits.
+    crate::bg::run_chunked(jobs, PROACTIVE_REFRESH_WIDTH);
     log::info!("proactive_refresh: done {} dirs in {:?}", n, t_pr.elapsed());
 }
 
