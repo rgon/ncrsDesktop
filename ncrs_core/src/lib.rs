@@ -4988,6 +4988,10 @@ impl NextCloudFs {
         let open_files = self.open_files.clone();
         let notifier_slot = self.notifier_slot.clone();
         Arc::new(move || {
+            // Staging files the journal dropped are deleted by its next save;
+            // until then the journal on disk still names them. Write it now,
+            // so what this purge sees unreferenced is unreferenced on disk too.
+            mutation_journal::flush_deferred(&journal);
             // Paths with a queued Put must be preserved — their local bytes are
             // unsynced. Collect them under the journal lock alone to avoid nesting.
             let (protected, staged): (std::collections::HashSet<PathBuf>, std::collections::HashSet<PathBuf>) = {
