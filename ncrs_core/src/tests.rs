@@ -4879,6 +4879,80 @@ mod upload_order_tests {
         }
 
         #[test]
+        fn a_stream_waiter_wakes_as_soon_as_the_finish_leaves_the_journal() {
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            let seq = queue_stream(&fake, &meta, tmp.path(), "/d/a.txt", b"x", b"y");
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+            assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+            assert_eq!(meta.stream_waiters.load(Ordering::SeqCst), 1);
+            // Assembled by a live worker: on the server, then out of the journal.
+            fake.files.lock().unwrap().insert(PathBuf::from("/d/a.txt"), (b"xy".to_vec(), Duration::ZERO));
+            let landed = Instant::now();
+            meta.journal.safe_lock().remove(seq);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            assert!(landed.elapsed() < Duration::from_millis(60), "not woken by the change: {:?}", landed.elapsed());
+            assert_eq!(std::fs::read(meta.open_files.safe_lock()[&fh].write_path.as_ref().unwrap()).unwrap(), b"xy");
+            assert_eq!(meta.stream_waiters.load(Ordering::SeqCst), 0, "the place is given back");
+            release_bookkeeping(&meta, fh);
+        }
+
+        #[test]
+        fn at_most_four_opens_wait_for_streamed_uploads_and_the_rest_try_again() {
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            let seq = queue_stream(&fake, &meta, tmp.path(), "/d/a.txt", b"x", b"y");
+            let waiting: Vec<_> = (0..STREAM_WAITERS_MAX).map(|_| {
+                let (r, rx) = reply();
+                open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+                rx
+            }).collect();
+            let t = Instant::now();
+            while meta.stream_waiters.load(Ordering::SeqCst) < STREAM_WAITERS_MAX {
+                assert!(t.elapsed() < Duration::from_secs(5), "the waiters never started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // One more is refused at once, before it takes a READ worker or a handle.
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_RDWR, None), listed(5), r, false);
+            assert_eq!(rx.try_recv().unwrap(), OpenOutcome::Error(libc::EAGAIN));
+            assert_eq!(meta.open_files.safe_lock().len(), STREAM_WAITERS_MAX);
+            // A truncating open needs no seed, so no place.
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_TRUNC, None), listed(5), r, false);
+            let trunc = fh_of(rx.try_recv().unwrap());
+            release_bookkeeping(&meta, trunc);
+            fake.files.lock().unwrap().insert(PathBuf::from("/d/a.txt"), (b"xy".to_vec(), Duration::ZERO));
+            meta.journal.safe_lock().remove(seq);
+            for rx in waiting {
+                let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+                release_bookkeeping(&meta, fh);
+            }
+            assert_eq!(meta.stream_waiters.load(Ordering::SeqCst), 0);
+            assert_all_given_back(&meta, ino);
+        }
+
+        #[test]
+        fn a_stream_waiter_gives_up_at_once_while_sync_is_paused() {
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            let seq = queue_stream(&fake, &meta, tmp.path(), "/d/a.txt", b"x", b"y");
+            meta.conn.paused.store(true, Ordering::SeqCst);
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+            assert_eq!(rx.try_recv().unwrap(), OpenOutcome::Error(libc::EIO), "paused, the finish cannot land: fail at once");
+            assert_all_given_back(&meta, ino);
+            // Paused while it waits: it stops within a recheck.
+            meta.conn.paused.store(false, Ordering::SeqCst);
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+            meta.conn.paused.store(true, Ordering::SeqCst);
+            assert_eq!(rx.recv_timeout(STREAM_WAIT_RECHECK + Duration::from_secs(2)).unwrap(), OpenOutcome::Error(libc::EIO));
+            assert_all_given_back(&meta, ino);
+            assert!(meta.journal.safe_lock().contains(seq), "the queued finish is left alone");
+            assert_eq!(meta.stream_waiters.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
         fn an_older_put_is_never_the_seed_of_a_file_whose_newer_upload_is_streamed() {
             let (fake, meta, tmp, ino) = open_setup(vec![], true);
             let old = tmp.path().join("write_old_put");

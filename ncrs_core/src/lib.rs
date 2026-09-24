@@ -3801,6 +3801,9 @@ struct MetaCtx {
     // A writable open seeds from a queued upload's staging file and finds a
     // rename's source here. Never locked while holding `cache`.
     journal: mutation_journal::SharedJournal,
+    // Writable opens waiting on a READ worker for a queued streamed upload
+    // to be assembled (`seed_from_queue`), at most STREAM_WAITERS_MAX.
+    stream_waiters: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]
@@ -3831,6 +3834,7 @@ impl MetaCtx {
                 let _ = std::fs::create_dir_all(&dir);
                 Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&dir)))
             },
+            stream_waiters: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -4372,6 +4376,12 @@ fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, mut rq: OpenReq, entry
     // handle is safe to expose early: it is not dirty, so no size overlay or
     // commit reads the half-filled staging file, and no read, write or release
     // can name it before the kernel gets the reply.
+    if matches!(seed_from, Seed::AwaitStream) {
+        if let Some(e) = stream_wait_refusal(ctx, &rq.path) {
+            reply.error(e);
+            return;
+        }
+    }
     let path = rq.path.clone();
     let undo = OpenUndo { ctx: ctx.clone(), fh, wp: wp.clone(), armed: true };
     let grant = open_register(ctx, rq, entry, fh, cache_fresh, Some(wp.clone()), true, None, &reply);
@@ -4385,25 +4395,33 @@ fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, mut rq: OpenReq, entry
         // its content is not needed.
         let (now_at, unlinked) = worker_ctx.open_files.safe_lock().get(&fh)
             .map_or((path.clone(), Unlinked::No), |of| (of.remote_path.clone(), of.unlinked));
-        let staged = match seed_from {
-            _ if unlinked == Unlinked::Local => std::fs::File::create(&wp).map(|_| ()).map_err(|e| e.to_string()),
-            Seed::Local(local) => std::fs::copy(&local, &wp).map(|_| ()).map_err(|e| e.to_string()),
+        let staged: Result<(), SeedFail> = match seed_from {
+            _ if unlinked == Unlinked::Local => std::fs::File::create(&wp).map(|_| ()).map_err(|e| e.to_string().into()),
+            Seed::Local(local) => std::fs::copy(&local, &wp).map(|_| ()).map_err(|e| e.to_string().into()),
             Seed::Pending(staged) => match std::fs::copy(&staged, &wp) {
                 Ok(_) => Ok(()),
                 // Uploaded or superseded meanwhile: its staging goes once it is
                 // on the server, or once the newer upload replaced it.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => seed_from_queue(&worker_ctx, fh, &path, &wp),
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(e.to_string().into()),
             },
             Seed::AwaitStream => seed_from_queue(&worker_ctx, fh, &path, &wp),
-            Seed::Download { absent } => download_seed(&worker_ctx, &wp, &now_at, absent),
+            Seed::Download { absent } => download_seed(&worker_ctx, &wp, &now_at, absent).map_err(SeedFail::from),
         };
         let path = worker_ctx.open_files.safe_lock().get(&fh).map_or(now_at, |of| of.remote_path.clone());
-        if let Err(e) = staged {
-            log::error!("open: cannot stage current content of {} for writing: {}", path.display(), e);
-            drop(undo);
-            reply.error(Errno::EIO);
-            return;
+        match staged {
+            Ok(()) => {}
+            Err(SeedFail::Again) => {
+                drop(undo);
+                reply.error(Errno::EAGAIN);
+                return;
+            }
+            Err(SeedFail::Failed(e)) => {
+                log::error!("open: cannot stage current content of {} for writing: {}", path.display(), e);
+                drop(undo);
+                reply.error(Errno::EIO);
+                return;
+            }
         }
         undo.armed = false;
         reply.opened(fh, grant);
@@ -4426,9 +4444,76 @@ enum Seed {
     Download { absent: bool },
 }
 
-/// How often `seed_from_queue` looks at the journal while a streamed upload
-/// of the file is still being assembled.
-const STREAM_SEED_POLL: Duration = Duration::from_millis(100);
+/// Why a writable open could not be staged.
+#[derive(Debug)]
+enum SeedFail {
+    /// STREAM_WAITERS_MAX opens already wait for a streamed upload: EAGAIN.
+    Again,
+    /// EIO, with what went wrong.
+    Failed(String),
+}
+
+impl From<String> for SeedFail {
+    fn from(e: String) -> Self {
+        SeedFail::Failed(e)
+    }
+}
+
+/// How many writable opens may wait at once, each on a READ worker, for a
+/// queued streamed upload of their file to be assembled. A wait can last up
+/// to DOWNLOAD_TIMEOUT, and cold `read()`s share that pool (32 workers):
+/// beyond this, such an open gets EAGAIN at once.
+const STREAM_WAITERS_MAX: usize = 4;
+
+/// The longest `seed_from_queue` sleeps between looks without a journal
+/// change: the offline and paused flags and the handle's path are not
+/// journal state.
+const STREAM_WAIT_RECHECK: Duration = Duration::from_secs(1);
+
+/// One of the STREAM_WAITERS_MAX places; given back on drop.
+struct StreamWaitSlot(Arc<AtomicUsize>);
+
+impl StreamWaitSlot {
+    fn take(waiters: &Arc<AtomicUsize>) -> Option<Self> {
+        waiters.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < STREAM_WAITERS_MAX).then_some(n + 1)).ok()?;
+        Some(StreamWaitSlot(waiters.clone()))
+    }
+}
+
+impl Drop for StreamWaitSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Why a writable open of `path`, whose streamed upload is queued, must not
+/// wait for it: offline or paused the upload cannot land (EIO, as for any
+/// content that cannot be had; never an empty or older seed), and with
+/// STREAM_WAITERS_MAX opens already waiting, EAGAIN.
+fn stream_wait_refusal(ctx: &MetaCtx, path: &Path) -> Option<Errno> {
+    if stream_cannot_land(ctx, path) {
+        return Some(Errno::EIO);
+    }
+    if ctx.stream_waiters.load(Ordering::Acquire) >= STREAM_WAITERS_MAX {
+        log::warn!("open: {} is a streamed copy not yet assembled, and {} opens already wait for one — try again", path.display(), STREAM_WAITERS_MAX);
+        return Some(Errno::EAGAIN);
+    }
+    None
+}
+
+/// Offline or with sync paused, a queued streamed upload of `path` cannot
+/// land: said at ERROR, since the open waiting for it fails.
+fn stream_cannot_land(ctx: &MetaCtx, path: &Path) -> bool {
+    let why = if ctx.conn.is_offline.load(Ordering::Relaxed) {
+        "the server is unreachable"
+    } else if ctx.conn.paused.load(Ordering::Relaxed) {
+        "sync is paused"
+    } else {
+        return false;
+    };
+    log::error!("open: {} is a streamed copy not yet assembled on the server, and {} — refusing to open it for writing until the copy lands", path.display(), why);
+    true
+}
 
 /// Stages handle `fh` from whatever the journal now says is the file's newest
 /// content, on a READ worker: the staging of a queued Put, or the server once
@@ -4440,56 +4525,66 @@ const STREAM_SEED_POLL: Duration = Duration::from_millis(100);
 /// version, an older Put's staging — stages the wrong bytes, and this
 /// handle's own upload then replaces the streamed file with them: an
 /// unclaimed finish is superseded (its session never assembled), a running
-/// one is overwritten. So this waits, up to DOWNLOAD_TIMEOUT, re-reading the
-/// handle's path each round (a rename moves the file). Offline
-/// the upload cannot land: EIO at once, never an empty or older seed.
-fn seed_from_queue(ctx: &MetaCtx, fh: u64, opened_as: &Path, wp: &Path) -> Result<(), String> {
+/// one is overwritten. So this waits, up to DOWNLOAD_TIMEOUT, holding one of
+/// the STREAM_WAITERS_MAX places (EAGAIN when none is free). It sleeps on the
+/// journal's condvar, looking under the same lock it waits on, so the
+/// finish leaving the journal wakes it at once; it looks again at least every
+/// STREAM_WAIT_RECHECK for the handle's path (a rename moves the file) and
+/// the flags. Offline or paused the upload cannot land: EIO at once, never
+/// an empty or older seed.
+fn seed_from_queue(ctx: &MetaCtx, fh: u64, opened_as: &Path, wp: &Path) -> Result<(), SeedFail> {
     let deadline = Instant::now() + DOWNLOAD_TIMEOUT;
-    let mut waited = false;
+    let mut slot: Option<StreamWaitSlot> = None;
     let mut missing: Option<PathBuf> = None;
     loop {
         let (now_at, unlinked) = ctx.open_files.safe_lock().get(&fh)
             .map_or((opened_as.to_path_buf(), Unlinked::No), |of| (of.remote_path.clone(), of.unlinked));
         if unlinked == Unlinked::Local {
-            return std::fs::File::create(wp).map(|_| ()).map_err(|e| e.to_string());
+            return std::fs::File::create(wp).map(|_| ()).map_err(|e| e.to_string().into());
         }
-        let newest = ctx.journal.safe_lock().newest_upload(&now_at);
-        match newest {
-            Some(mutation_journal::PendingUpload::Put(staged)) => match std::fs::copy(&staged, wp) {
-                Ok(_) => return Ok(()),
-                // Named by the journal and still missing a round later: not a
-                // race with its upload; the server's copy is all there is.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && missing.as_ref() == Some(&staged) => {
-                    return download_seed(ctx, wp, &now_at, false);
+        let j = ctx.journal.safe_lock();
+        match j.newest_upload(&now_at) {
+            Some(mutation_journal::PendingUpload::Put(staged)) => {
+                drop(j);
+                match std::fs::copy(&staged, wp) {
+                    Ok(_) => return Ok(()),
+                    // Named by the journal and still missing a look later: not a
+                    // race with its upload (a staging file is deleted only once
+                    // the journal stops naming it); the server's copy is all there is.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && missing.as_ref() == Some(&staged) => {
+                        return download_seed(ctx, wp, &now_at, false).map_err(SeedFail::from);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = Some(staged),
+                    Err(e) => return Err(e.to_string().into()),
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = Some(staged),
-                Err(e) => return Err(e.to_string()),
-            },
+            }
             Some(mutation_journal::PendingUpload::Stream) => {
-                if ctx.conn.is_offline.load(Ordering::Relaxed) {
-                    log::error!(
-                        "open: {} is a streamed copy not yet assembled on the server, which is unreachable — refusing to open it for writing until the copy lands",
-                        now_at.display(),
-                    );
-                    return Err("streamed upload not assembled yet, and offline".into());
+                if stream_cannot_land(ctx, &now_at) {
+                    return Err("streamed upload not assembled yet, and it cannot land now".to_string().into());
                 }
-                if !waited {
+                if slot.is_none() {
+                    let Some(s) = StreamWaitSlot::take(&ctx.stream_waiters) else {
+                        log::warn!("open: {} is a streamed copy not yet assembled, and {} opens already wait for one — try again", now_at.display(), STREAM_WAITERS_MAX);
+                        return Err(SeedFail::Again);
+                    };
+                    slot = Some(s);
                     log::info!("open: waiting for the streamed upload of {} to be assembled before staging it for writing", now_at.display());
-                    waited = true;
                 }
+                let now = Instant::now();
+                if now >= deadline {
+                    log::error!("open: the streamed upload of {} did not land within {:?} — refusing to open it for writing", now_at.display(), DOWNLOAD_TIMEOUT);
+                    return Err("streamed upload still not assembled".to_string().into());
+                }
+                drop(mutation_journal::MutationJournal::wait_changed(j, (deadline - now).min(STREAM_WAIT_RECHECK)));
             }
             None => {
-                if waited {
+                drop(j);
+                if slot.take().is_some() {
                     log::info!("open: streamed upload of {} landed — staging it from the server", now_at.display());
                 }
-                return download_seed(ctx, wp, &now_at, false);
+                return download_seed(ctx, wp, &now_at, false).map_err(SeedFail::from);
             }
         }
-        if Instant::now() >= deadline {
-            log::error!("open: the streamed upload of {} did not land within {:?} — refusing to open it for writing", now_at.display(), DOWNLOAD_TIMEOUT);
-            return Err("streamed upload still not assembled".into());
-        }
-        std::thread::sleep(STREAM_SEED_POLL);
     }
 }
 
@@ -5736,6 +5831,7 @@ impl NextCloudFs {
             resolve_within: CHILD_RESOLVE_DEADLINE,
             meta_pool: &bg::META,
             journal: self.journal.clone(),
+            stream_waiters: Arc::new(AtomicUsize::new(0)),
         })
     }
 
