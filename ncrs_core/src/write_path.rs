@@ -696,8 +696,9 @@ impl WriteCtx {
                     return;
                 }
                 // The replay assembles it, after the older changes of the file.
+                // The guard stays until then: the server has no such file yet,
+                // and a refresh of the parent would drop it from the listing.
                 crate::InOrder::Deferred => {
-                    cache.safe_lock().uploading.remove(&remote_path);
                     smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
                     return;
                 }
@@ -708,7 +709,9 @@ impl WriteCtx {
                 &*conn.backend, &cs.uploads_base, cs.next_index, cs.bytes_confirmed, total_len,
                 &tail_path, &remote_path, etag.as_deref(),
             );
-            cache.safe_lock().uploading.remove(&remote_path);
+            // The guard goes once the entry does (landed, or given up); while
+            // it stays queued the guard keeps the file listed until the
+            // replay lands it.
             match result {
                 Ok(result) => {
                     log::info!("PUT (streamed) {} → new etag {:?}", remote_path.display(), result.new_change_token);
@@ -728,6 +731,7 @@ impl WriteCtx {
                     }
                     // The tail is only the end of the file, so it can never become a kept copy.
                     smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
+                    crate::drop_upload_guard(&journal, &cache, seq, &remote_path);
                     journal.safe_lock().remove_discarding(seq, &tail_path);
                 }
                 Err(backend::BackendWriteError::Conflict) => {
@@ -739,6 +743,7 @@ impl WriteCtx {
                             log::info!("conflicted copy assembled as {}", conflict_name.display());
                             push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                             smap.safe_write().remove(&remote_path);
+                            crate::drop_upload_guard(&journal, &cache, seq, &remote_path);
                             journal.safe_lock().remove_discarding(seq, &tail_path);
                         }
                         // The session (with every chunk) is the only copy of this
@@ -771,6 +776,7 @@ impl WriteCtx {
                     if matches!(e, backend::BackendWriteError::Server(404, _)) {
                         // The session is gone; nothing left to retry from.
                         conn.backend.abort_chunked_upload(&backend::ChunkedUploadSession { uploads_base: cs.uploads_base.clone() });
+                        crate::drop_upload_guard(&journal, &cache, seq, &remote_path);
                         journal.safe_lock().remove_discarding(seq, &tail_path);
                     } else {
                         journal.safe_lock().mark_failed(seq, e.to_string());
@@ -867,8 +873,9 @@ impl WriteCtx {
                         return;
                     }
                     // The replay uploads it, after the older changes of the file.
+                    // The guard stays until then: without it a refresh of the
+                    // parent drops a file the server does not have yet.
                     crate::InOrder::Deferred => {
-                        cache.safe_lock().uploading.remove(&remote_path);
                         smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
                         return;
                     }
@@ -885,7 +892,7 @@ impl WriteCtx {
                 match conn.backend.put_file_from_path(&remote_path, &write_path, etag_ref) {
                     Ok(result) => {
                         tmap.safe_lock().remove(&remote_path);
-                        cache.safe_lock().uploading.remove(&remote_path);
+                        crate::drop_upload_guard(&journal, &cache, seq, &remote_path);
                         log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_change_token);
                         uploads.record(&remote_path, result.new_change_token.clone());
                         let new_size = upload_size;
@@ -940,7 +947,6 @@ impl WriteCtx {
                     }
                     Err(backend::BackendWriteError::Conflict) => {
                         tmap.safe_lock().remove(&remote_path);
-                        cache.safe_lock().uploading.remove(&remote_path);
                         smap.safe_write().remove(&remote_path);
                         log::warn!("CONFLICT on PUT {} — creating conflicted copy", remote_path.display());
                         let conflict_name = make_conflict_name(&remote_path);
@@ -951,6 +957,7 @@ impl WriteCtx {
                                 if let Some(of) = open_files.safe_lock().get_mut(&fh.0) {
                                     of.dirty = false;
                                 }
+                                crate::drop_upload_guard(&journal, &cache, seq, &remote_path);
                                 journal.safe_lock().remove_discarding(seq, &write_path);
                             }
                             // The staging file is the only copy of the edit: keep the
@@ -966,7 +973,7 @@ impl WriteCtx {
                     }
                     Err(ref e) => {
                         tmap.safe_lock().remove(&remote_path);
-                        cache.safe_lock().uploading.remove(&remote_path);
+                        // Still queued, so the guard stays until the replay lands it.
                         // Keep the local edit: the staging file and journal entry stay put,
                         // so the content survives and the mutation is retried. Surface it as
                         // PendingSync rather than dropping the status, so the UI shows the
