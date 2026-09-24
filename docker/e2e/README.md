@@ -65,3 +65,42 @@ Requires Docker (with `compose`) and `/dev/fuse`. The `ncrs` container needs
   not-kept file is re-downloaded on read, so the scenarios poll both the mount
   and the backend to a timeout — the guarantee is durability, not first-read
   consistency.
+
+## Walker harness (thread / CPU regression under a failing server)
+
+`docker/e2e/walker/` reproduces "a `find` walks the tree while the server
+answers listings with 500": a seeded 20k-dir tree on rclone, a stdlib fault
+proxy (`faultproxy.py`) in front of it, and the daemon walked by two concurrent
+`find`s plus an `ls -R` while `sampler.py` records threads, RSS, CPU and
+per-thread `comm` / `syscall` / `wchan` / state histograms every 2 s, then 60 s of
+idle to see threads drain.
+
+Nothing is compiled in Docker — a host-built binary is bind-mounted into an
+Ubuntu 24.04 runtime image (so it needs glibc <= 2.39):
+
+```sh
+NCRS_BIN=target/release/ncrs scripts/e2e-walker.sh                       # 20k dirs, no faults
+NCRS_BIN=/usr/bin/ncrs FAULT_RATE=0.3 FAULT_MODE=hash  scripts/e2e-walker.sh
+NCRS_BIN=/usr/bin/ncrs FAULT_RATE=0.3 FAULT_MODE=burst WALK_REPEAT=1 scripts/e2e-walker.sh
+NCRS_BIN=... DIRS=2000 WALK_SECS=60 scripts/e2e-walker.sh smoke           # quick
+```
+
+Knobs: `DIRS`, `WALK_SECS` (300), `WALK_REPEAT=1` (re-walk the cached tree until
+the deadline — exercises the per-readdir background revalidation), `FAULT_RATE`,
+`FAULT_MODE` (`hash` = the same dirs always fail, `random`, `burst` = alternating
+10 s windows of ~all-500 / pass-through), `FAULT_MIN_DEPTH` (2: top-level dirs
+are never faulted), `FAULT_DEPTHS` (`1`; `0,1` also fails etag probes),
+`FAULT_PATH_SUBSTR`, `FAULT_ROOT=1`, `FAULT_ARMED=0` (hold faults off until the
+mount is up — needed with `FAULT_ROOT=1`, since a 500 on the mount-time root
+probe makes the daemon exit), `LATENCY_MS`. Gates:
+`MAX_THREADS` (200 = the static `bg::MAX_THREADS` bound + 1, any sample), `IDLE_MAX_THREADS` (60, after idle),
+`IDLE_MAX_CPU` (5 %, last 30 s), mount answers `timeout 10 ls`, daemon alive.
+PROPFINDs per unique dir is reported, not gated. Exit 0 = pass. Walk errors are split by errno (ENOENT / EAGAIN / EIO) and the
+summary counts `LIST_BACKOFF`, `SERVER_BREAKER`, `WALKER`, `HEALTH`, `pool full`
+and `CONNECTIVITY lost` log lines.
+
+Results land in `docker/e2e/walker/results/<stamp>-<label>/` (gitignored):
+`timeseries.csv`, `samples.jsonl`, `summary.json`, `faultproxy.log`,
+`ncrs.log.gz`. The stack runs as compose project `ncrs-walker` and is always
+torn down with `down -v --rmi local` (`KEEP_IMAGES=1` keeps the runtime image
+between back-to-back runs).
