@@ -52,6 +52,12 @@ pub fn thumbnailer_process(pid: u32, matchers: &[ProcessMatch]) -> Option<String
     process::first_match(pid, matchers).map(ProcessMatch::describe)
 }
 
+/// `thumbnailer_process` for the FUSE dispatch thread: `None` when deciding
+/// would read `/proc` files that can hang it (see `process::try_matches`).
+pub fn try_thumbnailer_process(pid: u32, matchers: &[ProcessMatch]) -> Option<Option<String>> {
+    process::try_first_match(pid, matchers).map(|m| m.map(ProcessMatch::describe))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

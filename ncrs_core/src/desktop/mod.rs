@@ -123,6 +123,18 @@ impl DesktopPolicy {
         self.sniff_probes.iter().find(|p| p.matches_open(flags) && p.matches_process(pid))
     }
 
+    /// `sniff_probe_for_open` for the FUSE dispatch thread: `None` when a probe
+    /// that could match cannot be decided without reading `/proc/<pid>/maps`
+    /// or `cmdline` (see `process::try_matches`).
+    pub fn try_sniff_probe_for_open(&self, flags: i32, pid: u32) -> Option<Option<&sniff::SniffProbe>> {
+        for p in self.sniff_probes.iter().filter(|p| p.matches_open(flags)) {
+            if p.try_matches_process(pid)? {
+                return Some(Some(p));
+            }
+        }
+        Some(None)
+    }
+
     /// Whether `name` is a MIME-type xattr some active probe's toolkit reads.
     pub fn serves_mime_xattr(&self, name: &[u8]) -> bool {
         self.sniff_probes.iter().any(|p| p.xattr.is_some_and(|x| x.as_bytes() == name))
