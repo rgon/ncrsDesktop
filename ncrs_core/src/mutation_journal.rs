@@ -18,6 +18,37 @@ fn retry_backoff(attempts: u32) -> Duration {
 
 pub type SeqId = u64;
 
+/// Set when a live change was left to the replay (`MutationJournal::mark_waiting`)
+/// and the replay may be able to run it now: the connectivity monitor then
+/// replays within a second instead of at its next 30 s tick.
+static REPLAY_KICK: AtomicBool = AtomicBool::new(false);
+
+/// Asks the connectivity monitor for a replay run soon (see `REPLAY_KICK`).
+pub(crate) fn kick_replay() {
+    REPLAY_KICK.store(true, Ordering::Relaxed);
+}
+
+/// Whether a replay was asked for since the last call.
+pub(crate) fn take_replay_kick() -> bool {
+    REPLAY_KICK.swap(false, Ordering::Relaxed)
+}
+
+/// What the older entries about a live change's files are doing
+/// (`MutationJournal::older_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Older {
+    /// None is queued: the live change can run now.
+    None,
+    /// One is queued and can land soon: it is being sent (claimed by a live
+    /// worker or the replay), or it is due and nothing in front of it holds
+    /// the replay up.
+    Moving,
+    /// One is queued that the replay cannot reach before a backoff runs out:
+    /// it, or an entry in front of it, was rejected by the server. Waiting
+    /// for it would only hold a worker thread for nothing.
+    Stuck,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MutationOp {
     Put {
@@ -74,6 +105,11 @@ pub struct JournalEntry {
     /// makes every entry replayable again.
     #[serde(skip)]
     pub in_flight: bool,
+    /// A live worker gave it back to the replay because older entries of
+    /// its files were still queued (`mark_waiting`): not an error, and the
+    /// replay is kicked once it can run it. Never persisted.
+    #[serde(skip)]
+    pub left_to_replay: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -811,6 +847,7 @@ impl MutationJournal {
             not_before_ms: 0,
             queued_names: true,
             in_flight: false,
+            left_to_replay: false,
         });
         if let Some(sp) = self.entries.back().and_then(|e| e.op.staging_path()) {
             self.unsynced.push(sp.to_path_buf());
@@ -929,18 +966,28 @@ impl MutationJournal {
     /// FIFO, and running ahead of an older entry of the same files (an
     /// offline backlog: `rm b` queued, then a live `mv a b`) reorders them.
     pub fn earlier_related(&self, seq: SeqId, paths: &[&Path]) -> bool {
+        self.older_state(seq, paths) != Older::None
+    }
+
+    /// `earlier_related`, and whether the newest such entry can land soon
+    /// (see `Older`): the replay runs entries in order and stops at the
+    /// first one still backing off, so everything up to that entry counts.
+    /// `Older::None` when `seq` is gone.
+    pub fn older_state(&self, seq: SeqId, paths: &[&Path]) -> Older {
         // Entries are in increasing seq order (a journal file edited by hand
         // might not be: then the linear search).
         let found = self.entries.binary_search_by_key(&seq, |e| e.seq).ok().or_else(|| self.entries.iter().position(|e| e.seq == seq));
-        let Some(k) = found else { return false };
+        let Some(k) = found else { return Older::None };
         let mut at: Vec<PathBuf> = paths.iter().map(|p| p.to_path_buf()).collect();
-        for e in self.entries.range(..k).rev() {
+        for (i, e) in self.entries.range(..k).enumerate().rev() {
             let names = match &e.op {
                 MutationOp::Rename { from, to } => [Some(from.as_path()), Some(to.as_path())],
                 op => [Some(op.path()), None],
             };
             if names.iter().flatten().any(|n| at.iter().any(|a| nested_bytes(n, a))) {
-                return true;
+                let now = now_ms();
+                let held = self.entries.range(..=i).any(|e| !e.in_flight && e.not_before_ms > now);
+                return if held { Older::Stuck } else { Older::Moving };
             }
             if let (MutationOp::Rename { from, to }, true) = (&e.op, e.queued_names) {
                 for a in &mut at {
@@ -950,7 +997,7 @@ impl MutationJournal {
                 }
             }
         }
-        false
+        Older::None
     }
 
     /// The newest queued upload of the file called `path` now: it holds the
@@ -1014,6 +1061,7 @@ impl MutationJournal {
         match self.entries.iter_mut().find(|e| e.seq == seq) {
             Some(e) if !e.in_flight => {
                 e.in_flight = true;
+                e.left_to_replay = false;
                 true
             }
             _ => false,
@@ -1090,8 +1138,25 @@ impl MutationJournal {
         self.save_journal();
     }
 
+    /// A live worker gives its claim on `seq` back for the replay to run it
+    /// after the older entries of its files. Not a failure: `last_error`
+    /// keeps what it was (a wait is no error to show), and nothing is counted.
+    pub fn mark_waiting(&mut self, seq: SeqId) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.seq == seq) {
+            entry.in_flight = false;
+            entry.left_to_replay = true;
+        }
+        self.save_journal();
+    }
+
     pub fn remove(&mut self, seq: SeqId) {
         self.entries.retain(|e| e.seq != seq);
+        // A live change just landed. The entry now at the head may be one a
+        // live worker left to the replay behind it: nobody else sends it
+        // before the monitor's next tick.
+        if self.entries.front().is_some_and(|e| e.left_to_replay && !e.in_flight) {
+            kick_replay();
+        }
         self.save_journal();
     }
 
@@ -2395,6 +2460,7 @@ mod tests {
             not_before_ms: 0,
             queued_names: true,
             in_flight: false,
+            left_to_replay: false,
         }];
         let journal_path = dir.join(JOURNAL_FILE);
         fs::write(&journal_path, serde_json::to_vec(&entries).unwrap()).unwrap();
