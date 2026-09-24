@@ -4224,12 +4224,32 @@ fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: Op
     // disk-bound: either way, not on the dispatch thread.
     let worker_ctx = ctx.clone();
     let queued = bg::READ.submit_owning((undo, reply, grant), move |(mut undo, reply, grant)| {
-        let staged = match seed_from {
-            Some(local) => std::fs::copy(&local, &wp).map(|_| ()).map_err(|e| e.to_string()),
-            None => std::fs::File::create(&wp)
+        // Where the file is *now*: a rename or unlink since the open was
+        // requested updated the handle, not `path`. An unlinked handle is
+        // never committed (release drops its staging file), so its content is
+        // not needed.
+        let (now_at, unlinked) = worker_ctx.open_files.safe_lock().get(&fh)
+            .map_or((path.clone(), false), |of| (of.remote_path.clone(), of.unlinked));
+        let download = |from: &Path| {
+            std::fs::File::create(&wp)
                 .map_err(|e| e.to_string())
-                .and_then(|dest| open_file_timeout(&worker_ctx.conn, path.clone(), dest, Some(worker_ctx.transfer_map.clone()))),
+                .and_then(|dest| open_file_timeout(&worker_ctx.conn, from.to_path_buf(), dest, Some(worker_ctx.transfer_map.clone())))
         };
+        let staged = match seed_from {
+            _ if unlinked => std::fs::File::create(&wp).map(|_| ()).map_err(|e| e.to_string()),
+            Some(local) => std::fs::copy(&local, &wp).map(|_| ()).map_err(|e| e.to_string()),
+            // A rename's MOVE reaches the server after rename() answered, so
+            // the content can still be at the old path: try that one too
+            // (File::create starts the staging file over).
+            None => download(&now_at).or_else(|e| {
+                if now_at == path {
+                    return Err(e);
+                }
+                log::debug!("open: {} not on the server yet ({}) — staging from {}, before its rename", now_at.display(), e, path.display());
+                download(&path)
+            }),
+        };
+        let path = now_at;
         if let Err(e) = staged {
             log::error!("open: cannot stage current content of {} for writing: {}", path.display(), e);
             drop(undo);
@@ -4417,13 +4437,17 @@ fn open_register<R: OpenAnswer>(
 /// overlay the size of its unsent writes (`overlay_local_size`), and its
 /// parent listing is pinned against eviction until release.
 ///
-/// May run on a worker while rename() runs on the dispatch thread, so the
-/// handle is inserted first and only then checked against where the inode
-/// lives now: a rename that already moved the inode is picked up here, and
-/// one that has not reached `open_files` yet finds the handle there. The
-/// two locks are taken one after the other, never nested — rename nests
-/// `cache` → `open_files` and write nests the other way round, and a worker
-/// holding either while taking the other could deadlock against them.
+/// May run on a worker while rename() and unlink() run on the dispatch
+/// thread, so the handle is inserted first and only then checked against
+/// where the inode lives now: a rename that already moved the inode is picked
+/// up here, and one that has not reached `open_files` yet finds the handle
+/// there. Likewise an unlink that already took the name out of its listing
+/// (while this open was resolving it on a worker) marks the handle unlinked
+/// here, so release does not PUT the file back; one that runs later finds the
+/// handle. The two locks are taken one after the other, never nested —
+/// rename nests `cache` → `open_files` and write nests the other way round,
+/// and a worker holding either while taking the other could deadlock against
+/// them.
 fn insert_open_file(ctx: &MetaCtx, fh: u64, mut of: OpenFile) {
     of.writer = of.write_path.is_some();
     if of.writer {
@@ -4431,32 +4455,70 @@ fn insert_open_file(ctx: &MetaCtx, fh: u64, mut of: OpenFile) {
     }
     let (ino, opened_as) = (of.ino, of.remote_path.clone());
     ctx.open_files.safe_lock().insert(fh, of);
-    // Keep the parent listing resident while the file is open: every stat,
-    // write-size overlay and re-open resolves against it.
-    let now_at = {
-        let mut c = ctx.cache.safe_lock();
-        let now_at = c.get_path(ino).unwrap_or_else(|| opened_as.clone());
-        if let Some(parent) = now_at.parent() {
-            c.pin_dir(parent);
-        }
-        now_at
-    };
-    let mut files = ctx.open_files.safe_lock();
-    match files.get_mut(&fh) {
-        Some(of) => {
-            // Changed meanwhile means rename() already retargeted the handle.
-            if of.remote_path == opened_as {
-                of.remote_path = now_at.clone();
-            }
-            of.pinned_parent = now_at.parent().map(Path::to_path_buf);
-        }
-        None => {
-            drop(files);
-            if let Some(parent) = now_at.parent() {
-                ctx.cache.safe_lock().unpin_dir(parent);
-            }
-        }
+    let (now_at, gone) = pin_where_it_lives(ctx, ino, &opened_as);
+    adopt_pin(ctx, fh, &opened_as, &now_at, gone);
+}
+
+/// Keeps the parent listing of where inode `ino` lives now resident while it
+/// is open (every stat, write-size overlay and re-open resolves against it):
+/// pins it, and says whether that listing no longer has the file.
+fn pin_where_it_lives(ctx: &MetaCtx, ino: u64, opened_as: &Path) -> (PathBuf, bool) {
+    let mut c = ctx.cache.safe_lock();
+    let now_at = c.get_path(ino).unwrap_or_else(|| opened_as.to_path_buf());
+    if let Some(parent) = now_at.parent() {
+        c.pin_dir(parent);
     }
+    let gone = listed_absent(&mut c, &now_at);
+    (now_at, gone)
+}
+
+/// Hands the pin `pin_where_it_lives` took at `now_at`'s parent to handle
+/// `fh`. A rename that ran in between retargeted the handle but could not
+/// move a pin it did not have yet, so the pin is moved to the handle's
+/// current parent here: `pinned_parent` only ever names a listing the handle
+/// holds a pin on, which is what rename and release rely on.
+fn adopt_pin(ctx: &MetaCtx, fh: u64, opened_as: &Path, now_at: &Path, gone: bool) {
+    let pinned = now_at.parent().map(Path::to_path_buf);
+    let want = {
+        let mut files = ctx.open_files.safe_lock();
+        match files.get_mut(&fh) {
+            Some(of) => {
+                // Changed meanwhile means rename() already retargeted the handle.
+                if of.remote_path == opened_as {
+                    of.remote_path = now_at.to_path_buf();
+                }
+                if gone {
+                    of.unlinked = true;
+                }
+                of.pinned_parent = pinned.clone();
+                Some(of.remote_path.parent().map(Path::to_path_buf))
+            }
+            None => None,
+        }
+    };
+    let (old, want) = match (pinned, want) {
+        // Released meanwhile: release had no pin to give back.
+        (Some(old), None) => {
+            ctx.cache.safe_lock().unpin_dir(&old);
+            return;
+        }
+        (Some(old), Some(Some(want))) if old != want => (old, want),
+        _ => return,
+    };
+    // Pin the new parent first, then swap it in if no rename moved the pin
+    // meanwhile (one that did has already re-pinned where the handle is).
+    ctx.cache.safe_lock().pin_dir(&want);
+    let release = {
+        let mut files = ctx.open_files.safe_lock();
+        match files.get_mut(&fh) {
+            Some(of) if of.pinned_parent.as_deref() == Some(old.as_path()) => {
+                of.pinned_parent = Some(want);
+                old
+            }
+            _ => want,
+        }
+    };
+    ctx.cache.safe_lock().unpin_dir(&release);
 }
 
 /// unlink() of `path`: a handle still open on it must not re-create the file
@@ -4697,6 +4759,16 @@ fn lookup_recheck(cache: &Arc<Mutex<FsCache>>, hit: &LookupHit) -> Recheck {
         None if c.deleting.contains(path) => Recheck::Gone,
         None => Recheck::Same,
     }
+}
+
+/// Whether `path`'s parent listing is resident and does not have it: the
+/// file was unlinked or renamed away. A name whose upload is in flight counts
+/// as present (put_dir_cache keeps those, but only if the old listing was
+/// still resident). Unlike `lookup_recheck`, a DELETE in flight without a
+/// listing says nothing here: `rm f; echo x > f` re-creates `f` meanwhile.
+fn listed_absent(c: &mut FsCache, path: &Path) -> bool {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return false };
+    matches!(c.find_child(dir, name), Some((_, None))) && !c.uploading.contains_key(path)
 }
 
 pub struct NextCloudFs {
