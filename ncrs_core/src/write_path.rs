@@ -593,8 +593,7 @@ impl WriteCtx {
                     }
                     // The tail is only the end of the file, so it can never become a kept copy.
                     smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
-                    let _ = std::fs::remove_file(&tail_path);
-                    journal.safe_lock().remove(seq);
+                    journal.safe_lock().remove_discarding(seq, &tail_path);
                 }
                 Err(backend::BackendWriteError::Conflict) => {
                     // Every chunk is already on the server: assemble ours as a conflicted copy.
@@ -606,8 +605,7 @@ impl WriteCtx {
                     }
                     push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                     smap.safe_write().remove(&remote_path);
-                    let _ = std::fs::remove_file(&tail_path);
-                    journal.safe_lock().remove(seq);
+                    journal.safe_lock().remove_discarding(seq, &tail_path);
                 }
                 Err(ref e) if e.is_transient() => {
                     if e.is_network_down() {
@@ -630,8 +628,7 @@ impl WriteCtx {
                     if matches!(e, backend::BackendWriteError::Server(404, _)) {
                         // The session is gone; nothing left to retry from.
                         conn.backend.abort_chunked_upload(&backend::ChunkedUploadSession { uploads_base: cs.uploads_base.clone() });
-                        let _ = std::fs::remove_file(&tail_path);
-                        journal.safe_lock().remove(seq);
+                        journal.safe_lock().remove_discarding(seq, &tail_path);
                     } else {
                         journal.safe_lock().mark_failed(seq, e.to_string());
                     }
@@ -784,10 +781,10 @@ impl WriteCtx {
                         } else {
                             smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
                         }
-                        let _ = std::fs::remove_file(&write_path);
                         dirty.safe_lock().insert(remote_path.clone());
                         dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
-                        journal.safe_lock().remove(seq);
+                        // The staging goes once the journal without this entry is on disk.
+                        journal.safe_lock().remove_discarding(seq, &write_path);
                     }
                     Err(backend::BackendWriteError::Conflict) => {
                         tmap.safe_lock().remove(&remote_path);
@@ -805,8 +802,7 @@ impl WriteCtx {
                         }
                         dirty.safe_lock().insert(remote_path.clone());
                         dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
-                        journal.safe_lock().remove(seq);
-                        let _ = std::fs::remove_file(&write_path);
+                        journal.safe_lock().remove_discarding(seq, &write_path);
                     }
                     Err(ref e) => {
                         tmap.safe_lock().remove(&remote_path);

@@ -107,6 +107,12 @@ pub struct MutationJournal {
     deferred: Option<Arc<DeferredSaves>>,
     /// A change not yet handed to the deferred saver's next write.
     save_pending: bool,
+    /// Staging files the journal stopped naming (superseded, coalesced away,
+    /// uploaded). Deleted only once a journal that no longer names them is on
+    /// disk: until then the journal a crash would reload still does, and
+    /// `load_or_create` drops an entry whose staging is gone — while the newer
+    /// entry that replaced it was never written. That lost both versions.
+    delete_after_save: Vec<PathBuf>,
 }
 
 pub type SharedJournal = Arc<Mutex<MutationJournal>>;
@@ -151,7 +157,7 @@ pub fn defer_saves(journal: &SharedJournal, pool: &'static crate::bg::Pool) {
 pub fn flush_deferred(journal: &SharedJournal) {
     let d = journal.lock().unwrap_or_else(|e| e.into_inner()).deferred.clone();
     if let Some(d) = d {
-        d.write_pending();
+        let _ = d.write_pending();
     }
 }
 
@@ -169,8 +175,20 @@ impl DeferredSaves {
     }
 
     fn run(self: &Arc<Self>) {
+        let mut retry_in = SAVE_RETRY_MIN;
         loop {
-            self.write_pending();
+            if self.write_pending().is_err() {
+                // Still armed and still pending (write_pending put it back):
+                // a full disk must not turn into a busy loop, nor drop the save.
+                if self.journal.strong_count() == 0 {
+                    self.armed.store(false, Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(retry_in);
+                retry_in = (retry_in * 2).min(SAVE_RETRY_MAX);
+                continue;
+            }
+            retry_in = SAVE_RETRY_MIN;
             self.armed.store(false, Ordering::SeqCst);
             // A change made after our snapshot but before disarming found the
             // saver still armed and left it to us.
@@ -184,23 +202,71 @@ impl DeferredSaves {
         }
     }
 
-    fn write_pending(&self) {
+    /// Writes the latest snapshot if one is pending. On failure everything it
+    /// took is put back, so the next attempt (or the shutdown flush) writes it.
+    fn write_pending(&self) -> std::io::Result<()> {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(journal) = self.journal.upgrade() else { return };
-        let (data, unsynced, path) = {
+        let Some(journal) = self.journal.upgrade() else { return Ok(()) };
+        let (data, unsynced, deletable, path) = {
             let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
             if !j.save_pending {
-                return;
+                return Ok(());
             }
             j.save_pending = false;
-            (j.serialize_entries(), std::mem::take(&mut j.unsynced), j.journal_path.clone())
+            let deletable = j.take_deletable();
+            (j.serialize_entries(), std::mem::take(&mut j.unsynced), deletable, j.journal_path.clone())
         };
         // Outside the journal lock: nothing here may stall a FUSE handler.
         sync_staging(&unsynced);
-        if let Some(data) = data {
-            if let Err(e) = write_atomic_durable(&path, &data) {
-                log::error!("JOURNAL: durable write failed: {}", e);
+        let written = match data {
+            Some(data) => write_atomic_durable(&path, &data),
+            None => Err(std::io::Error::other("journal serialize failed")),
+        };
+        match written {
+            Ok(()) => {
+                delete_staging(&deletable);
+                Ok(())
             }
+            Err(e) => {
+                log::error!("JOURNAL: durable write failed: {} — will retry", e);
+                let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
+                j.save_pending = true;
+                j.unsynced.extend(unsynced);
+                j.delete_after_save.extend(deletable);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Backoff between attempts of a deferred save that failed (ENOSPC, EIO).
+const SAVE_RETRY_MIN: Duration = Duration::from_millis(100);
+const SAVE_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// Ends deferred saves for the rest of the process: writes what is pending
+/// now, and from then on every change is on disk before the call that made
+/// it returns. For shutdown, once a stop signal arrives: whatever happens
+/// after it — a `SIGKILL` when the unmount stays busy past the stop timeout —
+/// loses nothing.
+pub fn save_synchronously(journal: &SharedJournal) {
+    let d = journal.lock().unwrap_or_else(|e| e.into_inner()).deferred.clone();
+    let Some(d) = d else { return };
+    // Waits out a deferred write in flight; none can start while this is held
+    // (they take `write` before the journal), so no older snapshot can land
+    // after the synchronous ones.
+    let _w = d.write.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
+    j.deferred = None;
+    j.save_pending = false;
+    let _ = j.write_now();
+}
+
+fn delete_staging(paths: &[PathBuf]) {
+    for p in paths {
+        match std::fs::remove_file(p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("JOURNAL: removing staging {} failed: {}", p.display(), e),
         }
     }
 }
@@ -487,6 +553,7 @@ impl MutationJournal {
             unsynced: Vec::new(),
             deferred: None,
             save_pending: false,
+            delete_after_save: Vec::new(),
             journal_path,
             conflicts_path,
         };
@@ -600,7 +667,7 @@ impl MutationJournal {
         }
         for op in &stale {
             if let Some(sp) = op.staging_path() {
-                let _ = std::fs::remove_file(sp);
+                self.delete_after_save.push(sp.to_path_buf());
             }
         }
         log::debug!("JOURNAL: {} superseded upload(s) of {} dropped", stale.len(), path.display());
@@ -631,6 +698,34 @@ impl MutationJournal {
     pub fn remove(&mut self, seq: SeqId) {
         self.entries.retain(|e| e.seq != seq);
         self.save_journal();
+    }
+
+    /// `remove`, and delete `staging` once the journal without `seq` is on
+    /// disk (see `delete_after_save`). For an upload that finished or was
+    /// given up: deleting first and crashing before the save would reload the
+    /// entry without its bytes.
+    pub fn remove_discarding(&mut self, seq: SeqId, staging: &Path) {
+        self.delete_after_save.push(staging.to_path_buf());
+        self.remove(seq);
+    }
+
+    /// Deletes `staging` after the next save that no longer names it. The
+    /// caller follows with the change that stops naming it (which saves).
+    pub fn discard_staging(&mut self, staging: &Path) {
+        self.delete_after_save.push(staging.to_path_buf());
+    }
+
+    /// The part of `delete_after_save` no current entry names; the rest waits.
+    fn take_deletable(&mut self) -> Vec<PathBuf> {
+        if self.delete_after_save.is_empty() {
+            return Vec::new();
+        }
+        let named: std::collections::HashSet<&Path> =
+            self.entries.iter().filter_map(|e| e.op.staging_path()).collect();
+        let (keep, go): (Vec<PathBuf>, Vec<PathBuf>) =
+            std::mem::take(&mut self.delete_after_save).into_iter().partition(|p| named.contains(p.as_path()));
+        self.delete_after_save = keep;
+        go
     }
 
     pub fn entries(&self) -> &VecDeque<JournalEntry> {
@@ -744,10 +839,29 @@ impl MutationJournal {
             d.schedule();
             return;
         }
-        sync_staging(&std::mem::take(&mut self.unsynced));
-        if let Some(data) = self.serialize_entries() {
-            if let Err(e) = write_atomic_durable(&self.journal_path, &data) {
+        let _ = self.write_now();
+    }
+
+    /// The synchronous save: staging fsyncs, the journal, then the staging
+    /// files it stopped naming. What a failure leaves is retried by the next save.
+    fn write_now(&mut self) -> std::io::Result<()> {
+        let unsynced = std::mem::take(&mut self.unsynced);
+        sync_staging(&unsynced);
+        let deletable = self.take_deletable();
+        let written = match self.serialize_entries() {
+            Some(data) => write_atomic_durable(&self.journal_path, &data),
+            None => Err(std::io::Error::other("journal serialize failed")),
+        };
+        match written {
+            Ok(()) => {
+                delete_staging(&deletable);
+                Ok(())
+            }
+            Err(e) => {
                 log::error!("JOURNAL: durable write failed: {}", e);
+                self.unsynced.extend(unsynced);
+                self.delete_after_save.extend(deletable);
+                Err(e)
             }
         }
     }
@@ -792,7 +906,7 @@ impl MutationJournal {
                         && !matches!(&e.op, MutationOp::MkDir { path: p } if p == path)
                     });
                     if self.entries.len() < before {
-                        for sp in staging_to_delete { let _ = std::fs::remove_file(&sp); }
+                        self.delete_after_save.extend(staging_to_delete);
                         log::debug!("JOURNAL: coalesced — removed prior ops for {} before Unlink", path.display());
                     }
                 }
@@ -860,11 +974,13 @@ pub(crate) fn replay_journal(
                 None
             };
             // A streamed tail is not the whole file, so it is not worth preserving.
-            if let MutationOp::FinishChunked { uploads_base, tail_path, .. } = &entry.op {
+            if let MutationOp::FinishChunked { uploads_base, .. } = &entry.op {
                 ctx.backend.abort_chunked_upload(&crate::backend::ChunkedUploadSession { uploads_base: uploads_base.clone() });
-                let _ = std::fs::remove_file(tail_path);
             }
             let mut j = journal.safe_lock();
+            if let MutationOp::FinishChunked { tail_path, .. } = &entry.op {
+                j.discard_staging(tail_path);
+            }
             let last_err = entry.last_error.as_deref().unwrap_or("unknown");
             let desc = match recovered {
                 Some(p) => format!("{:?}: {} — local copy preserved at {}", entry.op, last_err, p.display()),
@@ -881,10 +997,10 @@ pub(crate) fn replay_journal(
         match execute_op(&entry, ctx, cache, dirty, error_log) {
             ReplayResult::Ok => {
                 let mut j = journal.safe_lock();
-                j.dequeue_front();
                 if let Some(staging_path) = entry.op.staging_path() {
-                    let _ = std::fs::remove_file(staging_path);
+                    j.discard_staging(staging_path);
                 }
+                j.dequeue_front();
                 if let MutationOp::Unlink { path } | MutationOp::RmDir { path } = &entry.op {
                     cache.safe_lock().deleting.remove(path);
                 }
@@ -895,26 +1011,26 @@ pub(crate) fn replay_journal(
                 // so the local staging is redundant. Any other conflict (e.g. the
                 // destination/parent is gone) means the bytes exist ONLY locally —
                 // preserve them so the user can recover.
+                let mut j = journal.safe_lock();
                 if let MutationOp::Put { staging_path, remote_path, .. } = &entry.op {
                     if matches!(kind, ConflictKind::EditConflict { .. }) {
-                        let _ = std::fs::remove_file(staging_path);
+                        j.discard_staging(staging_path);
                     } else {
-                        journal.safe_lock().recover_staging(staging_path, remote_path);
+                        j.recover_staging(staging_path, remote_path);
                     }
                 }
                 if let MutationOp::FinishChunked { tail_path, .. } = &entry.op {
-                    let _ = std::fs::remove_file(tail_path);
+                    j.discard_staging(tail_path);
                 }
-                let mut j = journal.safe_lock();
                 j.add_conflict(kind);
                 j.dequeue_front();
             }
             ReplayResult::Idempotent => {
                 let mut j = journal.safe_lock();
-                j.dequeue_front();
                 if let Some(staging_path) = entry.op.staging_path() {
-                    let _ = std::fs::remove_file(staging_path);
+                    j.discard_staging(staging_path);
                 }
+                j.dequeue_front();
                 if let MutationOp::Unlink { path } | MutationOp::RmDir { path } = &entry.op {
                     cache.safe_lock().deleting.remove(path);
                 }
@@ -1691,6 +1807,132 @@ mod tests {
         flush_deferred(&j);
         assert!(j.lock().unwrap().unsynced.is_empty());
         assert_eq!(on_disk(&dir).len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Crash consistency: staging outlives the journal that names it ──
+
+    #[test]
+    fn a_crash_before_the_save_after_a_supersede_keeps_the_older_version() {
+        static POOL: crate::bg::Pool = crate::bg::Pool::new("t-journal-crash-sup", 0, 0);
+        let dir = temp_dir("crash_supersede");
+        let j = deferred(&dir, &POOL);
+        let (a, a_path) = staged_put(&dir, "write_1", "A", None);
+        j.lock().unwrap().enqueue(a);
+        flush_deferred(&j);
+        let (b, b_path) = staged_put(&dir, "write_2", "B", None);
+        {
+            let mut g = j.lock().unwrap();
+            let seq = g.enqueue(b);
+            g.supersede_uploads(Path::new("/f.txt"), seq);
+        }
+        assert!(a_path.exists(), "the journal on disk still names A: its bytes must stay until it no longer does");
+
+        // Crash here: the saver never ran.
+        let reloaded = restart(&dir);
+        assert_eq!(staged_bytes(&reloaded), vec!["A"], "A is still queued after the restart");
+        assert!(reloaded.unresolved_conflicts().iter().any(|c| matches!(&c.kind, ConflictKind::PermanentFailure { description } if description.contains(RECOVERED_DIR))));
+        assert_eq!(fs::read_to_string(dir.join(RECOVERED_DIR).join("write_2")).unwrap(), "B", "and B's bytes are kept, not swept");
+        assert!(!b_path.exists());
+        drop(reloaded);
+        let _ = fs::remove_dir_all(&dir);
+
+        // Without the crash, the save that drops A deletes A's staging.
+        let dir = temp_dir("crash_supersede_saved");
+        let j = deferred(&dir, &POOL);
+        let (a, a_path) = staged_put(&dir, "write_1", "A", None);
+        j.lock().unwrap().enqueue(a);
+        flush_deferred(&j);
+        let (b, b_path2) = staged_put(&dir, "write_2", "B", None);
+        {
+            let mut g = j.lock().unwrap();
+            let seq = g.enqueue(b);
+            g.supersede_uploads(Path::new("/f.txt"), seq);
+        }
+        flush_deferred(&j);
+        assert!(!a_path.exists());
+        assert_eq!(staged_bytes(&restart(&dir)), vec!["B"]);
+        assert!(b_path2.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crash_before_the_save_after_an_unlink_coalesce_keeps_the_put() {
+        static POOL: crate::bg::Pool = crate::bg::Pool::new("t-journal-crash-coal", 0, 0);
+        let dir = temp_dir("crash_coalesce");
+        let j = deferred(&dir, &POOL);
+        let (a, a_path) = staged_put(&dir, "write_1", "A", None);
+        j.lock().unwrap().enqueue(a);
+        flush_deferred(&j);
+        j.lock().unwrap().enqueue(MutationOp::Unlink { path: PathBuf::from("/f.txt") });
+        assert!(!j.lock().unwrap().has_pending_put(Path::new("/f.txt")), "the fresh create is coalesced away in memory");
+        assert!(a_path.exists());
+        assert_eq!(staged_bytes(&restart(&dir)), vec!["A"], "a crash before the save replays the journal it had");
+        flush_deferred(&j);
+        assert!(!a_path.exists(), "once saved, the coalesced staging goes");
+        assert!(staged_bytes(&restart(&dir)).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crash_before_the_save_after_an_upload_finished_keeps_its_bytes() {
+        static POOL: crate::bg::Pool = crate::bg::Pool::new("t-journal-crash-put", 0, 0);
+        let dir = temp_dir("crash_put_ok");
+        let j = deferred(&dir, &POOL);
+        let (a, a_path) = staged_put(&dir, "write_1", "A", None);
+        let seq = j.lock().unwrap().enqueue(a);
+        flush_deferred(&j);
+        j.lock().unwrap().remove_discarding(seq, &a_path);
+        assert!(a_path.exists());
+        let reloaded = restart(&dir);
+        assert_eq!(staged_bytes(&reloaded), vec!["A"], "the entry reloads with its bytes (a re-upload, not a spurious conflict)");
+        assert!(reloaded.unresolved_conflicts().is_empty());
+        flush_deferred(&j);
+        assert!(!a_path.exists());
+        assert!(restart(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_staging_file_still_named_is_never_deleted() {
+        let dir = temp_dir("discard_still_named");
+        let mut j = MutationJournal::load_or_create(&dir);
+        let (a, a_path) = staged_put(&dir, "write_1", "A", None);
+        let seq = j.enqueue(a);
+        j.discard_staging(&a_path);
+        j.mark_deferred(seq, "offline".into()); // a save while the entry still names it
+        assert!(a_path.exists());
+        j.remove(seq);
+        assert!(!a_path.exists(), "deleted by the first save that no longer names it");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_deferred_save_is_retried_not_dropped() {
+        static POOL: crate::bg::Pool = crate::bg::Pool::new("t-journal-retry", 1, 4);
+        let dir = temp_dir("deferred_retry");
+        let j = deferred(&dir, &POOL);
+        fs::remove_dir_all(&dir).unwrap(); // every write now fails
+        let seq = j.lock().unwrap().enqueue(MutationOp::MkDir { path: PathBuf::from("/a") });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(j.lock().unwrap().save_pending || POOL.stats().active > 0, "the failed save is still pending");
+        fs::create_dir_all(&dir).unwrap();
+        wait_saved(&j, &POOL);
+        assert_eq!(on_disk(&dir), vec![seq]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn switching_to_synchronous_saves_writes_now_and_every_later_change() {
+        static POOL: crate::bg::Pool = crate::bg::Pool::new("t-journal-sync", 0, 0);
+        let dir = temp_dir("to_synchronous");
+        let j = deferred(&dir, &POOL);
+        let a = j.lock().unwrap().enqueue(MutationOp::MkDir { path: PathBuf::from("/a") });
+        assert!(on_disk(&dir).is_empty());
+        save_synchronously(&j);
+        assert_eq!(on_disk(&dir), vec![a]);
+        let b = j.lock().unwrap().enqueue(MutationOp::MkDir { path: PathBuf::from("/b") });
+        assert_eq!(on_disk(&dir), vec![a, b], "on disk before enqueue returned");
         let _ = fs::remove_dir_all(&dir);
     }
 }
