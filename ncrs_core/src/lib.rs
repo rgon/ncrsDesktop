@@ -4300,7 +4300,9 @@ impl NextCloudFs {
                     // background and, on mismatch, refreshes + notifies. Catches
                     // changes made while this client was offline, for which no
                     // notify-push event will ever arrive.
-                    if !conn.is_offline.load(Ordering::Relaxed) && !conn.paused.load(Ordering::Relaxed) {
+                    if !conn.is_offline.load(Ordering::Relaxed) && !conn.paused.load(Ordering::Relaxed)
+                        && !conn.walkers.is_walker(pid, Instant::now())
+                    {
                         notify_push::revalidate_dir_on_read(
                             &path, &conn.backend, &cache, &dirty, &conn.active_streams,
                             &conn.throttle, &notifier_slot, &refresh_debounce,
@@ -4592,7 +4594,9 @@ impl NextCloudFs {
 
                     // Thumbnails are the most expendable work there is: skip them
                     // outright while the server is failing requests.
-                    if offset == 0 && !thumb_candidates.is_empty() && !conn.breaker.is_open(Instant::now()) {
+                    if offset == 0 && !thumb_candidates.is_empty() && !conn.breaker.is_open(Instant::now())
+                        && !conn.walkers.is_walker(pid, Instant::now())
+                    {
                         let already = {
                             let mut inf = thumb_inflight.safe_lock();
                             !inf.insert(path.clone())
