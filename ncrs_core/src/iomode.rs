@@ -110,6 +110,12 @@ impl<B> InodeIoModes<B> {
         self.acquire(ino, None::<(FileId, fn() -> std::io::Result<B>)>).0.kind()
     }
 
+    /// No inode has an I/O mode: every open was given back.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.modes.is_empty()
+    }
+
     /// The inode's shared backing id is dropped with its last passthrough open.
     pub(crate) fn release(&mut self, ino: u64, kind: IoKind) {
         let now_unused = match (self.modes.get_mut(&ino), kind) {

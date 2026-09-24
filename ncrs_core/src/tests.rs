@@ -4031,7 +4031,23 @@ mod upload_order_tests {
             assert!(meta.open_files.safe_lock().is_empty(), "handle left registered");
             assert_eq!(meta.open_writers.load(Ordering::SeqCst), 0, "writer count leaked");
             assert!(meta.cache.safe_lock().pins.is_empty(), "parent pin leaked");
-            let _ = ino;
+            assert!(meta.io_modes.safe_lock().is_empty(), "io mode of inode {ino} leaked");
+        }
+
+        /// A pool that refuses every job, like `bg::META` when it is full.
+        static REFUSING: bg::Pool = bg::Pool::new("refusing", 0, 0);
+
+        /// What `release()` gives back for handle `fh` (its own bookkeeping is
+        /// in the write path and needs a FUSE request).
+        fn release_bookkeeping(meta: &MetaCtx, fh: u64) {
+            let of = meta.open_files.safe_lock().remove(&fh).expect("registered");
+            if of.writer {
+                meta.open_writers.fetch_sub(1, Ordering::SeqCst);
+            }
+            if let Some(ref parent) = of.pinned_parent {
+                meta.cache.safe_lock().unpin_dir(parent);
+            }
+            meta.io_modes.safe_lock().release(of.ino, of.io_kind);
         }
 
         #[test]
@@ -4202,6 +4218,30 @@ mod upload_order_tests {
             assert_eq!(files[&fh].original_etag.as_deref(), Some("e-kept"), "the replayed upload must still detect a server change");
         }
 
+        #[test]
+        fn an_unclassified_open_the_meta_pool_refuses_is_tried_again_not_downloaded() {
+            // A process whose classification nobody cached: GLib's probe matcher
+            // needs its /proc maps, which the dispatch thread must not read.
+            let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            let pid = child.id();
+            let (_, meta, _tmp, ino) = open_setup(vec![], true);
+            let meta = MetaCtx { meta_pool: &REFUSING, ..meta };
+            let open = |flags: i32| {
+                let (r, rx) = reply();
+                open_continue(&meta, OpenReq { pid, ..rq(ino, "/d/a.txt", flags, None) }, listed(5), r, false);
+                rx.try_recv().expect("answered inline")
+            };
+            assert_eq!(open(libc::O_RDONLY | libc::O_NOATIME), OpenOutcome::Error(libc::EAGAIN), "a sniff read as a plain read downloads the file");
+            assert!(meta.open_files.safe_lock().is_empty());
+            // No probe matches these flags: decided inline, never sent to the pool.
+            let fh = fh_of(open(libc::O_RDONLY));
+            assert!(meta.open_files.safe_lock()[&fh].mime_detect_ct.is_none());
+            release_bookkeeping(&meta, fh);
+            assert_all_given_back(&meta, ino);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
         // ── Size overlays ───────────────────────────────────────────────────
 
         fn writer(meta: &MetaCtx, fh: u64, path: &str, bytes: usize, unlinked: bool) {
@@ -4290,6 +4330,25 @@ mod upload_order_tests {
             });
             assert!(matches!(lookup_commit(&meta, h), LookupAnswer::Ghost(GhostKind::HiddenAdd)));
             assert!(!meta.details.safe_read().contains_key(Path::new("/d/f2.txt")));
+        }
+
+        #[test]
+        fn with_child_within_says_which_answers_come_from_a_worker() {
+            let cold = FakeDir { entries: names("/cold", 3), before_first: Duration::from_millis(50), ..Default::default() };
+            let (_, conn, cache) = setup(vec![("/cold", cold)]);
+            cache.safe_lock().put_dir_cache(PathBuf::from("/hot"), None, None, names("/hot", 3));
+            let meta = MetaCtx::for_tests(conn, cache, Duration::from_secs(5));
+            let ask = |meta: &MetaCtx, path: &str| {
+                let (tx, rx) = mpsc::channel();
+                with_child_within(meta, 0, Path::new(path), Duration::from_secs(5), tx, |_, _, _| (), |_| None, |_, _, tx, r, on_worker| {
+                    let _ = tx.send((matches!(r, Resolved::Found(())), on_worker));
+                });
+                rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            };
+            assert_eq!(ask(&meta, "/hot/f1.txt"), (true, false));
+            assert_eq!(ask(&meta, "/cold/f1.txt"), (true, true));
+            let refused = MetaCtx { meta_pool: &REFUSING, ..meta.clone() };
+            assert_eq!(ask(&refused, "/other/x.txt"), (false, false), "a refused miss is answered inline");
         }
 
         // ── Name index: built for listings that are read, not written ───────
