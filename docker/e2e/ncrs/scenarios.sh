@@ -852,6 +852,35 @@ done
 [ "$landed" = 8 ] && ok "all 8 files uploaded into their just-created folders" \
     || no "only $landed of 8 files reached their just-created folders"
 
+echo "→ 28. APPEND after the parent listing was evicted — the existing content must be kept"
+# open() took the file's size and etag from its parent's cached listing and assumed an
+# empty file when that listing had been evicted, so the staging file went unseeded and an
+# append (or an in-place write) uploaded a zero-filled prefix over the real content. The
+# kernel still holds the file's dentry and attributes (30 s TTL), so the append's open()
+# arrives for an inode whose parent listing is gone — the path that has to re-list.
+# (Scenario 20 restarts the daemon into its own log, so read both.)
+EV="evicted_parent_$(date +%s)"
+EB="evicted-parent-base $(date +%s%N)"
+mkdir "$MOUNT/$EV" && printf '%s' "$EB" > "$MOUNT/$EV/data.txt"
+if wait_dav_sha "$EV/data.txt" "$(printf '%s' "$EB" | sha)" 60; then
+    for i in $(seq 1 40); do mkdir "$MOUNT/${EV}_fill$i"; done
+    for _ in $(seq 1 45); do [ "$(dav_code "${EV}_fill40/")" != 404 ] && break; sleep 1; done
+    stat "$MOUNT/$EV/data.txt" >/dev/null
+    ev_before="$(cat "$NCRS_LOG" /tmp/ncrs_restart19.log 2>/dev/null | grep -c 'DIR_CACHE evicted')"
+    for i in $(seq 1 40); do ls "$MOUNT/${EV}_fill$i" >/dev/null; done
+    ev_after="$(cat "$NCRS_LOG" /tmp/ncrs_restart19.log 2>/dev/null | grep -c 'DIR_CACHE evicted')"
+    [ "$ev_after" -gt "$ev_before" ] && ok "listing 40 folders evicted older listings (max 30)" \
+        || no "setup: listing 40 folders evicted nothing — the scenario proves nothing"
+    printf '%s' "-tail" >> "$MOUNT/$EV/data.txt"
+    if wait_dav_sha "$EV/data.txt" "$(printf '%s-tail' "$EB" | sha)" 60; then
+        ok "append after the parent listing was evicted kept the existing content on the server"
+    else
+        no "append after eviction lost the existing content (server: $(curl -s -u "$U:$P" "${URL}$EV/data.txt" | od -An -c | head -2 | tr -s ' '))"
+    fi
+else
+    no "setup: $EV/data.txt never reached the backend"
+fi
+
 echo "→ 22. SERVER EDIT of a KEPT file — the refresh that evicts it must not freeze the mount"
 # Regression for the v0.1.73 freeze: a read-triggered refresh that found a locally
 # cached (kept) file changed on the server evicted it while holding the cache lock,

@@ -41,6 +41,9 @@ auto_keep_cached_files: false
 # Scenario 19 ages cached listings past this window; 1 minute keeps that wait
 # short enough for CI while still exercising the real code path.
 dir_cache_max_stale_mins: 1
+# Small enough that scenario 28 can push a listing out with a few dozen
+# folders; every other scenario must hold up under eviction too.
+dir_cache_max_dirs: 30
 EOF
 
 # This slim image has no GLib, so the GIO toolkit profile would resolve to

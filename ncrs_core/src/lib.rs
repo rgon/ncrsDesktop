@@ -4159,8 +4159,10 @@ fn lookup_commit(ctx: &MetaCtx, hit: LookupHit) -> FileAttr {
 
 pub struct NextCloudFs {
     // Shared handles for requests answered off the dispatch thread; the same
-    // Arcs as the fields below.
-    meta: MetaCtx,
+    // Arcs as the fields below. Built on first use (`meta()`), not in `new`:
+    // `mount_ncfs` still swaps fields in (`transfer_map`) and needs `conn`
+    // unshared for `Arc::get_mut` until the session starts.
+    meta: std::sync::OnceLock<MetaCtx>,
     cache: Arc<Mutex<FsCache>>,
     status: StatusMap,
     dirty: ipc::DirtySet,
@@ -4450,25 +4452,8 @@ impl NextCloudFs {
         let uploads = UploadOrder::default();
         let transfer_map: TransferMap = Arc::new(Mutex::new(HashMap::new()));
         let thumb_inflight = Arc::new(Mutex::new(HashSet::new()));
-        let meta = MetaCtx {
-            conn: conn.clone(),
-            cache: cache.clone(),
-            shared: shared.clone(),
-            fileids: fileids.clone(),
-            details: details.clone(),
-            children_map: children_map.clone(),
-            status: status.clone(),
-            open_files: open_files.clone(),
-            open_writers: Arc::new(AtomicUsize::new(0)),
-            next_fh: next_fh.clone(),
-            io_modes: io_modes.clone(),
-            uploads: uploads.clone(),
-            transfer_map: transfer_map.clone(),
-            thumbnail: make_thumbnail_callback(conn.clone(), fileids.clone(), thumb_inflight.clone()),
-            resolve_within: CHILD_RESOLVE_DEADLINE,
-        };
         Ok(NextCloudFs {
-            meta,
+            meta: std::sync::OnceLock::new(),
             cache,
             status,
             dirty,
@@ -5216,6 +5201,26 @@ impl NextCloudFs {
         Ok(())
     }
 
+    fn meta(&self) -> &MetaCtx {
+        self.meta.get_or_init(|| MetaCtx {
+            conn: self.conn.clone(),
+            cache: self.cache.clone(),
+            shared: self.shared.clone(),
+            fileids: self.fileids.clone(),
+            details: self.details.clone(),
+            children_map: self.children_map.clone(),
+            status: self.status.clone(),
+            open_files: self.open_files.clone(),
+            open_writers: Arc::new(AtomicUsize::new(0)),
+            next_fh: self.next_fh.clone(),
+            io_modes: self.io_modes.clone(),
+            uploads: self.uploads.clone(),
+            transfer_map: self.transfer_map.clone(),
+            thumbnail: self.thumbnail_callback(),
+            resolve_within: CHILD_RESOLVE_DEADLINE,
+        })
+    }
+
     /// See [`with_child`].
     fn with_child<R, T, P, A>(
         &self,
@@ -5231,11 +5236,11 @@ impl NextCloudFs {
         P: Fn(&mut FsCache, &Path, &RemoteEntry) -> T + Send + 'static,
         A: FnOnce(&MetaCtx, &Path, R, Resolved<T>) + Send + 'static,
     {
-        with_child(&self.meta, pid, path, reply, pick, inline_miss, answer)
+        with_child(&self.meta(), pid, path, reply, pick, inline_miss, answer)
     }
 
     fn insert_open_file(&self, fh: u64, of: OpenFile) {
-        insert_open_file(&self.meta, fh, of);
+        insert_open_file(&self.meta(), fh, of);
     }
 
     fn readdir_common(&self, pid: u32, ino: INodeNo, fh: u64, offset: u64, reply: DirReply) {
@@ -5943,7 +5948,7 @@ impl Filesystem for NextCloudFs {
 
         let rq = OpenReq { ino: ino.0, flags: flags.0, pid: req.pid(), writable, truncating, path, local };
         match listed {
-            Some(entry) => open_continue(&self.meta, rq, entry, reply, false),
+            Some(entry) => open_continue(&self.meta(), rq, entry, reply, false),
             // The parent listing was evicted. A writable open stages the file's
             // current content, so it has to know the file's size and etag:
             // assuming "empty" (what this did) left the staging file unseeded,
@@ -5973,7 +5978,7 @@ impl Filesystem for NextCloudFs {
             }
             // A read-only open takes only hints from the listing (the sniffing
             // content type falls back to octet-stream), as before.
-            None => open_continue(&self.meta, rq, OpenEntry::default(), reply, false),
+            None => open_continue(&self.meta(), rq, OpenEntry::default(), reply, false),
         }
     }
 
@@ -6641,7 +6646,7 @@ impl Filesystem for NextCloudFs {
             return;
         };
         if of.writer {
-            self.meta.open_writers.fetch_sub(1, Ordering::Relaxed);
+            self.meta().open_writers.fetch_sub(1, Ordering::Relaxed);
         }
         if let Some(ref parent) = of.pinned_parent {
             self.cache.safe_lock().unpin_dir(parent);
