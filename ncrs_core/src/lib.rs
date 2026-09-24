@@ -7724,9 +7724,6 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     if let Some(j) = journal {
         filesystem.journal = j;
     }
-    // Journal writes (and the staging fsyncs they depend on) leave the FUSE
-    // dispatch thread: see `mutation_journal::DeferredSaves`.
-    mutation_journal::defer_saves(&filesystem.journal, &bg::DISK);
     // One shared pause flag for the FUSE connection, background workers, and
     // the IPC PAUSE/RESUME verbs — callers without their own flag get one.
     let paused_flag = paused.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
@@ -7748,6 +7745,11 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     // directory during a previous session — see prepare_mount_point — are
     // queued into the journal now that it (and the backend connection) exist.
     adopt_orphaned_files(&filesystem, adopted);
+    // Only now: adoption's journal entries were each written synchronously,
+    // so a crash from here on still finds the adopted files queued. From here
+    // journal writes (and the staging fsyncs they depend on) leave the FUSE
+    // dispatch thread: see `mutation_journal::DeferredSaves`.
+    mutation_journal::defer_saves(&filesystem.journal, &bg::JOURNAL);
 
     let keep_cb = filesystem.keep_callback();
     let evict_cb = filesystem.evict_callback();

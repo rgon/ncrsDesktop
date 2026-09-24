@@ -2,7 +2,7 @@
 
 Every OS thread the daemon creates comes from [`ncrs_core/src/bg.rs`](../ncrs_core/src/bg.rs). It is either a worker of one of the fixed pools below or one of the named long-lived services. `std::thread::spawn` is banned everywhere else by `ncrs_core/clippy.toml`, and CI enforces this with `clippy -D clippy::disallowed_methods`. `std::thread::scope` stays allowed, because it joins its threads before returning.
 
-This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (190) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 50) + the main thread + reqwest's runtime threads (≤ 8), which is **273**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
+This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (191) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 50) + the main thread + reqwest's runtime threads (≤ 8), which is **274**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
 
 Why this matters: 0.1.76 spawned a detached thread per FUSE request and per background revalidation, and took its concurrency permit *inside* the thread. During a `find /` over a server answering 500, 9,800 of those threads parked on a 10-slot throttle. The daemon reached 10,160 threads and ~900 load average (2026-09-24; see `docs/plans/2026-09-24-thread-leak-5xx-walker.md`).
 
@@ -18,7 +18,8 @@ graph LR
   F0 -->|run_read_job(reply), EAGAIN if full| RE[[read ×32, q2048]]
   F0 -->|submit_mutation — ticket taken first, FIFO, never refused| MU[[mutate ×16, q∞]]
   F0 -->|write that fills a chunk: per-handle lane, reply in the job| UP[[upload ×4, q1024]]
-  F0 -->|seed a staging file, flush/fsync, journal group commit: per-handle lane| DK[[disk ×4, q4096]]
+  F0 -->|seed a staging file, flush/fsync: per-handle lane| DK[[disk ×4, q4096]]
+  F0 & MU -->|journal changed: group commit| JO[[journal ×1, q4]]
   UP -->|chunk PUT, retries| SRV
   F0 -->|notify_later| NO[[notify ×1, q8192]]
   RD -->|cold listing: per-pid token bucket| WK{walkers}
@@ -45,7 +46,8 @@ graph LR
 | `bg` | 4 | 256 | dropped | revalidation on read, prefetch, GIO temp purge, chunk-upload abort |
 | `mutate` | 16 | unbounded | journal replays it | PUT/MKCOL/DELETE/MOVE commits (`PathSeq` FIFO; see `path_seq.rs`) |
 | `upload` | 4 | 1024 | the write runs on the caller as a plain append; its chunk goes with the handle's next write | the `write()` that fills a 10 MB chunk of a streamed upload, and its PUT (with retries); the reply travels in the job. Queued per handle (`fh_lane.rs`), so a handle's later writes, flush and release wait behind it and nothing else does |
-| `disk` | 4 | 4096 | runs on the caller | seeding a staging file from the kept copy (first write, truncate), `flush`/`fsync` of a staging file (reply in the job), a `release` queued behind a handle's in-flight write, and the journal's group commit (`mutation_journal::DeferredSaves`: staging fsyncs, then one write of the latest journal) |
+| `disk` | 4 | 4096 | runs on the caller | seeding a staging file from the kept copy (first write, truncate), `flush`/`fsync` of a staging file (reply in the job), and a `release` queued behind a handle's in-flight write |
+| `journal` | 1 | 4 | left pending for the next change or the shutdown flush | the journal's group commit (`mutation_journal::DeferredSaves`): staging fsyncs, one durable write of the latest journal, then deleting the staging files it no longer names. A failed write is put back and retried with backoff (100 ms → 5 s) |
 | `notify` | 1 | 8192 | dropped (entry times out) | every `inval_inode` / `inval_entry` / `delete` to the kernel |
 | `ipc` | 64 | 0 | connection closed | one per connected IPC client |
 | `housekeeping` | 3 | 16 | disarmed, retried later | dir-cache saver, journal replay, reconnect revalidation |
