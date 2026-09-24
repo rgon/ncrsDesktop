@@ -3943,8 +3943,12 @@ fn with_child_within<R, T, P, A>(
 // caller from /proc/<pid>/{maps,cmdline} go to `bg::META`; downloading or
 // copying the current content into a staging file goes to `bg::READ` (it can
 // take the full DOWNLOAD_TIMEOUT, and must not hold a META worker that long).
-// Passthrough is only ever granted to a read-only open of a fresh local copy,
-// which never leaves the dispatch thread.
+// Passthrough is only ever granted to a read-only open of a fresh local copy:
+// on the dispatch thread, or on a META worker when the copy's parent listing
+// had to be resolved first (`open_unlisted`). Either is safe: `io_modes`
+// decides every grant under its lock, so two opens of one inode never get
+// conflicting modes whichever reply the kernel sees first, and the backing
+// file is registered through the reply's session, from any thread.
 
 /// What open() takes from the file's entry in its parent listing.
 #[derive(Default)]
@@ -4030,6 +4034,15 @@ impl OpenAnswer for ReplyOpen {
 /// kept copy was served as fresh. Both resolve the parent first, off the
 /// dispatch thread. Uncached read-only opens take only hints from the listing,
 /// so they don't wait for one.
+///
+/// A read-only open of a kept copy waits for the listing only briefly
+/// (`KEPT_COPY_RESOLVE_WITHIN`), and not at all while offline or while the
+/// server breaker is open: then it is served from the copy as it was before
+/// the parent had to be resolved, trusting it unless something we still know
+/// says it is stale. The trade-off: a copy the server has since changed can
+/// be served once more, where the full wait (up to the 15 s listing timeout,
+/// holding a META worker) would have caught it; the next open with the
+/// listing resident re-checks it.
 fn open_unlisted<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, reply: R) {
     if !rq.writable && rq.local.is_none() {
         // A read-only open takes only hints from the listing (the sniffing
@@ -4037,8 +4050,16 @@ fn open_unlisted<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, reply: R) {
         open_continue(ctx, rq, OpenEntry::default(), reply, false);
         return;
     }
+    let within = if rq.writable {
+        ctx.resolve_within
+    } else if ctx.conn.is_offline.load(Ordering::Relaxed) || ctx.conn.breaker.is_open(Instant::now()) {
+        open_continue(ctx, rq, OpenEntry::default(), reply, false);
+        return;
+    } else {
+        KEPT_COPY_RESOLVE_WITHIN.min(ctx.resolve_within)
+    };
     let path = rq.path.clone();
-    with_child(ctx, rq.pid, &path, (reply, rq), |_, _, e| OpenEntry::of(e), |_| None, |ctx, _, (reply, rq), r| match r {
+    with_child_within(ctx, rq.pid, &path, within, (reply, rq), |_, _, e| OpenEntry::of(e), |_| None, |ctx, _, (reply, rq), r, _| match r {
         Resolved::Found(entry) => open_continue(ctx, rq, entry, reply, false),
         // Not on the server: nothing to seed from.
         Resolved::Absent => open_continue(ctx, rq, OpenEntry::default(), reply, false),
@@ -4059,6 +4080,10 @@ fn open_unlisted<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, reply: R) {
         },
     });
 }
+
+/// How long a read-only open of a kept copy waits for its evicted parent
+/// listing before it is served from the copy (see `open_unlisted`).
+const KEPT_COPY_RESOLVE_WITHIN: Duration = Duration::from_secs(2);
 
 /// The version a writable open of a kept copy may be seeded from when its
 /// parent listing cannot be had: only while offline, and only if the copy is
@@ -4362,7 +4387,8 @@ fn open_register<R: OpenAnswer>(
     // the write staging path, both of which require ncrs to stay on the
     // data path (see the read()/write() handlers). io_modes then decides
     // whether this open may actually use it (see iomode.rs). Such an open
-    // never leaves the dispatch thread (see open_continue).
+    // runs here on the dispatch thread, or on a META worker when its parent
+    // listing had to be resolved (see the note above OpenEntry).
     let grant = if mime_detect {
         iomode::IoGrant::DirectIo
     } else {

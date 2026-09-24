@@ -4218,6 +4218,69 @@ mod upload_order_tests {
             assert_eq!(files[&fh].original_etag.as_deref(), Some("e-kept"), "the replayed upload must still detect a server change");
         }
 
+        fn keep(meta: &MetaCtx, tmp: &tempfile::TempDir, etag: &str) -> PathBuf {
+            let local = tmp.path().join("kept-a.txt");
+            std::fs::write(&local, b"kept!").unwrap();
+            meta.cache.safe_lock().file_cache.insert(PathBuf::from("/d/a.txt"), FileCacheEntry {
+                local_path: local.clone(), remote_modified: None, etag: Some(etag.into()), kept: true, size: 5,
+            });
+            local
+        }
+
+        #[test]
+        fn a_read_only_open_of_a_kept_copy_with_an_evicted_parent_is_checked_against_the_listing() {
+            // The server's a.txt carries "etag1".
+            let dir = FakeDir { entries: vec![entry_in("/d", "a.txt")], before_first: Duration::from_millis(50), ..Default::default() };
+            let (_, meta, tmp, ino) = open_setup(vec![("/d", dir)], false);
+            for (kept, fresh) in [("stale", false), ("etag1", true)] {
+                let local = keep(&meta, &tmp, kept);
+                meta.cache.safe_lock().dir_cache.remove(Path::new("/d"));
+                let (r, rx) = reply();
+                open_unlisted(&meta, rq(ino, "/d/a.txt", libc::O_RDONLY, Some(local)), r);
+                let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+                assert_eq!(meta.open_files.safe_lock()[&fh].cache_fresh, fresh, "kept copy with etag {kept}");
+                release_bookkeeping(&meta, fh);
+            }
+            assert_all_given_back(&meta, ino);
+        }
+
+        #[test]
+        fn a_read_only_open_of_a_kept_copy_waits_only_briefly_for_its_parent() {
+            let slow = FakeDir { entries: vec![entry_in("/d", "a.txt")], before_first: Duration::from_secs(30), ..Default::default() };
+            let (fake, meta, tmp, ino) = open_setup(vec![("/d", slow)], false);
+            let meta = MetaCtx { resolve_within: Duration::from_secs(20), ..meta };
+            let local = keep(&meta, &tmp, "e-kept");
+
+            // Offline, or with the server breaker open: served from the copy at once.
+            meta.conn.is_offline.store(true, Ordering::SeqCst);
+            let (r, rx) = reply();
+            open_unlisted(&meta, rq(ino, "/d/a.txt", libc::O_RDONLY, Some(local.clone())), r);
+            release_bookkeeping(&meta, fh_of(rx.try_recv().expect("offline: answered inline")));
+            meta.conn.is_offline.store(false, Ordering::SeqCst);
+            let now = Instant::now();
+            for _ in 0..30 {
+                meta.conn.breaker.record(true, now);
+            }
+            assert!(meta.conn.breaker.is_open(now));
+            let (r, rx) = reply();
+            open_unlisted(&meta, rq(ino, "/d/a.txt", libc::O_RDONLY, Some(local.clone())), r);
+            release_bookkeeping(&meta, fh_of(rx.try_recv().expect("breaker open: answered inline")));
+            assert_eq!(fake.lists.load(Ordering::SeqCst), 0, "no listing was started for either");
+
+            // Online, a listing that hangs is waited for about KEPT_COPY_RESOLVE_WITHIN,
+            // not the full resolve deadline, then the copy is served.
+            let meta = MetaCtx { conn: ConnInfo::for_tests(fake.clone()), ..meta };
+            let t = Instant::now();
+            let (r, rx) = reply();
+            open_unlisted(&meta, rq(ino, "/d/a.txt", libc::O_RDONLY, Some(local)), r);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            let took = t.elapsed();
+            assert!(took >= KEPT_COPY_RESOLVE_WITHIN - Duration::from_millis(100) && took < KEPT_COPY_RESOLVE_WITHIN + Duration::from_secs(2), "{took:?}");
+            assert!(meta.open_files.safe_lock()[&fh].cache_fresh, "served from the copy, as before the parent had to be resolved");
+            release_bookkeeping(&meta, fh);
+            assert_all_given_back(&meta, ino);
+        }
+
         #[test]
         fn an_unclassified_open_the_meta_pool_refuses_is_tried_again_not_downloaded() {
             // A process whose classification nobody cached: GLib's probe matcher
