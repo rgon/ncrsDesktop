@@ -1,6 +1,8 @@
 pub mod asset_url;
 pub mod auth;
 pub mod backend;
+pub mod backoff;
+pub mod bg;
 pub mod config;
 pub mod desktop;
 pub mod login_flow;
@@ -1022,7 +1024,8 @@ fn error_to_errno(err: &str) -> Errno {
         return Errno::ENOENT;
     }
     if err.starts_with("network:") || err.starts_with(backend::TRUNCATED_PREFIX) {
-        return if err == OFFLINE_READ_ERR { Errno::ETIMEDOUT } else { Errno::EAGAIN };
+        // Includes OFFLINE_READ_ERR ("… timed out waiting for connectivity").
+        return if is_timeout_err(err) { Errno::ETIMEDOUT } else { Errno::EAGAIN };
     }
     if err.contains("401") || err.contains("403") || err.contains("Unauthorized") || err.contains("Forbidden") {
         Errno::EACCES
@@ -1038,6 +1041,39 @@ fn error_to_errno(err: &str) -> Errno {
         Errno::EAGAIN
     } else {
         Errno::EIO
+    }
+}
+
+/// Starts one of the daemon's fixed, named long-lived threads.
+fn start_service(name: &str, f: impl FnOnce() + Send + 'static) {
+    if let Err(e) = bg::spawn_service(name, f) {
+        log::error!("could not start the {} thread: {}", name, e);
+    }
+}
+
+/// Queues a server mutation. Its `PathSeq` ticket was taken on the FUSE thread
+/// before this call, which is what keeps the FIFO pool deadlock-free. The
+/// queue is unbounded, so this only fails if the OS refuses a thread; the
+/// operation is then still in the journal and replays on the next reconnect.
+fn submit_mutation(job: impl FnOnce() + Send + 'static) {
+    if let Err(r) = bg::MUTATION.submit(job) {
+        log::error!("{} — mutation left in the journal for replay", r);
+    }
+}
+
+/// Sends a kernel cache notification from the single notify worker, never the
+/// FUSE dispatch thread (a notify the kernel blocks on would deadlock it).
+pub(crate) fn notify_later(job: impl FnOnce() + Send + 'static) {
+    if let Err(r) = bg::NOTIFY.submit(job) {
+        log::warn!("{} — kernel cache notification dropped; the entry stays cached until it times out", r);
+    }
+}
+
+/// Runs a read that has to wait for bytes off the FUSE dispatch thread. When
+/// the read pool is full the kernel gets EAGAIN rather than an unbounded thread.
+fn run_read_job(reply: ReplyData, job: impl FnOnce(ReplyData) + Send + 'static) {
+    if let Err((_, reply)) = bg::READ.submit_owning(reply, job) {
+        reply.error(Errno::EAGAIN);
     }
 }
 
@@ -1627,7 +1663,7 @@ fn schedule_save_dir_cache(cache: &Arc<Mutex<FsCache>>) {
     SAVE_FIRST_DIRTY_AT.store(now, Ordering::Relaxed);
 
     let cache = cache.clone();
-    thread::spawn(move || {
+    let submitted = bg::HOUSEKEEPING.submit(move || {
         loop {
             thread::sleep(SAVE_DEBOUNCE);
             let now = unix_millis();
@@ -1644,6 +1680,10 @@ fn schedule_save_dir_cache(cache: &Arc<Mutex<FsCache>>) {
         SAVE_ARMED.store(false, Ordering::Release);
         save_dir_cache_now(&cache);
     });
+    if submitted.is_err() {
+        // Disarm so the next change retries; staying armed would stop saves for good.
+        SAVE_ARMED.store(false, Ordering::Release);
+    }
 }
 
 /// Serialises the dir cache as a map without materialising one: the snapshot is
@@ -2071,6 +2111,76 @@ fn is_unreachable_listing_error(e: &str) -> bool {
         || backend::server_error_code(e).is_some_and(|c| c >= 500 || c == 429)
 }
 
+/// Feeds one listing outcome to the per-path backoff and the server breaker.
+/// Only answers count: a transport failure says nothing about the server's
+/// health and is the connectivity monitor's business.
+fn note_listing_outcome(conn: &ConnInfo, path: &Path, outcome: Result<(), &str>) {
+    let now = Instant::now();
+    match outcome {
+        Ok(()) => {
+            conn.breaker.record(false, now);
+            conn.backoff.clear(path);
+        }
+        Err(e) => match backend::server_error_code(e) {
+            Some(code) if backoff::is_struggling(code) => {
+                conn.breaker.record(true, now);
+                let cooldown = conn.backoff.record_failure(path, code, now);
+                log::info!("LIST_BACKOFF {} — server answered {}, not asking again for {:?}", path.display(), code, cooldown);
+            }
+            Some(_) => conn.breaker.record(false, now),
+            // A body that broke off mid-listing is the classic sign of a server
+            // timing out under load: count it against the server, not the path.
+            None if e.starts_with(backend::TRUNCATED_PREFIX) => conn.breaker.record(true, now),
+            None => {}
+        },
+    }
+}
+
+/// Background re-validation of a listing past its soft TTL: a cheap Depth-0
+/// etag probe first, a full re-list only if the directory changed. Runs on a
+/// `bg::LISTING` worker; the caller already served the cached listing.
+fn soft_refresh_dir(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, path: PathBuf, dm: Option<DirDetailArcs>) {
+    let old_etag = cache.safe_lock().cached_dir_etag(&path);
+    if let Some(ref old) = old_etag {
+        let probe = match conn.throttle.acquire_timeout(PROPFIND_TIMEOUT) {
+            Some(_permit) => conn.backend.dir_change_token(&path, PROPFIND_TIMEOUT).map_err(|e| e.to_string()),
+            None => Err("PROPFIND timeout (no request slot for the etag probe)".to_string()),
+        };
+        match probe {
+            Ok(Some(ref new_etag)) if new_etag == old => {
+                note_listing_outcome(conn, &path, Ok(()));
+                log::debug!("ETAG_MATCH {} — skipping full re-list", path.display());
+                cache.safe_lock().touch_dir_cache(&path);
+                return;
+            }
+            Ok(_) => note_listing_outcome(conn, &path, Ok(())),
+            Err(e) => {
+                note_listing_outcome(conn, &path, Err(&e));
+                log::debug!("etag check {}: {}", path.display(), e);
+                if is_server_error(&e) {
+                    // The server is failing this directory; a full listing would too.
+                    cache.safe_lock().clear_refreshing(&path);
+                    return;
+                }
+            }
+        }
+    }
+    match list_dir_propfind(conn, path.clone()) {
+        Ok((etag, self_entry, fresh)) => {
+            note_listing_outcome(conn, &path, Ok(()));
+            if let Some(ref arcs) = dm {
+                apply_dir_detail_maps(&path, &fresh, arcs);
+            }
+            cache.safe_lock().put_dir_cache(path, etag, self_entry, fresh);
+        }
+        Err(e) => {
+            note_listing_outcome(conn, &path, Err(&e));
+            log::debug!("background refresh {}: {}", path.display(), e);
+            cache.safe_lock().clear_refreshing(&path);
+        }
+    }
+}
+
 fn list_dir_cached_or_fresh(
     conn: &Arc<ConnInfo>,
     cache: &Arc<Mutex<FsCache>>,
@@ -2105,43 +2215,39 @@ fn list_dir_cached_or_fresh(
             let self_entry = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
             log::info!("LIST_CACHED {} ({} entries, refresh={}) in {:?}", path.display(), files.len(), needs_refresh, t0.elapsed());
             if needs_refresh {
-                let conn = conn.clone();
-                let cache = cache.clone();
-                let path = path.clone();
-                let dm = dir_maps;
-                std::thread::spawn(move || {
-                    let old_etag = cache.safe_lock().cached_dir_etag(&path);
-                    if let Some(ref old) = old_etag {
-                        let _permit = conn.throttle.acquire();
-                        match conn.backend.dir_change_token(&path, PROPFIND_TIMEOUT) {
-                            Ok(Some(ref new_etag)) if new_etag == old => {
-                                log::debug!("ETAG_MATCH {} — skipping full re-list", path.display());
-                                cache.safe_lock().touch_dir_cache(&path);
-                                return;
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                log::debug!("etag check {}: {}", path.display(), e);
-                            }
-                        }
+                let now = Instant::now();
+                if conn.breaker.is_open(now) || conn.backoff.blocked(&path, now).is_some() {
+                    // Serving what we have is the whole point of backing off.
+                    c.clear_refreshing(&path);
+                } else {
+                    let submitted = {
+                        let conn = conn.clone();
+                        let cache = cache.clone();
+                        let path = path.clone();
+                        let dm = dir_maps;
+                        bg::LISTING.submit(move || soft_refresh_dir(&conn, &cache, path, dm))
+                    };
+                    if submitted.is_err() {
+                        c.clear_refreshing(&path);
                     }
-                    match list_dir_propfind(&conn, path.clone()) {
-                        Ok((etag, self_entry, fresh)) => {
-                            if let Some(ref arcs) = dm {
-                                apply_dir_detail_maps(&path, &fresh, arcs);
-                            }
-                            cache.safe_lock().put_dir_cache(path, etag, self_entry, fresh);
-                        }
-                        Err(e) => {
-                            log::debug!("background refresh {}: {}", path.display(), e);
-                            cache.safe_lock().clear_refreshing(&path);
-                        }
-                    }
-                });
+                }
             }
             return Ok((files, self_entry));
         }
     }
+    // This directory just failed on the server: don't ask again until its
+    // cooldown passes. Any listing we hold — even one marked stale — beats an
+    // error, and without one the caller gets a fast "try again" (EAGAIN).
+    if let Some((left, code)) = conn.backoff.blocked(&path, Instant::now()) {
+        let c = cache.safe_lock();
+        if let Some(entry) = c.dir_cache.get(&path) {
+            log::debug!("LIST_BACKOFF_STALE {} — serving the cached listing for {:?} more", path.display(), left);
+            return Ok((Arc::clone(&entry.files), entry.self_entry.clone()));
+        }
+        return Err(format!("{}{}: {} (cooling down {:?} after a server error)",
+            backend::SERVER_ERROR_PREFIX, code, path.display(), left));
+    }
+
     // The listing is past dir_cache_max_stale_mins, so it may not be served before
     // we know whether it is still current. Ask for the directory etag first: that is
     // a Depth-0 PROPFIND whose cost is independent of how many entries the directory
@@ -2169,6 +2275,10 @@ fn list_dir_cached_or_fresh(
             Some(_permit) => conn.backend.dir_change_token(&path, PROPFIND_TIMEOUT),
             None => Err(backend::BackendReadError::Timeout),
         };
+        match &probe {
+            Ok(_) => note_listing_outcome(conn, &path, Ok(())),
+            Err(e) => note_listing_outcome(conn, &path, Err(&e.to_string())),
+        }
         let mut c = cache.safe_lock();
         match probe {
             Ok(Some(ref new_etag)) if *new_etag == old_etag => {
@@ -2233,22 +2343,35 @@ fn list_dir_cached_or_fresh(
             let conn2 = conn.clone();
             let path2 = path.clone();
             let pending_notify2 = c.pending_notify.clone();
-            std::thread::spawn(move || {
-                let _permit = conn2.throttle.acquire();
-                match conn2.backend.list_dir_streaming(
-                    &path2, PROPFIND_TIMEOUT, entry_tx, self_tx,
-                ) {
-                    Ok(etag) => {
-                        let _ = etag_tx.send(Ok(etag));
-                    }
+            // The worker owns the senders: the pending entry stays "in flight"
+            // (its channel connected) for exactly as long as the fetch is queued
+            // or running, which is what lets later readers join instead of
+            // starting a duplicate.
+            let submitted = bg::LISTING.submit(move || {
+                let result = match conn2.throttle.acquire_timeout(PROPFIND_TIMEOUT) {
+                    Some(_permit) => conn2.backend
+                        .list_dir_streaming(&path2, PROPFIND_TIMEOUT, entry_tx, self_tx)
+                        .map_err(|e| e.to_string()),
+                    None => Err(format!("PROPFIND timeout for {} (no request slot)", path2.display())),
+                };
+                match &result {
+                    Ok(_) => note_listing_outcome(&conn2, &path2, Ok(())),
                     Err(e) => {
-                        log::warn!("incremental list {}: {}", path2.display(), e);
-                        let _ = etag_tx.send(Err(e.to_string()));
+                        note_listing_outcome(&conn2, &path2, Err(e));
+                        // readdir reports the same failure to the user; keep this one quiet.
+                        log::debug!("incremental list {}: {}", path2.display(), e);
                     }
                 }
+                let _ = etag_tx.send(result);
                 // Wake any threads waiting in get_or_list_dir for this path.
                 pending_notify2.1.notify_all();
             });
+            if submitted.is_err() {
+                // Nothing will ever complete this entry; drop it so the next
+                // reader can try again once the pool has room.
+                c.pending_dirs.remove(&path);
+                return Err(format!("network: listing {} deferred — too many listings in flight", path.display()));
+            }
             false
         }, was_inv)
     };
@@ -2292,9 +2415,15 @@ fn list_dir_cached_or_fresh(
         let _ = pending_notify.1.wait_timeout(guard, Duration::from_millis(50)).unwrap();
     }
 
-    // Timeout: drain pending channel, only cache if entries arrived or sender finished
+    // Our wait is over but the fetch may not be. Drain what arrived, and:
+    //  * promote only a *finished* stream — caching a half-received listing as
+    //    complete would hide the rest of the directory until the next refresh;
+    //  * never drop the pending entry of a fetch still in flight (its sender is
+    //    connected). Dropping it here used to let the next readdir start a
+    //    duplicate fetch while this one sat in the throttle queue, which under
+    //    a slow or failing server snowballed into thousands of threads.
     let mut c = cache.safe_lock();
-    let should_promote = if let Some(pending) = c.pending_dirs.get_mut(&path) {
+    let (finished, partial) = if let Some(pending) = c.pending_dirs.get_mut(&path) {
         let mut disconnected = false;
         loop {
             match pending.rx.try_recv() {
@@ -2303,18 +2432,20 @@ fn list_dir_cached_or_fresh(
                 Err(mpsc::TryRecvError::Disconnected) => { disconnected = true; break; }
             }
         }
-        !pending.entries.is_empty() || disconnected
+        (disconnected, (!pending.entries.is_empty()).then(|| (pending.entries.clone(), pending.self_entry.clone())))
     } else {
-        false
+        (false, None)
     };
-    if should_promote {
+    if finished {
         let se = c.promote_pending(&path)?;
         if let Some((files, _)) = c.get_cached_dir(&path, ttl, max_stale) {
             return Ok((files, se));
         }
+    } else if let Some((entries, se)) = partial.filter(|_| !was_invalidated) {
+        log::info!("LIST_STREAM_PARTIAL {} ({} entries so far, still streaming) in {:?}", path.display(), entries.len(), t0.elapsed());
+        return Ok((Arc::new(entries), se));
     } else {
-        log::warn!("PROPFIND timeout {} — removing stale pending (no entries yet, elapsed {:?})", path.display(), t0.elapsed());
-        c.pending_dirs.remove(&path);
+        log::warn!("PROPFIND timeout {} — no entries yet after {:?}; the fetch stays in flight", path.display(), t0.elapsed());
     }
     Err(format!("PROPFIND timeout for {}", path.display()))
 }
@@ -2547,32 +2678,42 @@ fn start_background_propfind(
     chain_depth: u32,
 ) {
     if conn.shutdown.load(Ordering::Relaxed) || conn.paused.load(Ordering::Relaxed) { return; }
-    {
-        let c = cache.safe_lock();
-        if c.dir_cache.contains_key(&path) || c.pending_dirs.contains_key(&path) {
-            return;
-        }
+    // Prefetch is speculative: it is the first thing to go when the server struggles.
+    let now = Instant::now();
+    if conn.breaker.is_open(now) || conn.backoff.blocked(&path, now).is_some() {
+        return;
     }
+    // Check and register under one lock, so two callers can't both start a fetch.
     let (entry_tx, entry_rx) = mpsc::channel();
     let (etag_tx, etag_rx) = mpsc::channel();
     let (self_tx, self_rx) = mpsc::channel();
-    let pending_notify2 = cache.safe_lock().start_pending_and_notify(path.clone(), entry_rx, etag_rx, self_rx);
+    let pending_notify2 = {
+        let mut c = cache.safe_lock();
+        if c.dir_cache.contains_key(&path) || c.pending_dirs.contains_key(&path) {
+            return;
+        }
+        c.start_pending_and_notify(path.clone(), entry_rx, etag_rx, self_rx)
+    };
     let conn2 = conn.clone();
     let cache2 = cache.clone();
-    thread::spawn(move || {
-        let result = {
-            let _permit = conn2.prefetch_throttle.acquire();
-            let r = conn2.backend.list_dir_streaming(
-                &path, PROPFIND_TIMEOUT, entry_tx, self_tx,
-            );
-            r
-            // _permit (prefetch throttle slot) released here, before chaining children
+    let path_for_reject = path.clone();
+    let submitted = bg::BACKGROUND.submit(move || {
+        let result = match conn2.prefetch_throttle.acquire_timeout(PROPFIND_TIMEOUT) {
+            // The prefetch slot is released at the end of this arm, before chaining children.
+            Some(_permit) => conn2.backend
+                .list_dir_streaming(&path, PROPFIND_TIMEOUT, entry_tx, self_tx)
+                .map_err(|e| e.to_string()),
+            None => Err(format!("PROPFIND timeout for {} (no prefetch slot)", path.display())),
         };
         match result {
-            Ok(etag) => { let _ = etag_tx.send(Ok(etag)); }
+            Ok(etag) => {
+                note_listing_outcome(&conn2, &path, Ok(()));
+                let _ = etag_tx.send(Ok(etag));
+            }
             Err(e) => {
+                note_listing_outcome(&conn2, &path, Err(&e));
                 log::debug!("bg propfind {}: {}", path.display(), e);
-                let _ = etag_tx.send(Err(e.to_string()));
+                let _ = etag_tx.send(Err(e));
                 pending_notify2.1.notify_all();
                 schedule_save_dir_cache(&cache2);
                 return;
@@ -2592,6 +2733,9 @@ fn start_background_propfind(
         }
         schedule_save_dir_cache(&cache2);
     });
+    if submitted.is_err() {
+        cache.safe_lock().pending_dirs.remove(&path_for_reject);
+    }
 }
 
 // ── FileAttr helpers ──────────────────────────────────────────────────────────
@@ -2753,6 +2897,10 @@ struct ConnInfo {
     // fails (missing CAP_SYS_ADMIN, kernel <6.9, etc.) so every later open()
     // just falls back to a normal reply instead of re-probing and re-logging.
     passthrough_capable: Arc<AtomicBool>,
+    /// Per-directory cooldown after the server failed a listing (see `backoff.rs`).
+    backoff: Arc<backoff::PathBackoff>,
+    /// Server-wide 5xx breaker: pauses background listing work while open.
+    breaker: Arc<backoff::ServerBreaker>,
 }
 
 /// Clears an in-progress flag on drop, so a panicking worker cannot latch it.
@@ -3037,6 +3185,8 @@ impl NextCloudFs {
             paused: Arc::new(AtomicBool::new(false)),
             passthrough_enabled: Arc::new(AtomicBool::new(options.fuse_passthrough)),
             passthrough_capable: Arc::new(AtomicBool::new(true)),
+            backoff: Arc::new(backoff::PathBackoff::new()),
+            breaker: Arc::new(backoff::ServerBreaker::new()),
         });
 
         Ok(NextCloudFs {
@@ -3391,53 +3541,6 @@ impl DirReply {
     }
 }
 
-// Bounds how many readdir() background workers can be doing real work (a
-// PROPFIND round trip, cache population, an etag revalidation) at once.
-// `readdir_common` spawns a fresh OS thread per call and returns immediately
-// (fuser's single dispatch thread must never block on one directory's network
-// round trip), so nothing on the fast path otherwise limits how many of these
-// can be live simultaneously. A single caller doing a bulk recursive crawl of
-// the mount — a desktop search indexer's file miner, `find`, a backup tool —
-// fans that out into one thread per directory it visits *at once*: thousands
-// of them, each pulling a PROPFIND response, holding cache locks, and
-// contending the allocator's arenas, which is what pegs the CPU and drives
-// RSS into the gigabytes even though only a handful can usefully make network
-// progress concurrently anyway. Mirrors `preview::FetchPermit`, which the
-// same failure mode already forced onto the thumbnail-fetch path — this is
-// the equivalent for the directory-listing path itself, which never got one.
-//
-// The permit is acquired *inside* the spawned thread, not before spawning
-// it: gating the spawn itself would mean blocking fuser's one dispatch
-// thread until a slot frees, which would stall every other FUSE operation
-// (open, read, write, getattr on files the user is actively using) behind
-// whatever is saturating readdir — worse than the resource usage this fixes.
-const MAX_CONCURRENT_READDIR_WORKERS: usize = 24;
-static INFLIGHT_READDIR_WORKERS: AtomicUsize = AtomicUsize::new(0);
-
-struct ReaddirWorkerPermit;
-
-impl ReaddirWorkerPermit {
-    fn acquire() -> Self {
-        loop {
-            let cur = INFLIGHT_READDIR_WORKERS.load(Ordering::Acquire);
-            if cur < MAX_CONCURRENT_READDIR_WORKERS
-                && INFLIGHT_READDIR_WORKERS
-                    .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-            {
-                return ReaddirWorkerPermit;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-
-impl Drop for ReaddirWorkerPermit {
-    fn drop(&mut self) {
-        INFLIGHT_READDIR_WORKERS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 impl NextCloudFs {
     /// Called from write() once the tail staging file has accumulated at
     /// least one full CHUNK_SIZE of unsent bytes. Lazily opens the
@@ -3569,7 +3672,7 @@ impl NextCloudFs {
         let smap = self.status.clone();
         let uploads = self.uploads.clone();
         let ticket = uploads.ticket_entry(&remote_path);
-        thread::spawn(move || {
+        submit_mutation(move || {
             ticket.wait();
             if !journal.safe_lock().claim(seq) {
                 log::debug!("streamed finish of {} skipped — superseded or replayed", remote_path.display());
@@ -3734,7 +3837,7 @@ impl NextCloudFs {
             let uploads = self.uploads.clone();
             let ticket = uploads.ticket_entry(&remote_path);
 
-            thread::spawn(move || {
+            submit_mutation(move || {
                 ticket.wait();
                 if !journal.safe_lock().claim(seq) {
                     log::debug!("PUT {} skipped — superseded or replayed", remote_path.display());
@@ -3893,7 +3996,7 @@ impl NextCloudFs {
         self.cache.safe_lock().get_cached_dir_readonly(dir)
     }
 
-    fn readdir_common(&self, ino: INodeNo, fh: u64, offset: u64, mut reply: DirReply) {
+    fn readdir_common(&self, ino: INodeNo, fh: u64, offset: u64, reply: DirReply) {
         let (path, parent_ino) = {
             let c = self.cache.safe_lock();
             let path = match c.get_path(ino.0) {
@@ -3933,8 +4036,11 @@ impl NextCloudFs {
         let file_change_queue = self.file_change_queue.clone();
         let open_dirs = self.open_dirs.clone();
 
-        thread::spawn(move || {
-            let _readdir_permit = ReaddirWorkerPermit::acquire();
+        // A bounded pool worker, with the reply travelling in the job: fuser's one
+        // dispatch thread never blocks on a directory's network round trip, and
+        // a crawl can queue at most `bg::READDIR` workers + its queue — not the
+        // one-thread-per-call (then sleep-polling for a permit) it used to.
+        let submitted = bg::READDIR.submit_owning(reply, move |mut reply| {
             if offset == 0 {
                 let dot_attr = make_dir_attr(ino.0);
                 if reply.add(ino, 1, FileType::Directory, ".", &dot_attr) {
@@ -4040,6 +4146,7 @@ impl NextCloudFs {
                             &path, &conn.backend, &cache, &dirty, &conn.active_streams,
                             &conn.throttle, &notifier_slot, &refresh_debounce,
                             &ghost_entries, &file_change_queue,
+                            &notify_push::ServerHealth { breaker: conn.breaker.clone(), backoff: conn.backoff.clone() },
                         );
                     }
 
@@ -4059,7 +4166,7 @@ impl NextCloudFs {
                         if cleanup_stale_gio_temps {
                             log::info!("purging {} GIO temp(s) in {}", gio_temps.len(), path.display());
                             let conn2 = conn.clone();
-                            thread::spawn(move || {
+                            let _ = bg::BACKGROUND.submit(move || {
                                 for p in gio_temps {
                                     if let Err(e) = conn2.backend.delete(&p) {
                                         log::debug!("GIO temp delete {}: {}", p.display(), e);
@@ -4324,14 +4431,17 @@ impl NextCloudFs {
                         }
                     }
 
-                    if offset == 0 && !thumb_candidates.is_empty() {
+                    // Thumbnails are the most expendable work there is: skip them
+                    // outright while the server is failing requests.
+                    if offset == 0 && !thumb_candidates.is_empty() && !conn.breaker.is_open(Instant::now()) {
                         let already = {
                             let mut inf = thumb_inflight.safe_lock();
                             !inf.insert(path.clone())
                         };
                         if !already {
                             let conn2 = conn.clone();
-                            thread::spawn(move || {
+                            let (inflight2, path2) = (thumb_inflight.clone(), path.clone());
+                            let submitted = bg::THUMB.submit(move || {
                                 thread::sleep(Duration::from_millis(200));
                                 preview::prefetch_directory_thumbnails(
                                     &conn2.clients.get(),
@@ -4341,8 +4451,11 @@ impl NextCloudFs {
                                     &thumb_candidates,
                                     &conn2.active_streams,
                                 );
-                                thumb_inflight.safe_lock().remove(&path);
+                                inflight2.safe_lock().remove(&path2);
                             });
+                            if submitted.is_err() {
+                                thumb_inflight.safe_lock().remove(&path);
+                            }
                         }
                     }
                 }
@@ -4358,6 +4471,9 @@ impl NextCloudFs {
                 }
             }
         });
+        if let Err((_, reply)) = submitted {
+            reply.error(Errno::EAGAIN);
+        }
     }
 }
 
@@ -4967,7 +5083,7 @@ impl Filesystem for NextCloudFs {
                         let start = ra.start;
                         drop(ss);
                         drop(files);
-                        thread::spawn(move || {
+                        run_read_job(reply, move |reply| {
                             let (ref mtx, ref cv) = *shared;
                             let mut guard = mtx.lock().unwrap();
                             let deadline = Instant::now() + Duration::from_secs(30);
@@ -5049,7 +5165,7 @@ impl Filesystem for NextCloudFs {
                             let start = ra.start;
                             drop(ss);
                             drop(files);
-                            thread::spawn(move || {
+                            run_read_job(reply, move |reply| {
                                 let (ref mtx, ref cv) = *shared;
                                 let mut guard = mtx.lock().unwrap();
                                 let deadline = Instant::now() + Duration::from_secs(30);
@@ -5165,7 +5281,7 @@ impl Filesystem for NextCloudFs {
             std::cmp::max(sz, window)
         };
 
-        thread::spawn(move || {
+        run_read_job(reply, move |reply| {
             let use_throttle = fetch > sz;
             let _stream_guard = if use_throttle {
                 conn.active_streams.fetch_add(1, Ordering::Relaxed);
@@ -5237,7 +5353,7 @@ impl Filesystem for NextCloudFs {
                                 if stale && cache.safe_lock().set_entry_size(&path, total) {
                                     log::info!("read: reconciled {} size {} → {} (server-side change)", path.display(), file_total_size, total);
                                     let ns = notifier_slot.clone();
-                                    thread::spawn(move || {
+                                    notify_later(move || {
                                         // Let the triggering read fully release the
                                         // inode before invalidating; if this still
                                         // blocks it harms nothing (detached, holds no
@@ -5500,7 +5616,7 @@ impl Filesystem for NextCloudFs {
                     fh.0, of.remote_path.display(), cs.uploads_base,
                 );
                 let backend = self.conn.backend.clone();
-                thread::spawn(move || {
+                let _ = bg::BACKGROUND.submit(move || {
                     backend.abort_chunked_upload(&backend::ChunkedUploadSession { uploads_base: cs.uploads_base });
                 });
             }
@@ -6125,7 +6241,7 @@ impl Filesystem for NextCloudFs {
             let elog = self.error_log.clone();
             let cache = self.cache.clone();
             let ticket = self.uploads.ticket_entry(&remote_path);
-            thread::spawn(move || {
+            submit_mutation(move || {
                 ticket.wait();
                 let _permit = conn.throttle.acquire();
                 match conn.backend.mkdir(&remote_path) {
@@ -6190,7 +6306,7 @@ impl Filesystem for NextCloudFs {
             // mount against a concurrent lookup on the same directory. See the read()
             // handler's notify_inval_inode comment for the full explanation.
             let notifier_slot = self.notifier_slot.clone();
-            thread::spawn(move || {
+            notify_later(move || {
                 if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
                     let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
                     if child_ino != 0 {
@@ -6253,7 +6369,7 @@ impl Filesystem for NextCloudFs {
         {
             let notifier_slot = self.notifier_slot.clone();
             let file_name = file_name.clone();
-            thread::spawn(move || {
+            notify_later(move || {
                 if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
                     let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
                     if child_ino != 0 {
@@ -6281,7 +6397,7 @@ impl Filesystem for NextCloudFs {
             let cache = self.cache.clone();
             let uploads = self.uploads.clone();
             let ticket = uploads.ticket_entry(&remote_path);
-            thread::spawn(move || {
+            submit_mutation(move || {
                 ticket.wait();
                 uploads.forget(&remote_path);
                 // Hold the DELETE until the file's own upload has drained. LibreOffice
@@ -6402,7 +6518,7 @@ impl Filesystem for NextCloudFs {
         {
             let notifier_slot = self.notifier_slot.clone();
             let dir_name = dir_name.clone();
-            thread::spawn(move || {
+            notify_later(move || {
                 if let Some(notifier) = notifier_slot.safe_lock().as_ref() {
                     let _ = notifier.inval_inode(INodeNo(parent.0), 0, 0);
                     if child_ino != 0 {
@@ -6423,7 +6539,7 @@ impl Filesystem for NextCloudFs {
             let elog = self.error_log.clone();
             // Waits for every upload inside the folder (they hold it Shared).
             let ticket = self.uploads.ticket_entry(&remote_path);
-            thread::spawn(move || {
+            submit_mutation(move || {
                 ticket.wait();
                 let _permit = conn.throttle.acquire();
                 match conn.backend.delete(&remote_path) {
@@ -6647,7 +6763,7 @@ impl Filesystem for NextCloudFs {
                 (from.parent().unwrap_or(root), path_seq::Access::Shared),
                 (to.parent().unwrap_or(root), path_seq::Access::Shared),
             ]);
-            thread::spawn(move || {
+            submit_mutation(move || {
                 // Runs after every earlier change to either path, e.g. the source's upload.
                 ticket.wait();
                 // If the source was just created via create() + flush(), the PUT runs
@@ -7003,10 +7119,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let smap = filesystem.status_map();
             let active = replay_active.clone();
             if !active.swap(true, Ordering::Relaxed) {
-                thread::spawn(move || {
+                // Released when the job ends — or is dropped unrun by a full pool.
+                let running = ReleaseOnDrop(active);
+                let _ = bg::HOUSEKEEPING.submit(move || {
+                    let _running = running;
                     let ctx = mutation_journal::ReplayContext { backend: b, status: smap };
                     mutation_journal::replay_journal(&j, &ctx, &c, &d, &el);
-                    active.store(false, Ordering::Relaxed);
                 });
             }
         }
@@ -7027,7 +7145,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let wipe_flag_monitor = wipe_flag.clone();
             let conn_monitor = filesystem.conn.clone();
             let cache_dir_monitor = filesystem.cache_ref().safe_lock().cache_dir.clone();
-            thread::spawn(move || {
+            start_service("connectivity", move || {
                 loop {
                     if shutdown_monitor.load(Ordering::Relaxed) {
                         log::info!("CONNECTIVITY monitor: shutdown, exiting");
@@ -7076,11 +7194,11 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                                 let d = dirty_for_monitor.clone();
                                 let el = elog_for_monitor.clone();
                                 let smap = status_for_monitor.clone();
-                                let active = replay_active_monitor.clone();
-                                thread::spawn(move || {
+                                let running = ReleaseOnDrop(replay_active_monitor.clone());
+                                let _ = bg::HOUSEKEEPING.submit(move || {
+                                    let _running = running;
                                     let ctx = mutation_journal::ReplayContext { backend: b, status: smap };
                                     mutation_journal::replay_journal(&j, &ctx, &c, &d, &el);
-                                    active.store(false, Ordering::Relaxed);
                                 });
                             }
                         }
@@ -7164,7 +7282,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let revalidate_conn = filesystem.conn();
             let revalidate_cache = filesystem.cache_ref();
             let revalidating = Arc::new(AtomicBool::new(false));
-            thread::spawn(move || {
+            start_service("push-watch", move || {
                 let mut was_connected = false;
                 // Reconnects are detected by generation, not by observing the flag go
                 // false: a drop and re-auth can complete inside one poll interval and
@@ -7194,7 +7312,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                             let rc = revalidate_conn.clone();
                             let rcache = revalidate_cache.clone();
                             let guard = ReleaseOnDrop(revalidating.clone());
-                            thread::spawn(move || {
+                            let _ = bg::HOUSEKEEPING.submit(move || {
                                 // Held to the end of the closure, and released even if
                                 // the revalidation panics — a latched guard would
                                 // silently disable every later reconnect.
@@ -7223,7 +7341,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         let boot_conn = filesystem.conn.clone();
         let boot_cache = filesystem.cache_ref();
         let boot_shutdown = filesystem.shutdown_flag();
-        thread::spawn(move || {
+        start_service("boot-validate", move || {
             if !boot_shutdown.load(Ordering::Relaxed) {
                 boot_validate_root(&boot_conn, &boot_cache);
             }
@@ -7241,11 +7359,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let dirty = filesystem.dirty_set();
             let boot_transfers = filesystem.transfer_map();
             let file_shutdown = filesystem.shutdown_flag();
-            thread::spawn(move || {
+            start_service("boot-files", move || {
                 let total = saved_etags.len();
+                let conn_throttle_width = boot_conn.throttle.max;
                 log::info!("FILE_CACHE boot validation: checking {} files in parallel", total);
                 let stale = Arc::new(AtomicUsize::new(0));
-                let handles: Vec<_> = saved_etags.into_iter().map(|(remote_path, entry)| {
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = saved_etags.into_iter().map(|(remote_path, entry)| {
                     let conn = boot_conn.clone();
                     let cache = cache.clone();
                     let status = status.clone();
@@ -7254,7 +7373,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                     let shutdown = file_shutdown.clone();
                     let backend = boot_backend.clone();
                     let stale = stale.clone();
-                    thread::spawn(move || {
+                    Box::new(move || {
                         if shutdown.load(Ordering::Relaxed) { return; }
                         let _permit = conn.throttle.acquire();
                         if shutdown.load(Ordering::Relaxed) { return; }
@@ -7273,9 +7392,11 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
                                 log::debug!("FILE_CACHE etag check {} failed: {}", remote_path.display(), e);
                             }
                         }
-                    })
+                    }) as Box<dyn FnOnce() + Send>
                 }).collect();
-                for h in handles { h.join().ok(); }
+                // One thread per cached file used to start all at once; now at most
+                // as many as there are request slots, which is all that could run anyway.
+                bg::run_chunked(jobs, conn_throttle_width);
                 log::info!("FILE_CACHE boot validation done: {}/{} stale", stale.load(Ordering::Relaxed), total);
             });
         }
@@ -7294,7 +7415,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             if s.starts_with('/') { PathBuf::from(s) } else { PathBuf::from(format!("/{}", s)) }
         }).collect();
         log::info!("AUTO_KEEP: {} configured paths", paths.len());
-        thread::spawn(move || {
+        start_service("auto-keep", move || {
             for p in paths {
                 if keep_shutdown.load(Ordering::Relaxed) { break; }
                 log::info!("AUTO_KEEP: keeping {}", p.display());
@@ -7310,7 +7431,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         let stats_backend = backend.clone();
         let stats_shutdown = filesystem.shutdown_flag();
         let stats_store = storage_stats;
-        thread::spawn(move || {
+        start_service("storage-stats", move || {
             loop {
                 let (kept, cached) = stats_cache.safe_lock().storage_totals();
                 let (remote_used, remote_total) = stats_backend
@@ -7344,7 +7465,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         let max_bytes = options.cache_max_size_bytes;
         let purge_days = options.cache_auto_purge_days;
         let cleanup_interval = Duration::from_secs(options.cache_cleanup_interval_secs);
-        thread::spawn(move || {
+        start_service("cache-cleanup", move || {
             log::info!("CACHE_CLEANUP thread started (max={}GB, purge={}d, interval={}s)",
                 max_bytes as f64 / (1024.0 * 1024.0 * 1024.0), purge_days, cleanup_interval.as_secs());
             run_cache_cleanup(&cleanup_cache, &cleanup_status, &cleanup_dirty, max_bytes, purge_days);
@@ -7556,10 +7677,10 @@ fn write_mount_marker(cache_dir: &Path, mount_point: &Path) {
 /// finds one — this is what stops a recursive index crawl from fanning out
 /// across the whole remote tree the moment the mount lands under an indexed
 /// location (an XDG special folder, `$HOME` itself, …). See the
-/// `ReaddirWorkerPermit` cap above for the other half of that fix: this marker
-/// keeps the crawl from starting at all; the cap keeps a crawl that starts
-/// anyway (a different indexer, `find`, a backup tool) from spawning an
-/// unbounded number of readdir workers.
+/// `bg::READDIR` pool for the other half of that fix: this marker keeps the
+/// crawl from starting at all; the pool keeps a crawl that starts anyway (a
+/// different indexer, `find`, a backup tool) from spawning an unbounded number
+/// of readdir workers.
 ///
 /// Synthesized purely at the FUSE layer — never PUT to the backend — because a
 /// real write through the mount turned out to need an actual byte written

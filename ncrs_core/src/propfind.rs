@@ -966,6 +966,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // test scaffolding, not daemon threads
     fn streaming_channel_delivery() {
         let webdav_url = "https://cloud.example.com/remote.php/dav/files/user";
         let prefix = webdav_prefix(webdav_url);

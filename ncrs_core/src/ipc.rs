@@ -39,7 +39,14 @@ use std::time::Duration;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use crate::{MutexExt, RwLockExt};
 
-const MAX_IPC_CLIENTS: usize = 64;
+const MAX_IPC_CLIENTS: usize = crate::bg::IPC_WORKERS;
+
+/// Starts one of the IPC server's two long-lived threads (state publisher, accept loop).
+fn spawn_service(name: &str, f: impl FnOnce() + Send + 'static) {
+    if let Err(e) = crate::bg::spawn_service(name, f) {
+        log::error!("could not start the {} thread: {}", name, e);
+    }
+}
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longest request line a client may send. `BufRead::lines()` buffers an
 /// unbounded amount before yielding, so a peer that never sends `\n` (or
@@ -696,7 +703,7 @@ fn spawn_state_monitor(
     error_log: crate::ErrorLog,
     journal: crate::mutation_journal::SharedJournal,
 ) {
-    std::thread::spawn(move || {
+    spawn_service("ipc-state", move || {
         let mut cached_version = u64::MAX; // forces a build+publish on the first tick
         let mut journal_json = String::from("[]");
         let mut conflicts_json = String::from("[]");
@@ -798,7 +805,7 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
 
     let active = Arc::new(AtomicUsize::new(0));
 
-    std::thread::spawn(move || {
+    spawn_service("ipc-accept", move || {
         for stream in listener.incoming() {
             let stream = match stream {
                 Ok(s) => s,
@@ -838,11 +845,17 @@ pub fn start_server(mount_point: PathBuf, status_map: StatusMap, shared_set: Sha
             let pt_capable = passthrough_capable.clone();
             let active = active.clone();
             let v3c = v3.clone();
+            let active_reject = active.clone();
             active.fetch_add(1, Ordering::Relaxed);
-            std::thread::spawn(move || {
+            let admitted = crate::bg::IPC.submit(move || {
                 handle_client(stream, mount, map, shared, fids, details, children, dirty, creds_clone, burl, cb, ev, pf, th, pu, elog, tmap, jrnl, fcq, sstats, pause_flag, offline_flag, sp, pt_enabled, pt_capable, v3c);
                 active.fetch_sub(1, Ordering::Relaxed);
             });
+            if admitted.is_err() {
+                // The job (and the stream it owned) was dropped: the client sees a
+                // closed socket and reconnects later.
+                active_reject.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     });
 }
@@ -1275,7 +1288,7 @@ fn handle_client_loop(
                     let sm = status_map.clone();
                     let ds = dirty_set.clone();
                     let r = remote.clone();
-                    std::thread::spawn(move || {
+                    let _ = crate::bg::USER.submit(move || {
                         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
                             log::error!("KEEP callback panicked: {:?}", e);
                         }
@@ -1306,7 +1319,7 @@ fn handle_client_loop(
             match (strip_mount(Path::new(path_str), &mount_point), &prefetch_cb) {
                 (Some(remote), Some(cb)) => {
                     let cb = cb.clone();
-                    std::thread::spawn(move || {
+                    let _ = crate::bg::USER.submit(move || {
                         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
                             log::error!("PREFETCH callback panicked: {:?}", e);
                         }

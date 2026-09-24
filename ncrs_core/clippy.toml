@@ -1,0 +1,9 @@
+# Every OS thread the daemon creates goes through `src/bg.rs`, which bounds the
+# total (bg::MAX_THREADS). A detached `std::thread::spawn` anywhere else is how
+# 0.1.76 reached 10,160 threads during a tree walk; see bg.rs for the pools.
+# `std::thread::scope` stays allowed: it joins its threads before returning.
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "submit to a bg:: pool, or bg::spawn_service for a long-lived thread" },
+    { path = "std::thread::Builder::spawn", reason = "submit to a bg:: pool, or bg::spawn_service for a long-lived thread" },
+    { path = "std::thread::Builder::spawn_unchecked", reason = "submit to a bg:: pool" },
+]
