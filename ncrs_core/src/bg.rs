@@ -293,13 +293,19 @@ pub const UPLOAD_WORKERS: usize = 4;
 
 /// Local-disk work that used to run on the dispatch thread: seeding a
 /// staging file from a kept copy on the first write or truncate, `flush` and
-/// `fsync` of a staging file (the reply travels with the job), and the
-/// journal's group commit. A handle has at most one job in flight (its
-/// lane) and the journal saver at most one, so the queue stays short.
+/// `fsync` of a staging file (the reply travels with the job). A handle has
+/// at most one job in flight (its lane), so the queue stays short.
 pub static DISK: Pool = Pool::new("disk", DISK_WORKERS, 4096);
 pub const DISK_WORKERS: usize = 4;
 
-pub static POOLS: [&Pool; 13] = [&READDIR, &META, &READ, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER, &UPLOAD, &DISK];
+/// The journal's group commit (`mutation_journal::DeferredSaves`): one saver
+/// job queued or running at a time, on its own worker so a burst of staging
+/// seeds on `disk` never delays the write that makes edits crash-safe, and a
+/// save retrying after ENOSPC never holds a `disk` worker.
+pub static JOURNAL: Pool = Pool::new("journal", JOURNAL_WORKERS, 4);
+pub const JOURNAL_WORKERS: usize = 1;
+
+pub static POOLS: [&Pool; 14] = [&READDIR, &META, &READ, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER, &UPLOAD, &DISK, &JOURNAL];
 
 /// Named long-lived threads: the FUSE session, connectivity monitor, push
 /// watcher, IPC accept loop, savers, cleanup. Fixed in number.
@@ -336,7 +342,7 @@ pub const MAX_THREADS: usize = {
 /// fixed handful (metadata, transfers, previews, push). Generous upper bound.
 pub const MAX_HTTP_CLIENT_THREADS: usize = 8;
 
-const POOL_SIZES: [usize; 13] = [
+const POOL_SIZES: [usize; 14] = [
     READDIR_WORKERS,
     META_WORKERS,
     READ_WORKERS,
@@ -350,6 +356,7 @@ const POOL_SIZES: [usize; 13] = [
     USER_WORKERS,
     UPLOAD_WORKERS,
     DISK_WORKERS,
+    JOURNAL_WORKERS,
 ];
 
 /// A lifetime cap on how many threads a class may ever start.
