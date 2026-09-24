@@ -1427,6 +1427,58 @@ fn submit_mutation(job: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// How long a live worker waits for older queued changes of its files
+/// before it leaves its own entry to the replay.
+const LIVE_ORDER_WAIT: Duration = Duration::from_secs(30);
+
+/// What `claim_in_order` decided.
+#[derive(Debug, PartialEq, Eq)]
+enum InOrder {
+    /// Claimed, and nothing older about its files is queued: run it now.
+    Run,
+    /// Gone (superseded, coalesced away, done) or already claimed, by the
+    /// replay or another worker.
+    Skip,
+    /// Older entries of its files were still queued when the wait ran out:
+    /// the claim is given back, and the FIFO replay runs it after them.
+    Deferred,
+}
+
+/// Claims a live worker's own journal entry `seq`, then waits until no
+/// older entry about `paths` is queued (`MutationJournal::earlier_related`)
+/// and `busy()` is false. The replay is FIFO; a live worker is not, and ran
+/// ahead of an offline backlog: `rm a` queued offline, then a live PUT of a
+/// new `a` whose replayed DELETE removed it, or a live MOVE onto a name the
+/// backlog still deletes. The claim keeps the replay from running the entry
+/// a second time while the worker waits (the replay stops at a claimed
+/// entry). Woken by journal changes; `busy` (an `uploading` guard, not
+/// journal state) is looked at every 50 ms and never under the journal lock.
+fn claim_in_order(journal: &mutation_journal::SharedJournal, seq: mutation_journal::SeqId, paths: &[&Path], busy: impl Fn() -> bool, what: &str, within: Duration) -> InOrder {
+    if !journal.safe_lock().claim(seq) {
+        return InOrder::Skip;
+    }
+    let deadline = Instant::now() + within;
+    let mut logged = false;
+    loop {
+        let waiting = busy() || journal.safe_lock().earlier_related(seq, paths);
+        if !waiting {
+            return InOrder::Run;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            log::warn!("{} {}: older changes of it are still queued after {:?} — left to the replay, which runs them in order", what, paths[0].display(), within);
+            journal.safe_lock().mark_deferred(seq, "waiting for older queued changes".into());
+            return InOrder::Deferred;
+        }
+        if !logged {
+            log::info!("{} {}: waiting for older queued changes of it to reach the server", what, paths[0].display());
+            logged = true;
+        }
+        let j = journal.safe_lock();
+        drop(mutation_journal::MutationJournal::wait_changed(j, (deadline - now).min(Duration::from_millis(50))));
+    }
+}
+
 /// Sends a kernel cache notification from the single notify worker, never the
 /// FUSE dispatch thread (a notify the kernel blocks on would deadlock it).
 pub(crate) fn notify_later(job: impl FnOnce() + Send + 'static) {
@@ -7456,6 +7508,10 @@ impl Filesystem for NextCloudFs {
             let ticket = self.uploads.ticket_entry(&remote_path);
             submit_mutation(move || {
                 ticket.wait();
+                // After an older queued RMDIR of the name, or the MKCOL of a parent.
+                if claim_in_order(&journal, seq, &[&remote_path], || false, "MKCOL", LIVE_ORDER_WAIT) != InOrder::Run {
+                    return;
+                }
                 let _permit = conn.throttle.acquire();
                 match conn.backend.mkdir(&remote_path) {
                     Ok(()) => {
@@ -7623,17 +7679,10 @@ impl Filesystem for NextCloudFs {
                 // holds the file locked during upload, so a racing DELETE comes back 423.
                 // The enqueue above already coalesced away a still-queued Put, but a Put
                 // already dispatched by flush() lives in the `uploading` guard, so wait on
-                // that too — same drain the live MOVE uses for its source.
-                let pending = || {
-                    cache.safe_lock().uploading.contains_key(&remote_path)
-                        || journal.safe_lock().has_pending_put(&remote_path)
-                };
-                if pending() {
-                    log::info!("DELETE {}: waiting for in-flight PUT to drain", remote_path.display());
-                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                    while pending() && std::time::Instant::now() < deadline {
-                        thread::sleep(Duration::from_millis(50));
-                    }
+                // that too — and on every older queued change of the file (a MOVE onto it).
+                let in_order = claim_in_order(&journal, seq, &[&remote_path], || cache.safe_lock().uploading.contains_key(&remote_path), "DELETE", LIVE_ORDER_WAIT);
+                if in_order != InOrder::Run {
+                    return;
                 }
                 let _permit = conn.throttle.acquire();
                 match conn.backend.delete(&remote_path) {
@@ -7761,6 +7810,10 @@ impl Filesystem for NextCloudFs {
             let ticket = self.uploads.ticket_entry(&remote_path);
             submit_mutation(move || {
                 ticket.wait();
+                // After every older queued change inside the folder.
+                if claim_in_order(&journal, seq, &[&remote_path], || false, "RMDIR", LIVE_ORDER_WAIT) != InOrder::Run {
+                    return;
+                }
                 let _permit = conn.throttle.acquire();
                 match conn.backend.delete(&remote_path) {
                     Ok(()) => {
@@ -7934,32 +7987,13 @@ impl Filesystem for NextCloudFs {
             submit_mutation(move || {
                 // Runs after every earlier change to either path, e.g. the source's upload.
                 ticket.wait();
-                // If the source was just created via create() + flush(), the PUT runs
-                // asynchronously and the file may not yet exist on the server when this
-                // MOVE fires.  Wait until BOTH the in-flight upload guard is cleared AND
-                // no Put for the source is still queued in the journal before sending the
-                // MOVE, so the server has the file content in place first.  The `uploading`
-                // guard only covers PUTs started by the online flush path; offline-created
-                // files (or ones behind a backlog) sit in the journal with no guard, so the
-                // journal check is what stops the MOVE from racing ahead of a queued PUT and
-                // getting a 404 for a source that was never uploaded yet.
-                let source_pending = || {
-                    cache.safe_lock().uploading.contains_key(&from)
-                        || journal.safe_lock().earlier_related(seq, &[&from, &to])
-                };
-                if source_pending() {
-                    log::info!("MOVE {} → {}: waiting for source PUT to complete", from.display(), to.display());
-                }
-                let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                loop {
-                    if !source_pending() {
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        log::warn!("MOVE {} → {}: timed out waiting for source PUT", from.display(), to.display());
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(50));
+                // The source may exist on the server only once its upload lands: one
+                // started live holds the `uploading` guard, one behind a backlog (or
+                // queued offline) is an older journal entry, like any other queued
+                // change of either name (a DELETE of `to` must not run after this).
+                let in_order = claim_in_order(&journal, seq, &[&from, &to], || cache.safe_lock().uploading.contains_key(&from), "MOVE", LIVE_ORDER_WAIT);
+                if in_order != InOrder::Run {
+                    return;
                 }
                 let _permit = conn.throttle.acquire();
                 log::info!("MOVE {} → {}: sending WebDAV MOVE", from.display(), to.display());

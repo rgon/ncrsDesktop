@@ -4662,6 +4662,18 @@ mod upload_order_tests {
             }
         }
 
+        /// A queued MOVE lands. The PUT of an edit made since waits for it:
+        /// run first, the MOVE would put the old content over the edit.
+        fn land_move(fake: &FakeBackend, meta: &MetaCtx, seq: mutation_journal::SeqId, from: &str, to: &str) {
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(fake.puts.lock().unwrap().is_empty(), "the edit's PUT ran ahead of the queued MOVE");
+            let moved = fake.files.lock().unwrap().remove(Path::new(from));
+            if let Some(m) = moved {
+                fake.files.lock().unwrap().insert(PathBuf::from(to), m);
+            }
+            meta.journal.safe_lock().remove(seq);
+        }
+
         fn drop_from_listing(meta: &MetaCtx, dir: &str) {
             meta.cache.safe_lock().put_dir_cache(PathBuf::from(dir), None, None, vec![]);
         }
@@ -4698,11 +4710,12 @@ mod upload_order_tests {
                 c.move_inode(Path::new("/x/f"), Path::new("/y/g"));
                 ino
             };
-            meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/x/f"), to: PathBuf::from("/y/g") });
+            let mv = meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/x/f"), to: PathBuf::from("/y/g") });
             drop_from_listing(&meta, "/y");
             let fh = fh_of(open_by_inode(&meta, ino, libc::O_WRONLY | libc::O_APPEND));
             assert_eq!(meta.open_files.safe_lock()[&fh].unlinked, Unlinked::No);
             append_and_release(&write_ctx(&meta, tmp.path()), fh, b"+");
+            land_move(&fake, &meta, mv, "/x/f", "/y/g");
             assert_eq!(wait_for_put(&fake, "/y/g"), b"orig+");
         }
 
@@ -4725,11 +4738,12 @@ mod upload_order_tests {
             let (fake, meta, tmp, ino) = open_setup(vec![], true);
             meta.cache.safe_lock().put_dir_cache(PathBuf::from("/d2"), None, None, vec![]);
             meta.cache.safe_lock().move_inode(Path::new("/d"), Path::new("/d2"));
-            meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/d"), to: PathBuf::from("/d2") });
+            let mv = meta.journal.safe_lock().enqueue(mutation_journal::MutationOp::Rename { from: PathBuf::from("/d"), to: PathBuf::from("/d2") });
             let fh = fh_of(open_by_inode(&meta, ino, libc::O_WRONLY | libc::O_APPEND));
             assert_eq!(meta.open_files.safe_lock()[&fh].remote_path, PathBuf::from("/d2/a.txt"));
             assert_eq!(meta.open_files.safe_lock()[&fh].unlinked, Unlinked::No);
             append_and_release(&write_ctx(&meta, tmp.path()), fh, b"!");
+            land_move(&fake, &meta, mv, "/d/a.txt", "/d2/a.txt");
             assert_eq!(wait_for_put(&fake, "/d2/a.txt"), b"hello!");
         }
 
@@ -5558,12 +5572,13 @@ mod upload_order_tests {
             }
 
             /// release() of a written handle: its Put, then supersede.
-            fn save(&mut self, path: &str, bytes: &str, etag: Option<&str>) {
+            fn save(&mut self, path: &str, bytes: &str, etag: Option<&str>) -> mutation_journal::SeqId {
                 self.n += 1;
                 let staging = self.dir.path().join(format!("write_t_{}", self.n));
                 std::fs::write(&staging, bytes).unwrap();
                 let seq = self.enqueue(MutationOp::Put { remote_path: PathBuf::from(path), staging_path: staging, if_match_etag: etag.map(str::to_owned) });
                 self.journal.safe_lock().supersede_uploads(Path::new(path), seq);
+                seq
             }
 
             /// The release of a streamed copy: the session holds `sent`.
@@ -5766,6 +5781,40 @@ mod upload_order_tests {
             assert_eq!(off.journal.safe_lock().newest_upload(Path::new("/out/big.bin")), Some(mutation_journal::PendingUpload::Stream));
             assert!(off.replay(&srv).is_empty(), "{:?}", srv.log());
             assert_eq!(srv.files(), tree(&[("/out/big.bin", "first last")]));
+        }
+
+        #[test]
+        fn a_live_change_waits_for_older_queued_changes_of_its_files_and_holds_its_claim() {
+            // Offline `rm a`, then online a new `a` is saved before the replay
+            // reached the DELETE: run first, its PUT would be deleted after.
+            let mut off = Offline::new();
+            off.rm("/a");
+            let delete = off.journal.safe_lock().peek_front().unwrap().seq;
+            let put = off.save("/a", "A2", None);
+            let j = off.journal.clone();
+            let worker = std::thread::spawn(move || {
+                let r = claim_in_order(&j, put, &[Path::new("/a")], || false, "PUT", Duration::from_secs(10));
+                (r, Instant::now())
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!worker.is_finished(), "ran ahead of the queued DELETE");
+            assert!(!off.journal.safe_lock().claim(put), "claimed while it waits, so the replay cannot run it too");
+            let landed = Instant::now();
+            off.journal.safe_lock().remove(delete);
+            let (r, ran) = worker.join().unwrap();
+            assert_eq!(r, InOrder::Run);
+            assert!(ran.duration_since(landed) < Duration::from_millis(40), "woken by the change, not a poll: {:?}", ran.duration_since(landed));
+            // Unrelated older entries do not hold it up.
+            off.rm("/other");
+            let b = off.save("/b", "B", None);
+            assert_eq!(claim_in_order(&off.journal, b, &[Path::new("/b")], || false, "PUT", Duration::from_secs(10)), InOrder::Run);
+            // Still blocked when the wait runs out: given back to the replay.
+            off.rm("/c");
+            let c = off.save("/c", "C", None);
+            assert_eq!(claim_in_order(&off.journal, c, &[Path::new("/c")], || false, "PUT", Duration::from_millis(150)), InOrder::Deferred);
+            assert!(off.journal.safe_lock().claim(c), "claimable again, by the replay");
+            // Gone or claimed elsewhere: skipped.
+            assert_eq!(claim_in_order(&off.journal, c, &[Path::new("/c")], || false, "PUT", Duration::from_secs(1)), InOrder::Skip);
         }
 
         #[test]

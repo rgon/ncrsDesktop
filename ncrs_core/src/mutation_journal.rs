@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const JOURNAL_FILE: &str = "mutation_journal.json";
@@ -136,6 +136,10 @@ pub struct MutationJournal {
     /// not journaled yet: in neither place, a purge would take them for
     /// orphans (see `reserve_staging`). Never persisted.
     reserved: std::collections::HashSet<PathBuf>,
+    /// Notified on every change (`save_journal`), for `wait_changed`: a
+    /// waiter sleeps until an entry leaves, instead of polling. Paired with
+    /// the `SharedJournal` mutex this journal lives in.
+    changed: Arc<Condvar>,
 }
 
 pub type SharedJournal = Arc<Mutex<MutationJournal>>;
@@ -696,6 +700,17 @@ fn nested(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
+/// `nested` on the bytes of absolute, normalized paths (what the journal
+/// holds: no `.`, `..`, doubled or trailing `/` but the root's), without
+/// parsing components: `earlier_related` runs it against every older entry
+/// on each live mutation, under the journal lock.
+fn nested_bytes(a: &Path, b: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let (a, b) = (a.as_os_str().as_bytes(), b.as_os_str().as_bytes());
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    long.starts_with(short) && (long.len() == short.len() || short.ends_with(b"/") || long[short.len()] == b'/')
+}
+
 impl MutationJournal {
     pub fn load_or_create(cache_dir: &Path) -> Self {
         let journal_path = cache_dir.join(JOURNAL_FILE);
@@ -756,6 +771,7 @@ impl MutationJournal {
             save_pending: false,
             delete_after_save: Vec::new(),
             reserved: std::collections::HashSet::new(),
+            changed: Arc::new(Condvar::new()),
             journal_path,
             conflicts_path,
         };
@@ -913,14 +929,17 @@ impl MutationJournal {
     /// FIFO, and running ahead of an older entry of the same files (an
     /// offline backlog: `rm b` queued, then a live `mv a b`) reorders them.
     pub fn earlier_related(&self, seq: SeqId, paths: &[&Path]) -> bool {
-        let Some(k) = self.entries.iter().position(|e| e.seq == seq) else { return false };
+        // Entries are in increasing seq order (a journal file edited by hand
+        // might not be: then the linear search).
+        let found = self.entries.binary_search_by_key(&seq, |e| e.seq).ok().or_else(|| self.entries.iter().position(|e| e.seq == seq));
+        let Some(k) = found else { return false };
         let mut at: Vec<PathBuf> = paths.iter().map(|p| p.to_path_buf()).collect();
         for e in self.entries.range(..k).rev() {
             let names = match &e.op {
                 MutationOp::Rename { from, to } => [Some(from.as_path()), Some(to.as_path())],
                 op => [Some(op.path()), None],
             };
-            if names.iter().flatten().any(|n| at.iter().any(|a| nested(n, a))) {
+            if names.iter().flatten().any(|n| at.iter().any(|a| nested_bytes(n, a))) {
                 return true;
             }
             if let (MutationOp::Rename { from, to }, true) = (&e.op, e.queued_names) {
@@ -1180,6 +1199,19 @@ impl MutationJournal {
         self.entries = entries.into();
         self.conflicts = conflicts;
         self.dirty_version.fetch_add(1, Ordering::Relaxed);
+        self.changed.notify_all();
+    }
+
+    /// Sleeps until the journal changes or `timeout` passes, with the lock
+    /// released meanwhile, and returns it locked again. Wakeups can be
+    /// spurious: the caller re-checks what it waits for, in a loop bounded by
+    /// its own deadline.
+    pub fn wait_changed(guard: MutexGuard<'_, MutationJournal>, timeout: Duration) -> MutexGuard<'_, MutationJournal> {
+        let changed = guard.changed.clone();
+        match changed.wait_timeout(guard, timeout) {
+            Ok((g, _)) => g,
+            Err(e) => e.into_inner().0,
+        }
     }
 
     /// Monotonic version bumped on every mutation. A reader can cache derived
@@ -1235,6 +1267,7 @@ impl MutationJournal {
 
     fn save_journal(&mut self) {
         self.dirty_version.fetch_add(1, Ordering::Relaxed);
+        self.changed.notify_all();
         if let Some(d) = &self.deferred {
             self.save_pending = true;
             d.schedule();
@@ -2199,6 +2232,10 @@ mod tests {
         assert!(j.earlier_related(into_n, &[Path::new("/c"), Path::new("/n/c")]), "MKCOL n first");
         assert!(!j.earlier_related(unrelated, &[Path::new("/p"), Path::new("/q")]));
         assert!(!j.earlier_related(12345, &[Path::new("/b")]), "gone: nothing to wait for");
+        for (a, b, want) in [("/a", "/a", true), ("/a", "/a/b", true), ("/a/b", "/a", true), ("/a", "/ab", false), ("/ab", "/a", false), ("/", "/x/y", true), ("/x", "/y", false)] {
+            assert_eq!(nested_bytes(Path::new(a), Path::new(b)), want, "{a} {b}");
+            assert_eq!(nested(Path::new(a), Path::new(b)), want, "{a} {b}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
