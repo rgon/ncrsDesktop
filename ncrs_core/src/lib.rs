@@ -4389,7 +4389,7 @@ const STREAM_SEED_POLL: Duration = Duration::from_millis(100);
 /// handle's own upload then replaces the streamed file with them: an
 /// unclaimed finish is superseded (its session never assembled), a running
 /// one is overwritten. So this waits, up to DOWNLOAD_TIMEOUT, re-reading the
-/// handle's path each round (a rename rewrites the journal's paths). Offline
+/// handle's path each round (a rename moves the file). Offline
 /// the upload cannot land: EIO at once, never an empty or older seed.
 fn seed_from_queue(ctx: &MetaCtx, fh: u64, opened_as: &Path, wp: &Path) -> Result<(), String> {
     let deadline = Instant::now() + DOWNLOAD_TIMEOUT;
@@ -5509,12 +5509,10 @@ fn purge_all(
     // until then the journal on disk still names them. Write it now,
     // so what this purge sees unreferenced is unreferenced on disk too.
     mutation_journal::flush_deferred(journal);
-    // Paths with a queued Put must be preserved — their local bytes are
-    // unsynced. Collect them under the journal lock alone to avoid nesting.
-    let protected: std::collections::HashSet<PathBuf> = journal.safe_lock().entries().iter()
-        .filter(|e| e.op.staging_path().is_some())
-        .map(|e| e.op.path().to_path_buf())
-        .collect();
+    // Files with a queued upload must be preserved — their local bytes are
+    // unsynced — under the name each was queued as and the one it has now.
+    // Collected under the journal lock alone to avoid nesting.
+    let protected: std::collections::HashSet<PathBuf> = journal.safe_lock().upload_names();
     let to_remove: Vec<(PathBuf, PathBuf)> = {
         let c = cache.safe_lock();
         c.file_cache.iter()
@@ -6470,10 +6468,10 @@ impl Filesystem for NextCloudFs {
         // straight from the pending PUT's staging file. This is what lets edits
         // survive a server outage (read your own writes while offline) and fixes
         // the save-then-reopen EIO — including when a stale cache entry for the
-        // path exists, which is why this runs before every other source below. A
-        // rename rewrites the queued Put's remote_path to the destination (see
-        // MutationJournal::enqueue), so a reopen of the renamed-to path resolves
-        // here too. The staging file is removed the instant the PUT succeeds, so
+        // path exists, which is why this runs before every other source below. The
+        // journal finds a queued Put by the file's current name, through the Renames
+        // queued after it (MutationJournal::walk_history), so a reopen of the
+        // renamed-to path resolves here too. The staging file is removed once the PUT succeeds, so
         // this returns None again as soon as the file is safely on the server.
         {
             let staging = self.journal.safe_lock().pending_put_staging(&path);
@@ -7947,7 +7945,7 @@ impl Filesystem for NextCloudFs {
                 // getting a 404 for a source that was never uploaded yet.
                 let source_pending = || {
                     cache.safe_lock().uploading.contains_key(&from)
-                        || journal.safe_lock().has_pending_put(&from)
+                        || journal.safe_lock().earlier_related(seq, &[&from, &to])
                 };
                 if source_pending() {
                     log::info!("MOVE {} → {}: waiting for source PUT to complete", from.display(), to.display());

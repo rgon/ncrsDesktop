@@ -662,24 +662,31 @@ impl MutationOp {
         matches!(self, MutationOp::Put { remote_path, .. } | MutationOp::FinishChunked { remote_path, .. } if remote_path == path)
     }
 
-    fn update_path_prefix(&mut self, old_prefix: &Path, new_prefix: &Path) {
-        fn rewrite(p: &mut PathBuf, old: &Path, new: &Path) {
-            if let Ok(suffix) = p.strip_prefix(old) {
-                *p = new.join(suffix);
-            }
-        }
+    /// The If-Match etag of an upload: `None` for a file created locally.
+    fn upload_etag(&self) -> Option<&str> {
         match self {
-            MutationOp::Put { remote_path, .. } => rewrite(remote_path, old_prefix, new_prefix),
-            MutationOp::MkDir { path } => rewrite(path, old_prefix, new_prefix),
-            MutationOp::Unlink { path } => rewrite(path, old_prefix, new_prefix),
-            MutationOp::RmDir { path } => rewrite(path, old_prefix, new_prefix),
-            MutationOp::Rename { from, to } => {
-                rewrite(from, old_prefix, new_prefix);
-                rewrite(to, old_prefix, new_prefix);
-            }
-            MutationOp::FinishChunked { remote_path, .. } => rewrite(remote_path, old_prefix, new_prefix),
+            MutationOp::Put { if_match_etag, .. } | MutationOp::FinishChunked { if_match_etag, .. } => if_match_etag.as_deref(),
+            _ => None,
         }
     }
+}
+
+/// What `at`, a name after the rename `from` → `to`, was called before it;
+/// None when the rename did not move it.
+fn undo_rename(at: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = at.strip_prefix(to).ok()?;
+    Some(if rest.as_os_str().is_empty() { from.to_path_buf() } else { from.join(rest) })
+}
+
+/// What `at`, a name before the rename `from` → `to`, is called after it;
+/// None when the rename did not move it.
+fn redo_rename(at: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    undo_rename(at, to, from)
+}
+
+/// One path is the other or lies under it.
+fn nested(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
 }
 
 impl MutationJournal {
@@ -762,19 +769,14 @@ impl MutationJournal {
     pub fn enqueue(&mut self, op: MutationOp) -> SeqId {
         self.coalesce_before_enqueue(&op);
 
-        // Earlier uploads and directory changes follow the file to its new
-        // name. Earlier Renames do not: each is a MOVE the server has yet to
-        // make, in the names of its own time. Rewritten, `mv a b; mv b c`
-        // replayed as MOVE a→c then b→c (404), and `mv d/f e/f; mv e k`
-        // moved into a /k that did not exist yet.
-        if let MutationOp::Rename { ref from, ref to } = op {
-            for entry in &mut self.entries {
-                if !matches!(entry.op, MutationOp::Rename { .. }) {
-                    entry.op.update_path_prefix(from, to);
-                }
-            }
-        }
-
+        // No earlier entry is rewritten into a Rename's names: every op
+        // replays in the names it had when it was queued, and the replay is
+        // FIFO, so the server goes through the same steps this mount did.
+        // Rewritten, an earlier op ran under a name the file only gets once
+        // the later MOVE lands: offline `rm a; create a; mv a b` replayed as
+        // DELETE b, PUT b (the new a), then MOVE a→b put the deleted a over
+        // it. A lookup by a file's current name follows each entry's name
+        // forward through the Renames queued after it (`walk_history`).
         let seq = self.next_seq;
         self.next_seq += 1;
         self.entries.push_back(JournalEntry {
@@ -805,26 +807,136 @@ impl MutationJournal {
         self.entries.front()
     }
 
-    /// True while a Put for `path` is still queued (not yet uploaded/removed).
-    /// Used to hold back a live MOVE until the source exists on the server.
+    /// True while an upload of the file called `path` now is still queued
+    /// (under whatever name it had when it was queued).
     pub fn has_pending_put(&self, path: &Path) -> bool {
-        self.entries.iter().any(|e| e.op.is_upload_of(path))
+        self.newest_upload(path).is_some()
     }
 
     pub fn contains(&self, seq: SeqId) -> bool {
         self.entries.iter().any(|e| e.seq == seq)
     }
 
-    /// The newest queued upload of `path`: it holds the file's current content,
-    /// which neither the server nor a kept copy has yet.
-    pub fn newest_upload(&self, path: &Path) -> Option<PendingUpload> {
-        self.entries.iter().rev().find_map(|e| match &e.op {
-            MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
-                Some(PendingUpload::Put(staging_path.clone()))
+    /// The history of the file (or directory) called `path` now, newest
+    /// entry first: `f` gets each entry about it with the name the file had
+    /// when that entry was queued, i.e. `path` taken back through every
+    /// Rename queued after the entry. A Rename is passed only when it moved
+    /// the file, with the name after it. The history ends where the file
+    /// began: an Unlink or RmDir of its name (what came before was another
+    /// file, since deleted), or a Rename that moved another file away from
+    /// its name (`mv a b; create a`: the older entries of `a` are `b`'s).
+    /// `f` returns true to stop early.
+    fn walk_history(&self, path: &Path, mut f: impl FnMut(&JournalEntry, &Path) -> bool) {
+        let mut at = path.to_path_buf();
+        for e in self.entries.iter().rev() {
+            match &e.op {
+                MutationOp::Rename { from, to } => {
+                    if let Some(before) = undo_rename(&at, from, to) {
+                        if f(e, &at) {
+                            return;
+                        }
+                        at = before;
+                    } else if at.starts_with(from) {
+                        return;
+                    }
+                }
+                MutationOp::Unlink { path: gone } | MutationOp::RmDir { path: gone } if at.starts_with(gone) => {
+                    f(e, &at);
+                    return;
+                }
+                _ => {
+                    if f(e, &at) {
+                        return;
+                    }
+                }
             }
-            MutationOp::FinishChunked { remote_path, .. } if remote_path == path => Some(PendingUpload::Stream),
-            _ => None,
-        })
+        }
+    }
+
+    /// Entry `i`'s `path` carried forward through every entry queued after
+    /// it: what that file is called once the whole journal has run. None
+    /// once it is gone: deleted, or replaced by a Rename onto its name.
+    fn forward(&self, i: usize, path: &Path) -> Option<PathBuf> {
+        let mut at = path.to_path_buf();
+        for e in self.entries.range(i + 1..) {
+            match &e.op {
+                MutationOp::Rename { from, to } => {
+                    if let Some(after) = redo_rename(&at, from, to) {
+                        at = after;
+                    } else if at.starts_with(to) {
+                        return None;
+                    }
+                }
+                MutationOp::Unlink { path: gone } | MutationOp::RmDir { path: gone } if at.starts_with(gone) => return None,
+                _ => {}
+            }
+        }
+        Some(at)
+    }
+
+    /// What the file entry `seq` names as `path` is called now (see
+    /// `forward`). `path` itself when `seq` is gone.
+    pub fn current_name(&self, seq: SeqId, path: &Path) -> Option<PathBuf> {
+        match self.entries.iter().position(|e| e.seq == seq) {
+            Some(i) => self.forward(i, path),
+            None => Some(path.to_path_buf()),
+        }
+    }
+
+    /// Every name a queued upload's file has: the one it was queued under
+    /// and the one it has now. A purge keeps these files' kept copies.
+    pub fn upload_names(&self) -> std::collections::HashSet<PathBuf> {
+        let mut names = std::collections::HashSet::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.op.staging_path().is_some() {
+                names.insert(e.op.path().to_path_buf());
+                names.extend(self.forward(i, e.op.path()));
+            }
+        }
+        names
+    }
+
+    /// Whether an entry queued before `seq` is about `paths` (names at
+    /// `seq`'s time), a directory above them or a path below them. A live
+    /// worker runs its own entry only once there is none: the replay is
+    /// FIFO, and running ahead of an older entry of the same files (an
+    /// offline backlog: `rm b` queued, then a live `mv a b`) reorders them.
+    pub fn earlier_related(&self, seq: SeqId, paths: &[&Path]) -> bool {
+        let Some(k) = self.entries.iter().position(|e| e.seq == seq) else { return false };
+        let mut at: Vec<PathBuf> = paths.iter().map(|p| p.to_path_buf()).collect();
+        for e in self.entries.range(..k).rev() {
+            let names = match &e.op {
+                MutationOp::Rename { from, to } => [Some(from.as_path()), Some(to.as_path())],
+                op => [Some(op.path()), None],
+            };
+            if names.iter().flatten().any(|n| at.iter().any(|a| nested(n, a))) {
+                return true;
+            }
+            if let MutationOp::Rename { from, to } = &e.op {
+                for a in &mut at {
+                    if let Some(before) = undo_rename(a, from, to) {
+                        *a = before;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// The newest queued upload of the file called `path` now: it holds the
+    /// file's current content, which neither the server nor a kept copy has
+    /// yet. Found under the name the file had when it was queued.
+    pub fn newest_upload(&self, path: &Path) -> Option<PendingUpload> {
+        let mut found = None;
+        self.walk_history(path, |e, at| {
+            found = match &e.op {
+                MutationOp::Put { remote_path, staging_path, .. } if remote_path == at => Some(PendingUpload::Put(staging_path.clone())),
+                MutationOp::FinishChunked { remote_path, .. } if remote_path == at => Some(PendingUpload::Stream),
+                _ => None,
+            };
+            found.is_some()
+        });
+        found
     }
 
     /// Staging file of the newest queued upload of `path` when that upload is a
@@ -849,8 +961,8 @@ impl MutationJournal {
         let mut moved = false;
         for e in self.entries.iter().rev() {
             if let MutationOp::Rename { from, to } = &e.op {
-                if let Ok(rest) = at.strip_prefix(to) {
-                    at = if rest.as_os_str().is_empty() { from.clone() } else { from.join(rest) };
+                if let Some(before) = undo_rename(&at, from, to) {
+                    at = before;
                     moved = true;
                 }
             }
@@ -878,12 +990,29 @@ impl MutationJournal {
         }
     }
 
-    /// Drops every not-yet-claimed upload of `path` older than `newest`: each upload
-    /// carries the whole file, so only the newest needs to reach the server.
+    /// Drops every not-yet-claimed upload of the file called `path` now that
+    /// is older than `newest`: each upload carries the whole file, so only
+    /// the newest needs to reach the server. Across a Rename of the file too
+    /// (the MOVE carries the server's copy to the new name, where the newest
+    /// replaces it), except a create (no etag) a Rename moved: that MOVE
+    /// needs the file on the server, or it fails as a MoveSourceGone.
     pub fn supersede_uploads(&mut self, path: &Path, newest: SeqId) {
+        let mut drop_seqs = std::collections::HashSet::new();
+        let mut moved = false;
+        self.walk_history(path, |e, at| {
+            if matches!(e.op, MutationOp::Rename { .. }) {
+                moved = true;
+            } else if e.seq < newest && !e.in_flight && e.op.is_upload_of(at) && (!moved || e.op.upload_etag().is_some()) {
+                drop_seqs.insert(e.seq);
+            }
+            false
+        });
+        if drop_seqs.is_empty() {
+            return;
+        }
         let mut stale = Vec::new();
         self.entries.retain(|e| {
-            let drop = e.seq < newest && !e.in_flight && e.op.is_upload_of(path);
+            let drop = drop_seqs.contains(&e.seq);
             if drop {
                 stale.push(e.op.clone());
             }
@@ -1149,40 +1278,57 @@ impl MutationJournal {
     fn coalesce_before_enqueue(&mut self, new_op: &MutationOp) {
         match new_op {
             MutationOp::Unlink { path } => {
-                // If there's a Put for this path that was a fresh create (no etag),
-                // remove it — the file never reached the server
-                let has_prior_server_etag = self.entries.iter().any(|e| {
-                    matches!(&e.op,
-                        MutationOp::Put { remote_path, if_match_etag: Some(_), .. }
-                        | MutationOp::FinishChunked { remote_path, if_match_etag: Some(_), .. } if remote_path == path)
+                // The file's uploads (under the names it had then): when none
+                // carries an etag, it was created here and never reached the
+                // server, so they can go. Nothing later depends on them but a
+                // Rename of the file, whose MOVE then fails as a
+                // MoveSourceGone for a file that is deleted anyway.
+                let (mut ours, mut on_server) = (std::collections::HashSet::new(), false);
+                self.walk_history(path, |e, at| {
+                    if e.op.is_upload_of(at) {
+                        on_server |= e.op.upload_etag().is_some();
+                        ours.insert(e.seq);
+                    }
+                    false
                 });
-                if !has_prior_server_etag {
+                if !on_server && !ours.is_empty() {
                     let staging_to_delete: Vec<PathBuf> = self.entries.iter()
-                        .filter(|e| e.op.is_upload_of(path))
+                        .filter(|e| ours.contains(&e.seq))
                         .filter_map(|e| e.op.staging_path().map(Path::to_path_buf))
                         .collect();
-                    let before = self.entries.len();
-                    self.entries.retain(|e| {
-                        !e.op.is_upload_of(path)
-                        && !matches!(&e.op, MutationOp::MkDir { path: p } if p == path)
-                    });
-                    if self.entries.len() < before {
-                        self.delete_after_save.extend(staging_to_delete);
-                        log::debug!("JOURNAL: coalesced — removed prior ops for {} before Unlink", path.display());
-                    }
+                    self.entries.retain(|e| !ours.contains(&e.seq));
+                    self.delete_after_save.extend(staging_to_delete);
+                    log::debug!("JOURNAL: coalesced — removed prior ops for {} before Unlink", path.display());
                 }
             }
             MutationOp::RmDir { path } => {
-                let before = self.entries.len();
-                self.entries.retain(|e| {
-                    !matches!(&e.op, MutationOp::MkDir { path: p } if p == path)
+                let mut mkdir = None;
+                self.walk_history(path, |e, at| {
+                    if matches!(&e.op, MutationOp::MkDir { path: p } if p == at) {
+                        mkdir = Some(e.seq);
+                    }
+                    mkdir.is_some()
                 });
-                if self.entries.len() < before {
+                if let Some(seq) = mkdir.filter(|&s| !self.needed_as_parent(s)) {
+                    self.entries.retain(|e| e.seq != seq);
                     log::debug!("JOURNAL: coalesced — removed MkDir for {} before RmDir", path.display());
                 }
             }
             _ => {}
         }
+    }
+
+    /// Whether an entry after the MkDir `seq` needs its directory on the
+    /// server: something created in it, or a Rename into, out of or of it.
+    /// Deleting in it does not (a DELETE of a missing path is done).
+    fn needed_as_parent(&self, seq: SeqId) -> bool {
+        let Some(i) = self.entries.iter().position(|e| e.seq == seq) else { return false };
+        let dir = self.entries[i].op.path();
+        self.entries.range(i + 1..).any(|e| match &e.op {
+            MutationOp::Rename { from, to } => nested(from, dir) || nested(to, dir),
+            MutationOp::Unlink { .. } | MutationOp::RmDir { .. } => false,
+            op => op.path().starts_with(dir),
+        })
     }
 }
 
@@ -1205,7 +1351,7 @@ pub(crate) fn replay_journal(
     use crate::MutexExt;
 
     loop {
-        let entry = {
+        let (entry, now_at) = {
             let mut j = journal.safe_lock();
             match j.peek_front() {
                 // A live worker is executing it; later entries may depend on it, so stop.
@@ -1221,7 +1367,10 @@ pub(crate) fn replay_journal(
                 Some(e) => {
                     let e = e.clone();
                     j.claim(e.seq);
-                    e
+                    // Replayed under its queued name; the local bookkeeping
+                    // (status, listing) is the file's, under its name now.
+                    let now_at = j.forward(0, e.op.path());
+                    (e, now_at)
                 }
                 None => {
                     log::info!("JOURNAL: replay complete — queue empty");
@@ -1271,7 +1420,7 @@ pub(crate) fn replay_journal(
             continue;
         }
 
-        match execute_op(&entry, ctx, cache, dirty, error_log) {
+        match execute_op(&entry, now_at.as_deref(), ctx, cache, dirty, error_log) {
             ReplayResult::Ok => {
                 let mut j = journal.safe_lock();
                 if let Some(staging_path) = entry.op.staging_path() {
@@ -1342,13 +1491,13 @@ enum ReplayResult {
 
 fn execute_op(
     entry: &JournalEntry,
+    now_at: Option<&Path>,
     ctx: &ReplayContext,
     cache: &Arc<Mutex<crate::FsCache>>,
     dirty: &crate::ipc::DirtySet,
     error_log: &crate::ErrorLog,
 ) -> ReplayResult {
     use crate::backend::BackendWriteError;
-    use crate::MutexExt;
 
     match &entry.op {
         MutationOp::Put { remote_path, staging_path, if_match_etag } => {
@@ -1364,25 +1513,7 @@ fn execute_op(
             match ctx.backend.put_file_from_path(remote_path, staging_path, etag_ref) {
                 Ok(result) => {
                     log::info!("JOURNAL replay: PUT {} → token {:?}", remote_path.display(), result.new_change_token);
-                    let mut c = cache.safe_lock();
-                    let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
-                    if let Some(dir) = c.dir_cache.get_mut(&parent) {
-                        let mut files = (*dir.files).clone();
-                        if let Some(e) = files.iter_mut().find(|e| e.path == *remote_path) {
-                            e.change_token = result.new_change_token;
-                            e.size = file_size;
-                            e.modified = Some(SystemTime::now());
-                        }
-                        dir.files = Arc::new(files);
-                    }
-                    drop(c);
-                    // Clear the PendingSync marker the live upload path set on failure.
-                    {
-                        use crate::RwLockExt;
-                        ctx.status.safe_write().insert(remote_path.clone(), crate::ipc::FileStatus::Synced);
-                    }
-                    dirty.safe_lock().insert(parent);
-                    dirty.safe_lock().insert(remote_path.clone());
+                    upload_landed(ctx, cache, dirty, remote_path, now_at, result.new_change_token, file_size);
                     ReplayResult::Ok
                 }
                 Err(BackendWriteError::Conflict) => {
@@ -1477,25 +1608,7 @@ fn execute_op(
             match result {
                 Ok(result) => {
                     log::info!("JOURNAL replay: finished streamed upload {} → token {:?}", remote_path.display(), result.new_change_token);
-                    let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
-                    {
-                        let mut c = cache.safe_lock();
-                        if let Some(dir) = c.dir_cache.get_mut(&parent) {
-                            let mut files = (*dir.files).clone();
-                            if let Some(e) = files.iter_mut().find(|e| e.path == *remote_path) {
-                                e.change_token = result.new_change_token;
-                                e.size = *total_len;
-                                e.modified = Some(SystemTime::now());
-                            }
-                            dir.files = Arc::new(files);
-                        }
-                    }
-                    {
-                        use crate::RwLockExt;
-                        ctx.status.safe_write().insert(remote_path.clone(), crate::ipc::FileStatus::Synced);
-                    }
-                    dirty.safe_lock().insert(parent);
-                    dirty.safe_lock().insert(remote_path.clone());
+                    upload_landed(ctx, cache, dirty, remote_path, now_at, result.new_change_token, *total_len);
                     ReplayResult::Ok
                 }
                 Err(BackendWriteError::Conflict) => {
@@ -1523,6 +1636,48 @@ fn execute_op(
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
+    }
+}
+
+/// Local bookkeeping once an upload queued as `remote_path` landed: the
+/// file's listing entry and status, under the name it has now (`now_at`,
+/// after the Renames queued behind the upload; None when a later entry
+/// deletes or replaces it). The MOVEs still to come carry the new etag along
+/// with the file.
+fn upload_landed(
+    ctx: &ReplayContext,
+    cache: &Arc<Mutex<crate::FsCache>>,
+    dirty: &crate::ipc::DirtySet,
+    remote_path: &Path,
+    now_at: Option<&Path>,
+    token: Option<String>,
+    size: u64,
+) {
+    use crate::{MutexExt, RwLockExt};
+    let Some(now_at) = now_at else {
+        dirty.safe_lock().insert(remote_path.to_path_buf());
+        return;
+    };
+    let parent = now_at.parent().unwrap_or(Path::new("/")).to_path_buf();
+    {
+        let mut c = cache.safe_lock();
+        if let Some(dir) = c.dir_cache.get_mut(&parent) {
+            let mut files = (*dir.files).clone();
+            if let Some(e) = files.iter_mut().find(|e| e.path == now_at) {
+                e.change_token = token;
+                e.size = size;
+                e.modified = Some(SystemTime::now());
+            }
+            dir.files = Arc::new(files);
+        }
+    }
+    // Clear the PendingSync marker the live upload path set on failure.
+    ctx.status.safe_write().insert(now_at.to_path_buf(), crate::ipc::FileStatus::Synced);
+    let mut d = dirty.safe_lock();
+    d.insert(parent);
+    d.insert(now_at.to_path_buf());
+    if remote_path != now_at {
+        d.insert(remote_path.to_path_buf());
     }
 }
 
@@ -1847,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_updates_subsequent_paths() {
+    fn a_rename_leaves_earlier_entries_in_their_own_names() {
         let dir = temp_dir("rename_paths");
         let staging = dir.join("staging_2");
         fs::write(&staging, b"data").unwrap();
@@ -1855,29 +2010,27 @@ mod tests {
         let mut j = MutationJournal::load_or_create(&dir);
         j.enqueue(MutationOp::Put {
             remote_path: PathBuf::from("/old_dir/file.txt"),
-            staging_path: staging,
+            staging_path: staging.clone(),
             if_match_etag: None,
         });
         j.enqueue(MutationOp::Rename {
             from: PathBuf::from("/old_dir"),
             to: PathBuf::from("/new_dir"),
         });
-
-        let first = &j.entries()[0];
-        if let MutationOp::Put { remote_path, .. } = &first.op {
-            assert_eq!(remote_path, &PathBuf::from("/new_dir/file.txt"));
-        } else {
-            panic!("expected Put");
-        }
-
+        // Replayed before the MOVE, so under the name it was queued as.
+        assert_eq!(j.entries()[0].op.path(), Path::new("/old_dir/file.txt"));
+        // Found under the name the file has now.
+        assert_eq!(j.pending_put_staging(Path::new("/new_dir/file.txt")), Some(staging));
+        assert!(j.pending_put_staging(Path::new("/old_dir/file.txt")).is_none());
+        assert_eq!(j.upload_names(), [PathBuf::from("/old_dir/file.txt"), PathBuf::from("/new_dir/file.txt")].into());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn pending_put_staging_follows_rename() {
         // Mirrors the LibreOffice save: write temp file (Put), then rename temp onto
-        // the final name. enqueue() rewrites the queued Put's remote_path to the
-        // destination, so a read of the destination resolves to the temp's staging.
+        // the final name. The Put stays at the temp name (it replays before the MOVE),
+        // and a read of the destination resolves to the temp's staging.
         let dir = temp_dir("pending_put_staging");
         let staging = dir.join("staging_lo");
         fs::write(&staging, b"odf-bytes").unwrap();
@@ -1898,7 +2051,143 @@ mod tests {
         assert!(j.pending_put_staging(&PathBuf::from("/docs/lu123.tmp")).is_none());
         assert_eq!(j.pending_put_staging(&PathBuf::from("/docs/report.odt")), Some(staging));
         assert!(j.has_pending_put(&PathBuf::from("/docs/report.odt")));
+        assert_eq!(j.entries()[0].op.path(), Path::new("/docs/lu123.tmp"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn put_at(dir: &Path, path: &str, bytes: &str, etag: Option<&str>) -> MutationOp {
+        let staging = dir.join(format!("write_{}_{}", path.replace('/', "_"), bytes));
+        fs::write(&staging, bytes).unwrap();
+        MutationOp::Put { remote_path: PathBuf::from(path), staging_path: staging, if_match_etag: etag.map(str::to_owned) }
+    }
+
+    fn mv(j: &mut MutationJournal, a: &str, b: &str) -> SeqId {
+        j.enqueue(MutationOp::Rename { from: PathBuf::from(a), to: PathBuf::from(b) })
+    }
+
+    fn staged_of(j: &MutationJournal, path: &str) -> Option<String> {
+        j.pending_put_staging(Path::new(path)).map(|p| fs::read_to_string(p).unwrap())
+    }
+
+    #[test]
+    fn lookups_follow_a_file_through_later_renames_and_stop_where_it_began() {
+        let dir = temp_dir("history");
+        let mut j = MutationJournal::load_or_create(&dir);
+        // Offline `rm a; create a; mv a b` (the server had a).
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/a") });
+        j.enqueue(put_at(&dir, "/a", "A2", None));
+        mv(&mut j, "/a", "/b");
+        let names: Vec<_> = j.entries().iter().map(|e| e.op.path().to_path_buf()).collect();
+        assert_eq!(names, [Path::new("/a"), Path::new("/a"), Path::new("/a")], "every entry keeps its own name");
+        assert_eq!(staged_of(&j, "/b").as_deref(), Some("A2"));
+        assert!(!j.has_pending_put(Path::new("/a")), "a is gone: its upload is b's");
+        // A new a is another file; b's history is untouched by it.
+        j.enqueue(put_at(&dir, "/a", "A3", None));
+        assert_eq!(staged_of(&j, "/a").as_deref(), Some("A3"));
+        assert_eq!(staged_of(&j, "/b").as_deref(), Some("A2"));
+        // A Rename onto a name replaces what was there: c's upload is not x's.
+        j.enqueue(put_at(&dir, "/c", "C", None));
+        mv(&mut j, "/x", "/c");
+        assert_eq!(staged_of(&j, "/c"), None);
+        assert_eq!(j.rename_source_of(Path::new("/c")), Some(PathBuf::from("/x")));
+        // Deleted: the older upload is the deleted file's.
+        j.enqueue(put_at(&dir, "/e", "E1", Some("x")));
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/e") });
+        assert!(!j.has_pending_put(Path::new("/e")));
+        // A directory rename carries the files queued inside it; a chain too.
+        let f = j.enqueue(put_at(&dir, "/d/f", "F", None));
+        mv(&mut j, "/d", "/k");
+        mv(&mut j, "/k/f", "/g");
+        mv(&mut j, "/g", "/h");
+        assert_eq!(staged_of(&j, "/h").as_deref(), Some("F"));
+        assert_eq!(staged_of(&j, "/d/f"), None);
+        assert_eq!(j.current_name(f, Path::new("/d/f")), Some(PathBuf::from("/h")));
+        let c = j.entries().iter().find(|e| e.op.path() == Path::new("/c")).unwrap().seq;
+        assert_eq!(j.current_name(c, Path::new("/c")), None, "replaced by the rename onto it");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn supersede_follows_renames_but_keeps_a_create_a_later_move_needs() {
+        let dir = temp_dir("supersede_renames");
+        let mut j = MutationJournal::load_or_create(&dir);
+        // On the server: an older edit is replaced across the rename.
+        let old = j.enqueue(put_at(&dir, "/a", "A1", Some("e1")));
+        mv(&mut j, "/a", "/b");
+        let new = j.enqueue(put_at(&dir, "/b", "A2", Some("e1")));
+        j.supersede_uploads(Path::new("/b"), new);
+        assert!(!j.contains(old) && j.contains(new));
+        // Created here: the MOVE needs it on the server first.
+        let create = j.enqueue(put_at(&dir, "/n", "N1", None));
+        mv(&mut j, "/n", "/m");
+        let edit = j.enqueue(put_at(&dir, "/m", "N2", None));
+        j.supersede_uploads(Path::new("/m"), edit);
+        assert!(j.contains(create) && j.contains(edit));
+        // Without a rename between them, a create is superseded as before.
+        let first = j.enqueue(put_at(&dir, "/p", "P1", None));
+        let second = j.enqueue(put_at(&dir, "/p", "P2", None));
+        j.supersede_uploads(Path::new("/p"), second);
+        assert!(!j.contains(first));
+        // Not another file that used to have the name.
+        let other = j.enqueue(put_at(&dir, "/q", "Q", Some("q")));
+        mv(&mut j, "/q", "/r");
+        let fresh = j.enqueue(put_at(&dir, "/q", "Q2", None));
+        j.supersede_uploads(Path::new("/q"), fresh);
+        assert!(j.contains(other));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unlink_and_rmdir_coalesce_only_what_nothing_later_needs() {
+        let dir = temp_dir("coalesce_history");
+        let mut j = MutationJournal::load_or_create(&dir);
+        // Created, renamed, deleted: never on the server.
+        let create = j.enqueue(put_at(&dir, "/a", "A", None));
+        mv(&mut j, "/a", "/b");
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/b") });
+        assert!(!j.contains(create));
+        // An edit of a file the server has is not coalesced away.
+        let edit = j.enqueue(put_at(&dir, "/s", "S", Some("s")));
+        mv(&mut j, "/s", "/t");
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/t") });
+        assert!(j.contains(edit));
+        // A folder whose file moved out still has to exist for its PUT.
+        let mkdir = j.enqueue(MutationOp::MkDir { path: PathBuf::from("/d") });
+        j.enqueue(put_at(&dir, "/d/x", "X", None));
+        mv(&mut j, "/d/x", "/y");
+        j.enqueue(MutationOp::RmDir { path: PathBuf::from("/d") });
+        assert!(j.contains(mkdir), "PUT /d/x needs /d");
+        // An empty one comes and goes, even with a delete inside.
+        let mkdir = j.enqueue(MutationOp::MkDir { path: PathBuf::from("/e") });
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/e/z") });
+        j.enqueue(MutationOp::RmDir { path: PathBuf::from("/e") });
+        assert!(!j.contains(mkdir));
+        // Renamed, then removed under its new name: the MOVE needs it.
+        let mkdir = j.enqueue(MutationOp::MkDir { path: PathBuf::from("/f") });
+        mv(&mut j, "/f", "/g");
+        j.enqueue(MutationOp::RmDir { path: PathBuf::from("/g") });
+        assert!(j.contains(mkdir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn earlier_related_sees_older_entries_of_the_same_files_under_their_old_names() {
+        let dir = temp_dir("earlier_related");
+        let mut j = MutationJournal::load_or_create(&dir);
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/b") });
+        j.enqueue(put_at(&dir, "/x/f", "F", None));
+        mv(&mut j, "/x", "/y");
+        j.enqueue(MutationOp::MkDir { path: PathBuf::from("/n") });
+        let over_b = mv(&mut j, "/a", "/b");
+        let out_of_y = mv(&mut j, "/y/f", "/g");
+        let into_n = mv(&mut j, "/c", "/n/c");
+        let unrelated = mv(&mut j, "/p", "/q");
+        assert!(j.earlier_related(over_b, &[Path::new("/a"), Path::new("/b")]), "DELETE b must run before MOVE a→b");
+        assert!(j.earlier_related(out_of_y, &[Path::new("/y/f"), Path::new("/g")]), "its PUT (as /x/f) first");
+        assert!(j.earlier_related(into_n, &[Path::new("/c"), Path::new("/n/c")]), "MKCOL n first");
+        assert!(!j.earlier_related(unrelated, &[Path::new("/p"), Path::new("/q")]));
+        assert!(!j.earlier_related(12345, &[Path::new("/b")]), "gone: nothing to wait for");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2114,7 +2403,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_retargets_a_queued_streamed_finish() {
+    fn a_queued_streamed_finish_is_found_under_its_new_name() {
         let dir = temp_dir("finish_chunked_rename");
         let tail = dir.join("write_9");
         fs::write(&tail, b"").unwrap();
@@ -2129,7 +2418,9 @@ mod tests {
             if_match_etag: None,
         });
         j.enqueue(MutationOp::Rename { from: PathBuf::from("/d"), to: PathBuf::from("/e") });
-        assert_eq!(j.entries()[0].op.path(), Path::new("/e/tmp.bin"));
+        assert_eq!(j.entries()[0].op.path(), Path::new("/d/tmp.bin"), "assembled before the MOVE, under its own name");
+        assert_eq!(j.newest_upload(Path::new("/e/tmp.bin")), Some(PendingUpload::Stream));
+        assert_eq!(j.newest_upload(Path::new("/d/tmp.bin")), None);
         let _ = fs::remove_dir_all(&dir);
     }
 
