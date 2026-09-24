@@ -124,3 +124,14 @@ Don't build this now: it would need invalidation hooks at every listing mutation
 **New blocking path:** the first write and a size-changing setattr copy a whole kept file into staging with `std::fs::copy`, inline on fuser-0. That is a disk-bound stall; it belongs with step 8 unless it falls out of the open()/setattr rework.
 
 **Step 6 now includes the `/proc` fix.** The rest of the spec is unchanged.
+
+## Follow-ups (after the PR #92 code review)
+
+Fixed in PR #92: H1 (a writable open is registered before its content is staged), M1 (no promotion before the listing's result), M2 (offline edit of a kept copy whose parent was evicted), M3 (the name index waits for 8 lookups of one listing version), M4 (tests), L1 (a slow lookup re-checks unlink and ghosts after writing the IPC maps), L2 (the size overlay skips unlinked handles and takes the largest writer), L6 (a full META pool no longer fails a plain read-only open).
+
+Left for later:
+- **L3.** The size overlay covers open handles and `uploading`, but not a file that was closed and whose PUT is still queued in the journal. A `stat` in that window can show the server's old size. Overlaying `pending_put_staging`'s size in `attr_for` would fix it, at the cost of a journal lock per stat.
+- **L4, L5, L7, L9.** Deferred as recorded in the PR #92 review.
+- **Open racing unlink before registration.** H1 closes the staging window. An unlink that completes while open() is still resolving an evicted parent on META is not seen by the handle. The resolve then answers Absent (the file is gone or in `deleting`), and the open stages an empty file that release would PUT. Marking the handle unlinked because its path is in `deleting` is not safe: `rm f; echo x > f; echo y >> f` re-creates `f` while the old DELETE is still in flight. A per-path generation bumped by unlink would handle it.
+- **Rename of a directory with children open.** `move_inode` remaps only the renamed path, so a child's inode still resolves to its old path. `retarget_open_files` fixes registered handles, but a child opened during the rename is registered under the old path (pre-existing).
+- **release() bookkeeping is not unit-tested.** release() gives back the writer count, the pin and the io mode, and it can only be driven through a FUSE `Request`. Factoring that bookkeeping into a function shared with `OpenUndo` would let tests cover it, but it touches the write path's release.
