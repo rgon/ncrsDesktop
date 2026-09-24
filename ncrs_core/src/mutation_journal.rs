@@ -289,11 +289,18 @@ pub fn save_synchronously(journal: &SharedJournal) {
 
 fn delete_staging(paths: &[PathBuf]) {
     for p in paths {
-        match std::fs::remove_file(p) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => log::warn!("JOURNAL: removing staging {} failed: {}", p.display(), e),
+        if let Err(e) = remove_staging_file(p) {
+            log::warn!("JOURNAL: removing staging {} failed: {}", p.display(), e);
         }
+    }
+}
+
+/// Deletes a staging file and its `tail_marker`, if any. Already gone is fine.
+pub(crate) fn remove_staging_file(p: &Path) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(tail_marker(p));
+    match std::fs::remove_file(p) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -427,14 +434,30 @@ pub(crate) const RECOVERED_DIR: &str = "recovered";
 /// deleted the oldest kept edit to make room, which could be its only copy.
 const RECOVERED_KEEP_FOR: Duration = Duration::from_secs(30 * 24 * 3600);
 
-/// `<staging>.tail`: marks a streamed upload's staging file once the first
-/// chunk has left it, i.e. once it no longer starts at the file's first byte.
-/// Such a tail is worth nothing alone: its earlier chunks are in a server
-/// session only the lost process knew. The startup sweep deletes one it finds
-/// unnamed instead of keeping it in `recovered/`. A staging file whose first
-/// chunk has not been cut from it holds every byte written, and is kept.
+/// `<staging>.tail`: marks a streamed upload's staging file before its first
+/// chunk is cut from it, i.e. before it stops starting at the file's first
+/// byte, and stays until the staging file is deleted (`remove_staging_file`)
+/// — through release and the queued finish. Such a tail is worth nothing
+/// alone: its earlier chunks are in a server session only the lost process
+/// knew. The startup sweep deletes one it finds unnamed instead of keeping it
+/// in `recovered/`, and reports the file whose copy was lost (`TailMarker`).
+/// A staging file never marked holds every byte written, and is kept.
 pub(crate) fn tail_marker(staging: &Path) -> PathBuf {
     staging.with_extension("tail")
+}
+
+/// What a `tail_marker` records: the file being streamed, and the offset in it
+/// of the tail's first byte once the chunk about to be cut is gone.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct TailMarker {
+    pub remote_path: PathBuf,
+    pub offset: u64,
+}
+
+/// Writes (or rewrites) `staging`'s tail marker. Called before each cut.
+pub(crate) fn write_tail_marker(staging: &Path, remote_path: &Path, offset: u64) -> std::io::Result<()> {
+    let m = TailMarker { remote_path: remote_path.to_path_buf(), offset };
+    std::fs::write(tail_marker(staging), serde_json::to_vec(&m).map_err(std::io::Error::other)?)
 }
 
 /// Startup sweep of `cache_dir`: staging files left by an earlier process
@@ -453,12 +476,18 @@ pub(crate) fn quarantine_unreferenced_staging(journal: &mut MutationJournal, cac
         journal.entries().iter().filter_map(|e| e.op.staging_path().map(Path::to_path_buf)).collect();
     let Ok(dir_entries) = std::fs::read_dir(cache_dir) else { return 0 };
     let dir_entries: Vec<_> = dir_entries.flatten().collect();
-    let tails: std::collections::HashSet<PathBuf> = dir_entries.iter()
+    // A marker is read before anything is deleted: the loop below may reach
+    // it before its staging file. Empty or unreadable (an older version's,
+    // or a crash mid-write): still a tail, of an unknown file.
+    let tails: std::collections::HashMap<PathBuf, Option<TailMarker>> = dir_entries.iter()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "tail"))
-        .map(|p| p.with_extension(""))
+        .map(|p| {
+            let marker = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok());
+            (p.with_extension(""), marker)
+        })
         .collect();
-    let (mut moved, mut deleted) = (Vec::new(), 0usize);
+    let (mut moved, mut deleted, mut lost) = (Vec::new(), 0usize, Vec::new());
     for entry in dir_entries {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
         let kind = parse_staging_name(&name);
@@ -467,13 +496,19 @@ pub(crate) fn quarantine_unreferenced_staging(journal: &mut MutationJournal, cac
             continue; // not staging, or this process's own (adopted this boot)
         }
         let path = entry.path();
-        if named.contains(&path) {
+        // A queued finish's tail keeps its marker, for the next sweep.
+        if named.contains(&path) || (name.ends_with(".tail") && named.contains(&path.with_extension(""))) {
             continue;
         }
         let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        if tails.contains(&path) && len > 0 {
-            log::warn!("startup: {} ({} bytes) is the end of a streamed upload that never finished — deleted; the copy must be repeated", name, len);
-            let _ = std::fs::remove_file(&path);
+        if let Some(marker) = tails.get(&path).filter(|_| len > 0) {
+            let what = marker.as_ref().map_or_else(|| "a file".to_string(), |m| m.remote_path.display().to_string());
+            log::warn!("startup: {} ({} bytes) is the end of a streamed upload of {} that never finished — deleted; the copy must be repeated", name, len, what);
+            lost.push(match marker {
+                Some(m) => format!("{} (its last {} bytes, from offset {})", m.remote_path.display(), len, m.offset),
+                None => format!("{} ({} bytes)", name, len),
+            });
+            let _ = remove_staging_file(&path);
             continue;
         }
         if temp || len == 0 {
@@ -489,6 +524,14 @@ pub(crate) fn quarantine_unreferenced_staging(journal: &mut MutationJournal, cac
     }
     if deleted > 0 {
         log::info!("startup: removed {} empty or partial staging file(s)", deleted);
+    }
+    if !lost.is_empty() {
+        journal.add_conflict(ConflictKind::PermanentFailure {
+            description: format!(
+                "the streamed copy of {} was interrupted before it was queued for upload (the daemon stopped mid-copy); it is not on the server — copy it again",
+                lost.join(", "),
+            ),
+        });
     }
     if !moved.is_empty() {
         journal.add_conflict(ConflictKind::PermanentFailure {
@@ -1621,14 +1664,24 @@ mod tests {
         let dir = temp_dir("quarantine_tails");
         // Its first chunk left: only the end of the file, useless alone.
         fs::write(dir.join("write_9"), "end of a copy").unwrap();
-        fs::write(tail_marker(&dir.join("write_9")), "").unwrap();
+        write_tail_marker(&dir.join("write_9"), Path::new("/movies/big.mkv"), 20).unwrap();
+        // A queued finish's tail and its marker stay.
+        fs::write(dir.join("write_11"), "queued end").unwrap();
+        write_tail_marker(&dir.join("write_11"), Path::new("/q.bin"), 10).unwrap();
         // A stream whose session opened but whose first chunk never went: every byte.
         fs::write(dir.join("write_10"), "the whole file").unwrap();
         let mut j = MutationJournal::load_or_create(&dir);
+        j.enqueue(MutationOp::FinishChunked {
+            remote_path: PathBuf::from("/q.bin"), uploads_base: "u/2".into(), next_index: 1,
+            bytes_confirmed: 10, total_len: 20, tail_path: dir.join("write_11"), if_match_etag: None,
+        });
         assert_eq!(quarantine_unreferenced_staging(&mut j, &dir), 1);
         let rec = dir.join(RECOVERED_DIR);
         assert!(!dir.join("write_9").exists() && !rec.join("write_9").exists());
         assert!(!tail_marker(&dir.join("write_9")).exists());
+        assert!(dir.join("write_11").exists() && tail_marker(&dir.join("write_11")).exists());
+        let told: Vec<_> = j.unresolved_conflicts().iter().map(|c| format!("{:?}", c.kind)).collect();
+        assert!(told.iter().any(|c| c.contains("/movies/big.mkv")), "the lost copy is named: {told:?}");
         assert_eq!(fs::read_to_string(rec.join("write_10")).unwrap(), "the whole file");
         let _ = fs::remove_dir_all(&dir);
     }

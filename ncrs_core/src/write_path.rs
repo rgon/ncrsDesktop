@@ -505,10 +505,6 @@ impl WriteCtx {
             reply();
             return;
         };
-        if let (Some(_), Some(wp)) = (&of.chunk_upload, &of.write_path) {
-            // Journaled below, or given up: no longer a crash's leftover.
-            let _ = std::fs::remove_file(mutation_journal::tail_marker(wp));
-        }
         if of.writer {
             self.open_writers.fetch_sub(1, Ordering::Relaxed);
         }
@@ -586,7 +582,7 @@ impl WriteCtx {
                 if of.dirty {
                     log::info!("release: fh {} of {} was deleted while open — dropping its writes", fh, of.remote_path.display());
                 }
-                let _ = std::fs::remove_file(wp);
+                let _ = mutation_journal::remove_staging_file(wp);
             }
         }
     }
@@ -597,7 +593,7 @@ impl WriteCtx {
     /// `recovered/`.
     fn drop_failed_stream_staging(&self, fh: u64, of: &OpenFile, wp: &Path) {
         if of.chunk_upload.as_ref().is_some_and(|cs| cs.bytes_confirmed > 0) {
-            let _ = std::fs::remove_file(wp);
+            let _ = mutation_journal::remove_staging_file(wp);
             return;
         }
         if std::fs::metadata(wp).map_or(true, |m| m.len() == 0) {
@@ -1090,15 +1086,14 @@ fn graduate_chunk(
         s.bytes_confirmed += webdav_ops::CHUNK_SIZE as u64;
         publish(s);
 
+        // Before the cut: from then on the staging file lacks the file's
+        // start, and a crash must find it marked (`mutation_journal::tail_marker`).
+        let offset = s.bytes_confirmed;
+        if let Err(e) = mutation_journal::write_tail_marker(wp, remote_path, offset) {
+            log::warn!("cannot mark {} as a streamed tail: {}", wp.display(), e);
+        }
         shrink_tail_file(wp, webdav_ops::CHUNK_SIZE as u64)
             .map_err(|e| (format!("tail rewrite: {}", e), state.clone()))?;
-        if state.as_ref().is_some_and(|s| s.next_index == 1) {
-            // From here on the staging file lacks the file's start; see
-            // `mutation_journal::tail_marker`.
-            if let Err(e) = std::fs::File::create(mutation_journal::tail_marker(wp)) {
-                log::debug!("cannot mark {} as a streamed tail: {}", wp.display(), e);
-            }
-        }
     }
 }
 
