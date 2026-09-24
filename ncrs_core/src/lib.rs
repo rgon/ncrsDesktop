@@ -274,6 +274,114 @@ struct DirCacheEntry {
     // read path (`get_cached_dir_readonly`) can record an access too — a
     // directory that only ever gets stat'ed is still in use.
     last_access: AtomicU64,
+    // Built on the first child lookup in a wide listing (see `find_child`).
+    // Tagged with the `files` Arc it indexes: every mutation of a listing swaps
+    // that Arc, so a stale index is recognised and rebuilt instead of every
+    // mutation site having to remember to drop it. The Weak also keeps the old
+    // allocation's address from being reused while it is compared against.
+    name_index: Option<(std::sync::Weak<Vec<RemoteEntry>>, NameIndex)>,
+}
+
+/// Listings up to this size are scanned: indexing them costs more than it saves.
+const NAME_INDEX_MIN: usize = 256;
+/// A hash two different names share: look those up by scanning.
+const NAME_AMBIGUOUS: u32 = u32::MAX;
+
+fn entry_name(e: &RemoteEntry) -> Option<&str> {
+    e.path.file_name().and_then(|n| n.to_str())
+}
+
+fn name_hash(name: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    h.finish()
+}
+
+fn scan_for_name(files: &[RemoteEntry], name: &str) -> Option<usize> {
+    files.iter().position(|e| entry_name(e) == Some(name))
+}
+
+/// Name → position in one listing, so resolving a child is O(1) instead of a
+/// scan under the cache lock. A stat sweep over a 100k-entry directory used to
+/// cost O(n²) that way: each `getattr` scanned the whole listing.
+///
+/// Keyed by a hash of the name rather than the name itself: ~16 bytes an entry
+/// and no string copies. Two names sharing a hash mark it ambiguous, and those
+/// fall back to a scan, so a collision costs speed, never a wrong answer.
+#[derive(Default)]
+struct NameIndex {
+    map: HashMap<u64, u32>,
+    // Leading entries indexed so far. A streaming listing only grows, so the
+    // index of a pending fetch catches up incrementally.
+    indexed: usize,
+}
+
+impl NameIndex {
+    fn extend(&mut self, files: &[RemoteEntry]) {
+        for (i, e) in files.iter().enumerate().skip(self.indexed) {
+            let Some(n) = entry_name(e) else { continue };
+            match self.map.entry(name_hash(n)) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(i as u32);
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    // The same name twice keeps the first, like a scan would.
+                    let held = *o.get();
+                    if held != NAME_AMBIGUOUS && entry_name(&files[held as usize]) != Some(n) {
+                        o.insert(NAME_AMBIGUOUS);
+                    }
+                }
+            }
+        }
+        self.indexed = files.len();
+    }
+
+    /// Position of `name` among the first `self.indexed` entries of `files`.
+    fn find(&self, files: &[RemoteEntry], name: &str) -> Option<usize> {
+        match self.map.get(&name_hash(name)).copied() {
+            None => None,
+            Some(NAME_AMBIGUOUS) => scan_for_name(&files[..self.indexed], name),
+            Some(i) => (entry_name(&files[i as usize]) == Some(name)).then_some(i as usize),
+        }
+    }
+}
+
+/// What a parent listing says about one child name.
+#[derive(Debug, Clone)]
+enum Child {
+    Found(RemoteEntry),
+    /// A complete listing does not have it.
+    Absent,
+    /// No complete answer in time: the listing failed (the error, if any), is
+    /// still streaming at the deadline, or could not be started. Never ENOENT —
+    /// a walker told ENOENT believes the file does not exist.
+    Unknown(Option<String>),
+}
+
+/// A non-blocking look into an in-flight listing (see `FsCache::pending_find`).
+enum PendingLookup {
+    Found(RemoteEntry),
+    /// Not streamed yet; the fetch is still running.
+    Streaming,
+    /// The fetch just finished and was promoted: ask the dir cache.
+    Finished,
+    Failed(String),
+    /// No fetch in flight for this directory.
+    NoFetch,
+}
+
+/// Errno for a child we could not resolve. Only the server saying the parent
+/// itself is gone (404/410) justifies ENOENT. Untyped errors are classified by
+/// shape, never by the substring heuristics in `error_to_errno`, because they
+/// embed the path ("PROPFIND timeout for /x2404" is not a 404).
+fn unknown_child_errno(err: Option<&str>) -> Errno {
+    match err {
+        None => Errno::ETIMEDOUT,
+        Some(e) if backend::server_error_code(e).is_some() || e == "not found" => error_to_errno(e),
+        Some(e) if is_timeout_err(e) => Errno::ETIMEDOUT,
+        Some(_) => Errno::EAGAIN,
+    }
 }
 
 /// Source of LRU ordering for the dir cache. Wraps after 2^64 accesses, which
@@ -292,6 +400,35 @@ struct PendingDir {
     etag: Option<String>,
     self_entry: Option<RemoteEntry>,
     failed: Option<String>,
+    // Lets a child lookup ask "is it in the stream yet?" without copying the
+    // partial listing. The old way cloned the whole snapshot under the global
+    // cache lock every 50 ms per waiter, which froze everything else during a
+    // wide streaming listing (review of 2026-09-24).
+    index: NameIndex,
+}
+
+impl PendingDir {
+    /// Moves whatever the fetch has streamed so far into `entries`. Returns
+    /// (anything new arrived, the entry stream has ended).
+    fn drain(&mut self) -> (bool, bool) {
+        let mut got_new = false;
+        let disconnected = loop {
+            match self.rx.try_recv() {
+                Ok(entry) => {
+                    self.entries.push(entry);
+                    got_new = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break false,
+                Err(mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        if self.self_entry.is_none() {
+            if let Ok(se) = self.self_rx.try_recv() {
+                self.self_entry = Some(se);
+            }
+        }
+        (got_new, disconnected)
+    }
 }
 
 struct FileCacheEntry {
@@ -756,6 +893,11 @@ fn mark_online(is_offline: &AtomicBool, since: &Mutex<Option<Instant>>) -> bool 
 ///
 /// Returns true if the daemon is online by the time we stop waiting.
 fn wait_out_offline_blip(conn: &ConnInfo) -> bool {
+    wait_out_offline_blip_until(conn, None)
+}
+
+/// [`wait_out_offline_blip`], but never past `cap` (a caller's own deadline).
+fn wait_out_offline_blip_until(conn: &ConnInfo, cap: Option<Instant>) -> bool {
     if !conn.is_offline.load(Ordering::Relaxed) {
         return true;
     }
@@ -765,6 +907,7 @@ fn wait_out_offline_blip(conn: &ConnInfo) -> bool {
         // e.g. an offline-mode mount): treat it as a real outage, not a blip.
         None => return false,
     };
+    let deadline = cap.map_or(deadline, |c| c.min(deadline));
     while Instant::now() < deadline {
         if conn.shutdown.load(Ordering::Relaxed) {
             return false;
@@ -1154,15 +1297,6 @@ fn start_service(name: &str, f: impl FnOnce() + Send + 'static) {
     }
 }
 
-/// Errno for "the parent listing is unavailable" after a failed re-list: only
-/// the server saying the parent is gone (404) justifies ENOENT for the child.
-fn relist_errno(err: Option<&str>) -> Errno {
-    match err {
-        Some(e) => error_to_errno(e),
-        None => Errno::ENOENT,
-    }
-}
-
 /// Queues a server mutation. Its `PathSeq` ticket was taken on the FUSE thread
 /// before this call, which is what keeps the FIFO pool deadlock-free. The
 /// queue is unbounded, so this only fails if the OS refuses a thread; the
@@ -1368,6 +1502,72 @@ impl FsCache {
         })
     }
 
+    /// Position of `name` in the resident listing of `dir`: `None` when the
+    /// listing is not cached, `Some((files, None))` when it is and lacks the
+    /// name. Counts as an access for LRU, like `get_cached_dir_readonly`, and
+    /// likewise serves a listing whatever its freshness flags say.
+    fn find_child(&mut self, dir: &Path, name: &str) -> Option<(Arc<Vec<RemoteEntry>>, Option<usize>)> {
+        let tick = next_access_tick();
+        let e = self.dir_cache.get_mut(dir)?;
+        e.last_access.store(tick, Ordering::Relaxed);
+        let files = Arc::clone(&e.files);
+        if files.len() <= NAME_INDEX_MIN {
+            let pos = scan_for_name(&files, name);
+            return Some((files, pos));
+        }
+        let current = matches!(&e.name_index, Some((of, _)) if std::ptr::eq(of.as_ptr(), Arc::as_ptr(&files)));
+        if !current {
+            let mut ix = NameIndex::default();
+            ix.extend(&files);
+            e.name_index = Some((Arc::downgrade(&files), ix));
+        }
+        let pos = e.name_index.as_ref().and_then(|(_, ix)| ix.find(&files, name));
+        Some((files, pos))
+    }
+
+    /// `find_child` as an answer: `None` when the listing is not resident.
+    fn resolve_child_cached(&mut self, dir: &Path, name: &str) -> Option<Child> {
+        let (files, pos) = self.find_child(dir, name)?;
+        Some(match pos {
+            Some(i) => Child::Found(files[i].clone()),
+            None => Child::Absent,
+        })
+    }
+
+    /// Non-blocking: has the in-flight listing of `dir` streamed `name` yet?
+    /// Searches by reference and clones only the one entry found. When the
+    /// stream has ended it is promoted into the dir cache here, so the caller's
+    /// next `find_child` gives the complete answer.
+    fn pending_find(&mut self, dir: &Path, name: &str) -> PendingLookup {
+        let Some(p) = self.pending_dirs.get_mut(dir) else { return PendingLookup::NoFetch };
+        let (got_new, disconnected) = p.drain();
+        p.index.extend(&p.entries);
+        if let Some(i) = p.index.find(&p.entries, name) {
+            return PendingLookup::Found(p.entries[i].clone());
+        }
+        if !disconnected {
+            if got_new {
+                self.pending_notify.1.notify_all();
+            }
+            return PendingLookup::Streaming;
+        }
+        // The entry channel closes a moment before the worker sends the result:
+        // promoting now would cache a listing that may have broken off
+        // mid-stream as complete, and answer "absent" for what never arrived.
+        match p.etag_rx.try_recv() {
+            Ok(Ok(etag)) => p.etag = etag,
+            Ok(Err(e)) => p.failed = Some(e),
+            Err(mpsc::TryRecvError::Empty) => return PendingLookup::Streaming,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                p.failed.get_or_insert_with(|| "listing ended without a result".to_string());
+            }
+        }
+        match self.promote_pending(dir) {
+            Ok(_) => PendingLookup::Finished,
+            Err(e) => PendingLookup::Failed(e),
+        }
+    }
+
     /// Returns the NC oc:permissions string for a directory by looking it up in its
     /// parent's cached listing.  Returns None if the entry is not yet cached (in
     /// which case the caller should allow the operation and let the server enforce).
@@ -1416,6 +1616,7 @@ impl FsCache {
             refreshing: false, invalidated: false, hard_expired: false,
             expiry_retry_after: None,
             last_access: AtomicU64::new(next_access_tick()),
+            name_index: None,
         });
         self.evict_dir_cache();
     }
@@ -1511,6 +1712,7 @@ impl FsCache {
             etag: None,
             self_entry: None,
             failed: None,
+            index: NameIndex::default(),
         });
     }
 
@@ -1946,6 +2148,7 @@ fn load_dir_cache(cache: &Mutex<FsCache>) {
             invalidated: false,
             hard_expired: false,
             expiry_retry_after: None,
+            name_index: None,
         });
         count += 1;
     }
@@ -2293,17 +2496,45 @@ fn soft_refresh_dir(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, path: Pat
     }
 }
 
-fn list_dir_cached_or_fresh(
+/// What starting (or joining) a listing gave: a complete listing at once, or a
+/// fetch in flight to wait on.
+enum ListStart {
+    Ready(Arc<Vec<RemoteEntry>>, Option<RemoteEntry>),
+    InFlight {
+        /// Another reader's fetch was already running.
+        joined: bool,
+        /// The cached listing behind it is untrusted (invalidated or hard-expired),
+        /// so a partial stream snapshot must not be served in its place.
+        was_invalidated: bool,
+    },
+}
+
+/// Time left before `deadline`, capped at `cap`; `cap` itself without one.
+fn remaining(deadline: Option<Instant>, cap: Duration) -> Duration {
+    deadline.map_or(cap, |d| d.saturating_duration_since(Instant::now()).min(cap))
+}
+
+/// Everything `list_dir_cached_or_fresh` does before it waits: serve a cached
+/// (or, offline / backing off, a stale) listing, confirm a hard-expired one by
+/// etag, or start the streaming fetch — joining one already in flight rather
+/// than starting a duplicate. Shared with the child resolver
+/// (`resolve_child_slow`), which waits on the stream its own way.
+///
+/// `deadline` bounds the waits that happen here (the offline grace and the
+/// etag probe) for a caller with a single overall deadline; `None` keeps each
+/// at its own full timeout.
+fn list_dir_start(
     conn: &Arc<ConnInfo>,
     cache: &Arc<Mutex<FsCache>>,
-    path: PathBuf,
+    path: &Path,
     dir_maps: Option<DirDetailArcs>,
-) -> Result<(Arc<Vec<RemoteEntry>>, Option<RemoteEntry>), String> {
+    deadline: Option<Instant>,
+) -> Result<ListStart, String> {
     if conn.is_offline.load(Ordering::Relaxed) {
         {
             let c = cache.safe_lock();
-            if let Some(entry) = c.dir_cache.get(&path) {
-                return Ok((Arc::clone(&entry.files), entry.self_entry.clone()));
+            if let Some(entry) = c.dir_cache.get(path) {
+                return Ok(ListStart::Ready(Arc::clone(&entry.files), entry.self_entry.clone()));
             }
         }
         // Not cached, so failing here renders the directory empty in a file
@@ -2313,7 +2544,7 @@ fn list_dir_cached_or_fresh(
         // this listing the same blip grace a read gets instead of trusting a
         // flag that may already be stale. A sustained outage still fails fast:
         // past the grace window wait_out_offline_blip returns immediately.
-        if !wait_out_offline_blip(conn) {
+        if !wait_out_offline_blip_until(conn, deadline) {
             return Err(format!("{} not available offline", path.display()));
         }
         // Back online — fall through to a real listing.
@@ -2323,38 +2554,38 @@ fn list_dir_cached_or_fresh(
     let max_stale = effective_max_stale(conn.dir_cache_max_stale, &conn.notify_push_connected);
     {
         let mut c = cache.safe_lock();
-        if let Some((files, needs_refresh)) = c.get_cached_dir(&path, ttl, max_stale) {
-            let self_entry = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
+        if let Some((files, needs_refresh)) = c.get_cached_dir(path, ttl, max_stale) {
+            let self_entry = c.dir_cache.get(path).and_then(|e| e.self_entry.clone());
             log::info!("LIST_CACHED {} ({} entries, refresh={}) in {:?}", path.display(), files.len(), needs_refresh, t0.elapsed());
             if needs_refresh {
                 let now = Instant::now();
-                if conn.breaker.is_open(now) || conn.backoff.blocked(&path, now).is_some() {
+                if conn.breaker.is_open(now) || conn.backoff.blocked(path, now).is_some() {
                     // Serving what we have is the whole point of backing off.
-                    c.clear_refreshing(&path);
+                    c.clear_refreshing(path);
                 } else {
                     let submitted = {
                         let conn = conn.clone();
                         let cache = cache.clone();
-                        let path = path.clone();
+                        let path = path.to_path_buf();
                         let dm = dir_maps;
                         bg::LISTING.submit(move || soft_refresh_dir(&conn, &cache, path, dm))
                     };
                     if submitted.is_err() {
-                        c.clear_refreshing(&path);
+                        c.clear_refreshing(path);
                     }
                 }
             }
-            return Ok((files, self_entry));
+            return Ok(ListStart::Ready(files, self_entry));
         }
     }
     // This directory just failed on the server: don't ask again until its
     // cooldown passes. Any listing we hold — even one marked stale — beats an
     // error, and without one the caller gets a fast "try again" (EAGAIN).
-    if let Some((left, code)) = conn.backoff.blocked(&path, Instant::now()) {
+    if let Some((left, code)) = conn.backoff.blocked(path, Instant::now()) {
         let c = cache.safe_lock();
-        if let Some(entry) = c.dir_cache.get(&path) {
+        if let Some(entry) = c.dir_cache.get(path) {
             log::debug!("LIST_BACKOFF_STALE {} — serving the cached listing for {:?} more", path.display(), left);
-            return Ok((Arc::clone(&entry.files), entry.self_entry.clone()));
+            return Ok(ListStart::Ready(Arc::clone(&entry.files), entry.self_entry.clone()));
         }
         return Err(format!("{}{}: {} (cooling down {:?} after a server error)",
             backend::SERVER_ERROR_PREFIX, code, path.display(), left));
@@ -2367,7 +2598,7 @@ fn list_dir_cached_or_fresh(
     // of a full re-list. Only a mismatch (or a failed probe) falls through to one.
     let expired_etag = {
         let mut c = cache.safe_lock();
-        match c.dir_cache.get_mut(&path) {
+        match c.dir_cache.get_mut(path) {
             // `refreshing` doubles as the single-prober guard: a second reader racing
             // on the same directory goes straight to the full listing and joins the
             // in-flight PROPFIND there rather than issuing a duplicate probe.
@@ -2382,114 +2613,127 @@ fn list_dir_cached_or_fresh(
         }
     };
     if let Some(old_etag) = expired_etag {
-        // Reached from lookup/getattr/readdir on the FUSE dispatch thread.
-        let probe = match conn.throttle.acquire_timeout(PROPFIND_TIMEOUT) {
-            Some(_permit) => conn.backend.dir_change_token(&path, PROPFIND_TIMEOUT),
-            None => Err(backend::BackendReadError::Timeout),
+        // Runs on a pool worker (readdir, meta), never the FUSE dispatch thread.
+        let budget = remaining(deadline, PROPFIND_TIMEOUT);
+        let probe = match conn.throttle.acquire_timeout(budget) {
+            Some(_permit) if !budget.is_zero() => conn.backend.dir_change_token(path, remaining(deadline, PROPFIND_TIMEOUT)),
+            _ => Err(backend::BackendReadError::Timeout),
         };
         match &probe {
-            Ok(_) => note_listing_outcome(conn, &path, Ok(())),
-            Err(e) => note_listing_outcome(conn, &path, Err(&e.to_string())),
+            Ok(_) => note_listing_outcome(conn, path, Ok(())),
+            Err(e) => note_listing_outcome(conn, path, Err(&e.to_string())),
         }
         let mut c = cache.safe_lock();
         match probe {
             Ok(Some(ref new_etag)) if *new_etag == old_etag => {
-                let confirmed = c.confirm_dir_fresh(&path);
-                c.clear_refreshing(&path);
+                let confirmed = c.confirm_dir_fresh(path);
+                c.clear_refreshing(path);
                 if confirmed {
-                    if let Some(entry) = c.dir_cache.get(&path) {
+                    if let Some(entry) = c.dir_cache.get(path) {
                         log::info!("LIST_ETAG_CONFIRMED {} ({} entries) in {:?}", path.display(), entry.files.len(), t0.elapsed());
-                        return Ok((Arc::clone(&entry.files), entry.self_entry.clone()));
+                        return Ok(ListStart::Ready(Arc::clone(&entry.files), entry.self_entry.clone()));
                     }
                 }
                 // Invalidated while the probe was in flight — re-list after all.
             }
             Ok(_) => {
                 log::info!("LIST_ETAG_CHANGED {} — re-listing before serving", path.display());
-                c.clear_refreshing(&path);
+                c.clear_refreshing(path);
             }
             Err(e) => {
                 log::debug!("expiry etag check {}: {}", path.display(), e);
-                c.clear_refreshing(&path);
+                c.clear_refreshing(path);
             }
-        }
-    }
-
-    // Check if there's already an in-progress incremental fetch
-    {
-        let mut c = cache.safe_lock();
-        match c.get_pending_snapshot(&path) {
-            Err(e) => return Err(e),
-            // The freshness check comes after the call, not before: a completed fetch
-            // is promoted by get_pending_snapshot itself, and that promotion clears
-            // the flags — so what matters is whether the listing is trusted *now*.
-            Ok(Some(snapshot)) if c.may_serve_pending_snapshot(&path) => {
-                let self_entry = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
-                return Ok((Arc::new(snapshot), self_entry));
-            }
-            Ok(_) => {}
         }
     }
 
     // Start incremental streaming fetch — unless another thread already started one
-    let (already_pending, was_invalidated) = {
-        let mut c = cache.safe_lock();
-        // Both invalidated and hard-expired dirs still hold a stale listing that
-        // readdir's continuation pages read directly, so a partial stream snapshot
-        // must not be served for them: wait for the full listing to be promoted.
-        let was_inv = c.dir_cache.get(&path).map_or(false, |e| e.invalidated || e.hard_expired);
-        if c.dir_cache.contains_key(&path) {
-            if let Some((files, _)) = c.get_cached_dir(&path, ttl, max_stale) {
-                let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
-                return Ok((files, se));
+    let mut c = cache.safe_lock();
+    // Both invalidated and hard-expired dirs still hold a stale listing that
+    // readdir's continuation pages read directly, so a partial stream snapshot
+    // must not be served for them: wait for the full listing to be promoted.
+    let was_invalidated = c.dir_cache.get(path).map_or(false, |e| e.invalidated || e.hard_expired);
+    if c.dir_cache.contains_key(path) {
+        if let Some((files, _)) = c.get_cached_dir(path, ttl, max_stale) {
+            let se = c.dir_cache.get(path).and_then(|e| e.self_entry.clone());
+            return Ok(ListStart::Ready(files, se));
+        }
+    }
+    if c.pending_dirs.contains_key(path) {
+        return Ok(ListStart::InFlight { joined: true, was_invalidated });
+    }
+    let (entry_tx, entry_rx) = mpsc::channel();
+    let (etag_tx, etag_rx) = mpsc::channel::<Result<Option<String>, String>>();
+    let (self_tx, self_rx) = mpsc::channel();
+    c.start_pending(path.to_path_buf(), entry_rx, etag_rx, self_rx);
+
+    let conn2 = conn.clone();
+    let path2 = path.to_path_buf();
+    let pending_notify2 = c.pending_notify.clone();
+    // The worker owns the senders: the pending entry stays "in flight"
+    // (its channel connected) for exactly as long as the fetch is queued
+    // or running, which is what lets later readers join instead of
+    // starting a duplicate.
+    let submitted = bg::LISTING.submit(move || {
+        let result = match conn2.throttle.acquire_timeout(PROPFIND_TIMEOUT) {
+            Some(_permit) => conn2.backend
+                .list_dir_streaming(&path2, PROPFIND_TIMEOUT, entry_tx, self_tx)
+                .map_err(|e| e.to_string()),
+            None => Err(format!("PROPFIND timeout for {} (no request slot)", path2.display())),
+        };
+        match &result {
+            Ok(_) => note_listing_outcome(&conn2, &path2, Ok(())),
+            Err(e) => {
+                note_listing_outcome(&conn2, &path2, Err(e));
+                // readdir reports the same failure to the user; keep this one quiet.
+                log::debug!("incremental list {}: {}", path2.display(), e);
             }
         }
-        (if c.pending_dirs.contains_key(&path) {
-            true
-        } else {
-            let (entry_tx, entry_rx) = mpsc::channel();
-            let (etag_tx, etag_rx) = mpsc::channel::<Result<Option<String>, String>>();
-            let (self_tx, self_rx) = mpsc::channel();
-            c.start_pending(path.clone(), entry_rx, etag_rx, self_rx);
-
-            let conn2 = conn.clone();
-            let path2 = path.clone();
-            let pending_notify2 = c.pending_notify.clone();
-            // The worker owns the senders: the pending entry stays "in flight"
-            // (its channel connected) for exactly as long as the fetch is queued
-            // or running, which is what lets later readers join instead of
-            // starting a duplicate.
-            let submitted = bg::LISTING.submit(move || {
-                let result = match conn2.throttle.acquire_timeout(PROPFIND_TIMEOUT) {
-                    Some(_permit) => conn2.backend
-                        .list_dir_streaming(&path2, PROPFIND_TIMEOUT, entry_tx, self_tx)
-                        .map_err(|e| e.to_string()),
-                    None => Err(format!("PROPFIND timeout for {} (no request slot)", path2.display())),
-                };
-                match &result {
-                    Ok(_) => note_listing_outcome(&conn2, &path2, Ok(())),
-                    Err(e) => {
-                        note_listing_outcome(&conn2, &path2, Err(e));
-                        // readdir reports the same failure to the user; keep this one quiet.
-                        log::debug!("incremental list {}: {}", path2.display(), e);
-                    }
-                }
-                let _ = etag_tx.send(result);
-                // Wake any threads waiting in get_or_list_dir for this path.
-                pending_notify2.1.notify_all();
-            });
-            if submitted.is_err() {
-                // Nothing will ever complete this entry; drop it so the next
-                // reader can try again once the pool has room.
-                c.pending_dirs.remove(&path);
-                return Err(format!("network: listing {} deferred — too many listings in flight", path.display()));
-            }
-            false
-        }, was_inv)
-    };
-    if already_pending {
-        log::info!("LIST_JOIN {} — waiting for existing fetch", path.display());
+        let _ = etag_tx.send(result);
+        // Wake any threads waiting in get_or_list_dir for this path.
+        pending_notify2.1.notify_all();
+    });
+    if submitted.is_err() {
+        // Nothing will ever complete this entry; drop it so the next
+        // reader can try again once the pool has room.
+        c.pending_dirs.remove(path);
+        return Err(format!("network: listing {} deferred — too many listings in flight", path.display()));
     }
+    Ok(ListStart::InFlight { joined: false, was_invalidated })
+}
+
+fn list_dir_cached_or_fresh(
+    conn: &Arc<ConnInfo>,
+    cache: &Arc<Mutex<FsCache>>,
+    path: PathBuf,
+    dir_maps: Option<DirDetailArcs>,
+) -> Result<(Arc<Vec<RemoteEntry>>, Option<RemoteEntry>), String> {
+    let t0 = Instant::now();
+    let ttl = effective_dir_ttl(conn.optimistic_listing, &conn.notify_push_connected);
+    let max_stale = effective_max_stale(conn.dir_cache_max_stale, &conn.notify_push_connected);
+    let was_invalidated = match list_dir_start(conn, cache, &path, dir_maps, None)? {
+        ListStart::Ready(files, self_entry) => return Ok((files, self_entry)),
+        ListStart::InFlight { joined, was_invalidated } => {
+            if joined {
+                // Serve what an already-running fetch has streamed so far.
+                let mut c = cache.safe_lock();
+                match c.get_pending_snapshot(&path) {
+                    Err(e) => return Err(e),
+                    // The freshness check comes after the call, not before: a completed fetch
+                    // is promoted by get_pending_snapshot itself, and that promotion clears
+                    // the flags — so what matters is whether the listing is trusted *now*.
+                    Ok(Some(snapshot)) if c.may_serve_pending_snapshot(&path) => {
+                        let self_entry = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
+                        return Ok((Arc::new(snapshot), self_entry));
+                    }
+                    Ok(_) => {}
+                }
+                drop(c);
+                log::info!("LIST_JOIN {} — waiting for existing fetch", path.display());
+            }
+            was_invalidated
+        }
+    };
 
     // Block until first entries arrive or PROPFIND completes/times out.
     let deadline = Instant::now() + PROPFIND_TIMEOUT;
@@ -2498,15 +2742,32 @@ fn list_dir_cached_or_fresh(
     loop {
         {
             let mut c = cache.safe_lock();
-            match c.get_pending_snapshot(&path) {
-                Err(e) => return Err(e),
-                Ok(Some(snapshot)) if !snapshot.is_empty() && !was_invalidated => {
-                    if poll_iters > 2 { log::debug!("LIST_STREAM_WAIT {} iters before stream", poll_iters); }
-                    log::info!("LIST_STREAM {} ({} entries) in {:?}", path.display(), snapshot.len(), t0.elapsed());
-                    let se = c.pending_dirs.get(&path).and_then(|p| p.self_entry.clone());
-                    return Ok((Arc::new(snapshot), se));
+            // Only copy the partial listing when it is about to be served: an
+            // untrusted listing waits for the promotion, and cloning the whole
+            // snapshot on every wake-up (what this did) held the global cache
+            // lock for O(entries) per waiter per 50 ms.
+            let progress = match c.pending_dirs.get_mut(&path) {
+                Some(p) => {
+                    let (got_new, disconnected) = p.drain();
+                    Some((!p.entries.is_empty(), disconnected, got_new))
                 }
-                Ok(_) => {}
+                None => None,
+            };
+            if progress.is_some_and(|(_, _, got_new)| got_new) {
+                c.pending_notify.1.notify_all();
+            }
+            match progress.map(|(any, done, _)| (any, done)) {
+                Some((_, true)) => {
+                    // The stream ended: promote it (or surface its failure).
+                    c.promote_pending(&path)?;
+                }
+                Some((true, false)) if !was_invalidated => {
+                    let p = c.pending_dirs.get(&path).expect("checked above");
+                    if poll_iters > 2 { log::debug!("LIST_STREAM_WAIT {} iters before stream", poll_iters); }
+                    log::info!("LIST_STREAM {} ({} entries) in {:?}", path.display(), p.entries.len(), t0.elapsed());
+                    return Ok((Arc::new(p.entries.clone()), p.self_entry.clone()));
+                }
+                _ => {}
             }
             if c.dir_cache.get(&path).map_or(false, |e| !e.invalidated && !e.hard_expired) {
                 let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
@@ -2523,8 +2784,8 @@ fn list_dir_cached_or_fresh(
         poll_iters += 1;
         // Wait on condvar instead of fixed sleep so we wake immediately when
         // a pending PROPFIND delivers its first entries or completes.
-        let guard = pending_notify.0.lock().unwrap();
-        let _ = pending_notify.1.wait_timeout(guard, Duration::from_millis(50)).unwrap();
+        let guard = pending_notify.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = pending_notify.1.wait_timeout(guard, Duration::from_millis(50));
     }
 
     // Our wait is over but the fetch may not be. Drain what arrived, and:
@@ -2536,14 +2797,7 @@ fn list_dir_cached_or_fresh(
     //    a slow or failing server snowballed into thousands of threads.
     let mut c = cache.safe_lock();
     let (finished, partial) = if let Some(pending) = c.pending_dirs.get_mut(&path) {
-        let mut disconnected = false;
-        loop {
-            match pending.rx.try_recv() {
-                Ok(entry) => pending.entries.push(entry),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => { disconnected = true; break; }
-            }
-        }
+        let (_, disconnected) = pending.drain();
         (disconnected, (!pending.entries.is_empty()).then(|| (pending.entries.clone(), pending.self_entry.clone())))
     } else {
         (false, None)
@@ -2560,6 +2814,81 @@ fn list_dir_cached_or_fresh(
         log::warn!("PROPFIND timeout {} — no entries yet after {:?}; the fetch stays in flight", path.display(), t0.elapsed());
     }
     Err(format!("PROPFIND timeout for {}", path.display()))
+}
+
+/// How long a child lookup that has to list its parent may take, from the
+/// moment it was submitted. One deadline for the whole resolution — queueing,
+/// the walker wait, the offline grace, the etag probe and the stream — because
+/// a request the daemon has read waits uninterruptibly in the kernel.
+const CHILD_RESOLVE_DEADLINE: Duration = PROPFIND_TIMEOUT;
+
+/// Resolves `name` in `dir` when its listing is not resident: starts or joins
+/// the listing and answers as soon as the name streams in, or once the listing
+/// is complete. Runs on a pool worker; everything it waits on is bounded by
+/// `deadline`.
+///
+/// A listing that is still streaming or failed at the deadline answers
+/// `Unknown`, never `Absent`: the old `parent_listing` answered ENOENT for a
+/// name the partial listing did not have yet, and `find` then reported a file
+/// it had just been shown as missing.
+fn resolve_child_slow(conn: &Arc<ConnInfo>, cache: &Arc<Mutex<FsCache>>, dir: &Path, name: &str, pid: u32, deadline: Instant) -> Child {
+    // A sibling queued behind the same listing answers at once once it lands.
+    if let Some(child) = cache.safe_lock().resolve_child_cached(dir, name) {
+        return child;
+    }
+    // An uncached listing counts against the requester's walker budget, like a
+    // cold readdir does; the wait happens here, on the worker.
+    let wait = conn.walkers.note_uncached(pid, Instant::now());
+    if !wait.is_zero() {
+        thread::sleep(wait.min(deadline.saturating_duration_since(Instant::now())));
+    }
+    match list_dir_start(conn, cache, dir, None, Some(deadline)) {
+        // A complete listing (cached meanwhile, offline, backing off, or
+        // confirmed by etag). Re-read it under the lock for the final answer.
+        Ok(ListStart::Ready(files, _)) => {
+            return cache.safe_lock().resolve_child_cached(dir, name).unwrap_or_else(|| {
+                match scan_for_name(&files, name) {
+                    Some(i) => Child::Found(files[i].clone()),
+                    None => Child::Absent,
+                }
+            });
+        }
+        Ok(ListStart::InFlight { .. }) => {}
+        Err(e) => {
+            log::debug!("resolve {}/{}: listing failed: {}", dir.display(), name, e);
+            // Another reader's fetch may have landed meanwhile.
+            return cache.safe_lock().resolve_child_cached(dir, name).unwrap_or(Child::Unknown(Some(e)));
+        }
+    }
+    let notify = cache.safe_lock().pending_notify.clone();
+    loop {
+        {
+            let mut c = cache.safe_lock();
+            if let Some(child) = c.resolve_child_cached(dir, name) {
+                return child;
+            }
+            match c.pending_find(dir, name) {
+                PendingLookup::Found(e) => return Child::Found(e),
+                PendingLookup::Streaming => {}
+                PendingLookup::Finished => {
+                    return c.resolve_child_cached(dir, name).unwrap_or(Child::Unknown(None));
+                }
+                PendingLookup::Failed(e) => return Child::Unknown(Some(e)),
+                // Finished and consumed by another waiter — which, on failure,
+                // took the error with it.
+                PendingLookup::NoFetch => {
+                    return Child::Unknown(Some("listing ended before the name was seen".to_string()));
+                }
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            log::info!("RESOLVE_TIMEOUT {}/{} — parent still listing at the deadline", dir.display(), name);
+            return Child::Unknown(None);
+        }
+        let guard = notify.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = notify.1.wait_timeout(guard, left.min(Duration::from_millis(50)));
+    }
 }
 
 pub(crate) fn ensure_file_cached(
@@ -3015,6 +3344,41 @@ struct ConnInfo {
     breaker: Arc<backoff::ServerBreaker>,
     /// Per-process accounting and rate limit for uncached listings (see `walkers.rs`).
     walkers: Arc<walkers::WalkerTracker>,
+}
+
+#[cfg(test)]
+impl ConnInfo {
+    /// An online connection to `backend` with default limits, for tests that
+    /// drive the listing machinery without a server.
+    fn for_tests(backend: Arc<dyn crate::backend::CloudBackend>) -> Arc<Self> {
+        let client = || reqwest::blocking::Client::builder().build().expect("test client");
+        let (a, b) = (client(), client());
+        Arc::new(ConnInfo {
+            backend,
+            base_url: "http://test.invalid".into(),
+            webdav_url: "http://test.invalid/remote.php/dav/files/u/".into(),
+            creds: auth::Credentials::Basic { username: "u".into(), password: "p".into() },
+            mount_point: PathBuf::from("/tmp/ncrs-test-mount"),
+            clients: crate::http_clients::HttpClients::new(a.clone(), b.clone(), a, b, false),
+            optimistic_listing: false,
+            dir_cache_max_stale: None,
+            notify_push_connected: Arc::new(AtomicBool::new(false)),
+            throttle: Arc::new(Throttle::new(10)),
+            read_throttle: Arc::new(Throttle::new(3)),
+            prefetch_throttle: Arc::new(Throttle::new(5)),
+            is_offline: Arc::new(AtomicBool::new(false)),
+            offline_since: Arc::new(Mutex::new(None)),
+            active_streams: Arc::new(AtomicUsize::new(0)),
+            deferred_invalidation: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            passthrough_enabled: Arc::new(AtomicBool::new(false)),
+            passthrough_capable: Arc::new(AtomicBool::new(false)),
+            backoff: Arc::new(backoff::PathBackoff::new()),
+            breaker: Arc::new(backoff::ServerBreaker::new()),
+            walkers: Arc::new(walkers::WalkerTracker::new(false, 10)),
+        })
+    }
 }
 
 /// Clears an in-progress flag on drop, so a panicking worker cannot latch it.
@@ -4107,64 +4471,12 @@ impl NextCloudFs {
         Ok(())
     }
 
-    /// Cached listing for `dir`, re-listing once if it is not resident.
-    ///
-    /// The dir cache is bounded, so a listing an inode was handed out from can
-    /// be gone by the time the kernel asks about that inode again. Every caller
-    /// that used to treat a miss as "does not exist" has to re-list first.
-    fn relist_if_missing(&self, dir: &Path) -> Option<Arc<Vec<RemoteEntry>>> {
-        self.parent_listing(dir, None).ok()
-    }
-
-    /// The listing of `dir` to answer a child lookup from: the cached one if
-    /// resident, else whatever a (possibly joined, still streaming) fetch
-    /// returns. When `want` is named and not in a partial listing yet, waits —
-    /// up to `PROPFIND_TIMEOUT` — for the stream to finish before answering.
-    ///
-    /// Reading the finished-listing cache after `get_or_list_dir` (what this
-    /// used to do) missed every listing still streaming: `find` read a wide
-    /// directory from the partial snapshot, then got ENOENT stat'ing a child
-    /// it had just been shown.
-    fn parent_listing(&self, dir: &Path, want: Option<&str>) -> Result<Arc<Vec<RemoteEntry>>, Option<String>> {
-        if let Some(files) = self.cache.safe_lock().get_cached_dir_readonly(dir) {
-            return Ok(files);
+    /// `name` in `dir`: from the resident listing, else by listing `dir`.
+    fn child_blocking(&self, pid: u32, dir: &Path, name: &str) -> Child {
+        if let Some(child) = self.cache.safe_lock().resolve_child_cached(dir, name) {
+            return child;
         }
-        let files = match get_or_list_dir(&self.conn, &self.cache, dir.to_path_buf(), None) {
-            Ok((files, _)) => files,
-            Err(e) => {
-                log::debug!("re-list {} failed: {}", dir.display(), e);
-                // A listing may have landed meanwhile (another reader's fetch).
-                return self.cache.safe_lock().get_cached_dir_readonly(dir).ok_or(Some(e));
-            }
-        };
-        let Some(name) = want else { return Ok(files) };
-        let has = |f: &[RemoteEntry]| f.iter().any(|e| e.path.file_name().and_then(|n| n.to_str()) == Some(name));
-        if has(&files) {
-            return Ok(files);
-        }
-        let deadline = Instant::now() + PROPFIND_TIMEOUT;
-        let notify = self.cache.safe_lock().pending_notify.clone();
-        loop {
-            {
-                let mut c = self.cache.safe_lock();
-                if let Some(done) = c.get_cached_dir_readonly(dir) {
-                    return Ok(done);
-                }
-                match c.get_pending_snapshot(dir) {
-                    Ok(Some(partial)) if has(&partial) => return Ok(Arc::new(partial)),
-                    Ok(Some(_)) => {}
-                    // No fetch in flight any more and nothing cached: the partial
-                    // listing we got is all there is.
-                    Ok(None) => return Ok(files),
-                    Err(e) => return Err(Some(e)),
-                }
-            }
-            if Instant::now() >= deadline {
-                return Ok(files);
-            }
-            let guard = notify.0.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = notify.1.wait_timeout(guard, Duration::from_millis(50));
-        }
+        resolve_child_slow(&self.conn, &self.cache, dir, name, pid, Instant::now() + CHILD_RESOLVE_DEADLINE)
     }
 
     fn readdir_common(&self, pid: u32, ino: INodeNo, fh: u64, offset: u64, reply: DirReply) {
@@ -4707,18 +5019,16 @@ impl Filesystem for NextCloudFs {
             ghosts.remove(&full_path);
         }
 
-        let entries = match self.parent_listing(&parent_path, Some(&name_str)) {
-            Ok(files) => files,
+        let entry = match self.child_blocking(_req.pid(), &parent_path, &name_str) {
+            Child::Found(e) => e,
+            Child::Absent => { reply.error(Errno::ENOENT); return; }
             // We don't know the parent's contents, so we can't say the name is
-            // absent: a walker told ENOENT believes it, while EAGAIN/EIO says "ask later".
-            Err(e) => { reply.error(relist_errno(e.as_deref())); return; }
+            // absent: a walker told ENOENT believes it, while EAGAIN says "ask later".
+            Child::Unknown(e) => { reply.error(unknown_child_errno(e.as_deref())); return; }
         };
 
-        let found = entries.iter().find(|e| {
-            e.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == name_str
-        });
-
-        if let Some(entry) = found {
+        {
+            let entry = &entry;
             let target_path = parent_path.join(&name_str);
             let ino = self.cache.safe_lock().allocate_inode(target_path.clone());
             let attr = make_file_attr(ino, entry);
@@ -4745,9 +5055,7 @@ impl Filesystem for NextCloudFs {
                 self.status.safe_write().entry(target_path).or_insert(FileStatus::Remote);
             }
             reply.entry(&TTL, &attr, Generation(0));
-            return;
         }
-        reply.error(Errno::ENOENT);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -4801,13 +5109,11 @@ impl Filesystem for NextCloudFs {
         // out fail every stat(), which a file manager renders as an empty folder.
         let entries = match cached {
             Some(files) => files,
-            None => {
-                let want = path.file_name().and_then(|n| n.to_str()).map(str::to_string);
-                match self.parent_listing(&parent, want.as_deref()) {
-                    Ok(files) => files,
-                    Err(e) => { reply.error(relist_errno(e.as_deref())); return; }
-                }
-            }
+            None => match self.child_blocking(_req.pid(), &parent, &file_name) {
+                Child::Found(entry) => { reply.attr(&TTL, &make_file_attr(ino.0, &entry)); return; }
+                Child::Absent => { reply.error(Errno::ENOENT); return; }
+                Child::Unknown(e) => { reply.error(unknown_child_errno(e.as_deref())); return; }
+            },
         };
 
         for entry in entries.iter() {
@@ -4836,13 +5142,10 @@ impl Filesystem for NextCloudFs {
         // An evicted parent listing must not turn into ENODATA: without
         // user.xdg.mime.type GLib falls back to magic-byte sniffing, which
         // downloads the file just to identify it.
-        let entries = match self.relist_if_missing(&parent) {
-            Some(e) => e,
-            None => { reply.error(Errno::ENODATA); return; }
+        let ct = match self.child_blocking(_req.pid(), &parent, &file_name) {
+            Child::Found(e) => e.content_type,
+            Child::Absent | Child::Unknown(_) => None,
         };
-        let ct = entries.iter()
-            .find(|e| e.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == file_name)
-            .and_then(|e| e.content_type.clone());
         match ct {
             Some(ct) => {
                 let bytes = ct.as_bytes().to_vec();
@@ -4865,14 +5168,10 @@ impl Filesystem for NextCloudFs {
         };
         let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        let entries = match self.relist_if_missing(&parent) {
-            Some(e) => e,
-            None => { if size == 0 { reply.size(0); } else { reply.data(b""); } return; }
+        let has_ct = match self.child_blocking(_req.pid(), &parent, &file_name) {
+            Child::Found(e) => e.content_type.is_some(),
+            Child::Absent | Child::Unknown(_) => false,
         };
-        let has_ct = entries.iter()
-            .find(|e| e.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == file_name)
-            .map(|e| e.content_type.is_some())
-            .unwrap_or(false);
         let mut list: Vec<u8> = Vec::new();
         if has_ct {
             for name in desktop::policy().sniff_probes.iter().filter_map(|p| p.xattr) {
@@ -5975,11 +6274,12 @@ impl Filesystem for NextCloudFs {
                 // The parent listing can have been evicted since this inode was
                 // handed out; re-list rather than answer from nothing.
                 lookup_entry(p).or_else(|| {
-                    let parent = p.parent().unwrap_or(Path::new("/")).to_path_buf();
-                    if let Err(e) = get_or_list_dir(&self.conn, &self.cache, parent.clone(), None) {
-                        log::debug!("setattr: re-list {} failed: {}", parent.display(), e);
+                    let parent = p.parent().unwrap_or(Path::new("/"));
+                    let name = p.file_name().and_then(|n| n.to_str())?;
+                    match self.child_blocking(_req.pid(), parent, name) {
+                        Child::Found(e) => Some(e),
+                        _ => None,
                     }
-                    lookup_entry(p)
                 })
             });
             let mut attr = match entry {
