@@ -284,7 +284,22 @@ pub const THUMB_WORKERS: usize = 2;
 pub static USER: Pool = Pool::new("user", USER_WORKERS, 4096);
 pub const USER_WORKERS: usize = 4;
 
-pub static POOLS: [&Pool; 11] = [&READDIR, &META, &READ, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER];
+/// Chunk graduation of a streamed upload: the `write()` that fills a 10 MB
+/// chunk PUTs it (with retries) here, holding its reply. Small, so a big copy
+/// can't starve `META`/`READ`; a handle's writes queue behind its own
+/// graduation in its lane (`fh_lane.rs`), never behind another file's.
+pub static UPLOAD: Pool = Pool::new("upload", UPLOAD_WORKERS, 1024);
+pub const UPLOAD_WORKERS: usize = 4;
+
+/// Local-disk work that used to run on the dispatch thread: seeding a
+/// staging file from a kept copy on the first write or truncate, `flush` and
+/// `fsync` of a staging file (the reply travels with the job), and the
+/// journal's group commit. A handle has at most one job in flight (its
+/// lane) and the journal saver at most one, so the queue stays short.
+pub static DISK: Pool = Pool::new("disk", DISK_WORKERS, 4096);
+pub const DISK_WORKERS: usize = 4;
+
+pub static POOLS: [&Pool; 13] = [&READDIR, &META, &READ, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER, &UPLOAD, &DISK];
 
 /// Named long-lived threads: the FUSE session, connectivity monitor, push
 /// watcher, IPC accept loop, savers, cleanup. Fixed in number.
@@ -321,7 +336,7 @@ pub const MAX_THREADS: usize = {
 /// fixed handful (metadata, transfers, previews, push). Generous upper bound.
 pub const MAX_HTTP_CLIENT_THREADS: usize = 8;
 
-const POOL_SIZES: [usize; 11] = [
+const POOL_SIZES: [usize; 13] = [
     READDIR_WORKERS,
     META_WORKERS,
     READ_WORKERS,
@@ -333,6 +348,8 @@ const POOL_SIZES: [usize; 11] = [
     HOUSEKEEPING_WORKERS,
     THUMB_WORKERS,
     USER_WORKERS,
+    UPLOAD_WORKERS,
+    DISK_WORKERS,
 ];
 
 /// A lifetime cap on how many threads a class may ever start.
