@@ -3191,6 +3191,8 @@ mod upload_order_tests {
         struct FakeBackend {
             dirs: Mutex<HashMap<PathBuf, FakeDir>>,
             lists: AtomicUsize,
+            /// Content served by `download_file`, after the given pause.
+            files: Mutex<HashMap<PathBuf, (Vec<u8>, Duration)>>,
         }
 
         impl FakeBackend {
@@ -3230,8 +3232,11 @@ mod upload_order_tests {
             fn dir_change_token(&self, _: &Path, _: Duration) -> Result<Option<String>, backend::BackendReadError> {
                 Err(unsupported())
             }
-            fn download_file(&self, _: &Path, _: &mut dyn std::io::Write, _: Duration) -> Result<u64, backend::BackendReadError> {
-                Err(unsupported())
+            fn download_file(&self, path: &Path, out: &mut dyn std::io::Write, _: Duration) -> Result<u64, backend::BackendReadError> {
+                let (bytes, pause) = self.files.lock().unwrap().get(path).cloned().ok_or_else(unsupported)?;
+                std::thread::sleep(pause);
+                out.write_all(&bytes).map_err(|e| backend::BackendReadError::Network(e.to_string()))?;
+                Ok(bytes.len() as u64)
             }
             fn read_file_range(&self, _: &Path, _: u64, _: &mut [u8], _: Duration) -> Result<usize, backend::BackendReadError> {
                 Err(unsupported())
@@ -3402,6 +3407,398 @@ mod upload_order_tests {
                 let (r, on) = rx.recv_timeout(Duration::from_secs(10)).expect("every slow resolver is answered by its deadline");
                 assert_eq!(on, "ncrs-meta");
                 assert!(matches!(r, Resolved::Unknown(None)), "a name not streamed by the deadline is unknown, never absent");
+            }
+        }
+
+        // ── open(): registration, staging, and the evicted-parent cases ─────
+
+        #[derive(Debug, PartialEq)]
+        enum OpenOutcome {
+            Opened(u64),
+            Error(i32),
+        }
+
+        struct TestReply(mpsc::Sender<OpenOutcome>);
+
+        impl OpenAnswer for TestReply {
+            fn error(self, e: Errno) {
+                let _ = self.0.send(OpenOutcome::Error(e.code()));
+            }
+            fn opened(self, fh: u64, _: iomode::IoGrant<BackingId>) {
+                let _ = self.0.send(OpenOutcome::Opened(fh));
+            }
+            fn open_backing(&self, _: std::fs::File) -> std::io::Result<BackingId> {
+                Err(std::io::Error::other("no passthrough in tests"))
+            }
+        }
+
+        fn reply() -> (TestReply, mpsc::Receiver<OpenOutcome>) {
+            let (tx, rx) = mpsc::channel();
+            (TestReply(tx), rx)
+        }
+
+        /// A MetaCtx over `fake` whose staging files go to a fresh directory,
+        /// with `/d/a.txt` (5 bytes on the server) listed and given an inode.
+        fn open_setup(dirs: Vec<(&str, FakeDir)>, list_parent: bool) -> (Arc<FakeBackend>, MetaCtx, tempfile::TempDir, u64) {
+            let (fake, conn, cache) = setup(dirs);
+            let tmp = tempfile::tempdir().unwrap();
+            let ino = {
+                let mut c = cache.safe_lock();
+                c.cache_dir = tmp.path().to_path_buf();
+                if list_parent {
+                    let mut e = entry_in("/d", "a.txt");
+                    e.size = 5;
+                    c.put_dir_cache(PathBuf::from("/d"), None, None, vec![e]);
+                }
+                c.allocate_inode(PathBuf::from("/d/a.txt"))
+            };
+            fake.files.lock().unwrap().insert(PathBuf::from("/d/a.txt"), (b"hello".to_vec(), Duration::from_millis(400)));
+            (fake, MetaCtx::for_tests(conn, cache, Duration::from_millis(400)), tmp, ino)
+        }
+
+        fn rq(ino: u64, path: &str, flags: i32, local: Option<PathBuf>) -> OpenReq {
+            let writable = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
+            OpenReq { ino, flags, pid: 0, writable, truncating: writable && flags & libc::O_TRUNC != 0, path: PathBuf::from(path), local }
+        }
+
+        fn listed(size: u64) -> OpenEntry {
+            let mut e = entry_in("/d", "a.txt");
+            e.size = size;
+            OpenEntry::of(&e)
+        }
+
+        fn fh_of(o: OpenOutcome) -> u64 {
+            match o {
+                OpenOutcome::Opened(fh) => fh,
+                other => panic!("expected an open, got {other:?}"),
+            }
+        }
+
+        /// Nothing an open took is still held: no handle, writer, pin or io mode.
+        fn assert_all_given_back(meta: &MetaCtx, ino: u64) {
+            assert!(meta.open_files.safe_lock().is_empty(), "handle left registered");
+            assert_eq!(meta.open_writers.load(Ordering::SeqCst), 0, "writer count leaked");
+            assert!(meta.cache.safe_lock().pins.is_empty(), "parent pin leaked");
+            let _ = ino;
+        }
+
+        #[test]
+        fn a_writable_open_is_registered_before_staging_so_unlink_and_rename_find_it() {
+            let (_, meta, _tmp, ino) = open_setup(vec![], true);
+
+            // rename while the content downloads: the handle follows it.
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+            assert!(rx.try_recv().is_err(), "a seeded open is answered after staging, off this thread");
+            {
+                let files = meta.open_files.safe_lock();
+                let of = files.values().next().expect("registered before staging");
+                assert!(!of.dirty, "a staging handle must not look written");
+                assert!(!of.stream_eligible);
+            }
+            assert_eq!(meta.open_writers.load(Ordering::SeqCst), 1);
+            assert_eq!(meta.cache.safe_lock().pins.get(Path::new("/d")), Some(&1));
+            meta.cache.safe_lock().move_inode(Path::new("/d/a.txt"), Path::new("/d/b.txt"));
+            retarget_open_files(&meta.open_files, Path::new("/d/a.txt"), Path::new("/d/b.txt"));
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            {
+                let files = meta.open_files.safe_lock();
+                let of = &files[&fh];
+                assert_eq!(of.remote_path, PathBuf::from("/d/b.txt"), "release would write to the old path");
+                assert_eq!(std::fs::read(of.write_path.as_ref().unwrap()).unwrap(), b"hello");
+                assert_eq!(of.original_etag.as_deref(), Some("etag1"));
+            }
+            meta.open_files.safe_lock().clear();
+
+            // unlink while the content downloads: release must not PUT it back.
+            meta.cache.safe_lock().move_inode(Path::new("/d/b.txt"), Path::new("/d/a.txt"));
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_RDWR, None), listed(5), r, false);
+            mark_unlinked(&meta.open_files, Path::new("/d/a.txt"));
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            assert!(meta.open_files.safe_lock()[&fh].unlinked);
+        }
+
+        #[test]
+        fn a_rename_before_the_handle_is_registered_is_read_from_the_inode_map() {
+            let (_, meta, _tmp, ino) = open_setup(vec![], true);
+            // The rename ran while open() was resolving: the inode moved, but
+            // there was no handle yet for rename() to retarget.
+            meta.cache.safe_lock().move_inode(Path::new("/d/a.txt"), Path::new("/e/a.txt"));
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY, None), listed(0), r, false);
+            let fh = fh_of(rx.try_recv().expect("an empty file needs no staging: answered inline"));
+            let files = meta.open_files.safe_lock();
+            assert_eq!(files[&fh].remote_path, PathBuf::from("/e/a.txt"));
+            assert_eq!(files[&fh].pinned_parent.as_deref(), Some(Path::new("/e")), "the pin follows the file");
+        }
+
+        #[test]
+        fn seeded_and_unseeded_writable_opens() {
+            let (_, meta, tmp, ino) = open_setup(vec![], true);
+            // Unseeded: the server file is empty, nothing to stage.
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY, None), listed(0), r, false);
+            let fh = fh_of(rx.try_recv().expect("inline"));
+            {
+                let files = meta.open_files.safe_lock();
+                assert!(files[&fh].stream_eligible, "an empty staging file may stream from 0");
+                assert!(!files[&fh].write_path.as_ref().unwrap().exists(), "write() creates it on first use");
+            }
+            meta.open_files.safe_lock().clear();
+
+            // Truncating: an empty staging file, dirty from the start.
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_TRUNC, None), listed(5), r, false);
+            let fh = fh_of(rx.try_recv().expect("inline"));
+            {
+                let files = meta.open_files.safe_lock();
+                assert!(files[&fh].dirty);
+                assert_eq!(std::fs::metadata(files[&fh].write_path.as_ref().unwrap()).unwrap().len(), 0);
+            }
+            meta.open_files.safe_lock().clear();
+
+            // Seeded from a fresh local copy: copied, not downloaded.
+            let local = tmp.path().join("kept-a.txt");
+            std::fs::write(&local, b"local").unwrap();
+            meta.cache.safe_lock().file_cache.insert(PathBuf::from("/d/a.txt"), FileCacheEntry {
+                local_path: local.clone(), remote_modified: None, etag: Some("etag1".into()), kept: true, size: 5,
+            });
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, Some(local)), listed(5), r, false);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            let files = meta.open_files.safe_lock();
+            assert_eq!(std::fs::read(files[&fh].write_path.as_ref().unwrap()).unwrap(), b"local");
+            assert!(!files[&fh].stream_eligible);
+        }
+
+        #[test]
+        fn a_failed_staging_gives_back_everything_the_open_took() {
+            let (fake, meta, tmp, ino) = open_setup(vec![], true);
+            fake.files.lock().unwrap().clear();
+            let (r, rx) = reply();
+            open_continue(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), listed(5), r, false);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), OpenOutcome::Error(libc::EIO));
+            assert_all_given_back(&meta, ino);
+            assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "staging file left behind");
+        }
+
+        #[test]
+        fn an_open_the_staging_pool_refuses_gives_back_everything() {
+            // What the EAGAIN arm (and a panicking staging job) runs: the undo
+            // guard, dropped while still armed.
+            let (_, meta, tmp, ino) = open_setup(vec![], true);
+            let wp = tmp.path().join("write_99");
+            std::fs::write(&wp, b"partial").unwrap();
+            let (r, _rx) = reply();
+            let undo = OpenUndo { ctx: meta.clone(), fh: 99, wp: wp.clone(), armed: true };
+            let _grant = open_register(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY, None), listed(5), 99, false, Some(wp.clone()), true, None, &r);
+            assert_eq!(meta.open_writers.load(Ordering::SeqCst), 1);
+            drop(undo);
+            assert_all_given_back(&meta, ino);
+            assert!(!wp.exists());
+        }
+
+        #[test]
+        fn a_writable_open_with_an_unknown_parent_is_refused_unless_it_truncates() {
+            let slow = FakeDir { entries: vec![entry_in("/d", "a.txt")], before_first: Duration::from_secs(3), ..Default::default() };
+            let (_, meta, _tmp, ino) = open_setup(vec![("/d", slow)], false);
+
+            let (r, rx) = reply();
+            open_unlisted(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), r);
+            let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(got, OpenOutcome::Error(libc::ETIMEDOUT), "staging it empty would upload a zero-filled prefix");
+            assert_all_given_back(&meta, ino);
+
+            // A truncating open discards the content anyway.
+            let (r, rx) = reply();
+            open_unlisted(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_TRUNC, None), r);
+            fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+
+        #[test]
+        fn a_writable_open_with_an_unknown_parent_resolves_it_when_it_lands() {
+            let dir = FakeDir { entries: vec![{ let mut e = entry_in("/d", "a.txt"); e.size = 5; e }], before_first: Duration::from_millis(50), ..Default::default() };
+            let (_, meta, _tmp, ino) = open_setup(vec![("/d", dir)], false);
+            let (r, rx) = reply();
+            open_unlisted(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, None), r);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            let files = meta.open_files.safe_lock();
+            assert_eq!(std::fs::read(files[&fh].write_path.as_ref().unwrap()).unwrap(), b"hello", "seeded with the real content");
+        }
+
+        #[test]
+        fn offline_a_kept_copy_with_an_evicted_parent_is_edited_from_the_copy() {
+            let (_, meta, tmp, ino) = open_setup(vec![], false);
+            let local = tmp.path().join("kept-a.txt");
+            std::fs::write(&local, b"kept!").unwrap();
+            meta.cache.safe_lock().file_cache.insert(PathBuf::from("/d/a.txt"), FileCacheEntry {
+                local_path: local.clone(), remote_modified: None, etag: Some("e-kept".into()), kept: true, size: 5,
+            });
+            // Online, a parent listing we cannot get says nothing: refused.
+            let (r, rx) = reply();
+            open_unlisted(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, Some(local.clone())), r);
+            assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), OpenOutcome::Error(_)));
+            assert_all_given_back(&meta, ino);
+
+            meta.conn.is_offline.store(true, Ordering::SeqCst);
+            let (r, rx) = reply();
+            open_unlisted(&meta, rq(ino, "/d/a.txt", libc::O_WRONLY | libc::O_APPEND, Some(local)), r);
+            let fh = fh_of(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            let files = meta.open_files.safe_lock();
+            assert_eq!(std::fs::read(files[&fh].write_path.as_ref().unwrap()).unwrap(), b"kept!");
+            assert_eq!(files[&fh].original_etag.as_deref(), Some("e-kept"), "the replayed upload must still detect a server change");
+        }
+
+        // ── Size overlays ───────────────────────────────────────────────────
+
+        fn writer(meta: &MetaCtx, fh: u64, path: &str, bytes: usize, unlinked: bool) {
+            let wp = meta.cache.safe_lock().cache_dir.join(format!("write_{fh}"));
+            std::fs::write(&wp, vec![b'x'; bytes]).unwrap();
+            let (r, _rx) = reply();
+            let _ = open_register(meta, rq(0, path, libc::O_WRONLY, None), OpenEntry::default(), fh, false, Some(wp), false, None, &r);
+            let mut files = meta.open_files.safe_lock();
+            let of = files.get_mut(&fh).unwrap();
+            of.dirty = true;
+            of.unlinked = unlinked;
+        }
+
+        #[test]
+        fn the_local_size_overlay_takes_the_largest_live_writer() {
+            let (_, meta, _tmp, _) = open_setup(vec![], true);
+            let e = { let mut e = entry_in("/d", "a.txt"); e.size = 5; e };
+            let attr = |meta: &MetaCtx| {
+                let mut a = make_file_attr(7, &e);
+                overlay_local_size(meta, Path::new("/d/a.txt"), &mut a);
+                a.size
+            };
+            assert_eq!(attr(&meta), 5, "no writer: the listing's size");
+            writer(&meta, 1, "/d/a.txt", 10, false);
+            writer(&meta, 2, "/d/a.txt", 30, false);
+            writer(&meta, 3, "/d/a.txt", 99, true);
+            writer(&meta, 4, "/d/other.txt", 77, false);
+            assert_eq!(attr(&meta), 30, "largest writer, skipping the unlinked one and other files");
+        }
+
+        #[test]
+        fn an_upload_in_flight_overlays_its_size_on_the_listing() {
+            let mut c = make_test_cache();
+            let e = { let mut e = entry_in("/d", "a.txt"); e.size = 5; e };
+            c.uploading.insert(PathBuf::from("/d/a.txt"), Some(4096));
+            assert_eq!(attr_for(&c, 7, Path::new("/d/a.txt"), &e).size, 4096);
+            assert_eq!(attr_for(&c, 7, Path::new("/d/a.txt"), &e).blocks, 8);
+            c.uploading.insert(PathBuf::from("/d/a.txt"), None);
+            assert_eq!(attr_for(&c, 7, Path::new("/d/a.txt"), &e).size, 5, "unknown upload size keeps the listing's");
+        }
+
+        // ── Answers that must reflect an unlink during the wait ─────────────
+
+        #[test]
+        fn a_slow_lookup_of_a_name_deleted_meanwhile_is_absent() {
+            let cold = FakeDir { entries: names("/cold", 3), before_first: Duration::from_millis(300), ..Default::default() };
+            let (_, conn, cache) = setup(vec![("/cold", cold)]);
+            let meta = MetaCtx::for_tests(conn, cache, Duration::from_secs(5));
+            let rx = ask(&meta, "/cold/f1.txt");
+            // unlink() while the worker waits on the listing.
+            meta.cache.safe_lock().deleting.insert(PathBuf::from("/cold/f1.txt"));
+            let (r, _) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(r, Resolved::Absent), "a deleted name must not be answered from the listing");
+        }
+
+        #[test]
+        fn a_lookup_committed_after_an_unlink_does_not_bring_its_maps_back() {
+            let (_, conn, cache) = setup(vec![]);
+            cache.safe_lock().put_dir_cache(PathBuf::from("/d"), None, None, names("/d", 3));
+            let meta = MetaCtx::for_tests(conn, cache, Duration::from_secs(5));
+            let hit = |meta: &MetaCtx, name: &str| {
+                let mut c = meta.cache.safe_lock();
+                let e = c.find_child(Path::new("/d"), name).and_then(|(f, i)| i.map(|i| f[i].clone())).unwrap();
+                lookup_pick(&mut c, &Path::new("/d").join(name), &e)
+            };
+            assert!(matches!(lookup_commit(&meta, hit(&meta, "f0.txt")), LookupAnswer::Entry(_)));
+            assert!(meta.details.safe_read().contains_key(Path::new("/d/f0.txt")));
+
+            // Picked, then unlink() edits the listing before the commit.
+            let h = hit(&meta, "f1.txt");
+            {
+                let mut c = meta.cache.safe_lock();
+                let files: Vec<RemoteEntry> = c.dir_cache[Path::new("/d")].files.iter().filter(|e| e.path != Path::new("/d/f1.txt")).cloned().collect();
+                c.dir_cache.get_mut(Path::new("/d")).unwrap().files = Arc::new(files);
+                c.deleting.insert(PathBuf::from("/d/f1.txt"));
+            }
+            assert!(matches!(lookup_commit(&meta, h), LookupAnswer::Gone));
+            assert!(!meta.details.safe_read().contains_key(Path::new("/d/f1.txt")));
+            assert!(!meta.status.safe_read().contains_key(Path::new("/d/f1.txt")));
+            assert!(!meta.children_map.safe_read().get(Path::new("/d")).is_some_and(|s| s.contains(Path::new("/d/f1.txt"))));
+
+            // A ghost that appeared during the wait answers as a ghost.
+            let h = hit(&meta, "f2.txt");
+            meta.ghost_entries.safe_lock().insert(PathBuf::from("/d/f2.txt"), GhostEntry {
+                kind: GhostKind::HiddenAdd, created_at: Instant::now(), rename_pair_id: None,
+            });
+            assert!(matches!(lookup_commit(&meta, h), LookupAnswer::Ghost(GhostKind::HiddenAdd)));
+            assert!(!meta.details.safe_read().contains_key(Path::new("/d/f2.txt")));
+        }
+
+        // ── Name index: built for listings that are read, not written ───────
+
+        #[test]
+        fn a_mutated_wide_listing_is_not_reindexed_on_its_first_lookup() {
+            let mut c = make_test_cache();
+            c.put_dir_cache(PathBuf::from("/w"), None, None, names("/w", 20_000));
+            let built = |c: &FsCache| c.dir_cache[Path::new("/w")].name_index.as_ref().is_some_and(|s| s.index.is_some());
+            // A bulk copy: every create swaps the listing, then looks the new name up.
+            let t = Instant::now();
+            for i in 0..20 {
+                let mut files = (*c.dir_cache[Path::new("/w")].files).clone();
+                files.push(entry_in("/w", &format!("new{i}.txt")));
+                c.dir_cache.get_mut(Path::new("/w")).unwrap().files = Arc::new(files);
+                assert!(c.find_child(Path::new("/w"), &format!("new{i}.txt")).and_then(|(_, p)| p).is_some());
+                assert!(!built(&c), "an index was built for a listing looked up once");
+            }
+            eprintln!("20 create+lookup rounds on a 20k listing: {:?}", t.elapsed());
+            // A version that keeps being read gets its index.
+            for i in 0..=NAME_INDEX_AFTER_LOOKUPS as usize {
+                assert!(c.find_child(Path::new("/w"), &format!("f{i}.txt")).and_then(|(_, p)| p).is_some());
+            }
+            assert!(built(&c));
+            assert_eq!(c.find_child(Path::new("/w"), "f19999.txt").map(|(_, p)| p), Some(Some(19_999)));
+            assert_eq!(c.find_child(Path::new("/w"), "nope").map(|(_, p)| p), Some(None));
+        }
+
+        // ── Promotion through the readdir waiter ────────────────────────────
+
+        #[test]
+        fn a_readdir_waiter_does_not_promote_a_stream_before_its_result() {
+            let (_, conn, cache) = setup(vec![]);
+            for (dir, result) in [("/ok", Ok(Some("e1".to_string()))), ("/bad", Err("truncated: body error".to_string()))] {
+                let etx = {
+                    let mut c = cache.safe_lock();
+                    let (tx, etx) = start(&mut c, dir);
+                    drop(tx); // the entry stream ended empty; the result is still on its way
+                    etx
+                };
+                let failed = result.is_err();
+                let (done_tx, done_rx) = mpsc::channel();
+                let r = std::thread::scope(|s| {
+                    let waiter = s.spawn(|| {
+                        let r = list_dir_cached_or_fresh(&conn, &cache, PathBuf::from(dir), None);
+                        let _ = done_tx.send(());
+                        r
+                    });
+                    assert!(done_rx.recv_timeout(Duration::from_millis(300)).is_err(), "{dir}: answered before the result arrived");
+                    assert!(cache.safe_lock().dir_cache.get(Path::new(dir)).is_none(), "{dir}: promoted without its result");
+                    etx.send(result).unwrap();
+                    cache.safe_lock().pending_notify.1.notify_all();
+                    waiter.join().unwrap()
+                });
+                if failed {
+                    assert!(r.is_err());
+                    assert!(cache.safe_lock().dir_cache.get(Path::new(dir)).is_none(), "a broken listing must not be cached");
+                } else {
+                    assert!(r.is_ok(), "{r:?}");
+                    assert_eq!(cache.safe_lock().dir_cache.get(Path::new(dir)).and_then(|e| e.etag.clone()).as_deref(), Some("e1"));
+                }
             }
         }
     }
