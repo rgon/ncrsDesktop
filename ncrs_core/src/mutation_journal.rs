@@ -63,6 +63,13 @@ pub struct JournalEntry {
     /// attempt on the same entry within one pass.
     #[serde(default)]
     pub not_before_ms: u64,
+    /// Its paths are the names it had when it was queued. False for an entry
+    /// written by 0.1.77 or older, which rewrote an entry's paths into every
+    /// later Rename's names: they already are the names those Renames give,
+    /// so a lookup does not carry them through those Renames again. Such an
+    /// entry replays as stored, exactly as it did before.
+    #[serde(default)]
+    pub queued_names: bool,
     /// Claimed by a live worker or the replay loop; never persisted, so a restart
     /// makes every entry replayable again.
     #[serde(skip)]
@@ -786,6 +793,7 @@ impl MutationJournal {
             attempts: 0,
             last_error: None,
             not_before_ms: 0,
+            queued_names: true,
             in_flight: false,
         });
         if let Some(sp) = self.entries.back().and_then(|e| e.op.staging_path()) {
@@ -830,6 +838,8 @@ impl MutationJournal {
         let mut at = path.to_path_buf();
         for e in self.entries.iter().rev() {
             match &e.op {
+                // Older entries are already in its names (`queued_names`).
+                MutationOp::Rename { .. } if !e.queued_names => {}
                 MutationOp::Rename { from, to } => {
                     if let Some(before) = undo_rename(&at, from, to) {
                         if f(e, &at) {
@@ -860,6 +870,7 @@ impl MutationJournal {
         let mut at = path.to_path_buf();
         for e in self.entries.range(i + 1..) {
             match &e.op {
+                MutationOp::Rename { .. } if !e.queued_names => {}
                 MutationOp::Rename { from, to } => {
                     if let Some(after) = redo_rename(&at, from, to) {
                         at = after;
@@ -912,7 +923,7 @@ impl MutationJournal {
             if names.iter().flatten().any(|n| at.iter().any(|a| nested(n, a))) {
                 return true;
             }
-            if let MutationOp::Rename { from, to } = &e.op {
+            if let (MutationOp::Rename { from, to }, true) = (&e.op, e.queued_names) {
                 for a in &mut at {
                     if let Some(before) = undo_rename(a, from, to) {
                         *a = before;
@@ -2308,6 +2319,7 @@ mod tests {
             attempts: 0,
             last_error: None,
             not_before_ms: 0,
+            queued_names: true,
             in_flight: false,
         }];
         let journal_path = dir.join(JOURNAL_FILE);
