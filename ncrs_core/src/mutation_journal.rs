@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const JOURNAL_FILE: &str = "mutation_journal.json";
 const CONFLICTS_FILE: &str = "conflicts.json";
@@ -223,6 +223,140 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+// ── Staging file names ───────────────────────────────────────────────────
+
+/// Tags every staging file this process creates. File handles restart at 1
+/// in each process, and the startup sweep keeps the `write_<fh>` files a
+/// surviving journal still names; a bare `write_<fh>` would let the new
+/// process's first open truncate the bytes of a pending offline upload (and
+/// that upload's success delete the new file's staging). No `.`: callers
+/// derive temp names with `Path::with_extension`.
+pub(crate) fn boot_tag() -> &'static str {
+    static TAG: OnceLock<String> = OnceLock::new();
+    TAG.get_or_init(|| format!("{}p{}", now_ms(), std::process::id()))
+}
+
+/// `write_<boot>_<fh>`: the staging file of handle `fh` of this process.
+pub(crate) fn staging_file_name(fh: u64) -> String {
+    format!("write_{}_{}", boot_tag(), fh)
+}
+
+/// `adopted_<boot>_<n>`: a file adopted from the bare mount point at startup.
+pub(crate) fn adopted_file_name(n: u64) -> String {
+    format!("adopted_{}_{}", boot_tag(), n)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StagingName {
+    /// Created by this process, with its handle (or adoption) number.
+    Ours(u64),
+    /// Left by an earlier process — including the untagged `write_<fh>` and
+    /// `adopted_<pid>_<n>` names of older versions.
+    Earlier,
+}
+
+/// Classifies a `write_*` / `adopted_*` staging file name; `None` for any
+/// other name (temp files such as `write_…seed` included).
+pub(crate) fn parse_staging_name(name: &str) -> Option<StagingName> {
+    let rest = name.strip_prefix("write_").or_else(|| name.strip_prefix("adopted_"))?;
+    let (boot, n) = match rest.rsplit_once('_') {
+        Some((boot, n)) => (Some(boot), n),
+        None => (None, rest),
+    };
+    let n: u64 = n.parse().ok()?;
+    Some(if boot == Some(boot_tag()) { StagingName::Ours(n) } else { StagingName::Earlier })
+}
+
+/// Where the startup sweep keeps staging files no journal entry names.
+pub(crate) const RECOVERED_DIR: &str = "recovered";
+const RECOVERED_KEEP_FILES: usize = 64;
+const RECOVERED_KEEP_BYTES: u64 = 2 << 30;
+
+/// Startup sweep of `cache_dir`: staging files left by an earlier process
+/// that `journal` does not name. They used to be deleted, but a crash can
+/// leave real edits there — a written file never closed, bytes an `fsync`
+/// made durable (fsync writes no journal record), an upload whose journal
+/// save the crash beat. Non-empty ones are moved to `recovered/` (bounded,
+/// newest kept) and reported once as a conflict; empty ones and partial
+/// temp files carry nothing and are deleted. Returns how many were moved.
+pub(crate) fn quarantine_unreferenced_staging(journal: &mut MutationJournal, cache_dir: &Path) -> usize {
+    let named: std::collections::HashSet<PathBuf> =
+        journal.entries().iter().filter_map(|e| e.op.staging_path().map(Path::to_path_buf)).collect();
+    let recovered_dir = cache_dir.join(RECOVERED_DIR);
+    let (mut moved, mut deleted) = (Vec::new(), 0usize);
+    let Ok(dir_entries) = std::fs::read_dir(cache_dir) else { return 0 };
+    for entry in dir_entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        let kind = parse_staging_name(&name);
+        let temp = kind.is_none() && name.starts_with("write_");
+        if !(kind == Some(StagingName::Earlier) || temp) {
+            continue; // not staging, or this process's own (adopted this boot)
+        }
+        let path = entry.path();
+        if named.contains(&path) {
+            continue;
+        }
+        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if temp || len == 0 {
+            if std::fs::remove_file(&path).is_ok() {
+                deleted += 1;
+            }
+            continue;
+        }
+        if std::fs::create_dir_all(&recovered_dir).is_err() {
+            log::error!("startup: cannot create {} — leaving {} in place", recovered_dir.display(), path.display());
+            continue;
+        }
+        let mut dest = recovered_dir.join(&name);
+        if dest.exists() {
+            dest = recovered_dir.join(format!("{}.{}", name, now_ms()));
+        }
+        match std::fs::rename(&path, &dest) {
+            Ok(()) => {
+                log::warn!("startup: staging {} ({} bytes) is in no pending upload — kept at {}", name, len, dest.display());
+                moved.push(dest);
+            }
+            Err(e) => log::error!("startup: cannot move {} to {}: {}", path.display(), dest.display(), e),
+        }
+    }
+    if deleted > 0 {
+        log::info!("startup: removed {} empty or partial staging file(s)", deleted);
+    }
+    if !moved.is_empty() {
+        prune_recovered(&recovered_dir);
+        journal.add_conflict(ConflictKind::PermanentFailure {
+            description: format!(
+                "{} locally written file(s) from an interrupted session were not queued for upload; their bytes are kept in {}",
+                moved.len(),
+                recovered_dir.display(),
+            ),
+        });
+    }
+    moved.len()
+}
+
+/// Keeps the newest files of `recovered/` within the count and size bounds.
+fn prune_recovered(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(SystemTime, u64, PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok().filter(|m| m.is_file())?;
+            Some((m.modified().unwrap_or(UNIX_EPOCH), m.len(), e.path()))
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut bytes = 0u64;
+    for (i, (_, len, path)) in files.iter().enumerate() {
+        bytes = bytes.saturating_add(*len);
+        // The newest one is always kept, however large.
+        if i > 0 && (i >= RECOVERED_KEEP_FILES || bytes > RECOVERED_KEEP_BYTES) {
+            log::warn!("startup: {} over its bounds — deleting the oldest recovered file {}", RECOVERED_DIR, path.display());
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Atomically and durably replace `path` with `data`: write a temp file, fsync
@@ -1056,6 +1190,92 @@ mod tests {
         let j = MutationJournal::load_or_create(&dir);
         assert!(j.is_empty());
         assert_eq!(j.unresolved_conflicts().len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Staging names ────────────────────────────────────────
+
+    fn staged_put(dir: &Path, name: &str, bytes: &str, etag: Option<&str>) -> (MutationOp, PathBuf) {
+        let staging = dir.join(name);
+        fs::write(&staging, bytes).unwrap();
+        let op = MutationOp::Put {
+            remote_path: PathBuf::from("/f.txt"),
+            staging_path: staging.clone(),
+            if_match_etag: etag.map(str::to_owned),
+        };
+        (op, staging)
+    }
+
+    /// What a restart finds: the journal on disk plus the startup sweep.
+    fn restart(dir: &Path) -> MutationJournal {
+        let mut j = MutationJournal::load_or_create(dir);
+        quarantine_unreferenced_staging(&mut j, dir);
+        j
+    }
+
+    fn staged_bytes(j: &MutationJournal) -> Vec<String> {
+        j.entries().iter().filter_map(|e| e.op.staging_path()).map(|p| fs::read_to_string(p).unwrap()).collect()
+    }
+
+    #[test]
+    fn staging_names_carry_the_process_and_parse_back() {
+        assert_eq!(parse_staging_name(&staging_file_name(7)), Some(StagingName::Ours(7)));
+        assert_eq!(parse_staging_name(&adopted_file_name(3)), Some(StagingName::Ours(3)));
+        assert_eq!(parse_staging_name("write_7"), Some(StagingName::Earlier), "untagged names are from older versions");
+        assert_eq!(parse_staging_name("adopted_4242_1"), Some(StagingName::Earlier));
+        assert_eq!(parse_staging_name("write_1790000000000p99_7"), Some(StagingName::Earlier));
+        assert_eq!(parse_staging_name("write_7.seed"), None);
+        assert_eq!(parse_staging_name("mutation_journal.json"), None);
+        assert!(!staging_file_name(1).contains('.'), "with_extension-derived temp names must stay distinct");
+    }
+
+    #[test]
+    fn a_pending_upload_from_an_earlier_process_survives_and_is_not_reused() {
+        let dir = temp_dir("earlier_staging");
+        let legacy = dir.join("write_1");
+        {
+            let mut j = MutationJournal::load_or_create(&dir);
+            let (op, _) = staged_put(&dir, "write_1", "offline edit", Some("e1"));
+            j.enqueue(op);
+        }
+        let j = restart(&dir);
+        assert_eq!(staged_bytes(&j), vec!["offline edit"]);
+        assert_ne!(dir.join(staging_file_name(1)), legacy, "the new process's first handle must not truncate it");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_startup_sweep_quarantines_unnamed_bytes_and_drops_empty_files() {
+        let dir = temp_dir("quarantine");
+        fs::write(dir.join("write_3"), "unsaved edit").unwrap();
+        fs::write(dir.join("write_4"), "").unwrap();
+        fs::write(dir.join("write_5.seed"), "partial").unwrap();
+        fs::write(dir.join("adopted_77_1"), "old adoption").unwrap();
+        fs::write(dir.join(adopted_file_name(1)), "adopted this boot").unwrap();
+        fs::write(dir.join("other.bin"), "x").unwrap();
+        let mut j = MutationJournal::load_or_create(&dir);
+        assert_eq!(quarantine_unreferenced_staging(&mut j, &dir), 2);
+        let rec = dir.join(RECOVERED_DIR);
+        assert_eq!(fs::read_to_string(rec.join("write_3")).unwrap(), "unsaved edit");
+        assert_eq!(fs::read_to_string(rec.join("adopted_77_1")).unwrap(), "old adoption");
+        assert!(!dir.join("write_4").exists() && !dir.join("write_5.seed").exists());
+        assert!(dir.join(adopted_file_name(1)).exists(), "this process's adoptions are journaled right after");
+        assert!(dir.join("other.bin").exists());
+        assert_eq!(j.unresolved_conflicts().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovered_keeps_the_newest_files_within_bounds() {
+        let dir = temp_dir("recovered_prune");
+        for i in 0..(RECOVERED_KEEP_FILES + 3) {
+            fs::write(dir.join(format!("f{i}")), "x").unwrap();
+            let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + i as u64);
+            fs::File::options().write(true).open(dir.join(format!("f{i}"))).unwrap().set_modified(t).unwrap();
+        }
+        prune_recovered(&dir);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), RECOVERED_KEEP_FILES);
+        assert!(!dir.join("f0").exists() && dir.join(format!("f{}", RECOVERED_KEEP_FILES + 2)).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

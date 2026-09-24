@@ -4113,7 +4113,7 @@ fn open_continue_classified<R: OpenAnswer>(ctx: &MetaCtx, rq: OpenReq, entry: Op
         return;
     }
 
-    let wp = ctx.cache.safe_lock().cache_dir.join(format!("write_{}", fh));
+    let wp = ctx.cache.safe_lock().cache_dir.join(mutation_journal::staging_file_name(fh));
     // Stage the current content before any write: a write that does not start at
     // 0 (O_APPEND, an in-place edit) would otherwise upload a zero-filled prefix.
     let seed: Option<Option<PathBuf>> = if rq.truncating {
@@ -4601,31 +4601,11 @@ impl NextCloudFs {
         let journal_arc: mutation_journal::SharedJournal =
             Arc::new(Mutex::new(mutation_journal::MutationJournal::load_or_create(&cache_dir)));
 
-        // Remove write_* staging files not referenced by any pending journal entry.
-        // Files in the journal still need their staging data for upload replay;
-        // everything else is orphaned (upload completed, non-dirty open, coalesced, etc.).
-        {
-            let j = journal_arc.safe_lock();
-            let referenced: std::collections::HashSet<PathBuf> = j.entries()
-                .iter()
-                .filter_map(|e| e.op.staging_path().map(Path::to_path_buf))
-                .collect();
-            let mut stale_count = 0usize;
-            if let Ok(dir_entries) = std::fs::read_dir(&cache_dir) {
-                for entry in dir_entries.flatten() {
-                    if entry.file_name().to_str().map_or(false, |n| n.starts_with("write_")) {
-                        let path = entry.path();
-                        if !referenced.contains(&path) {
-                            let _ = std::fs::remove_file(&path);
-                            stale_count += 1;
-                        }
-                    }
-                }
-            }
-            if stale_count > 0 {
-                log::info!("cleaned up {} orphaned write_* staging files at startup", stale_count);
-            }
-        }
+        // Staging files an earlier process left that no pending journal entry
+        // names: moved to `recovered/`, not deleted — a crash can leave real
+        // edits there. Files this process already adopted from the mount point
+        // are its own (see prepare_mount_point) and are journaled next.
+        mutation_journal::quarantine_unreferenced_staging(&mut journal_arc.safe_lock(), &cache_dir);
 
         let mut inodes = HashMap::new();
         let mut paths = HashMap::new();
@@ -5058,16 +5038,15 @@ impl NextCloudFs {
                 for entry in dir_entries.flatten() {
                     let path = entry.path();
                     let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
-                    let Some(fh_str) = name.strip_prefix("write_") else { continue };
-                    if staged.contains(&path) {
+                    if !name.starts_with("write_") || staged.contains(&path) {
                         continue;
                     }
-                    let fh: u64 = match fh_str.parse() {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    if open_fhs.contains(&fh) {
-                        continue;
+                    // Handle numbers restart in each process: only a name this
+                    // process created can belong to one of its open handles.
+                    match mutation_journal::parse_staging_name(&name) {
+                        None => continue,
+                        Some(mutation_journal::StagingName::Ours(fh)) if open_fhs.contains(&fh) => continue,
+                        Some(_) => {}
                     }
                     match std::fs::remove_file(&path) {
                         Ok(()) => staging_purged += 1,
@@ -6791,7 +6770,7 @@ impl Filesystem for NextCloudFs {
         };
 
         let cache_dir = self.cache.safe_lock().cache_dir.clone();
-        let write_path = cache_dir.join(format!("write_{}", fh));
+        let write_path = cache_dir.join(mutation_journal::staging_file_name(fh));
         if let Err(e) = std::fs::File::create(&write_path) {
             log::error!("create: cannot create staging file {}: {}", write_path.display(), e);
             reply.error(Errno::EIO);
@@ -8510,7 +8489,6 @@ fn relocate_leftovers(
     let _ = std::fs::create_dir_all(cache_dir);
     let mut adopted = Vec::new();
     let mut next_id: u64 = 0;
-    let pid = std::process::id();
     for entry in entries.iter().rev() {
         match entry {
             LeftoverEntry::Junk(rel) => {
@@ -8519,7 +8497,7 @@ fn relocate_leftovers(
             LeftoverEntry::File(rel) => {
                 let abs = mount_point.join(rel);
                 next_id += 1;
-                let staging_path = cache_dir.join(format!("adopted_{}_{}", pid, next_id));
+                let staging_path = cache_dir.join(mutation_journal::adopted_file_name(next_id));
                 std::fs::rename(&abs, &staging_path)
                     .map_err(|e| format!("failed to adopt {}: {}", abs.display(), e))?;
                 adopted.push(AdoptedFile {
