@@ -1373,6 +1373,8 @@ fn handle_client_loop(
         } else if trimmed == "STORAGE" {
             let stats = storage_stats.safe_lock().clone();
             serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())
+        } else if trimmed == "HEALTH" {
+            crate::health_json()
         } else if trimmed == "STATE" {
             let active = !transfer_map.safe_lock().is_empty();
             state_word(&paused, &offline, active).to_string()

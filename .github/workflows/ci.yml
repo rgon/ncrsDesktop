@@ -136,6 +136,9 @@ jobs:
           RUSTC_WRAPPER: sccache
         run: cargo clippy --release -p ncrs_core --lib --tests -- -A clippy::all -D clippy::disallowed_methods
 
+      - name: Check every thread pool and service is documented
+        run: bash scripts/check-thread-sites.sh
+
       - name: Build .deb
         if: steps.binary-cache.outputs.cache-hit != 'true'
         run: bash scripts/build-deb.sh --skip-build --require-dolphin
