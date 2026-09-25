@@ -287,13 +287,18 @@ pub const KEEP_SCOPE_WIDTH: usize = 2; // per `user` worker (keep_locally_recurs
 pub const BOOT_SCOPE_WIDTH: usize = 16; // boot file-cache validation, once
 pub const REFRESH_SCOPE_WIDTH: usize = 4; // notify-push proactive refresh, one at a time
 pub const SEARCH_WIDTH: usize = 6; // unified-search providers per search
+/// Extra segments of read-ahead windows (lib.rs `WindowPump::run`). Each holds
+/// one `read_throttle` slot beyond its window's own, so across every window at
+/// once there are at most this many, however many readers there are.
+pub const SEGMENT_SCOPE_WIDTH: usize = crate::http_clients::DOWNLOAD_CONNECTIONS - 1;
 
 /// Upper bound on scoped threads alive at once (assuming one search at a time).
 pub const MAX_SCOPED_THREADS: usize = THUMB_WORKERS * THUMB_SCOPE_WIDTH
     + USER_WORKERS * KEEP_SCOPE_WIDTH
     + BOOT_SCOPE_WIDTH
     + REFRESH_SCOPE_WIDTH
-    + SEARCH_WIDTH;
+    + SEARCH_WIDTH
+    + SEGMENT_SCOPE_WIDTH;
 
 /// Every thread the daemon can ever have: pool workers + services + scoped
 /// fan-outs + the main thread + reqwest's internal runtime threads.
