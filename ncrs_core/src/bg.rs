@@ -227,10 +227,14 @@ pub const READDIR_WORKERS: usize = 24;
 
 /// FUSE read-path jobs that own a reply: opening a range stream up to its first
 /// bytes, and waits on read-ahead windows. Each is time-bounded (see the table in
-/// docs/threads.md), and the queue holds at most one more round of them, so a
-/// queued READ is answered within one job's bound. Window bodies do not run here
-/// (see [`STREAM`]): a slow body must not be what a READ is queued behind.
-pub static READ: Pool = Pool::new("read", READ_WORKERS, READ_WORKERS);
+/// docs/threads.md), and window bodies do not run here (see [`STREAM`]), so a slow
+/// body is never what a READ is queued behind.
+///
+/// The queue is deep on purpose: a burst of READs (a `cp` of many files) must
+/// queue, not bounce — `cp` treats EAGAIN as fatal. Depth does not stretch reply
+/// latency: `run_read_job` answers EAGAIN, at once, any job that waited past
+/// READ_QUEUE_MAX_WAIT, so a backlog drains as fast as workers dequeue it.
+pub static READ: Pool = Pool::new("read", READ_WORKERS, 2048);
 pub const READ_WORKERS: usize = 32;
 
 /// Read-ahead window bodies (and a sequential reader's look-ahead window) after
@@ -240,7 +244,8 @@ pub const READ_WORKERS: usize = 32;
 pub static STREAM: Pool = Pool::new("stream", STREAM_WORKERS, STREAM_WORKERS);
 pub const STREAM_WORKERS: usize = crate::http_clients::DOWNLOAD_CONNECTIONS;
 
-/// Host lookups for every reqwest client (`http_clients::PooledResolver`).
+/// Host lookups for every reqwest client the daemon builds
+/// (`http_clients::PooledResolver`, one lookup in flight per host, cached).
 /// reqwest's default resolver runs getaddrinfo on each client's own tokio
 /// blocking pool — up to 512 threads per client runtime, a dozen-plus runtimes —
 /// which no static budget could count. Here it is two threads for the process.
@@ -354,14 +359,16 @@ pub const MAX_THREADS: usize = {
 };
 
 /// reqwest's blocking client runs one runtime thread per client, alive as long as
-/// the client. ncrs builds a fixed set, all at startup or first use and never more:
-/// a generous 8 for the singletons (metadata per transport, previews, push,
-/// notifications, search, assets, one read client per transport), plus the
-/// read clients beyond the first for each transport — one per download slot, for
-/// HTTP/3 and for the HTTP/2 fallback (see `http_clients::DOWNLOAD_CONNECTIONS`).
-/// Under HTTP/3 the HTTP/2 read set exists only after a demotion, so this is the
-/// ceiling, reached only then.
-pub const MAX_HTTP_CLIENT_THREADS: usize = 8 + 2 * (crate::http_clients::DOWNLOAD_CONNECTIONS - 1);
+/// the client. The daemon's clients, all built at startup or first use and never
+/// more (and their lookups run on the `dns` pool, not per runtime):
+/// - HTTP_SINGLETON_CLIENTS: the metadata client for HTTP/3 and for HTTP/2,
+///   notifications and search for each transport (each keeps both, to fall back),
+///   and the asset client;
+/// - one read client per download slot for HTTP/3, and again for HTTP/2 (under
+///   HTTP/3 that set exists only after a demotion). See
+///   `http_clients::DOWNLOAD_CONNECTIONS`.
+pub const HTTP_SINGLETON_CLIENTS: usize = 7;
+pub const MAX_HTTP_CLIENT_THREADS: usize = HTTP_SINGLETON_CLIENTS + 2 * crate::http_clients::DOWNLOAD_CONNECTIONS;
 
 const POOL_SIZES: [usize; 12] = [
     READDIR_WORKERS,
