@@ -355,10 +355,11 @@ pub const DISK_WORKERS: usize = 4;
 pub static DISK_SLOW: Pool = Pool::new("disk-slow", DISK_SLOW_WORKERS, usize::MAX);
 pub const DISK_SLOW_WORKERS: usize = 2;
 
-/// The journal's group commit (`mutation_journal::DeferredSaves`): one saver
-/// job queued or running at a time, on its own worker so a burst of staging
-/// seeds on `disk-slow` never delays the write that makes edits crash-safe, and a
-/// save retrying after ENOSPC never holds a `disk` worker.
+/// The journal's group commit (`mutation_journal::DeferredSaves`), which
+/// writes the conflicts file too: one saver job queued or running at a time,
+/// on its own worker so a burst of staging seeds on `disk-slow` never delays
+/// the write that makes edits crash-safe, and a save retrying after ENOSPC
+/// never holds a `disk` worker.
 pub static JOURNAL: Pool = Pool::new("journal", JOURNAL_WORKERS, 4);
 pub const JOURNAL_WORKERS: usize = 1;
 

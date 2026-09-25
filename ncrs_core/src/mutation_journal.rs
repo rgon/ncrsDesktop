@@ -162,6 +162,10 @@ pub struct MutationJournal {
     deferred: Option<Arc<DeferredSaves>>,
     /// A change not yet handed to the deferred saver's next write.
     save_pending: bool,
+    /// A conflicts change not yet handed to the deferred saver's next write:
+    /// with deferred saves the conflicts file is written by the same saver,
+    /// never under the journal lock (`save_conflicts`).
+    conflicts_pending: bool,
     /// Staging files the journal stopped naming (superseded, coalesced away,
     /// uploaded). Deleted only once a journal that no longer names them is on
     /// disk: until then the journal a crash would reload still does, and
@@ -207,6 +211,13 @@ pub enum PendingUpload {
 /// milliseconds, the same ones a crash slightly earlier would have lost. Each
 /// written snapshot is a state the journal really had, and every staging file
 /// it names was fsynced before it was written.
+///
+/// The conflicts file is saved the same way, by the same saver: a conflict
+/// recorded while a FUSE handler waits for the journal lock (release, unlink,
+/// rename and mkdir all take it) used to be fsynced under that lock. Both
+/// snapshots are taken together, and the conflicts are written first: a crash
+/// between the two writes leaves a conflict whose entry is still queued (the
+/// replay may record it again), never an entry gone with no record of it.
 pub struct DeferredSaves {
     // One saver job queued or running at a time.
     armed: AtomicBool,
@@ -270,7 +281,10 @@ impl DeferredSaves {
             // A change made after our snapshot but before disarming found the
             // saver still armed and left it to us.
             let again = match self.journal.upgrade() {
-                Some(j) => j.lock().unwrap_or_else(|e| e.into_inner()).save_pending,
+                Some(j) => {
+                    let j = j.lock().unwrap_or_else(|e| e.into_inner());
+                    j.save_pending || j.conflicts_pending
+                }
                 None => false,
             };
             if !again || self.armed.swap(true, Ordering::SeqCst) {
@@ -279,21 +293,47 @@ impl DeferredSaves {
         }
     }
 
-    /// Writes the latest snapshot if one is pending. On failure everything it
-    /// took is put back, so the next attempt (or the shutdown flush) writes it.
+    /// Writes the latest snapshot of the journal and of the conflicts, each
+    /// if one is pending. On failure everything it took is put back, so the
+    /// next attempt (or the shutdown flush) writes it.
     fn write_pending(&self) -> std::io::Result<()> {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let Some(journal) = self.journal.upgrade() else { return Ok(()) };
-        let (data, unsynced, deletable, path) = {
+        let (data, unsynced, deletable, path, conflicts, conflicts_path) = {
             let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
-            if !j.save_pending {
+            if !j.save_pending && !j.conflicts_pending {
                 return Ok(());
             }
-            j.save_pending = false;
-            let deletable = j.take_deletable();
-            (j.serialize_entries(), std::mem::take(&mut j.unsynced), deletable, j.journal_path.clone())
+            let conflicts = std::mem::take(&mut j.conflicts_pending).then(|| j.serialize_conflicts());
+            let journal = std::mem::take(&mut j.save_pending).then(|| {
+                let deletable = j.take_deletable();
+                (j.serialize_entries(), std::mem::take(&mut j.unsynced), deletable)
+            });
+            let (data, unsynced, deletable) = match journal {
+                Some((data, unsynced, deletable)) => (Some(data), unsynced, deletable),
+                None => (None, Vec::new(), Vec::new()),
+            };
+            (data, unsynced, deletable, j.journal_path.clone(), conflicts, j.conflicts_path.clone())
         };
         // Outside the journal lock: nothing here may stall a FUSE handler.
+        if let Some(conflicts) = conflicts {
+            let written = match conflicts {
+                Some(c) => write_atomic_durable(&conflicts_path, &c),
+                None => Err(std::io::Error::other("conflicts serialize failed")),
+            };
+            if let Err(e) = written {
+                log::error!("JOURNAL: conflicts durable write failed: {} — will retry", e);
+                let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
+                j.conflicts_pending = true;
+                if data.is_some() {
+                    j.save_pending = true;
+                    j.unsynced.extend(unsynced);
+                    j.delete_after_save.extend(deletable);
+                }
+                return Err(e);
+            }
+        }
+        let Some(data) = data else { return Ok(()) };
         sync_staging(&unsynced);
         let written = match data {
             Some(data) => write_atomic_durable(&path, &data),
@@ -335,10 +375,56 @@ pub fn save_synchronously(journal: &SharedJournal) {
     let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
     j.deferred = None;
     j.save_pending = false;
+    if std::mem::take(&mut j.conflicts_pending) {
+        j.write_conflicts_now();
+    }
     let _ = j.write_now();
 }
 
+#[cfg(test)]
+thread_local! {
+    // The journal a test watches on this thread (`watch_journal_lock`).
+    static LOCK_PROBE: std::cell::RefCell<Option<std::sync::Weak<Mutex<MutationJournal>>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Until the returned guard is dropped, every durable write, staging fsync,
+/// delete or move to a recovery folder made on this thread panics if
+/// `journal`'s lock is held: the disk work the journal does must happen after
+/// its snapshot is taken, never while a FUSE handler could be waiting for the
+/// lock. The test must keep other threads off the lock meanwhile (a saver
+/// pool that never runs), since a lock held by another thread looks the same.
+#[cfg(test)]
+pub(crate) fn watch_journal_lock(journal: &SharedJournal) -> impl Drop {
+    struct Unwatch;
+    impl Drop for Unwatch {
+        fn drop(&mut self) {
+            LOCK_PROBE.with(|p| *p.borrow_mut() = None);
+        }
+    }
+    LOCK_PROBE.with(|p| *p.borrow_mut() = Some(Arc::downgrade(journal)));
+    Unwatch
+}
+
+/// Marks disk work that must not run under the journal lock; tests check it
+/// here (`watch_journal_lock`).
+#[inline]
+fn off_journal_lock(what: &str) {
+    #[cfg(test)]
+    LOCK_PROBE.with(|p| {
+        if let Some(j) = p.borrow().as_ref().and_then(std::sync::Weak::upgrade) {
+            if let Err(std::sync::TryLockError::WouldBlock) = j.try_lock() {
+                panic!("{what} while the journal lock is held");
+            }
+        }
+    });
+    #[cfg(not(test))]
+    let _ = what;
+}
+
 fn delete_staging(paths: &[PathBuf]) {
+    if !paths.is_empty() {
+        off_journal_lock("staging delete");
+    }
     for p in paths {
         if let Err(e) = remove_staging_file(p) {
             log::warn!("JOURNAL: removing staging {} failed: {}", p.display(), e);
@@ -359,6 +445,9 @@ pub(crate) fn remove_staging_file(p: &Path) -> std::io::Result<()> {
 /// one was already uploaded, superseded or recovered. A failed fsync is not
 /// fatal: the save still goes ahead, only its crash-safety is weaker.
 fn sync_staging(paths: &[PathBuf]) {
+    if !paths.is_empty() {
+        off_journal_lock("staging fsync");
+    }
     for p in paths {
         if let Ok(f) = std::fs::File::open(p) {
             if let Err(e) = f.sync_all() {
@@ -458,6 +547,7 @@ fn copy_to_recovered(cache_dir: &Path, src: &Path, remote_path: Option<&Path>, r
 }
 
 fn place_in_recovered(cache_dir: &Path, src: &Path, remote_path: Option<&Path>, reason: &str, session: Option<(&str, u64)>, copy: bool) -> Option<PathBuf> {
+    off_journal_lock("move to recovered/");
     let dir = cache_dir.join(RECOVERED_DIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::error!("cannot create {}: {} — leaving {} in place", dir.display(), e, src.display());
@@ -681,6 +771,7 @@ fn prune_recovered(dir: &Path, now: SystemTime) {
 /// success — which would strand the staged bytes with no record to replay them.
 fn write_atomic_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    off_journal_lock("durable write");
     let tmp = path.with_extension("tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -820,6 +911,7 @@ impl MutationJournal {
             unsynced: Vec::new(),
             deferred: None,
             save_pending: false,
+            conflicts_pending: false,
             delete_after_save: Vec::new(),
             reserved: std::collections::HashSet::new(),
             changed: Arc::new(Condvar::new()),
@@ -1394,45 +1486,10 @@ impl MutationJournal {
 
     // ── Recovery ─────────────────────────────────────────────
 
-    /// Move a failed upload's staged bytes out of the volatile write-staging area
-    /// into a durable `unsynced/` recovery folder, so a permanent failure never
-    /// silently destroys the user's local edit. Returns the recovery path on
-    /// success. Named after the remote file (not the opaque `write_N` staging
-    /// name) so the user can recognise it; collisions get the staging name as a
-    /// disambiguating suffix.
-    fn recover_staging(&self, staging_path: &Path, remote_path: &Path) -> Option<PathBuf> {
-        let cache_dir = self.journal_path.parent()?;
-        let recovery_dir = cache_dir.join("unsynced");
-        if std::fs::create_dir_all(&recovery_dir).is_err() {
-            return None;
-        }
-        let base = remote_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "recovered".to_string());
-        let mut dest = recovery_dir.join(&base);
-        if dest.exists() {
-            if let Some(uniq) = staging_path.file_name().and_then(|n| n.to_str()) {
-                dest = recovery_dir.join(format!("{}.{}", base, uniq));
-            }
-        }
-        // rename is atomic on the same filesystem; fall back to copy+remove across
-        // filesystems (cache dir and staging are normally colocated, so rare).
-        if std::fs::rename(staging_path, &dest).is_ok() {
-            log::warn!("JOURNAL: preserved unsynced local copy at {}", dest.display());
-            return Some(dest);
-        }
-        match std::fs::copy(staging_path, &dest) {
-            Ok(_) => {
-                let _ = std::fs::remove_file(staging_path);
-                log::warn!("JOURNAL: preserved unsynced local copy at {}", dest.display());
-                Some(dest)
-            }
-            Err(e) => {
-                log::error!("JOURNAL: failed to preserve staging {}: {}", staging_path.display(), e);
-                None
-            }
-        }
+    /// The folder the journal lives in, where staging files and the recovery
+    /// folders are.
+    fn cache_dir(&self) -> Option<PathBuf> {
+        self.journal_path.parent().map(Path::to_path_buf)
     }
 
     // ── Persistence ──────────────────────────────────────────
@@ -1477,15 +1534,29 @@ impl MutationJournal {
         serde_json::to_vec(&list).map_err(|e| log::error!("JOURNAL: serialize failed: {}", e)).ok()
     }
 
-    fn save_conflicts(&self) {
+    /// Every conflicts change goes through here. With deferred saves (the
+    /// mounted daemon) it only marks the conflicts pending for the journal's
+    /// saver, which writes them off the lock (see `DeferredSaves`); without
+    /// (tests, and after `save_synchronously`) it writes them now.
+    fn save_conflicts(&mut self) {
         self.dirty_version.fetch_add(1, Ordering::Relaxed);
-        match serde_json::to_vec(&self.conflicts) {
-            Ok(data) => {
-                if let Err(e) = write_atomic_durable(&self.conflicts_path, &data) {
-                    log::error!("JOURNAL: conflicts durable write failed: {}", e);
-                }
+        if let Some(d) = &self.deferred {
+            self.conflicts_pending = true;
+            d.schedule();
+            return;
+        }
+        self.write_conflicts_now();
+    }
+
+    fn serialize_conflicts(&self) -> Option<Vec<u8>> {
+        serde_json::to_vec(&self.conflicts).map_err(|e| log::error!("JOURNAL: conflicts serialize failed: {}", e)).ok()
+    }
+
+    fn write_conflicts_now(&self) {
+        if let Some(data) = self.serialize_conflicts() {
+            if let Err(e) = write_atomic_durable(&self.conflicts_path, &data) {
+                log::error!("JOURNAL: conflicts durable write failed: {}", e);
             }
-            Err(e) => log::error!("JOURNAL: conflicts serialize failed: {}", e),
         }
     }
 
@@ -1585,6 +1656,54 @@ pub struct ReplayContext {
     pub status: crate::ipc::StatusMap,
 }
 
+/// Move a failed upload's staged bytes out of the volatile write-staging area
+/// into a durable `unsynced/` recovery folder, so a permanent failure never
+/// silently destroys the user's local edit. Returns the recovery path on
+/// success. Named after the remote file (not the opaque `write_N` staging
+/// name) so the user can recognise it; collisions get the staging name as a
+/// disambiguating suffix.
+///
+/// A rename, or a whole-file copy across filesystems: never under the journal
+/// lock. The replay calls it while the entry naming `staging_path` is still
+/// queued and claimed by it, so nothing can delete the file meanwhile: a
+/// claimed entry is never superseded or coalesced away, the purge spares
+/// every staging file an entry names, and no other replay or worker can
+/// claim it. The entry leaves the journal only after this returns.
+fn recover_staging(cache_dir: &Path, staging_path: &Path, remote_path: &Path) -> Option<PathBuf> {
+    off_journal_lock("staging recovery");
+    let recovery_dir = cache_dir.join("unsynced");
+    if std::fs::create_dir_all(&recovery_dir).is_err() {
+        return None;
+    }
+    let base = remote_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "recovered".to_string());
+    let mut dest = recovery_dir.join(&base);
+    if dest.exists() {
+        if let Some(uniq) = staging_path.file_name().and_then(|n| n.to_str()) {
+            dest = recovery_dir.join(format!("{}.{}", base, uniq));
+        }
+    }
+    // rename is atomic on the same filesystem; fall back to copy+remove across
+    // filesystems (cache dir and staging are normally colocated, so rare).
+    if std::fs::rename(staging_path, &dest).is_ok() {
+        log::warn!("JOURNAL: preserved unsynced local copy at {}", dest.display());
+        return Some(dest);
+    }
+    match std::fs::copy(staging_path, &dest) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(staging_path);
+            log::warn!("JOURNAL: preserved unsynced local copy at {}", dest.display());
+            Some(dest)
+        }
+        Err(e) => {
+            log::error!("JOURNAL: failed to preserve staging {}: {}", staging_path.display(), e);
+            None
+        }
+    }
+}
+
 pub(crate) fn replay_journal(
     journal: &SharedJournal,
     ctx: &ReplayContext,
@@ -1639,7 +1758,9 @@ pub(crate) fn replay_journal(
             // failure must never silently destroy the user's edit.
             let desc = match &entry.op {
                 MutationOp::Put { staging_path, remote_path, .. } => {
-                    match journal.safe_lock().recover_staging(staging_path, now_at.as_deref().unwrap_or(remote_path)) {
+                    // Off the lock, the entry still queued and claimed (see `recover_staging`).
+                    let cache_dir = journal.safe_lock().cache_dir();
+                    match cache_dir.and_then(|d| recover_staging(&d, staging_path, now_at.as_deref().unwrap_or(remote_path))) {
                         Some(p) => format!("{:?}: {} — local copy preserved at {}", entry.op, last_err, p.display()),
                         None => format!("{:?}: {}", entry.op, last_err),
                     }
@@ -1649,7 +1770,7 @@ pub(crate) fn replay_journal(
                 // copy of the file. The session is left for the server to
                 // expire; the tail goes to `recovered/` with a note naming it.
                 MutationOp::FinishChunked { remote_path, uploads_base, bytes_confirmed, tail_path, .. } => {
-                    let cache_dir = journal.safe_lock().journal_path.parent().map(Path::to_path_buf);
+                    let cache_dir = journal.safe_lock().cache_dir();
                     let kept = cache_dir.and_then(|d| move_to_recovered_noted(
                         &d, tail_path, Some(now_at.as_deref().unwrap_or(remote_path)),
                         "the end of a streamed upload the server refused to assemble",
@@ -1693,13 +1814,20 @@ pub(crate) fn replay_journal(
                 // server. An EditConflict has already uploaded a conflicted copy,
                 // so the local staging is redundant. Any other conflict (e.g. the
                 // destination/parent is gone) means the bytes exist ONLY locally —
-                // preserve them so the user can recover.
-                let mut j = journal.safe_lock();
+                // preserve them so the user can recover. Off the lock, with
+                // the entry still queued and claimed (see `recover_staging`).
                 if let MutationOp::Put { staging_path, remote_path, .. } = &entry.op {
+                    if !matches!(kind, ConflictKind::EditConflict { .. }) {
+                        let cache_dir = journal.safe_lock().cache_dir();
+                        if let Some(d) = cache_dir {
+                            recover_staging(&d, staging_path, now_at.as_deref().unwrap_or(remote_path));
+                        }
+                    }
+                }
+                let mut j = journal.safe_lock();
+                if let MutationOp::Put { staging_path, .. } = &entry.op {
                     if matches!(kind, ConflictKind::EditConflict { .. }) {
                         j.discard_staging(staging_path);
-                    } else {
-                        j.recover_staging(staging_path, now_at.as_deref().unwrap_or(remote_path));
                     }
                 }
                 if let MutationOp::FinishChunked { tail_path, .. } = &entry.op {
@@ -3006,6 +3134,87 @@ mod tests {
         assert_eq!(on_disk(&dir), vec![a]);
         let b = j.lock().unwrap().enqueue(MutationOp::MkDir { path: PathBuf::from("/b") });
         assert_eq!(on_disk(&dir), vec![a, b], "on disk before enqueue returned");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn conflicts_on_disk(dir: &Path) -> Vec<(u64, bool)> {
+        let data = fs::read(dir.join(CONFLICTS_FILE)).unwrap_or_default();
+        let list: Vec<ConflictRecord> = serde_json::from_slice(&data).unwrap_or_default();
+        list.iter().map(|c| (c.id, c.resolved)).collect()
+    }
+
+    fn failure(n: usize) -> ConflictKind {
+        ConflictKind::PermanentFailure { description: format!("failure {n}") }
+    }
+
+    #[test]
+    fn no_durable_write_happens_under_the_journal_lock_with_deferred_saves() {
+        // No saver ever runs, so nothing but this thread takes the lock, and
+        // the watch below can tell "held by me" from "held by someone".
+        static POOL: crate::bg::Pool = crate::bg::Pool::new("t-journal-watch", 0, 0);
+        let dir = temp_dir("watch_lock");
+        let j = deferred(&dir, &POOL);
+        let _watch = watch_journal_lock(&j);
+        // Every change a FUSE handler or the replay makes under the lock:
+        // conflicts included, which used to be fsynced right there.
+        let first = j.lock().unwrap().add_conflict(failure(1));
+        let second = j.lock().unwrap().add_conflict(failure(2));
+        j.lock().unwrap().resolve_conflict(first);
+        let (op, _) = staged_put(&dir, "write_w", "W", None);
+        let seq = j.lock().unwrap().enqueue(op);
+        j.lock().unwrap().mark_deferred(seq, "offline".into());
+        assert!(conflicts_on_disk(&dir).is_empty() && on_disk(&dir).is_empty(), "written under the lock");
+        {
+            let g = j.lock().unwrap();
+            assert!(g.conflicts_pending && g.save_pending);
+        }
+        // Written by the saver's path, off the lock: both files, from one snapshot.
+        flush_deferred(&j);
+        assert_eq!(conflicts_on_disk(&dir), vec![(first, true), (second, false)]);
+        assert_eq!(on_disk(&dir), vec![seq]);
+        // And the shutdown switch writes a pending conflict too. Unwatched:
+        // from a stop signal on, every save is written under the lock on
+        // purpose (`save_synchronously`).
+        let third = j.lock().unwrap().add_conflict(failure(3));
+        drop(_watch);
+        save_synchronously(&j);
+        assert_eq!(conflicts_on_disk(&dir), vec![(first, true), (second, false), (third, false)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[should_panic(expected = "durable write while the journal lock is held")]
+    fn the_journal_lock_watch_trips_on_a_durable_write_under_the_lock() {
+        // What makes the test above prove something: a synchronous journal
+        // writes the conflicts under the lock, and the watch catches it.
+        let dir = temp_dir("watch_trips");
+        let j: SharedJournal = Arc::new(Mutex::new(MutationJournal::load_or_create(&dir)));
+        let _watch = watch_journal_lock(&j);
+        j.lock().unwrap().add_conflict(failure(1));
+    }
+
+    #[test]
+    fn conflicts_are_group_committed_by_the_journal_saver() {
+        static POOL: crate::bg::Pool = crate::bg::Pool::new("t-journal-conflicts", 1, 4);
+        let dir = temp_dir("conflicts_group");
+        let j = deferred(&dir, &POOL);
+        std::thread::scope(|sc| {
+            for t in 0..4 {
+                let j = &j;
+                sc.spawn(move || {
+                    for i in 0..25 {
+                        j.lock().unwrap().add_conflict(failure(t * 100 + i));
+                    }
+                });
+            }
+        });
+        let t = std::time::Instant::now();
+        while j.lock().unwrap().conflicts_pending || POOL.stats().active > 0 {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "saver never drained");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(conflicts_on_disk(&dir).len(), 100, "the file holds every conflict recorded");
+        assert!(POOL.stats().completed < 100, "one write per change: not a group commit");
         let _ = fs::remove_dir_all(&dir);
     }
 }
