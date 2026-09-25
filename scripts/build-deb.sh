@@ -97,6 +97,7 @@ install -Dm755 target/release/ncrs                                       "$PKG_D
 install -Dm755 target/release/ncrs-open                                  "$PKG_DIR/usr/bin/ncrs-open"
 install -Dm755 target/release/ncrs-ctl                                   "$PKG_DIR/usr/bin/ncrs-ctl"
 install -Dm644 packaging/ncrs.service                                    "$PKG_DIR/usr/lib/systemd/user/ncrs.service"
+install -Dm644 packaging/05-ncrs-quic.conf                               "$PKG_DIR/usr/lib/sysctl.d/05-ncrs-quic.conf"
 install -Dm644 packaging/ncrs-open.desktop                               "$PKG_DIR/usr/share/applications/ncrs-open.desktop"
 install -Dm644 shell_integration/file-managers/nautilus/syncstate.py      "$PKG_DIR/usr/share/nautilus-python/extensions/ncrs-syncstate.py"
 install -Dm755 shell_integration/gnome-search/ncrs-search-provider       "$PKG_DIR/usr/bin/ncrs-search-provider"

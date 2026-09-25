@@ -84,6 +84,7 @@ REQUIRED=(
     ./usr/bin/ncrs-ctl
     ./usr/bin/ncrs-search-provider
     ./usr/lib/systemd/user/ncrs.service
+    ./usr/lib/sysctl.d/05-ncrs-quic.conf
     ./usr/share/applications/ncrs-open.desktop
     ./usr/share/applications/es.rgon.ncrs.desktop
     ./usr/share/dbus-1/services/es.rgon.ncrs.SearchProvider.service
