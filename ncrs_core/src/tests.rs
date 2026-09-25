@@ -4380,7 +4380,13 @@ mod upload_order_tests {
                 std::thread::sleep(Duration::from_micros(500));
             }
             lat.sort();
-            eprintln!("fast path over {} lookups: p50 {:?} p99 {:?} max {:?}", lat.len(), lat[lat.len() / 2], lat[lat.len() * 99 / 100], lat.last().unwrap());
+            let p99 = lat[lat.len() * 99 / 100];
+            eprintln!("fast path over {} lookups: p50 {:?} p99 {:?} max {:?}", lat.len(), lat[lat.len() / 2], p99, lat.last().unwrap());
+            // A sanity bound, not a benchmark: a debug run measures p99 3-4 ms
+            // alone and up to ~8 ms under parallel test load, so host load
+            // should not trip it, while work under the lock that grows with
+            // the stream (a copy or scan of 100k entries per look) would.
+            assert!(p99 < Duration::from_millis(50), "fast-path p99 {p99:?}: something under the cache lock grew with the stream");
 
             for rx in slow {
                 let (r, on) = rx.recv_timeout(Duration::from_secs(10)).expect("every slow resolver is answered by its deadline");
