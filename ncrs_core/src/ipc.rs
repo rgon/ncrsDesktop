@@ -645,8 +645,7 @@ fn collect_cheap_fields(
     transfer_map: &crate::TransferMap,
     error_log: &crate::ErrorLog,
 ) -> (&'static str, String, String, bool) {
-    let transfers: Vec<crate::TransferProgress> =
-        transfer_map.safe_lock().values().cloned().collect();
+    let transfers: Vec<crate::TransferProgress> = crate::transfer_snapshot(transfer_map);
     let active = !transfers.is_empty();
     let state = state_word(paused, offline, active);
     let errors: Vec<crate::SyncError> = error_log.safe_lock().iter().cloned().collect();
@@ -1353,7 +1352,7 @@ fn handle_client_loop(
             let errors: Vec<crate::SyncError> = error_log.safe_lock().iter().cloned().collect();
             serde_json::to_string(&errors).unwrap_or_else(|_| "[]".to_string())
         } else if trimmed == "TRANSFERS" {
-            let transfers: Vec<crate::TransferProgress> = transfer_map.safe_lock().values().cloned().collect();
+            let transfers: Vec<crate::TransferProgress> = crate::transfer_snapshot(&transfer_map);
             serde_json::to_string(&transfers).unwrap_or_else(|_| "[]".to_string())
         } else if trimmed == "JOURNAL" {
             journal_entries_json(&journal.safe_lock())
