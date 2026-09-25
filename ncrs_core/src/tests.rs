@@ -20,6 +20,7 @@
             pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
             uploading: HashSet::new(),
             deleting: HashSet::new(),
+            not_dirs: HashSet::new(),
             trackerignore_hidden: false,
         }
     }
@@ -237,6 +238,48 @@
         let perms = cache.nc_dir_perms(dir_ino).expect("perms must be present");
         assert!(perms.contains('N'), "RGDNVCK has N → same-dir rename must be allowed");
         assert!(perms.contains('V'), "RGDNVCK has V → cross-dir move must be allowed");
+    }
+
+    fn file_self_entry(path: &str) -> RemoteEntry {
+        let mut e = make_dav_entry(path.trim_start_matches('/'), None);
+        e.path = PathBuf::from(path);
+        e.is_dir = false;
+        e
+    }
+
+    #[test]
+    fn listing_of_a_file_is_never_cached_as_a_directory() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/relock/kept.txt");
+        // A PROPFIND of a file: 207 with only the file itself, so no children.
+        cache.put_dir_cache(path.clone(), None, Some(file_self_entry("/relock/kept.txt")), vec![]);
+        assert!(!cache.dir_cache.contains_key(&path), "a file must not become an empty directory");
+        assert!(cache.not_dirs.contains(&path), "the caller must learn it listed a file");
+    }
+
+    #[test]
+    fn file_listing_removes_a_stale_directory_entry_for_the_path() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/relock/kept.txt");
+        // What older versions left behind: the file cached as an empty directory.
+        cache.put_dir_cache(path.clone(), None, None, vec![]);
+        assert!(cache.dir_cache.contains_key(&path));
+        cache.put_dir_cache(path.clone(), None, Some(file_self_entry("/relock/kept.txt")), vec![]);
+        assert!(!cache.dir_cache.contains_key(&path));
+    }
+
+    #[test]
+    fn directory_listing_clears_the_not_a_directory_mark() {
+        let mut cache = make_test_cache();
+        let path = PathBuf::from("/was-a-file");
+        cache.put_dir_cache(path.clone(), None, Some(file_self_entry("/was-a-file")), vec![]);
+        assert!(cache.not_dirs.contains(&path));
+        // Replaced on the server by a folder of the same name.
+        let mut dir_self = file_self_entry("/was-a-file");
+        dir_self.is_dir = true;
+        cache.put_dir_cache(path.clone(), None, Some(dir_self), vec![make_dav_entry("a.txt", None)]);
+        assert!(!cache.not_dirs.contains(&path));
+        assert!(cache.dir_cache.contains_key(&path));
     }
 
     #[test]
