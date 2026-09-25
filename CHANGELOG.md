@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.79](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.78...ncrs-v0.1.79) (2026-09-25)
+
+
+### Bug Fixes
+
+* **read:** cap the QUIC stream window at 2 MiB so quinn never closes a read connection for too many gaps, and refill the break budget as a resumed stream makes progress ([cff472c](https://github.com/rgon/ncrsDesktop/commit/cff472c279549c9cf24577fb19c2d9f6eccbc1f7))
+
 ## [0.1.78](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.77...ncrs-v0.1.78) (2026-09-25)
 
 
