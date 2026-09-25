@@ -173,6 +173,19 @@ const READ_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// QUIC idle timeout for the read clients: quinn's and Chrome's default. See the
 /// read client's construction for why it is not shorter.
 const H3_MAX_IDLE: Duration = Duration::from_secs(30);
+/// Per-stream QUIC receive window of the read clients.
+///
+/// quinn-proto keeps at most 1024 separate out-of-order spans per stream
+/// (`MAX_CHUNKS` in its assembler) and past that closes the *whole connection*
+/// with `INTERNAL_ERROR: too many gaps in stream buffer`, killing every stream on
+/// it. Each lost packet the server keeps sending past leaves one gap, so the
+/// window caps how many can pile up: at worst every other ~1200-byte packet is
+/// missing, 2 MiB / 2400 B ≈ 870 spans, under the limit. 4 MiB (≈1750) was not:
+/// with several parallel connections on a lossy path it tripped within seconds
+/// of a cold read, under BBR and CUBIC alike, and every window then failed with
+/// EIO. 2 MiB still allows ~170 MB/s per stream at 12 ms RTT, and measured
+/// faster than 4 MiB here (34-37 vs 31-33 MiB/s) since nothing is torn down.
+const H3_STREAM_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024;
 /// How long a warm QUIC read connection is reused: just under H3_MAX_IDLE, so the
 /// pool never hands out a connection quinn is about to close for idleness.
 const H3_READ_POOL_IDLE: Duration = Duration::from_secs(28);
@@ -7902,17 +7915,17 @@ fn build_read_clients(http3: bool) -> Result<Vec<reqwest::blocking::Client>, Str
             // still-broken stream now retries in-process (see the read-ahead
             // body loop) instead of surfacing straight to the caller.
             //
-            // The stream receive window is also bumped: quinn's default
-            // (~1.25 MB, sized for 100 Mbps at 100 ms RTT) can rate-limit a
-            // single stream below what a 64 MiB read-ahead window wants on a
-            // higher-RTT path. BBR is a better fit than the default CUBIC for
+            // The stream receive window is also bumped from quinn's default
+            // (~1.25 MB, sized for 100 Mbps at 100 ms RTT), but no further than
+            // H3_STREAM_RECEIVE_WINDOW: a larger one lets enough loss gaps pile
+            // up for quinn to close the connection. BBR is a better fit than the default CUBIC for
             // exactly this kind of path (real-world jitter / non-congestion
             // loss, which CUBIC misreads as congestion and backs off from
             // unnecessarily).
             read = read.http3_prior_knowledge()
                 .pool_idle_timeout(H3_READ_POOL_IDLE)
                 .http3_max_idle_timeout(H3_MAX_IDLE)
-                .http3_stream_receive_window(4 * 1024 * 1024)
+                .http3_stream_receive_window(H3_STREAM_RECEIVE_WINDOW)
                 .http3_congestion_bbr();
         }
         read
@@ -8196,7 +8209,14 @@ fn open_window<'a>(conn: &'a ConnInfo, path: &Path, req: WindowRequest<'a>) -> R
 /// the window would otherwise get EIO (see `wait_on_window`), which every player
 /// has to notice and recover from itself; VLC in particular does this slowly
 /// enough to look like a stall.
-const MAX_BODY_RETRIES: u32 = 1;
+///
+/// The budget is per run of trouble, not per segment: it refills once a resumed
+/// stream has delivered BODY_RETRY_REFILL_BYTES, so a long segment that loses
+/// its connection now and then keeps going, while one that breaks over and over
+/// without progress still gives up after this many tries.
+const MAX_BODY_RETRIES: u32 = 3;
+/// Bytes a resumed stream must deliver before its break budget refills.
+const BODY_RETRY_REFILL_BYTES: u64 = 4 * 1024 * 1024;
 /// Stalls resumed per segment. Kept separate from MAX_BODY_RETRIES: a stall costs
 /// READ_STALL_TIMEOUT already, so it resumes without backoff, and a QUIC stream
 /// that went silent says nothing about whether a fresh request will.
@@ -8434,6 +8454,7 @@ impl<'a> WindowPump<'a> {
         let mut since_check = 0usize;
         let mut last_check = Instant::now();
         let mut retries = 0u32;
+        let mut got_at_break = 0u64;
         let mut stalls = 0u32;
         while let Some(r) = resp.as_mut() {
             if got >= seg.len {
@@ -8475,6 +8496,9 @@ impl<'a> WindowPump<'a> {
                     cv.notify_all();
                     if halted {
                         break;
+                    }
+                    if retries > 0 && got - got_at_break >= BODY_RETRY_REFILL_BYTES {
+                        retries = 0;
                     }
                     since_check += n;
                     if since_check >= 2 * 1024 * 1024 || last_check.elapsed() >= SUPERSEDE_CHECK_EVERY {
@@ -8537,6 +8561,7 @@ impl<'a> WindowPump<'a> {
                         );
                     } else {
                         retries += 1;
+                        got_at_break = got;
                         log::warn!(
                             "read-ahead segment {} of {} broke after {} of {} bytes (retry {}/{}): {}",
                             idx, self.path.display(), got, seg.len, retries, MAX_BODY_RETRIES, why,

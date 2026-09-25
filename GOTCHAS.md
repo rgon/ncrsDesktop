@@ -203,3 +203,20 @@ would break type detection. It is recognised by the read signature *and* a
 process condition, both required. The same process also does real reads, so
 the process alone cannot decide, and unrelated tools share the signature, so
 the signature alone is not enough.
+
+## 5. quinn closes the whole connection past 1024 gaps in one stream
+
+quinn-proto keeps at most 1024 separate out-of-order spans per receive stream
+(`MAX_CHUNKS` in `connection/assembler.rs`). One more and it closes the
+connection with `INTERNAL_ERROR: too many gaps in stream buffer`, so every
+stream on it fails at once. reqwest reports this only as
+`request or response body error`; the reason is in the error's source chain.
+
+Each packet lost while the server keeps sending leaves one gap, so the stream
+receive window bounds the count. With a 4 MiB window (about 1750 spans at worst)
+and several parallel read connections on a lossy internet path, cold reads broke
+within seconds and readers got EIO, under BBR and CUBIC alike. The local UDP
+sockets dropped nothing: the loss was on the path. The read clients therefore
+cap the window at `H3_STREAM_RECEIVE_WINDOW` (2 MiB, about 870 spans), which
+also measured faster, because no connection is torn down mid-window. Don't
+raise it without a loss test against a real server.
