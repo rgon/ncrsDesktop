@@ -33,7 +33,7 @@ graph LR
 | Pool | Workers | Queue | Full → | Used for |
 |---|---|---|---|---|
 | `readdir` | 24 | 512 | EAGAIN to the kernel | `readdir`/`readdirplus` workers; the reply travels in the job |
-| `read` | 32 | 2048 | EAGAIN | read waits on read-ahead streams, range streams |
+| `read` | 32 | 2048 | EAGAIN | read waits on read-ahead streams, range streams, a sequential reader's look-ahead window (dropped, not EAGAIN, when full) |
 | `list` | 16 | 2048 | error (stale listing served if cached) | streaming lists, soft-TTL refreshes |
 | `bg` | 4 | 256 | dropped | revalidation on read, prefetch, GIO temp purge, chunk-upload abort |
 | `mutate` | 16 | unbounded | journal replays it | PUT/MKCOL/DELETE/MOVE commits (`PathSeq` FIFO; see `path_seq.rs`) |
