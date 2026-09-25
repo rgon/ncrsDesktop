@@ -3474,7 +3474,11 @@ impl NextCloudFs {
         };
         let (http_h2, http_read_h2) = build_pair(false)?;
         let (http_pref, http_read_pref) = if use_http3 {
-            build_pair(true)?
+            let pair = build_pair(true)?;
+            // Building the pair bound its QUIC endpoints' UDP sockets; reqwest gives
+            // no way to size them, so find and enlarge them now.
+            crate::http_clients::raise_quic_socket_buffers();
+            pair
         } else {
             (http_h2.clone(), http_read_h2.clone())
         };
