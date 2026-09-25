@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.82](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.81...ncrs-v0.1.82) (2026-09-25)
+
+
+### Bug Fixes
+
+* **keep:** keep a file whose folder listing isn't cached instead of listing it as an empty directory, and report kept only when something was ([58ebe2e](https://github.com/rgon/ncrsDesktop/commit/58ebe2e2a510c9b2c53c6afa5336ebb4a8b60455))
+
 ## [0.1.81](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.80...ncrs-v0.1.81) (2026-09-25)
 
 
