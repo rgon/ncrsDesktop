@@ -885,6 +885,12 @@ fn read_line_bounded<R: BufRead>(reader: &mut R, max_len: usize) -> std::io::Res
     }
 }
 
+/// Whether a read failed because the socket's read timeout ran out. Linux reports
+/// an expired `SO_RCVTIMEO` as EAGAIN (`WouldBlock`), not `TimedOut`.
+fn is_idle_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+}
+
 fn strip_mount<'a>(path: &'a Path, mount_point: &Path) -> Option<PathBuf> {
     if path.starts_with(mount_point) {
         Some(
@@ -1027,6 +1033,13 @@ fn handle_client_loop(
         let line = match read_line_bounded(reader, MAX_IPC_LINE_LEN) {
             Ok(Some(l)) => l,
             Ok(None) => break,
+            // A client holding its connection open between requests (the Nautilus
+            // extension keeps one per worker thread) ran out CLIENT_READ_TIMEOUT.
+            // Closing it is the point of the timeout; the client reconnects.
+            Err(e) if is_idle_timeout(&e) => {
+                log::debug!("IPC client idle for {:?}, closing its connection", CLIENT_READ_TIMEOUT);
+                break;
+            }
             Err(e) => {
                 log::warn!("IPC client sent an oversized or unreadable request: {}", e);
                 break;
@@ -1475,6 +1488,22 @@ fn handle_client_loop(
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn idle_client_read_timeout_is_classified_as_idle() {
+        let (server, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+        server.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let mut reader = BufReader::new(server);
+        let err = read_line_bounded(&mut reader, MAX_IPC_LINE_LEN).unwrap_err();
+        assert!(is_idle_timeout(&err), "unexpected error kind: {:?}", err.kind());
+    }
+
+    #[test]
+    fn oversized_request_is_not_classified_as_idle() {
+        let long = vec![b'x'; MAX_IPC_LINE_LEN + 2];
+        let err = read_line_bounded(&mut &long[..], MAX_IPC_LINE_LEN).unwrap_err();
+        assert!(!is_idle_timeout(&err));
+    }
 
     fn detail(perms: &str, owner_id: &str, owner_name: &str, size: u64, is_dir: bool) -> FileDetail {
         FileDetail {
