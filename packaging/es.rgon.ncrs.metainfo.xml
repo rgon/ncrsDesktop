@@ -20,6 +20,10 @@
 
   <launchable type="desktop-id">es.rgon.ncrs.desktop</launchable>
   <icon type="stock">ncrs</icon>
+  <!-- Ubuntu Software (the snap-store snap) can't see the host icon theme for a
+       local .deb, so without these it shows the theme's "image-missing" badge. -->
+  <icon type="remote" width="64" height="64">https://raw.githubusercontent.com/rgon/ncrsDesktop/master/ncrs-gui/src-tauri/icons/64x64.png</icon>
+  <icon type="remote" width="128" height="128">https://raw.githubusercontent.com/rgon/ncrsDesktop/master/ncrs-gui/src-tauri/icons/128x128.png</icon>
 
   <categories>
     <category>Network</category>
