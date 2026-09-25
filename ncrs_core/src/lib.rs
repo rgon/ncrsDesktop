@@ -523,31 +523,52 @@ impl Drop for BufferReservation {
     }
 }
 
-/// Recent single-window download rate, in bytes per second (0 = not measured
-/// yet). An exponentially weighted average over finished windows, mount-wide.
+/// Recent download rate of *segmented* windows (all segments together), in bytes
+/// per second; 0 = no recent sample. An exponentially weighted average,
+/// mount-wide. Only segmented windows feed it: a single-stream window measures one
+/// connection, not the link, and letting those in meant one slow sample switched
+/// segmenting off and nothing could ever switch it back on.
 static WINDOW_THROUGHPUT: AtomicU64 = AtomicU64::new(0);
+/// When WINDOW_THROUGHPUT last got a sample, in ms since THROUGHPUT_EPOCH.
+static WINDOW_THROUGHPUT_AT: AtomicU64 = AtomicU64::new(0);
+/// Every this many windows one is segmented regardless of the estimate, so a
+/// link that got faster is noticed.
+static WINDOWS_SINCE_PROBE: AtomicU64 = AtomicU64::new(0);
+const SEGMENT_PROBE_EVERY: u64 = 8;
+/// An estimate older than this is forgotten ("unknown" segments again).
+const THROUGHPUT_MAX_AGE: Duration = Duration::from_secs(60);
 /// Below this measured rate a window is never split into segments: on a slow link
 /// segments only divide the same bandwidth into more streams that each look
 /// stalled, and their extra requests buy nothing.
 const SEGMENT_MIN_THROUGHPUT: u64 = 1024 * 1024;
 
-/// Folds one finished window's rate into WINDOW_THROUGHPUT. Only windows big
-/// enough to say something (≥ 1 MiB over ≥ 100 ms) count.
-fn record_window_throughput(bytes: u64, elapsed: Duration) {
-    if bytes < 1024 * 1024 || elapsed < Duration::from_millis(100) {
+fn throughput_clock_ms() -> u64 {
+    static THROUGHPUT_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    THROUGHPUT_EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Folds one finished segmented window's rate into WINDOW_THROUGHPUT. Only
+/// windows big enough to say something (≥ 1 MiB over ≥ 100 ms) count.
+fn record_window_throughput(bytes: u64, elapsed: Duration, segments: usize) {
+    if segments < 2 || bytes < 1024 * 1024 || elapsed < Duration::from_millis(100) {
         return;
     }
     let rate = (bytes as f64 / elapsed.as_secs_f64()) as u64;
     let _ = WINDOW_THROUGHPUT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
         Some(if old == 0 { rate } else { (old * 3 + rate) / 4 })
     });
+    WINDOW_THROUGHPUT_AT.store(throughput_clock_ms().max(1), Ordering::Relaxed);
 }
 
-/// Whether the link looks fast enough for segmented windows (unknown counts as
-/// yes: the first windows measure it).
+/// Whether the next large window should be segmented: yes when the estimate is
+/// unknown or stale (THROUGHPUT_MAX_AGE), when it says the link is fast, and for
+/// one window in SEGMENT_PROBE_EVERY anyway, so the estimate keeps being measured.
 fn segments_worthwhile() -> bool {
+    let at = WINDOW_THROUGHPUT_AT.load(Ordering::Relaxed);
+    let fresh = at != 0 && throughput_clock_ms().saturating_sub(at) < THROUGHPUT_MAX_AGE.as_millis() as u64;
     let r = WINDOW_THROUGHPUT.load(Ordering::Relaxed);
-    r == 0 || r >= SEGMENT_MIN_THROUGHPUT
+    !fresh || r >= SEGMENT_MIN_THROUGHPUT
+        || WINDOWS_SINCE_PROBE.fetch_add(1, Ordering::Relaxed) % SEGMENT_PROBE_EVERY == 0
 }
 
 // ── Cache data types ──────────────────────────────────────────────────────────
@@ -852,6 +873,60 @@ fn promote_lookahead(of: &mut OpenFile, off: u64) {
     }
 }
 
+/// How far into the current window a READ must be before the previous window is
+/// let go even though it is not finished: by then no READ for its tail can still
+/// be in flight.
+const PREV_WINDOW_KEEP: u64 = 4 * 1024 * 1024;
+
+/// Drops `prev_buf` (and with it, once its pump and waiters let go, its share of
+/// the read-ahead budget) as soon as nothing can still need it: the READ landed
+/// in the current window and the old one is finished, or it has no READ parked on
+/// it and this READ is PREV_WINDOW_KEEP into the current window.
+fn retire_prev_window(of: &mut OpenFile, off: u64) {
+    let (Some(prev), Some(buf)) = (of.prev_buf.as_ref(), of.buf.as_ref()) else { return };
+    if off < buf.start || off >= buf.start + buf.target_len {
+        return;
+    }
+    let (done, waiters) = {
+        let ss = prev.stream.0.lock().unwrap();
+        (ss.done, ss.waiters)
+    };
+    if done || (waiters == 0 && off >= buf.start + PREV_WINDOW_KEEP) {
+        of.prev_buf = None;
+    }
+}
+
+/// A handle with no READ for this long counts as idle (a paused player).
+const HANDLE_IDLE: Duration = Duration::from_secs(10);
+
+/// Under read-ahead memory pressure (half the budget reserved), lets idle handles
+/// give back their speculative windows — the look-ahead and the previous window —
+/// so a paused player cannot starve everyone else's look-ahead. Its current window
+/// stays: that is what it reads first when it resumes. Checked opportunistically
+/// from `read()`, at most once a second, and only under pressure, so the common
+/// path costs one atomic load.
+fn release_idle_windows(ofs: &mut HashMap<u64, OpenFile>) {
+    static LAST_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
+    if READ_AHEAD_RESERVED.load(Ordering::Relaxed) < READ_AHEAD_BUDGET / 2 {
+        return;
+    }
+    let now = throughput_clock_ms();
+    let last = LAST_SWEEP_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1000
+        || LAST_SWEEP_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    for of in ofs.values_mut() {
+        if of.last_read.elapsed() >= HANDLE_IDLE && (of.next_buf.is_some() || of.prev_buf.is_some()) {
+            // Their pumps see they are no longer wanted (no READ is parked on an
+            // idle handle) and stop within SUPERSEDE_CHECK_EVERY.
+            of.next_buf = None;
+            of.prev_buf = None;
+        }
+    }
+}
+
 /// The window that follows a handle's first one, when that first one showed a
 /// straight read through a large file; `None` to keep the normal ramp.
 ///
@@ -1003,6 +1078,8 @@ struct OpenFile {
     // were still in flight are served from it (see `promote_lookahead`). Replaced
     // at the next promotion, dropped when a fetch replaces `buf`.
     prev_buf: Option<ReadAheadBuf>,
+    // When the last READ on this handle arrived; see `release_idle_windows`.
+    last_read: Instant,
     // A look-ahead job for this handle is queued, connecting or streaming. Cleared
     // by the job itself on every exit; keeps a second one from starting meanwhile.
     lookahead_inflight: bool,
@@ -5874,6 +5951,7 @@ impl Filesystem for NextCloudFs {
                 next_buf: None,
                 prev_buf: None,
                 lookahead_inflight: false,
+                last_read: Instant::now(),
                 total_written: 0,
                 // Only an empty staging file can stream from offset 0.
                 stream_eligible: !seeded,
@@ -5938,10 +6016,12 @@ impl Filesystem for NextCloudFs {
         // counts as sequential access when a later read finally misses.
         let sequential = {
             let mut ofs = self.open_files.safe_lock();
+            release_idle_windows(&mut ofs);
             match ofs.get_mut(&fh.0) {
                 Some(of) => {
                     let continues = of.next_expected_off == off;
                     of.next_expected_off = off.saturating_add(sz as u64);
+                    of.last_read = Instant::now();
                     continues
                 }
                 None => false,
@@ -5980,6 +6060,7 @@ impl Filesystem for NextCloudFs {
             let mut files = self.open_files.safe_lock();
             if let Some(of) = files.get_mut(&fh.0) {
                 promote_lookahead(of, off);
+                retire_prev_window(of, off);
                 // GLib 2.80+ MIME detection: serve synthetic magic bytes instead of
                 // downloading the file. The content-type was captured at open() from the
                 // PROPFIND dir cache. Zero network I/O; see mime_magic_bytes() for details.
@@ -6991,6 +7072,7 @@ impl Filesystem for NextCloudFs {
                                     next_buf: None,
                                     prev_buf: None,
                                     lookahead_inflight: false,
+                                    last_read: Instant::now(),
                                     total_written: 0,
                                     stream_eligible: false,
                                     chunk_upload: None,
@@ -7080,6 +7162,7 @@ impl Filesystem for NextCloudFs {
                 next_buf: None,
                 prev_buf: None,
                 lookahead_inflight: false,
+                last_read: Instant::now(),
                 total_written: 0,
                 stream_eligible: true,
                 chunk_upload: None,
@@ -8147,14 +8230,29 @@ struct WindowPump<'a> {
 /// Marks a window finished — `done`, waiters woken, TRANSFERS entry gone — when
 /// its pump ends, however it ends (unwinding included), so no reader can be left
 /// waiting on a window nothing fills any more.
-struct WindowDone<'p, 'a>(&'p WindowPump<'a>);
+///
+/// A window that ends short of its target without the prefix reaching the proven
+/// end of file — a segment panicked, or exited on a path that marked nothing — is
+/// also marked stopped, so its waiters get EAGAIN rather than EIO or a short reply.
+struct WindowDone<'p, 'a> {
+    pump: &'p WindowPump<'a>,
+    /// Bytes the window was planned to hold.
+    target: u64,
+}
 
 impl Drop for WindowDone<'_, '_> {
     fn drop(&mut self) {
-        let (ref mtx, ref cv) = **self.0.shared;
-        mtx.lock().unwrap_or_else(|e| e.into_inner()).done = true;
+        let (ref mtx, ref cv) = **self.pump.shared;
+        {
+            let mut ss = mtx.lock().unwrap_or_else(|e| e.into_inner());
+            let short = (ss.data.len() as u64) < self.target && !ss.at_eof() && self.pump.total.is_some();
+            if !ss.halted() && (std::thread::panicking() || short) {
+                ss.stopped = true;
+            }
+            ss.done = true;
+        }
         cv.notify_all();
-        self.0.tmap.safe_lock().remove(&self.0.tkey);
+        self.pump.tmap.safe_lock().remove(&self.pump.tkey);
     }
 }
 
@@ -8249,7 +8347,7 @@ impl<'a> WindowPump<'a> {
         extras: Vec<(ThrottleGuard<'a>, bg::SegmentThread)>,
         plan: &[Segment],
     ) -> usize {
-        let _done = WindowDone(&self);
+        let _done = WindowDone { pump: &self, target: plan.iter().map(|s| s.len).sum() };
         let already = self.shared.0.lock().unwrap().data.len() as u64;
         let t0 = Instant::now();
         let (resp, permit) = first;
@@ -8264,7 +8362,7 @@ impl<'a> WindowPump<'a> {
             pump.segment(0, plan[0], Some(resp), permit, already);
         });
         let ss = self.shared.0.lock().unwrap();
-        record_window_throughput((ss.received() as u64).saturating_sub(already), t0.elapsed());
+        record_window_throughput((ss.received() as u64).saturating_sub(already), t0.elapsed(), plan.len());
         ss.data.len()
     }
 
