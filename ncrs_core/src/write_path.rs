@@ -30,7 +30,10 @@
 //! unbounded): every job on them is a lane step, which owns a kernel request's
 //! reply, or a released handle's staging cleanup. A lane submits one step at a
 //! time, whichever pool runs it, so the lane steps queued never outnumber the
-//! requests the kernel has outstanding on distinct handles.
+//! requests the kernel has outstanding on distinct handles. The cleanups are
+//! queued after RELEASE's reply, so no kernel request bounds them (only one
+//! per released handle); they are counted (`FhLanes::cleanup`) for HEALTH and
+//! for the shutdown drain.
 //! Refusing instead would mean running the step on `fuser-0` (the disk wait
 //! this module exists to avoid) or answering EAGAIN, which `write(2)` hands to
 //! the application: `cp` would fail a copy under load.
@@ -685,9 +688,14 @@ impl WriteCtx {
     /// Runs `job`, which touches the disk and answers nobody, off the calling
     /// thread: on `disk_slow_pool`, which never refuses; failing that (the OS
     /// could not start a worker) on `spill_pool`; only if that fails too, here.
+    /// Counted by the lanes (`FhLanes::cleanup`) until it has run.
     fn off_dispatch(&self, job: impl FnOnce() + Send + 'static) {
         type Job = Box<dyn FnOnce() + Send>;
-        let job: Job = Box::new(job);
+        let counted = self.lanes.cleanup();
+        let job: Job = Box::new(move || {
+            let _counted = counted;
+            job()
+        });
         let job = match self.disk_slow_pool.submit_owning(job, |j: Job| j()) {
             Ok(()) => return,
             Err((_, j)) => j,
