@@ -78,7 +78,7 @@ fn client(http3: bool) -> crate::http_clients::DavClient {
     static H2: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     let cell = if http3 { &H3 } else { &H2 };
     let raw = cell.get_or_init(|| {
-        let mut b = reqwest::blocking::Client::builder().timeout(API_TIMEOUT);
+        let mut b = crate::http_clients::with_pooled_dns(reqwest::blocking::Client::builder()).timeout(API_TIMEOUT);
         if http3 {
             b = b.http3_prior_knowledge();
         }

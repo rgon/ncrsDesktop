@@ -2,7 +2,7 @@
 
 Every OS thread the daemon creates comes from [`ncrs_core/src/bg.rs`](../ncrs_core/src/bg.rs). It is either a worker of one of the fixed pools below or one of the named long-lived services. `std::thread::spawn` is banned everywhere else by `ncrs_core/clippy.toml`, and CI enforces this with `clippy -D clippy::disallowed_methods`. `std::thread::scope` stays allowed, because it joins its threads before returning.
 
-This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (166) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 57) + the main thread + reqwest's runtime threads (`MAX_HTTP_CLIENT_THREADS`, 22: 8 singletons plus the extra per-download-slot read clients, 7 per transport — see `http_clients::DOWNLOAD_CONNECTIONS`), which is **270**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
+This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (176) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 57) + the main thread + reqwest's runtime threads (`MAX_HTTP_CLIENT_THREADS`, 22: 8 singletons plus the extra per-download-slot read clients, 7 per transport — see `http_clients::DOWNLOAD_CONNECTIONS`), which is **280**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
 
 Why this matters: 0.1.76 spawned a detached thread per FUSE request and per background revalidation, and took its concurrency permit *inside* the thread. During a `find /` over a server answering 500, 9,800 of those threads parked on a 10-slot throttle. The daemon reached 10,160 threads and ~900 load average (2026-09-24; see `docs/plans/2026-09-24-thread-leak-5xx-walker.md`).
 
@@ -12,7 +12,9 @@ Why this matters: 0.1.76 spawned a detached thread per FUSE request and per back
 graph LR
   K[kernel request] --> F0[fuser-0: FUSE dispatch — never blocks on the network]
   F0 -->|submit_owning(reply), EAGAIN if full| RD[[readdir ×24, q512]]
-  F0 -->|run_read_job(reply), EAGAIN if full| RE[[read ×32, q2048]]
+  F0 -->|run_read_job(reply), EAGAIN if full| RE[[read ×32, q32]]
+  RE -->|window body, after the reply| ST[[stream ×8, q8]]
+  F0 -->|look-ahead, slot taken first| ST
   F0 -->|submit_mutation — ticket taken first, FIFO, never refused| MU[[mutate ×16, q∞]]
   F0 -->|notify_later| NO[[notify ×1, q8192]]
   RD -->|cold listing: per-pid token bucket| WK{walkers}
@@ -33,7 +35,9 @@ graph LR
 | Pool | Workers | Queue | Full → | Used for |
 |---|---|---|---|---|
 | `readdir` | 24 | 512 | EAGAIN to the kernel | `readdir`/`readdirplus` workers; the reply travels in the job |
-| `read` | 32 | 2048 | EAGAIN | read waits on read-ahead streams, range streams, a sequential reader's look-ahead window (dropped, not EAGAIN, when full) |
+| `read` | 32 | 32 | EAGAIN | jobs that own a READ reply: opening a range stream to its first bytes, waits on read-ahead windows, the bounded whole-file fallback. The queue holds one more round at most, and a job dequeued after 30 s answers EAGAIN, so a queued READ is answered within one job's bound (table below) |
+| `stream` | 8 (= `DOWNLOAD_CONNECTIONS`) | 8 | foreground: runs on in its `read` worker; look-ahead: dropped | read-ahead window bodies after their READ was answered, and look-ahead windows (whose slot is taken before submission, so they never wait for one here) |
+| `dns` | 2 | 64 | lookup fails | host lookups for every reqwest client (`http_clients::PooledResolver`), instead of each client runtime's own blocking pool |
 | `list` | 16 | 2048 | error (stale listing served if cached) | streaming lists, soft-TTL refreshes |
 | `bg` | 4 | 256 | dropped | revalidation on read, prefetch, GIO temp purge, chunk-upload abort |
 | `mutate` | 16 | unbounded | journal replays it | PUT/MKCOL/DELETE/MOVE commits (`PathSeq` FIFO; see `path_seq.rs`) |
@@ -71,6 +75,22 @@ graph LR
 | notify-push proactive refresh (`bg::run_chunked`) | `REFRESH_SCOPE_WIDTH` 4 | one event at a time |
 | unified search providers (`search.rs`) | `SEARCH_WIDTH` 6 | per search |
 | read-ahead window segments (`WindowPump::run`, `lib.rs`) | up to `MAX_WINDOW_SEGMENTS` − 1 = 3 per window | `SEGMENT_SCOPE_WIDTH` 7 in total: each holds a `read_throttle` slot beyond its window's own |
+
+## How long a READ can go unanswered
+
+Every path from `read()` to a reply, worst case (typical is milliseconds):
+
+| Path | Bound |
+|---|---|
+| cached / staging / in-window hit | inline on `fuser-0`, no wait |
+| pool full | EAGAIN at once |
+| queued in `read` | ≤ one job bound below; a job that waited > 30 s answers EAGAIN at once |
+| range open | offline-blip wait ≤ 15 s + `RANGE_OPEN_BUDGET` 30 s (+ ≤ 15 s header wait overrun) → EAGAIN if no slot or no headers |
+| first bytes | + `FIRST_BYTES_DEADLINE` 30 s (+ ≤ 15 s one read) → EAGAIN when slow, EIO when truncated |
+| whole-file fallback (server answered the range with an error) | + `READ_FALLBACK_BUDGET` 60 s |
+| wait on a window | 60 s without progress, 120 s in all → EAGAIN; EIO if the window broke |
+
+So a READ is answered in at most ~165 s from dequeue plus one such bound queued. A window body holds no reply and runs on `stream`; it ends within its stall rules (no 256 KiB per 15 s → resume on another connection, ≤ 2 stall resumes + 1 retry, each open ≤ 30 s), and stops within ~1 s of being superseded.
 
 ## Rules
 

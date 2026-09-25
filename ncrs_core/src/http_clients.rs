@@ -359,3 +359,44 @@ pub fn raise_quic_socket_buffers() {
         }
     }
 }
+
+/// reqwest DNS resolver that runs every lookup on the shared, bounded `bg::DNS`
+/// pool. Every daemon client is built with it ([`with_pooled_dns`]).
+///
+/// Why: reqwest's default resolver hands each `getaddrinfo` to its client's own
+/// tokio runtime's blocking pool, which can grow to 512 threads, and the daemon
+/// runs over a dozen client runtimes (one per read slot per transport, plus the
+/// singletons). Those threads never appeared in `bg::MAX_THREADS`. Here lookups
+/// share two threads process-wide, and a lookup the pool cannot take fails like a
+/// resolver error rather than growing anything.
+pub struct PooledResolver;
+
+impl reqwest::dns::Resolve for PooledResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let submitted = crate::bg::DNS.submit(move || {
+            use std::net::ToSocketAddrs;
+            // Port 0: reqwest substitutes the URL's port.
+            let result = (host.as_str(), 0).to_socket_addrs().map(|it| it.collect::<Vec<_>>());
+            // The request may have given up already; nothing to do then.
+            let _ = tx.send(result);
+        });
+        Box::pin(async move {
+            if let Err(r) = submitted {
+                return Err(format!("DNS lookup refused: {}", r).into());
+            }
+            match rx.await {
+                Ok(Ok(addrs)) => Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs),
+                Ok(Err(e)) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                Err(_) => Err("DNS lookup dropped".into()),
+            }
+        })
+    }
+}
+
+/// `builder` with the process-wide [`PooledResolver`].
+pub fn with_pooled_dns(builder: reqwest::blocking::ClientBuilder) -> reqwest::blocking::ClientBuilder {
+    static RESOLVER: std::sync::OnceLock<Arc<PooledResolver>> = std::sync::OnceLock::new();
+    builder.dns_resolver(Arc::clone(RESOLVER.get_or_init(|| Arc::new(PooledResolver))))
+}
