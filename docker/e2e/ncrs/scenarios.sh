@@ -476,7 +476,15 @@ for _ in $(seq 1 30); do
     [ "$(curl -s -o /dev/null -w '%{http_code}' -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}revdir/")" = "207" ] && break
     sleep 1
 done
-ls "$MOUNT/revdir" >/dev/null 2>&1          # cache the (empty) listing
+# Cache the (empty) listing from the server. A listing served before the MKCOL
+# lands comes from the local placeholder, which carries no ETag and is dropped
+# once the MKCOL succeeds; the next look then re-lists instead of probing. Keep
+# looking until the daemon has fetched the folder's listing itself.
+for _ in $(seq 1 30); do
+    ls "$MOUNT/revdir" >/dev/null 2>&1
+    grep -q "PROPFIND_STREAM /revdir done" "${NCRS_LOG:-/tmp/ncrs.log}" && break
+    sleep 0.5
+done
 T_CACHE=$(date +%s)
 ETAG_BEFORE="$(curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}revdir/" | grep -o '<[^>]*getetag>[^<]*' | head -1)"
 RVC="revalidate-me $(date +%s%N)"
