@@ -1431,6 +1431,9 @@ const OFFLINE_READ_ERR: &str = "network: offline — timed out waiting for conne
 fn mark_offline(is_offline: &AtomicBool, since: &Mutex<Option<Instant>>) {
     if !is_offline.swap(true, Ordering::Relaxed) {
         *since.safe_lock() = Some(Instant::now());
+        // The network — or its DNS view (VPN, split horizon) — may have changed:
+        // re-resolve on the next request instead of trusting a 45 s-fresh answer.
+        crate::http_clients::expire_fresh_dns();
     }
 }
 
