@@ -244,3 +244,89 @@ fn read_marker_age(path: &Path) -> Option<Duration> {
         .as_secs();
     Some(Duration::from_secs(now.saturating_sub(ts)))
 }
+
+/// UDP buffer size asked for on the QUIC sockets; see [`raise_quic_socket_buffers`].
+pub const QUIC_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+
+/// Raises `SO_RCVBUF`/`SO_SNDBUF` to [`QUIC_SOCKET_BUFFER`] on every IPv4/IPv6
+/// datagram socket this process owns. Call it after building an HTTP/3 client.
+///
+/// Why: reqwest 0.13's H3 connector binds its own `quinn::Endpoint` on `[::]:0`
+/// and offers no knob for the socket, so every QUIC socket kept the kernel default
+/// receive buffer (~208 KiB). A download bursting at tens of MB/s over a few ms of
+/// scheduling delay overruns that, and the kernel drops the datagrams (thousands
+/// counted by `ss -uanem` on the live daemon), which QUIC then treats as loss and
+/// backs off from. The kernel caps the value at `net.core.rmem_max`/`wmem_max`;
+/// the effective size is read back and logged once.
+///
+/// reqwest hides the socket, so this finds it: walk `/proc/self/fd`, keep the
+/// sockets whose `SO_TYPE` is `SOCK_DGRAM` and `SO_DOMAIN` inet/inet6. Setting a
+/// buffer size is idempotent and harmless on any other datagram socket (a resolver's
+/// transient one), and an fd that closes or is reused mid-scan just fails a
+/// syscall. Runs at client build time — mount setup, or a side client's first use
+/// — never on the FUSE thread.
+pub fn raise_quic_socket_buffers() {
+    use std::os::unix::ffi::OsStrExt;
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+
+    fn get_int(fd: libc::c_int, opt: libc::c_int) -> Option<libc::c_int> {
+        let mut v: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `v`/`len` are valid for the duration of the call and sized for
+        // an int option; a stale or non-socket fd only makes the call fail.
+        let r = unsafe {
+            libc::getsockopt(fd, libc::SOL_SOCKET, opt, &mut v as *mut _ as *mut libc::c_void, &mut len)
+        };
+        (r == 0).then_some(v)
+    }
+    fn set_int(fd: libc::c_int, opt: libc::c_int, v: libc::c_int) -> bool {
+        // SAFETY: as above; the kernel copies the int and keeps no pointer.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &v as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) == 0
+        }
+    }
+
+    let Ok(dir) = std::fs::read_dir("/proc/self/fd") else { return };
+    let want = QUIC_SOCKET_BUFFER as libc::c_int;
+    let mut tuned = 0usize;
+    let mut effective = None;
+    for ent in dir.flatten() {
+        let Some(fd) = ent.file_name().to_str().and_then(|n| n.parse::<libc::c_int>().ok()) else {
+            continue;
+        };
+        // Cheap pre-filter before any syscall on the fd: the link reads "socket:[ino]".
+        match std::fs::read_link(ent.path()) {
+            Ok(target) if target.as_os_str().as_bytes().starts_with(b"socket:") => {}
+            _ => continue,
+        }
+        if get_int(fd, libc::SO_TYPE) != Some(libc::SOCK_DGRAM) {
+            continue;
+        }
+        if !matches!(get_int(fd, libc::SO_DOMAIN), Some(libc::AF_INET) | Some(libc::AF_INET6)) {
+            continue;
+        }
+        let rcv_ok = set_int(fd, libc::SO_RCVBUF, want);
+        let snd_ok = set_int(fd, libc::SO_SNDBUF, want);
+        if rcv_ok || snd_ok {
+            tuned += 1;
+            effective = Some((get_int(fd, libc::SO_RCVBUF), get_int(fd, libc::SO_SNDBUF)));
+        }
+    }
+    if let Some((rcv, snd)) = effective {
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            // Linux reports twice the size set (it counts its bookkeeping overhead),
+            // capped by net.core.rmem_max / wmem_max.
+            log::info!(
+                "QUIC UDP buffers: asked {} KiB on {} socket(s); kernel reports rcv={:?} snd={:?} bytes \
+                 (capped by net.core.rmem_max/wmem_max)",
+                QUIC_SOCKET_BUFFER / 1024, tuned, rcv, snd,
+            );
+        }
+    }
+}

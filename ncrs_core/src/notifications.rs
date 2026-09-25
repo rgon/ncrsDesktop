@@ -71,7 +71,12 @@ fn client(http3: bool) -> crate::http_clients::DavClient {
         if http3 {
             builder = builder.http3_prior_knowledge();
         }
-        builder.build().expect("reqwest client")
+        let client = builder.build().expect("reqwest client");
+        if http3 {
+            // Its QUIC endpoint's socket exists now; give it room (see the fn).
+            crate::http_clients::raise_quic_socket_buffers();
+        }
+        client
     });
     // Stamp HTTP/3 requests with their version: reqwest routes a request to
     // the QUIC connector only when the request itself says Version::HTTP_3.
