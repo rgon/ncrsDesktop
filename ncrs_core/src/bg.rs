@@ -307,9 +307,13 @@ pub const MAX_THREADS: usize = {
     n + MAX_SERVICES + MAX_SCOPED_THREADS + 1 + MAX_HTTP_CLIENT_THREADS
 };
 
-/// reqwest's blocking client runs one runtime thread per client; ncrs builds a
-/// fixed handful (metadata, transfers, previews, push). Generous upper bound.
-pub const MAX_HTTP_CLIENT_THREADS: usize = 8;
+/// reqwest's blocking client runs one runtime thread per client, alive as long as
+/// the client. ncrs builds a fixed set, all at startup or first use and never more:
+/// a generous 8 for the singletons (metadata per transport, previews, push,
+/// notifications, search, assets, one read client per transport), plus the
+/// read clients beyond the first for each transport — one per download slot, for
+/// HTTP/3 and for the HTTP/2 fallback (see `http_clients::DOWNLOAD_CONNECTIONS`).
+pub const MAX_HTTP_CLIENT_THREADS: usize = 8 + 2 * (crate::http_clients::DOWNLOAD_CONNECTIONS - 1);
 
 const POOL_SIZES: [usize; 10] = [
     READDIR_WORKERS,

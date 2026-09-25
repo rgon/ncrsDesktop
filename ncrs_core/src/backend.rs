@@ -382,19 +382,24 @@ pub trait CloudBackend: Send + Sync + 'static {
 
     // -- File reading ---------------------------------------------------------
 
+    /// `slot` is the caller's `read_throttle` permit slot: the download goes out on
+    /// that slot's own read connection (see `http_clients::DOWNLOAD_CONNECTIONS`).
     fn download_file(
         &self,
         path: &Path,
         dest: &mut dyn std::io::Write,
         timeout: Duration,
+        slot: usize,
     ) -> Result<u64, BackendReadError>;
 
+    /// `slot` as for [`download_file`](Self::download_file).
     fn read_file_range(
         &self,
         path: &Path,
         offset: u64,
         buf: &mut [u8],
         timeout: Duration,
+        slot: usize,
     ) -> Result<usize, BackendReadError>;
 
     // -- Write operations -----------------------------------------------------

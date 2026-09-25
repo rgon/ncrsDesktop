@@ -210,12 +210,13 @@ impl CloudBackend for NextcloudBackend {
         path: &Path,
         dest: &mut dyn std::io::Write,
         timeout: Duration,
+        slot: usize,
     ) -> Result<u64, BackendReadError> {
         // One path for both auth types. The basic-auth branch used to go through
         // remotefs-webdav, which buffered the entire file in memory before
         // writing it out; this streams straight into `dest`.
         let url = self.webdav_file_url(path);
-        let mut resp = self.creds.apply(self.clients.read().get(&url).timeout(timeout))
+        let mut resp = self.creds.apply(self.clients.read(slot).get(&url).timeout(timeout))
             .send()
             .map_err(|e| BackendReadError::Network(e.to_string()))?;
         let status = resp.status();
@@ -236,12 +237,13 @@ impl CloudBackend for NextcloudBackend {
         offset: u64,
         buf: &mut [u8],
         timeout: Duration,
+        slot: usize,
     ) -> Result<usize, BackendReadError> {
         let url = self.webdav_file_url(path);
         let end = offset + buf.len() as u64 - 1;
         let resp = self
             .clients
-            .read()
+            .read(slot)
             .get(&url)
             .timeout(timeout)
             .header("Range", format!("bytes={}-{}", offset, end))
