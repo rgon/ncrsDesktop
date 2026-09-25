@@ -346,8 +346,12 @@ pub const DISK_WORKERS: usize = 4;
 /// released handle's staging delete or move to `recovered/`. Split off `DISK`
 /// so four of these at once can't stall every other file's `write(2)`.
 ///
-/// Never refused, for the same reason as `DISK`: the lane steps here own a
-/// reply and a handle has one step submitted at a time.
+/// Never refused. The lane steps here are bounded like `DISK`'s: each owns a
+/// reply and a handle has one step submitted at a time. The cleanups are not:
+/// they answer nobody and are queued after RELEASE's reply, so how many wait
+/// is bounded only by how many handles were released (one each). HEALTH
+/// reports them (`staging_cleanups`, `FhLanes::cleanups`) and shutdown waits
+/// for them, bounded, before the process exits.
 pub static DISK_SLOW: Pool = Pool::new("disk-slow", DISK_SLOW_WORKERS, usize::MAX);
 pub const DISK_SLOW_WORKERS: usize = 2;
 

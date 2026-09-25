@@ -40,6 +40,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::bg::Pool;
@@ -70,6 +71,18 @@ struct Step {
 pub(crate) struct FhLanes {
     // A handle is present while its lane is busy; the deque holds what waits.
     lanes: Mutex<HashMap<u64, VecDeque<Step>>>,
+    // Released handles' staging cleanups queued or running (`cleanup`).
+    cleanups: AtomicUsize,
+}
+
+/// A released handle's staging cleanup, counted by its lanes until it has
+/// run (or been dropped unrun). See [`FhLanes::cleanup`].
+pub(crate) struct Cleanup(Arc<FhLanes>);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        self.0.cleanups.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// An idle lane taken for work on the current thread; dropping it starts
@@ -156,6 +169,25 @@ impl FhLanes {
     /// Handles with work queued or running, for HEALTH.
     pub fn busy_count(&self) -> usize {
         self.lock().len()
+    }
+
+    /// Counts a released handle's staging cleanup until the returned value
+    /// is dropped. The cleanup runs off the lane, after RELEASE was answered,
+    /// so nothing the kernel still waits for bounds how many are queued; the
+    /// count shows them in HEALTH and keeps shutdown waiting for them.
+    pub fn cleanup(self: &Arc<Self>) -> Cleanup {
+        self.cleanups.fetch_add(1, Ordering::SeqCst);
+        Cleanup(self.clone())
+    }
+
+    /// Staging cleanups queued or running, for HEALTH.
+    pub fn cleanups(&self) -> usize {
+        self.cleanups.load(Ordering::SeqCst)
+    }
+
+    /// What shutdown waits for: handles with lane work, and cleanups.
+    pub fn outstanding(&self) -> usize {
+        self.busy_count() + self.cleanups()
     }
 
     // Starts `step`, which now owns `fh`'s lane, and every step after it that

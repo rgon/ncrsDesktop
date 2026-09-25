@@ -678,6 +678,10 @@
             let wp5 = r.of(5, |of| of.write_path.clone().unwrap());
             r.ctx.open_files.safe_lock().get_mut(&5).unwrap().dirty = false;
             recv(&r.release(5), "release of a clean handle");
+            // Queued after the reply, so no lane holds it (only the four
+            // handles above are busy): counted instead, for HEALTH and the
+            // shutdown drain.
+            assert_eq!((r.ctx.lanes.busy_count(), r.ctx.lanes.cleanups(), r.ctx.lanes.outstanding()), (4, 1, 5));
 
             // A plain write on another handle lands while all of that waits.
             r.open(6, "/c.txt", None);
@@ -697,7 +701,7 @@
             assert_eq!(recv(&seed_truncate, "seeding truncate"), Ok(()));
             recv(&fsync, "fsync");
             recv(&flush, "flush");
-            wait_for("the release cleanup", || !wp5.exists());
+            wait_for("the release cleanup", || !wp5.exists() && r.ctx.lanes.cleanups() == 0);
             let wp3 = r.of(3, |of| of.write_path.clone().unwrap());
             let mut expect = pattern(MIB, 30);
             expect[..4].copy_from_slice(b"EDIT");

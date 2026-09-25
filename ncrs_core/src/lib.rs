@@ -1308,6 +1308,7 @@ struct HealthSources {
     breaker: Arc<backoff::ServerBreaker>,
     backoff: Arc<backoff::PathBackoff>,
     walkers: Arc<walkers::WalkerTracker>,
+    lanes: Arc<fh_lane::FhLanes>,
 }
 static HEALTH: std::sync::OnceLock<HealthSources> = std::sync::OnceLock::new();
 
@@ -1320,6 +1321,12 @@ struct HealthReport {
     paths_backing_off: usize,
     walkers: Vec<walkers::WalkerStats>,
     metadata: MetaHealth,
+    /// Open handles with write-path steps queued or running (`fh_lane.rs`).
+    busy_handles: usize,
+    /// Released handles' staging deletes and moves still queued or running on
+    /// `disk-slow`. Queued after RELEASE's reply, so unlike the lane steps no
+    /// outstanding kernel request bounds them.
+    staging_cleanups: usize,
 }
 
 /// Cumulative counters behind the "remember attributes of evicted listings?"
@@ -1363,6 +1370,8 @@ fn health_report() -> HealthReport {
         paths_backing_off: h.map_or(0, |h| h.backoff.len()),
         walkers: h.map(|h| h.walkers.active(now)).unwrap_or_default(),
         metadata: MetaHealth::now(),
+        busy_handles: h.map_or(0, |h| h.lanes.busy_count()),
+        staging_cleanups: h.map_or(0, |h| h.lanes.cleanups()),
     }
 }
 
@@ -1417,8 +1426,8 @@ fn health_log_loop(shutdown: Arc<AtomicBool>) {
         let open = r.breaker.as_ref().is_some_and(|b| b.open);
         let m = r.metadata;
         let line = format!(
-            "HEALTH threads={}/{} pools=[{}] refused+{} breaker={} backing_off={} walkers=[{}] slow_lookups+{} unresolved+{} evicted+{} (crawler {})",
-            r.threads, r.max_threads, busy.join(", "), rejected - last_rejected.min(rejected),
+            "HEALTH threads={}/{} pools=[{}] refused+{} busy_handles={} staging_cleanups={} breaker={} backing_off={} walkers=[{}] slow_lookups+{} unresolved+{} evicted+{} (crawler {})",
+            r.threads, r.max_threads, busy.join(", "), rejected - last_rejected.min(rejected), r.busy_handles, r.staging_cleanups,
             if open { "open" } else { "closed" }, r.paths_backing_off, walkers.join("; "),
             m.slow_lookups - last_meta.slow_lookups.min(m.slow_lookups),
             m.unresolved - last_meta.unresolved.min(m.unresolved),
@@ -5549,10 +5558,12 @@ impl NextCloudFs {
                 options.walker_listings_per_sec,
             )),
         });
+        let lanes = fh_lane::FhLanes::new();
         let _ = HEALTH.set(HealthSources {
             breaker: conn.breaker.clone(),
             backoff: conn.backoff.clone(),
             walkers: conn.walkers.clone(),
+            lanes: lanes.clone(),
         });
 
         let cache = {
@@ -5587,7 +5598,7 @@ impl NextCloudFs {
         Ok(NextCloudFs {
             meta: std::sync::OnceLock::new(),
             wctx: std::sync::OnceLock::new(),
-            lanes: fh_lane::FhLanes::new(),
+            lanes,
             cache,
             status,
             dirty,
@@ -9086,7 +9097,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     // a clean unmount that ends the session below (no-op for library callers).
     {
         let lanes = shutdown_lanes.clone();
-        signals::mounted(options.mount_point.clone(), move || lanes.busy_count());
+        signals::mounted(options.mount_point.clone(), move || lanes.outstanding());
     }
 
     let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;
@@ -9104,11 +9115,13 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     log::info!("FUSE session ended — shutdown signal sent to background threads");
 
     // A release still queued behind a handle's in-flight write has not
-    // journaled its file yet, and a journal change may still be waiting for
-    // the deferred saver: give the first a moment, then write the journal
-    // here, before the process can exit under both.
+    // journaled its file yet, a released handle's staging may still be on
+    // its way to `recovered/` (and its conflict record with it), and a
+    // journal change may still be waiting for the deferred saver: give the
+    // first two a moment, then write the journal here, before the process
+    // can exit under all three.
     let drain_until = Instant::now() + Duration::from_secs(10);
-    while shutdown_lanes.busy_count() > 0 && Instant::now() < drain_until {
+    while shutdown_lanes.outstanding() > 0 && Instant::now() < drain_until {
         thread::sleep(Duration::from_millis(50));
     }
     mutation_journal::flush_deferred(&shutdown_journal);
