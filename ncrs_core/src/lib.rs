@@ -209,6 +209,16 @@ const READ_HEADER_TIMEOUT_ERR: &str = "range read: server sent no response heade
 /// Prefix of `read_exact_from_stream`'s error when the body stalled or crawled
 /// before the first bytes a READ needs arrived.
 const READ_BODY_SLOW_PREFIX: &str = "range read too slow";
+/// Error for a lookup the DNS pool refused (`http_clients::is_dns_refusal`).
+/// Matches neither network-down classifier: answered EAGAIN, never offline.
+const DNS_BUSY_ERR: &str = "range read: name lookup refused (lookup pool busy)";
+
+/// Whether a range-open error means "try again shortly" (daemon busy, server slow,
+/// offline blip) rather than a wrong answer: waiters get EAGAIN for these.
+fn is_retry_later_err(e: &str) -> bool {
+    e == READ_SLOTS_BUSY_ERR || e == READ_HEADER_TIMEOUT_ERR || e == OFFLINE_READ_ERR || e == DNS_BUSY_ERR
+        || read_err_is_network_down(e)
+}
 
 /// Asks the connectivity monitor to probe the server now rather than at its next
 /// tick. How a read that only proved "slow", not "gone", gets reachability decided
@@ -441,8 +451,10 @@ impl Throttle {
 // ── Read-ahead memory budget ─────────────────────────────────────────────────
 
 /// Bytes every read-ahead window together may reserve. A handle can hold its
-/// current window, its look-ahead and — until that window's pump notices — a
-/// superseded one, each up to the 64 MB ceiling, so without a global cap a few
+/// current window, its look-ahead, the window it just left (`prev_buf`) and —
+/// until that window's pump notices — a superseded one, each up to the 64 MB
+/// ceiling (plus, when segmented, one segment of transient copy), so without a
+/// global cap a few
 /// busy readers could pin gigabytes. When the budget is spent, new windows shrink
 /// (never below what the READ waiting on them needs) and look-aheads are skipped;
 /// no reply ever waits on it.
@@ -478,10 +490,64 @@ impl BufferReservation {
     }
 }
 
+impl BufferReservation {
+    /// Grows this reservation to `want`, all or nothing.
+    fn grow_to(&mut self, want: u64) -> bool {
+        if want <= self.0 {
+            return true;
+        }
+        let extra = want - self.0;
+        let ok = READ_AHEAD_RESERVED
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                (used + extra <= READ_AHEAD_BUDGET).then_some(used + extra)
+            })
+            .is_ok();
+        if ok {
+            self.0 = want;
+        }
+        ok
+    }
+
+    /// Gives back everything above `want`.
+    fn shrink_to(&mut self, want: u64) {
+        if want < self.0 {
+            READ_AHEAD_RESERVED.fetch_sub(self.0 - want, Ordering::SeqCst);
+            self.0 = want;
+        }
+    }
+}
+
 impl Drop for BufferReservation {
     fn drop(&mut self) {
         READ_AHEAD_RESERVED.fetch_sub(self.0, Ordering::SeqCst);
     }
+}
+
+/// Recent single-window download rate, in bytes per second (0 = not measured
+/// yet). An exponentially weighted average over finished windows, mount-wide.
+static WINDOW_THROUGHPUT: AtomicU64 = AtomicU64::new(0);
+/// Below this measured rate a window is never split into segments: on a slow link
+/// segments only divide the same bandwidth into more streams that each look
+/// stalled, and their extra requests buy nothing.
+const SEGMENT_MIN_THROUGHPUT: u64 = 1024 * 1024;
+
+/// Folds one finished window's rate into WINDOW_THROUGHPUT. Only windows big
+/// enough to say something (≥ 1 MiB over ≥ 100 ms) count.
+fn record_window_throughput(bytes: u64, elapsed: Duration) {
+    if bytes < 1024 * 1024 || elapsed < Duration::from_millis(100) {
+        return;
+    }
+    let rate = (bytes as f64 / elapsed.as_secs_f64()) as u64;
+    let _ = WINDOW_THROUGHPUT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(if old == 0 { rate } else { (old * 3 + rate) / 4 })
+    });
+}
+
+/// Whether the link looks fast enough for segmented windows (unknown counts as
+/// yes: the first windows measure it).
+fn segments_worthwhile() -> bool {
+    let r = WINDOW_THROUGHPUT.load(Ordering::Relaxed);
+    r == 0 || r >= SEGMENT_MIN_THROUGHPUT
 }
 
 // ── Cache data types ──────────────────────────────────────────────────────────
@@ -557,15 +623,28 @@ struct StreamState {
     /// Per-segment bytes not yet contiguous with `data`. Every segment covers a
     /// disjoint part of the window, so `data` plus these never exceed the window.
     ahead: Vec<SegmentBuf>,
-    /// A segment gave up: `data` can never grow past the hole it left, so the
-    /// window's other segments stop too.
+    /// A segment gave up for good (the transport kept failing, or the server
+    /// answered wrongly): `data` can never grow past the hole it left, so the
+    /// window's other segments stop too, and waiters inside the hole get EIO.
     broken: bool,
-    /// The window's last request ended exactly at the end of the file the server
-    /// reported (Content-Range total). Only then may the window's end be served as
-    /// EOF when the dir-cache size cannot vouch for it.
-    eof_proven: bool,
+    /// A segment stopped for a reason trying again can fix — superseded, no slot
+    /// free for a resume, the server too slow. Like `broken` it halts the window,
+    /// but waiters inside the hole get EAGAIN. Never a short reply either way.
+    stopped: bool,
+    /// Window-relative offset where the file ends, when the window's last request
+    /// ran into the end of the body the server said the file has (Content-Range
+    /// total). Only `at_eof` may use it: a later segment can reach the end while an
+    /// earlier one left a hole, and the end is only the prefix's end once the
+    /// prefix actually gets there.
+    eof_len: Option<usize>,
+    /// READs parked on this window (`wait_on_window`). A window with waiters is
+    /// never stopped for being superseded: its tail is exactly what they want.
+    waiters: usize,
+    /// Start of the current progress period and the bytes received by then, for
+    /// the window-wide trickle rule (MIN_BODY_PROGRESS).
+    progress_mark: (Instant, u64),
     /// This window's share of READ_AHEAD_BUDGET, given back when the window goes.
-    _budget: BufferReservation,
+    budget: BufferReservation,
 }
 
 #[derive(Default)]
@@ -587,9 +666,22 @@ impl StreamState {
             done: false,
             ahead: plan.iter().map(|_| SegmentBuf::default()).collect(),
             broken: false,
-            eof_proven: false,
-            _budget: budget,
+            stopped: false,
+            eof_len: None,
+            waiters: 0,
+            progress_mark: (Instant::now(), 0),
+            budget,
         }
+    }
+
+    /// Whether `data` can still grow.
+    fn halted(&self) -> bool {
+        self.broken || self.stopped
+    }
+
+    /// Whether the prefix ends exactly where the server said the file does.
+    fn at_eof(&self) -> bool {
+        self.eof_len == Some(self.data.len())
     }
 
     /// Records `bytes` that segment `seg` fetched at window offset `at`. A segment
@@ -753,7 +845,10 @@ fn promote_lookahead(of: &mut OpenFile, off: u64) {
         return;
     }
     if of.next_buf.as_ref().is_some_and(covers) {
-        of.buf = of.next_buf.take();
+        // The old window stays reachable as `prev_buf`: READs for its tail can still
+        // be in flight (the kernel issues them asynchronously, in any order), and
+        // without it each would miss both windows and start a fresh GET.
+        of.prev_buf = std::mem::replace(&mut of.buf, of.next_buf.take());
     }
 }
 
@@ -904,6 +999,10 @@ struct OpenFile {
     // `buf` by the first read that lands in it. At most one per handle, so a handle
     // holds at most two windows. Dropped whenever a fetch replaces `buf` (a seek).
     next_buf: Option<ReadAheadBuf>,
+    // The window before `buf`, kept after a promotion so READs for its tail that
+    // were still in flight are served from it (see `promote_lookahead`). Replaced
+    // at the next promotion, dropped when a fetch replaces `buf`.
+    prev_buf: Option<ReadAheadBuf>,
     // A look-ahead job for this handle is queued, connecting or streaming. Cleared
     // by the job itself on every exit; keeps a second one from starting meanwhile.
     lookahead_inflight: bool,
@@ -1716,17 +1815,37 @@ const WINDOW_WAIT_IDLE: Duration = Duration::from_secs(
 /// Longest a read waits on a window at all, progress or not.
 const WINDOW_WAIT_MAX: Duration = Duration::from_secs(120);
 
+/// Counts a READ as parked on a window for as long as it waits (see
+/// `StreamState::waiters`), however the wait ends.
+struct Parked<'a>(&'a Mutex<StreamState>);
+
+impl<'a> Parked<'a> {
+    fn new(m: &'a Mutex<StreamState>) -> Self {
+        m.lock().unwrap().waiters += 1;
+        Parked(m)
+    }
+}
+
+impl Drop for Parked<'_> {
+    fn drop(&mut self) {
+        let mut ss = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        ss.waiters = ss.waiters.saturating_sub(1);
+    }
+}
+
 /// Answers a READ for `off..off+sz` from the window at `start` once its bytes are
 /// in, waiting (off the FUSE thread) while they arrive.
 ///
 /// A short reply latches EOF on the inode, so the window's end is only ever served
-/// short when it provably is the file's end: the window's last request ran into the
-/// end of the body the server said the file has (`eof_proven`), or the dir-cache
-/// size says so (`short_reply_ok`) — never when a segment broke, and never on an
-/// unknown size. A window that ended early is EIO (the transport gave up); one that
-/// simply has not delivered in time is EAGAIN, since trying again can work.
+/// short when it provably is the file's end: the prefix reached the end the server
+/// stated (`at_eof`), or the dir-cache size says so (`short_reply_ok`) — never when
+/// the window halted with a hole, and never on an unknown size. A window that broke
+/// is EIO (the transport gave up); one that stopped, or has not delivered in time,
+/// is EAGAIN, since trying again can work.
 fn wait_on_window(reply: ReplyData, shared: &Arc<(Mutex<StreamState>, Condvar)>, start: u64, off: u64, sz: usize, file_size: u64) {
     let (ref mtx, ref cv) = **shared;
+    // Declared before the lock guard, so it drops (and takes the lock) after it.
+    let _parked = Parked::new(mtx);
     let mut guard = mtx.lock().unwrap();
     let parked = Instant::now();
     let mut last_len = guard.data.len();
@@ -1737,22 +1856,22 @@ fn wait_on_window(reply: ReplyData, shared: &Arc<(Mutex<StreamState>, Condvar)>,
             reply.data(&guard.data[o..o + sz]);
             return;
         }
-        if guard.done || guard.broken {
+        if guard.done || guard.halted() {
             let avail = guard.data.len().saturating_sub(o);
-            if !guard.broken && (guard.eof_proven || short_reply_ok(off, avail, sz, file_size)) {
+            if !guard.halted() && (guard.at_eof() || short_reply_ok(off, avail, sz, file_size)) {
                 let e = guard.data.len().min(o.saturating_add(sz));
                 reply.data(if o < guard.data.len() { &guard.data[o..e] } else { &[] });
-            } else {
-                // The window promised these bytes and then stopped early — a transport
-                // error, or another read on this handle superseded the stream. Replying
-                // with what did arrive tells the kernel the file ends here and
-                // truncates it for every handle, so fail the read instead.
-                log::warn!(
-                    "read-ahead window ended {} bytes short of offset {} (broken={}) — failing the read rather than reporting EOF",
-                    sz.saturating_sub(avail), off, guard.broken,
-                );
-                reply.error(Errno::EIO);
+                return;
             }
+            // The window promised these bytes and then stopped early. Replying with
+            // what did arrive tells the kernel the file ends here and truncates it
+            // for every handle, so fail the read instead.
+            let errno = if guard.broken { Errno::EIO } else { Errno::EAGAIN };
+            log::warn!(
+                "read-ahead window ended {} bytes short of offset {} (broken={}, stopped={}) — {:?}, not EOF",
+                sz.saturating_sub(avail), off, guard.broken, guard.stopped, errno,
+            );
+            reply.error(errno);
             return;
         }
         if guard.data.len() > last_len {
@@ -3854,7 +3973,7 @@ impl NextCloudFs {
             // The HTTP/2 read set is only the demotion fallback: built on first use
             // after a demotion instead of idling eight runtime threads all session.
             crate::http_clients::HttpClients::with_lazy_h2_reads(
-                pref, reads, http_h2, || build_read_clients(false),
+                pref, reads, http_h2, || build_read_clients(false), READ_STALL_TIMEOUT,
             )
         } else {
             let reads = build_read_clients(false)?;
@@ -5753,6 +5872,7 @@ impl Filesystem for NextCloudFs {
                 next_expected_off: 0,
                 read_ahead_window: READ_AHEAD_INITIAL,
                 next_buf: None,
+                prev_buf: None,
                 lookahead_inflight: false,
                 total_written: 0,
                 // Only an empty staging file can stream from offset 0.
@@ -5910,7 +6030,15 @@ impl Filesystem for NextCloudFs {
                         }
                     }
                 }
-                if let Some(ref ra) = of.buf {
+                // A READ for the tail of the window the reader just left (see
+                // `promote_lookahead`) is served from that window, not refetched.
+                let covers = |b: &ReadAheadBuf| off >= b.start && off < b.start + b.target_len;
+                let window = if !of.buf.as_ref().is_some_and(covers) && of.prev_buf.as_ref().is_some_and(covers) {
+                    of.prev_buf.as_ref()
+                } else {
+                    of.buf.as_ref()
+                };
+                if let Some(ra) = window {
                     let (ref mtx, ref _cv) = *ra.stream;
                     let ss = mtx.lock().unwrap();
                     let available = ra.start + ss.data.len() as u64;
@@ -5958,13 +6086,19 @@ impl Filesystem for NextCloudFs {
                     if off >= ra.start && off < ra.start + ra.target_len {
                         let o = (off - ra.start) as usize;
                         let window_end = ra.start + ra.target_len;
-                        // The straddle runs into the look-ahead window: when this window
-                        // is complete and the look-ahead already holds the rest, stitch
-                        // the two instead of re-fetching (and discarding the look-ahead).
-                        if let Some(ref nb) = of.next_buf {
-                            if nb.start == window_end && ss.done && ra.start + ss.data.len() as u64 == window_end {
-                                // Lock order is always current window, then look-ahead;
-                                // a pump only ever holds its own stream's lock.
+                        // The straddle runs into the following window (the look-ahead,
+                        // or the current one when this is `prev_buf`): when this window
+                        // is complete and the next already holds the rest, stitch the
+                        // two instead of re-fetching (and discarding the look-ahead).
+                        let following = if of.prev_buf.as_ref().is_some_and(|p| Arc::ptr_eq(&p.stream, &ra.stream)) {
+                            of.buf.as_ref()
+                        } else {
+                            of.next_buf.as_ref()
+                        };
+                        if let Some(nb) = following {
+                            if nb.start == window_end && ss.done && !ss.halted() && ra.start + ss.data.len() as u64 == window_end {
+                                // Lock order is always the earlier window, then the later
+                                // one; a pump only ever holds its own stream's lock.
                                 let ns = nb.stream.0.lock().unwrap();
                                 let need = (off + sz as u64 - window_end) as usize;
                                 if ns.data.len() >= need {
@@ -5979,9 +6113,9 @@ impl Filesystem for NextCloudFs {
                                 }
                             }
                         }
-                        if ss.done && !ss.broken {
+                        if ss.done && !ss.halted() {
                             let avail = ss.data.len().saturating_sub(o);
-                            if ss.eof_proven || short_reply_ok(off, avail, sz, file_size) {
+                            if ss.at_eof() || short_reply_ok(off, avail, sz, file_size) {
                                 let e = ss.data.len().min(o.saturating_add(sz));
                                 reply.data(&ss.data[o..e]);
                                 drop(ss);
@@ -6195,6 +6329,7 @@ impl Filesystem for NextCloudFs {
                                 // seek, or a boundary the look-ahead did not cover):
                                 // the look-ahead is for a position nobody is at.
                                 of.next_buf = None;
+                                of.prev_buf = None;
                             });
                             // The READ is answered; the rest of the window is a body with
                             // no reply attached, so it moves off this `read` worker.
@@ -6297,6 +6432,10 @@ impl Filesystem for NextCloudFs {
                             reply.error(Errno::EIO);
                         }
                     }
+                }
+                Err(e) if e == DNS_BUSY_ERR => {
+                    log::warn!("read {} at {}: {} — EAGAIN", path.display(), off, e);
+                    reply.error(Errno::EAGAIN);
                 }
                 Err(e) if e == READ_HEADER_TIMEOUT_ERR => {
                     // Already probed and quarantined in do_range_read_stream.
@@ -6850,6 +6989,7 @@ impl Filesystem for NextCloudFs {
                                     next_expected_off: 0,
                                     read_ahead_window: READ_AHEAD_INITIAL,
                                     next_buf: None,
+                                    prev_buf: None,
                                     lookahead_inflight: false,
                                     total_written: 0,
                                     stream_eligible: false,
@@ -6938,6 +7078,7 @@ impl Filesystem for NextCloudFs {
                 next_expected_off: 0,
                 read_ahead_window: READ_AHEAD_INITIAL,
                 next_buf: None,
+                prev_buf: None,
                 lookahead_inflight: false,
                 total_written: 0,
                 stream_eligible: true,
@@ -7768,13 +7909,30 @@ fn do_range_read_stream<'a>(
                 // A 206 is the range asked for. A 200 is the whole file from byte 0:
                 // fine for a range that starts there (every consumer stops reading at
                 // its own length), wrong bytes for any other offset.
-                return if status == reqwest::StatusCode::PARTIAL_CONTENT
-                    || (status == reqwest::StatusCode::OK && offset == 0)
-                {
+                if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                    // A 206 must be the range asked for: starting anywhere else would
+                    // put the wrong bytes at every offset of the window.
+                    let range = resp.headers()
+                        .get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_content_range_span);
+                    return match range {
+                        Some((first, last)) if first == offset && last <= end => Ok((resp, permit)),
+                        other => Err(format!(
+                            "range read for bytes {}-{} got Content-Range {:?}", offset, end, other,
+                        )),
+                    };
+                }
+                return if status == reqwest::StatusCode::OK && offset == 0 {
                     Ok((resp, permit))
                 } else {
                     Err(format!("range read returned {} for offset {}", status, offset))
                 };
+            }
+            Err(e) if crate::http_clients::is_dns_refusal(&e) => {
+                // Our own lookup pool could not take the lookup: a busy daemon, not an
+                // unreachable server. Never a reason to go offline.
+                return Err(DNS_BUSY_ERR.into());
             }
             Err(e) if e.is_timeout() => {
                 // No response headers within READ_STALL_TIMEOUT. On QUIC that is most
@@ -7810,6 +7968,15 @@ fn do_range_read_stream<'a>(
         }
     }
     unreachable!()
+}
+
+/// Parse the first and last byte out of a `Content-Range: bytes 0-499/1234`
+/// header.
+fn parse_content_range_span(v: &str) -> Option<(u64, u64)> {
+    let span = v.trim().strip_prefix("bytes")?.trim_start().split('/').next()?;
+    let (a, b) = span.split_once('-')?;
+    let (a, b) = (a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?);
+    (a <= b).then_some((a, b))
 }
 
 /// Parse the total length out of a `Content-Range: bytes 0-499/1234` header.
@@ -7886,9 +8053,11 @@ fn open_window<'a>(conn: &'a ConnInfo, path: &Path, req: WindowRequest<'a>) -> R
     let budget = reserved.unwrap_or_else(|| {
         BufferReservation::up_to(target as u64, need.max(READ_AHEAD_INITIAL) as u64)
     });
+    let mut budget = budget;
     let target = (budget.0 as usize).min(target).max(need.min(target));
     let span = (file_size > start).then(|| file_size - start);
-    let most = segment_plan(target, span, MAX_WINDOW_SEGMENTS, need).len();
+    let max_segments = if segments_worthwhile() { MAX_WINDOW_SEGMENTS } else { 1 };
+    let most = segment_plan(target, span, max_segments, need).len();
     let mut extras = Vec::new();
     while extras.len() + 1 < most {
         let Some(token) = bg::SegmentThread::try_take() else { break };
@@ -7898,6 +8067,16 @@ fn open_window<'a>(conn: &'a ConnInfo, path: &Path, req: WindowRequest<'a>) -> R
         }
     }
     let mut plan = segment_plan(target, span, 1 + extras.len(), need);
+    // Moving a parked segment onto the prefix briefly holds its bytes twice, so a
+    // segmented window's peak is the window plus its largest segment. Reserve that
+    // too, or fetch the window as one segment.
+    if plan.len() > 1 {
+        let window: u64 = plan.iter().map(|s| s.len).sum();
+        let peak = window + plan.iter().map(|s| s.len).max().unwrap_or(0);
+        if !budget.grow_to(peak) {
+            plan = segment_plan(target, span, 1, need);
+        }
+    }
     // Rounding can make fewer segments than slots; hand the surplus straight back.
     extras.truncate(plan.len() - 1);
     let (resp, permit) = do_range_read_stream(
@@ -7917,7 +8096,10 @@ fn open_window<'a>(conn: &'a ConnInfo, path: &Path, req: WindowRequest<'a>) -> R
         plan.truncate(1);
         plan[0].last = true;
     }
-    let target = plan.iter().map(|s| s.len).sum();
+    let target: u64 = plan.iter().map(|s| s.len).sum();
+    // Keep only what this window can actually use (see the peak note above).
+    let peak = if plan.len() > 1 { target + plan.iter().map(|s| s.len).max().unwrap_or(0) } else { target };
+    budget.shrink_to(peak);
     Ok(OpenedWindow { resp, permit, extras, plan, target, total, budget })
 }
 
@@ -7933,10 +8115,12 @@ const MAX_BODY_RETRIES: u32 = 1;
 /// READ_STALL_TIMEOUT already, so it resumes without backoff, and a QUIC stream
 /// that went silent says nothing about whether a fresh request will.
 const MAX_STALL_RESUMES: u32 = 2;
-/// Least a body must deliver per READ_STALL_TIMEOUT to count as flowing. The
-/// per-read timeout resets on every byte, so on its own a body trickling a few
-/// bytes at a time would hold its slot and worker for as long as it liked.
-const MIN_BODY_PROGRESS: u64 = 256 * 1024;
+/// Least a window (all its segments together) must receive per READ_STALL_TIMEOUT
+/// to count as flowing. The per-read timeout resets on every byte, so on its own a
+/// body trickling a few bytes at a time would hold its slot for as long as it
+/// liked. ~4 KiB/s: far below any link worth streaming over, so a slow link stays
+/// slow rather than turning into resumes and errors.
+const MIN_BODY_PROGRESS: u64 = 64 * 1024;
 /// How often a pump checks, by time, whether anyone still wants its window. It
 /// also checks every 2 MB; the timer covers a slow body.
 const SUPERSEDE_CHECK_EVERY: Duration = Duration::from_secs(1);
@@ -7985,19 +8169,53 @@ enum BodyRead {
 
 impl<'a> WindowPump<'a> {
     /// Whether nobody can read this window any more: the handle was released, or
-    /// a seek replaced its buffer (as the current window or the look-ahead).
+    /// a seek or promotion replaced its buffer (as the current window or the
+    /// look-ahead) — and no READ is still parked on it. Waiters count as readers:
+    /// a sequential reader's async READs for the old window's tail are often still
+    /// parked when the look-ahead gets promoted, and stopping then failed them.
     fn superseded(&self) -> bool {
+        if self.shared.0.lock().unwrap().waiters > 0 {
+            return false;
+        }
         let ofs = self.open_files.safe_lock();
         let Some(of) = ofs.get(&self.fh) else { return true };
         let holds = |b: &Option<ReadAheadBuf>| b.as_ref().is_some_and(|b| Arc::ptr_eq(&b.stream, self.shared));
-        !(holds(&of.buf) || holds(&of.next_buf))
+        !(holds(&of.buf) || holds(&of.next_buf) || holds(&of.prev_buf))
     }
 
-    /// A segment gave up: nothing past its hole can ever reach readers.
+    /// A segment gave up for good: nothing past its hole can ever reach readers,
+    /// and those waiting inside it get EIO.
     fn break_window(&self) {
         let (ref mtx, ref cv) = **self.shared;
         mtx.lock().unwrap().broken = true;
         cv.notify_all();
+    }
+
+    /// A segment stopped for a reason retrying can fix (superseded, no slot for a
+    /// resume, the server too slow): halts the window like `break_window`, but
+    /// waiters inside the hole get EAGAIN. Every early exit of a segment marks the
+    /// window one way or the other, so a hole can never look like the file's end.
+    fn stop_window(&self) {
+        let (ref mtx, ref cv) = **self.shared;
+        mtx.lock().unwrap().stopped = true;
+        cv.notify_all();
+    }
+
+    /// The window-wide trickle rule: once a READ_STALL_TIMEOUT period is over, the
+    /// window as a whole — all its segments together — must have received
+    /// MIN_BODY_PROGRESS in it. Measured per window, not per segment: a slow link
+    /// shared by segments and readers is still progress, where a per-segment
+    /// floor turned every stream on a ~256 kbit/s link into a "stall".
+    fn window_crawling(&self) -> Option<String> {
+        let mut ss = self.shared.0.lock().unwrap();
+        let (at, base) = ss.progress_mark;
+        if at.elapsed() < READ_STALL_TIMEOUT {
+            return None;
+        }
+        let received = ss.received() as u64;
+        let gained = received.saturating_sub(base);
+        ss.progress_mark = (Instant::now(), received);
+        (gained < MIN_BODY_PROGRESS).then(|| format!("window received only {} bytes in {:?}", gained, at.elapsed()))
     }
 
     /// Fetches the window: `first` is the open first segment, `extras` one held
@@ -8033,6 +8251,7 @@ impl<'a> WindowPump<'a> {
     ) -> usize {
         let _done = WindowDone(&self);
         let already = self.shared.0.lock().unwrap().data.len() as u64;
+        let t0 = Instant::now();
         let (resp, permit) = first;
         std::thread::scope(|scope| {
             let pump = &self;
@@ -8044,27 +8263,19 @@ impl<'a> WindowPump<'a> {
             }
             pump.segment(0, plan[0], Some(resp), permit, already);
         });
-        self.shared.0.lock().unwrap().data.len()
+        let ss = self.shared.0.lock().unwrap();
+        record_window_throughput((ss.received() as u64).saturating_sub(already), t0.elapsed());
+        ss.data.len()
     }
 
-    /// One body read, with the trickle rule applied on top of the stall timeout.
-    fn read_body(r: &mut reqwest::blocking::Response, buf: &mut [u8], rate: &mut (Instant, u64)) -> BodyRead {
+    /// One body read. A read that times out (READ_STALL_TIMEOUT without a byte on
+    /// this connection) is a stall; the window-wide trickle rule is applied by the
+    /// caller.
+    fn read_body(r: &mut reqwest::blocking::Response, buf: &mut [u8]) -> BodyRead {
         use std::io::Read;
         match r.read(buf) {
             Ok(0) => BodyRead::End,
-            Ok(n) => {
-                rate.1 += n as u64;
-                if rate.0.elapsed() >= READ_STALL_TIMEOUT {
-                    if rate.1 < MIN_BODY_PROGRESS {
-                        return BodyRead::Failed {
-                            stalled: true,
-                            why: format!("only {} bytes in {:?}", rate.1, rate.0.elapsed()),
-                        };
-                    }
-                    *rate = (Instant::now(), 0);
-                }
-                BodyRead::Bytes(n)
-            }
+            Ok(n) => BodyRead::Bytes(n),
             Err(e) => BodyRead::Failed { stalled: io_is_timeout(&e), why: e.to_string() },
         }
     }
@@ -8102,7 +8313,14 @@ impl<'a> WindowPump<'a> {
                     }
                     Err(e) => {
                         log::warn!("segment {} of {} failed to open: {}", idx, self.path.display(), e);
-                        None
+                        // A busy daemon or a slow server is worth retrying; anything
+                        // else is the server answering wrongly.
+                        if is_retry_later_err(&e) {
+                            self.stop_window();
+                        } else {
+                            self.break_window();
+                        }
+                        return;
                     }
                 }
             }
@@ -8114,7 +8332,6 @@ impl<'a> WindowPump<'a> {
         let mut chunk = vec![0u8; 256 * 1024];
         let mut since_check = 0usize;
         let mut last_check = Instant::now();
-        let mut rate = (Instant::now(), 0u64);
         let mut retries = 0u32;
         let mut stalls = 0u32;
         while let Some(r) = resp.as_mut() {
@@ -8122,7 +8339,22 @@ impl<'a> WindowPump<'a> {
                 break;
             }
             let want = ((seg.len - got) as usize).min(chunk.len());
-            match Self::read_body(r, &mut chunk[..want], &mut rate) {
+            let outcome = match Self::read_body(r, &mut chunk[..want]) {
+                BodyRead::Bytes(n) => match self.window_crawling() {
+                    // Keep the bytes, then treat the crawl as a stall.
+                    Some(why) => {
+                        let mut ss = mtx.lock().unwrap();
+                        ss.push(idx, (seg.at + got) as usize, &chunk[..n], (seg.len - got) as usize);
+                        drop(ss);
+                        got += n as u64;
+                        cv.notify_all();
+                        BodyRead::Failed { stalled: true, why }
+                    }
+                    None => BodyRead::Bytes(n),
+                },
+                other => other,
+            };
+            match outcome {
                 BodyRead::End => {
                     // The end of the body. Legitimate only in the window's last
                     // segment (the file ends there); anywhere else it is a hole.
@@ -8133,14 +8365,14 @@ impl<'a> WindowPump<'a> {
                     break;
                 }
                 BodyRead::Bytes(n) => {
-                    let broken = {
+                    let halted = {
                         let mut ss = mtx.lock().unwrap();
                         ss.push(idx, (seg.at + got) as usize, &chunk[..n], (seg.len - got) as usize);
-                        ss.broken
+                        ss.halted()
                     };
                     got += n as u64;
                     cv.notify_all();
-                    if broken {
+                    if halted {
                         break;
                     }
                     since_check += n;
@@ -8156,11 +8388,15 @@ impl<'a> WindowPump<'a> {
                         if self.superseded() {
                             log::debug!("read-ahead stream for {} superseded, stopping early",
                                 self.path.display());
+                            self.stop_window();
                             break;
                         }
                     }
                 }
                 BodyRead::Failed { stalled, why } => {
+                    if got >= seg.len {
+                        break;
+                    }
                     let remaining = seg.len - got;
                     let budget_left = if stalled { stalls < MAX_STALL_RESUMES } else { retries < MAX_BODY_RETRIES };
                     // Abort this response and hand its slot back *before* waiting for
@@ -8175,13 +8411,21 @@ impl<'a> WindowPump<'a> {
                         // another one (see Throttle::quarantine).
                         self.conn.read_throttle.quarantine(slot, H3_MAX_IDLE);
                     }
-                    let broken = mtx.lock().unwrap().broken;
-                    if !budget_left || broken || self.superseded() {
-                        // Stops the window short of its target. Readers parked on it
-                        // get EIO rather than a phantom EOF (see `wait_on_window`).
-                        log::warn!("read-ahead segment {} of {} broke after {} of {} bytes, giving up (stalled={}): {}",
+                    let halted = mtx.lock().unwrap().halted();
+                    if halted {
+                        break;
+                    }
+                    if self.superseded() {
+                        self.stop_window();
+                        break;
+                    }
+                    if !budget_left {
+                        // Stops the window short of its target; readers parked in the
+                        // hole never get a phantom EOF (see `wait_on_window`). Out of
+                        // stall resumes, the server is slow, not wrong: EAGAIN.
+                        log::warn!("read-ahead segment {} of {} gave up after {} of {} bytes (stalled={}): {}",
                             idx, self.path.display(), got, seg.len, stalled, why);
-                        self.break_window();
+                        if stalled { self.stop_window() } else { self.break_window() }
                         break;
                     }
                     if stalled {
@@ -8208,7 +8452,6 @@ impl<'a> WindowPump<'a> {
                             slot = new_permit.slot();
                             resp = Some(new_resp);
                             _permit = Some(new_permit);
-                            rate = (Instant::now(), 0);
                         }
                         Ok((new_resp, _)) => {
                             log::warn!("read-ahead resume for {} got {} instead of 206, giving up", self.path.display(), new_resp.status());
@@ -8216,16 +8459,21 @@ impl<'a> WindowPump<'a> {
                         }
                         Err(resume_err) => {
                             log::warn!("read-ahead resume for {} failed: {}", self.path.display(), resume_err);
-                            self.break_window();
+                            if is_retry_later_err(&resume_err) {
+                                self.stop_window();
+                            } else {
+                                self.break_window();
+                            }
                         }
                     }
                 }
             }
         }
-        // The window's last segment reached the end of the file the server stated:
-        // its end is the file's end, whatever the dir cache believes.
+        // The window's last segment reached the end of the file the server stated.
+        // Recorded as a position, not a verdict: `at_eof` only honours it once the
+        // prefix actually reaches it, since an earlier segment may have left a hole.
         if seg.last && self.total == Some(self.start + seg.at + got) {
-            mtx.lock().unwrap().eof_proven = true;
+            mtx.lock().unwrap().eof_len = Some((seg.at + got) as usize);
             cv.notify_all();
         }
     }

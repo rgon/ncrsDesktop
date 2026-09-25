@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long a persisted demotion keeps subsequent sessions on HTTP/2 before
 /// HTTP/3 is given another chance.
@@ -48,12 +48,20 @@ const H3_DEMOTION_RETRY: Duration = Duration::from_secs(7 * 24 * 3600);
 pub struct DavClient {
     client: reqwest::blocking::Client,
     version: Option<reqwest::Version>,
+    /// A per-request timeout stamped onto every request, for a client standing in
+    /// for one whose client-level timeout it does not share (see `h2_reads`). A
+    /// caller's own `.timeout()` afterwards still overrides it.
+    timeout: Option<Duration>,
 }
 
 impl DavClient {
     fn stamp(&self, rb: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
-        match self.version {
+        let rb = match self.version {
             Some(v) => rb.version(v),
+            None => rb,
+        };
+        match self.timeout {
+            Some(t) => rb.timeout(t),
             None => rb,
         }
     }
@@ -82,7 +90,7 @@ impl DavClient {
     /// plain TCP requests. For client sets managed outside [`HttpClients`]
     /// (the notifications and search side-clients).
     pub fn new(client: reqwest::blocking::Client, h3: bool) -> Self {
-        DavClient { client, version: h3.then_some(reqwest::Version::HTTP_3) }
+        DavClient { client, version: h3.then_some(reqwest::Version::HTTP_3), timeout: None }
     }
 
     /// True when requests built through this handle go out over QUIC.
@@ -123,6 +131,11 @@ pub struct HttpClients {
     /// holding a runtime thread per slot all session.
     read_h2: Arc<std::sync::OnceLock<Arc<[reqwest::blocking::Client]>>>,
     build_read_h2: Option<Arc<ReadSetBuilder>>,
+    /// Serializes building the HTTP/2 read set, so two threads never build two
+    /// sets (their runtime threads would briefly exceed the budget).
+    build_lock: Arc<std::sync::Mutex<()>>,
+    /// Stall bound stamped onto the metadata client while it stands in for reads.
+    read_fallback_timeout: Duration,
     demoted: Arc<AtomicBool>,
     http3: bool,
     /// Where a demotion is recorded so the next session starts on HTTP/2
@@ -150,6 +163,9 @@ impl HttpClients {
             h2,
             read_h2: Arc::new(built),
             build_read_h2: None,
+            build_lock: Arc::new(std::sync::Mutex::new(())),
+            // Never used: this set is built up front, so there is no fallback.
+            read_fallback_timeout: Duration::ZERO,
             demoted: Arc::new(AtomicBool::new(false)),
             http3,
             marker: None,
@@ -163,6 +179,7 @@ impl HttpClients {
         read_pref: Vec<reqwest::blocking::Client>,
         h2: reqwest::blocking::Client,
         build_read_h2: impl Fn() -> Result<Vec<reqwest::blocking::Client>, String> + Send + Sync + 'static,
+        read_fallback_timeout: Duration,
     ) -> Self {
         assert!(!read_pref.is_empty(), "a read client set cannot be empty");
         HttpClients {
@@ -171,30 +188,37 @@ impl HttpClients {
             h2,
             read_h2: Arc::new(std::sync::OnceLock::new()),
             build_read_h2: Some(Arc::new(build_read_h2)),
+            build_lock: Arc::new(std::sync::Mutex::new(())),
+            read_fallback_timeout,
             demoted: Arc::new(AtomicBool::new(false)),
             http3: true,
             marker: None,
         }
     }
 
-    /// The HTTP/2 read set, building it on first use. Should building fail, the
-    /// HTTP/2 metadata client stands in for every slot rather than reads failing.
-    fn h2_reads(&self) -> &Arc<[reqwest::blocking::Client]> {
-        self.read_h2.get_or_init(|| {
-            let built = self.build_read_h2.as_ref().map(|b| b());
-            match built {
-                Some(Ok(v)) if !v.is_empty() => {
-                    log::info!("built the {} HTTP/2 read clients for the demotion", v.len());
-                    v.into()
-                }
-                other => {
-                    if let Some(Err(e)) = other {
-                        log::warn!("could not build the HTTP/2 read clients ({}) — using the metadata client for reads", e);
-                    }
-                    vec![self.h2.clone()].into()
-                }
+    /// The HTTP/2 read set, building it on first use. A failed build is not
+    /// remembered — the next read tries again — and meanwhile `read` falls back to
+    /// the metadata client with the stall bound stamped on.
+    fn h2_reads(&self) -> Option<&Arc<[reqwest::blocking::Client]>> {
+        if let Some(set) = self.read_h2.get() {
+            return Some(set);
+        }
+        let _building = self.build_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = self.read_h2.get() {
+            return Some(set);
+        }
+        match self.build_read_h2.as_ref().map(|b| b()) {
+            Some(Ok(v)) if !v.is_empty() => {
+                log::info!("built the {} HTTP/2 read clients for the demotion", v.len());
+                let _ = self.read_h2.set(v.into());
+                self.read_h2.get()
             }
-        })
+            Some(Err(e)) => {
+                log::warn!("could not build the HTTP/2 read clients ({}) — reads use the metadata client until they can be", e);
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Persist demotions to `path`, and honour a demotion a previous session
@@ -235,9 +259,9 @@ impl HttpClients {
     /// The metadata/write client every caller should use.
     pub fn get(&self) -> DavClient {
         if self.demoted.load(Ordering::Relaxed) {
-            DavClient { client: self.h2.clone(), version: None }
+            DavClient { client: self.h2.clone(), version: None, timeout: None }
         } else {
-            DavClient { client: self.pref.clone(), version: self.pref_version() }
+            DavClient { client: self.pref.clone(), version: self.pref_version(), timeout: None }
         }
     }
 
@@ -247,20 +271,27 @@ impl HttpClients {
     pub fn read(&self, slot: usize) -> DavClient {
         // Both sets are the same size; the modulo only keeps a stray index in range.
         if self.demoted.load(Ordering::Relaxed) && self.http3 {
-            let set = self.h2_reads();
-            DavClient { client: set[slot % set.len()].clone(), version: None }
+            match self.h2_reads() {
+                Some(set) => DavClient { client: set[slot % set.len()].clone(), version: None, timeout: None },
+                // The HTTP/2 read clients could not be built (this time). The metadata
+                // client stands in, with the read clients' stall bound stamped on as a
+                // per-request timeout: its own client-level one is reqwest's 30 s
+                // default. Per request that bound is a total deadline, so a long body
+                // gets cut and resumed — degraded, but every READ bound still holds.
+                None => DavClient { client: self.h2.clone(), version: None, timeout: Some(self.read_fallback_timeout) },
+            }
         } else if self.demoted.load(Ordering::Relaxed) {
             // Without HTTP/3 the preferred set already is the HTTP/2 one.
-            DavClient { client: self.read_pref[slot % self.read_pref.len()].clone(), version: None }
+            DavClient { client: self.read_pref[slot % self.read_pref.len()].clone(), version: None, timeout: None }
         } else {
-            DavClient { client: self.read_pref[slot % self.read_pref.len()].clone(), version: self.pref_version() }
+            DavClient { client: self.read_pref[slot % self.read_pref.len()].clone(), version: self.pref_version(), timeout: None }
         }
     }
 
     /// The HTTP/2 client, for the mount-time probe that decides whether to
     /// demote.
     pub fn h2(&self) -> DavClient {
-        DavClient { client: self.h2.clone(), version: None }
+        DavClient { client: self.h2.clone(), version: None, timeout: None }
     }
 
     /// True while requests still go out over QUIC — i.e. HTTP/3 is configured
@@ -414,35 +445,159 @@ pub fn raise_quic_socket_buffers() {
     }
 }
 
-/// reqwest DNS resolver that runs every lookup on the shared, bounded `bg::DNS`
-/// pool. Every daemon client is built with it ([`with_pooled_dns`]).
+/// reqwest DNS resolver that runs lookups on the shared, bounded `bg::DNS` pool,
+/// with one lookup in flight per host and a short positive cache. Every client the
+/// daemon (`ncrs`) builds uses it ([`with_pooled_dns`]); `ncrs-open`
+/// (`edit_locally`) and the GUI (`login_flow`) build theirs in their own processes,
+/// outside the daemon's thread budget, and keep reqwest's default resolver.
 ///
-/// Why: reqwest's default resolver hands each `getaddrinfo` to its client's own
-/// tokio runtime's blocking pool, which can grow to 512 threads, and the daemon
-/// runs over a dozen client runtimes (one per read slot per transport, plus the
-/// singletons). Those threads never appeared in `bg::MAX_THREADS`. Here lookups
-/// share two threads process-wide, and a lookup the pool cannot take fails like a
-/// resolver error rather than growing anything.
-pub struct PooledResolver;
+/// Why pooled: reqwest's default resolver hands each `getaddrinfo` to its client's
+/// own tokio runtime's blocking pool, which can grow to 512 threads, and the daemon
+/// runs over a dozen client runtimes. Those threads never appeared in
+/// `bg::MAX_THREADS`.
+///
+/// Why single-flight and cached: the read clients keep no idle TCP connections, so
+/// every window, segment and resume connects — and resolves — afresh, and reqwest's
+/// connect timeout includes the lookup. With a bare two-thread pool, a burst of
+/// them queued behind each other past that timeout (and past the connectivity
+/// probe's, whose lookup waited in the same queue), which reads as the network
+/// being down. Now a host is looked up at most once at a time, everyone asking
+/// meanwhile shares the answer, answers are reused for DNS_FRESH, and a failed
+/// lookup falls back to the last good answer (up to DNS_STALE_MAX old). So the pool
+/// sees roughly one job per host per DNS_FRESH, and nothing waits behind it.
+pub struct PooledResolver {
+    hosts: std::sync::Mutex<std::collections::HashMap<String, HostEntry>>,
+}
 
-impl reqwest::dns::Resolve for PooledResolver {
+/// How long a successful lookup is reused without asking again.
+const DNS_FRESH: Duration = Duration::from_secs(45);
+/// How old an answer may be and still stand in for a lookup that failed.
+const DNS_STALE_MAX: Duration = Duration::from_secs(3600);
+
+type LookupResult = Result<Vec<std::net::SocketAddr>, String>;
+
+#[derive(Default)]
+struct HostEntry {
+    last_good: Option<(Instant, Vec<std::net::SocketAddr>)>,
+    /// Callers waiting on the lookup in flight; `None` when none is running.
+    waiting: Option<Vec<tokio::sync::oneshot::Sender<LookupResult>>>,
+}
+
+/// The error a lookup reports when the DNS pool refused it. Typed, so the read
+/// path can tell "our own pool is busy" from "the network is down" by walking
+/// the error's sources ([`is_dns_refusal`]) instead of trusting reqwest's text,
+/// which renders every connect failure as "error sending request".
+#[derive(Debug)]
+pub struct DnsRefused;
+
+impl std::fmt::Display for DnsRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("name lookup refused: the daemon's lookup pool is full")
+    }
+}
+
+impl std::error::Error for DnsRefused {}
+
+/// Whether `e` failed because the DNS pool refused the lookup.
+pub fn is_dns_refusal(e: &reqwest::Error) -> bool {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = src {
+        if err.is::<DnsRefused>() {
+            return true;
+        }
+        src = err.source();
+    }
+    false
+}
+
+impl PooledResolver {
+    fn new() -> Self {
+        PooledResolver { hosts: std::sync::Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// Finishes the lookup in flight for `host`: records a good answer, falls back
+    /// to the last good one on failure, and answers everyone waiting.
+    fn complete(&self, host: &str, result: LookupResult) {
+        let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = hosts.entry(host.to_string()).or_default();
+        let answer = match result {
+            Ok(addrs) if !addrs.is_empty() => {
+                entry.last_good = Some((Instant::now(), addrs.clone()));
+                Ok(addrs)
+            }
+            other => match &entry.last_good {
+                Some((at, addrs)) if at.elapsed() < DNS_STALE_MAX => {
+                    log::warn!("lookup of {} failed ({:?}) — using the answer from {:?} ago", host, other.err(), at.elapsed());
+                    Ok(addrs.clone())
+                }
+                _ => other.and_then(|v| if v.is_empty() { Err("no addresses".to_string()) } else { Ok(v) }),
+            },
+        };
+        for tx in entry.waiting.take().unwrap_or_default() {
+            let _ = tx.send(answer.clone());
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for &'static PooledResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let this: &'static PooledResolver = self;
         let host = name.as_str().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let submitted = crate::bg::DNS.submit(move || {
-            use std::net::ToSocketAddrs;
-            // Port 0: reqwest substitutes the URL's port.
-            let result = (host.as_str(), 0).to_socket_addrs().map(|it| it.collect::<Vec<_>>());
-            // The request may have given up already; nothing to do then.
-            let _ = tx.send(result);
-        });
-        Box::pin(async move {
-            if let Err(r) = submitted {
-                return Err(format!("DNS lookup refused: {}", r).into());
+        let mut start = false;
+        let fresh = {
+            let mut hosts = this.hosts.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = hosts.entry(host.clone()).or_default();
+            match &entry.last_good {
+                Some((at, addrs)) if at.elapsed() < DNS_FRESH => Some(addrs.clone()),
+                _ => {
+                    match entry.waiting.as_mut() {
+                        Some(w) => w.push(tx),
+                        None => {
+                            entry.waiting = Some(vec![tx]);
+                            start = true;
+                        }
+                    }
+                    None
+                }
             }
+        };
+        if let Some(addrs) = fresh {
+            return Box::pin(async move { Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs) });
+        }
+        if start {
+            let h = host.clone();
+            let submitted = crate::bg::DNS.submit(move || {
+                use std::net::ToSocketAddrs;
+                // Everyone who asked may have given up already (their request timed
+                // out): then there is nobody to answer, and no reason to block a pool
+                // thread on getaddrinfo for them.
+                let anyone = this.hosts.lock().unwrap_or_else(|e| e.into_inner())
+                    .get(&h)
+                    .and_then(|e| e.waiting.as_ref())
+                    .is_some_and(|w| w.iter().any(|tx| !tx.is_closed()));
+                if !anyone {
+                    this.complete(&h, Err("lookup abandoned".into()));
+                    return;
+                }
+                // Port 0: reqwest substitutes the URL's port.
+                let result = (h.as_str(), 0)
+                    .to_socket_addrs()
+                    .map(|it| it.collect::<Vec<_>>())
+                    .map_err(|e| e.to_string());
+                this.complete(&h, result);
+            });
+            if submitted.is_err() {
+                // Answer the waiters now: a stale answer if there is one, else the
+                // typed refusal.
+                this.complete(&host, Err("refused".into()));
+            }
+        }
+        Box::pin(async move {
             match rx.await {
                 Ok(Ok(addrs)) => Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs),
-                Ok(Err(e)) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                Ok(Err(e)) if e == "refused" => Err(Box::new(DnsRefused) as Box<dyn std::error::Error + Send + Sync>),
+                Ok(Err(e)) => Err(e.into()),
                 Err(_) => Err("DNS lookup dropped".into()),
             }
         })
@@ -451,6 +606,7 @@ impl reqwest::dns::Resolve for PooledResolver {
 
 /// `builder` with the process-wide [`PooledResolver`].
 pub fn with_pooled_dns(builder: reqwest::blocking::ClientBuilder) -> reqwest::blocking::ClientBuilder {
-    static RESOLVER: std::sync::OnceLock<Arc<PooledResolver>> = std::sync::OnceLock::new();
-    builder.dns_resolver(Arc::clone(RESOLVER.get_or_init(|| Arc::new(PooledResolver))))
+    static RESOLVER: std::sync::OnceLock<PooledResolver> = std::sync::OnceLock::new();
+    let r: &'static PooledResolver = RESOLVER.get_or_init(PooledResolver::new);
+    builder.dns_resolver(Arc::new(r))
 }
