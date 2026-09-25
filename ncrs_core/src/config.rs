@@ -318,21 +318,31 @@ pub fn write_private(path: &std::path::Path, content: &[u8]) -> std::io::Result<
     }
 }
 
-/// Warn if the config file permissions are broader than 0600.
-/// Does not modify the file — just logs so the user knows to run `chmod 0600`.
-pub fn warn_config_permissions(path: &std::path::Path) {
+/// Strip group and other access from the config file, which can hold the
+/// password. Files written by ncrs are already owner-only (see `write_private`);
+/// this fixes one left broader by an older version or a manual edit, on every
+/// start, so an upgrade secures it without the user having to `chmod`. The
+/// owner's own bits are kept as they are.
+pub fn secure_config_permissions(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         match std::fs::metadata(path) {
             Ok(meta) => {
                 let mode = meta.permissions().mode() & 0o777;
-                if mode != 0o600 {
-                    log::warn!(
-                        "config file {} has permissions {:04o} — expected 0600 (owner read/write only). \
-                         Run `chmod 0600 {}` to secure your credentials.",
-                        path.display(), mode, path.display()
-                    );
+                if mode & 0o077 != 0 {
+                    let tightened = mode & 0o700;
+                    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(tightened)) {
+                        Ok(()) => log::info!(
+                            "config file {} had permissions {:04o}; tightened to {:04o} (owner only)",
+                            path.display(), mode, tightened
+                        ),
+                        Err(e) => log::warn!(
+                            "config file {} has permissions {:04o} and could not be tightened ({}). \
+                             Run `chmod 0600 {}` to secure your credentials.",
+                            path.display(), mode, e, path.display()
+                        ),
+                    }
                 }
             }
             Err(e) => log::warn!("could not check permissions on {}: {}", path.display(), e),
@@ -418,14 +428,14 @@ pub fn load_config() -> Result<MountOptions, String> {
             .map_err(|e| format!("Cannot create config dir {}: {}", dir.display(), e))?;
         write_private(&path, DEFAULT_CONFIG.as_bytes())
             .map_err(|e| format!("Cannot write default config: {}", e))?;
-        warn_config_permissions(&path);
+        secure_config_permissions(&path);
         return Err(format!(
             "Created default config at {}. Please fill it in and restart.",
             path.display()
         ));
     }
 
-    warn_config_permissions(&path);
+    secure_config_permissions(&path);
 
     let yaml = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
@@ -656,7 +666,7 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
     }
     write_private(&path, content.as_bytes()).map_err(|e| format!("write config: {}", e))?;
-    warn_config_permissions(&path);
+    secure_config_permissions(&path);
     Ok(())
 }
 
@@ -705,6 +715,29 @@ mod permission_tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "rewriting must tighten a world-readable config");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn existing_broad_config_is_tightened_on_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("ncrs-perm-test-secure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, b"password: \"hunter2\"\n").unwrap();
+        let mode_of = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        secure_config_permissions(&path);
+        assert_eq!(mode_of(&path), 0o600);
+
+        // Owner bits are never widened: a read-only config stays read-only.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        secure_config_permissions(&path);
+        assert_eq!(mode_of(&path), 0o400);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }
