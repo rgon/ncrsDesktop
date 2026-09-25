@@ -18,7 +18,13 @@
     <name>Gonzalo Ruiz</name>
   </developer>
 
-  <launchable type="desktop-id">ncrs-gui.desktop</launchable>
+  <launchable type="desktop-id">es.rgon.ncrs.desktop</launchable>
+  <icon type="stock">ncrs</icon>
+
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+  </categories>
 
   <screenshots>
     <screenshot type="default">

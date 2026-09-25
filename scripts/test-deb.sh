@@ -85,8 +85,9 @@ REQUIRED=(
     ./usr/bin/ncrs-search-provider
     ./usr/lib/systemd/user/ncrs.service
     ./usr/lib/sysctl.d/05-ncrs-quic.conf
-    ./usr/share/applications/ncrs-open.desktop
-    ./usr/share/applications/es.rgon.ncrs.desktop
+    ./usr/share/applications/es.rgon.ncrs.Open.desktop
+    ./usr/share/applications/es.rgon.ncrs.SearchProvider.desktop
+    ./usr/share/metainfo/es.rgon.ncrs.metainfo.xml
     ./usr/share/dbus-1/services/es.rgon.ncrs.SearchProvider.service
     ./usr/share/gnome-shell/search-providers/es.rgon.ncrs.SearchProvider.ini
     ./usr/share/nautilus-python/extensions/ncrs-syncstate.py
@@ -95,8 +96,8 @@ REQUIRED=(
 if ! $SKIP_GUI; then
     REQUIRED+=(
         ./usr/bin/ncrs-gui
-        ./usr/share/applications/ncrs-gui.desktop
-        ./etc/xdg/autostart/ncrs-gui.desktop
+        ./usr/share/applications/es.rgon.ncrs.desktop
+        ./etc/xdg/autostart/es.rgon.ncrs.desktop
         ./usr/share/icons/hicolor/32x32/apps/ncrs.png
         ./usr/share/icons/hicolor/64x64/apps/ncrs.png
         ./usr/share/icons/hicolor/128x128/apps/ncrs.png
@@ -115,6 +116,16 @@ done
 if ! $SKIP_DOLPHIN; then
     check "Dolphin plugin (KF6)" grep -q '/qt6/plugins/kf6/overlayicon/ncrsoverlayplugin\.so$' <<<"$CONTENTS"
     check "Dolphin plugin (KF5)" grep -q '/qt5/plugins/kf5/overlayicon/ncrsoverlayplugin\.so$' <<<"$CONTENTS"
+fi
+
+# GNOME Software (Ubuntu Software) derives a local .deb's app id from the
+# shortest /usr/share/applications basename and only shows the metainfo
+# (screenshots etc.) when that equals the metainfo <id>.
+if ! $SKIP_GUI; then
+    SHORTEST_DESKTOP="$(grep -E '^\./usr/share/applications/[^/]+\.desktop$' <<<"$CONTENTS" \
+        | xargs -n1 basename | awk '{ print length, $0 }' | sort -n | head -1 | cut -d' ' -f2)"
+    check "shortest desktop file ($SHORTEST_DESKTOP) matches the metainfo id" \
+        test "$SHORTEST_DESKTOP" = "es.rgon.ncrs.desktop"
 fi
 
 # A GUI binary built without tauri's custom-protocol feature embeds no
@@ -170,7 +181,7 @@ if $CONTAINER; then
         GUI_CHECKS=""
         if ! $SKIP_GUI; then
             GUI_CHECKS='
-            test -f /etc/xdg/autostart/ncrs-gui.desktop || { echo "FAIL: autostart entry missing"; exit 1; }
+            test -f /etc/xdg/autostart/es.rgon.ncrs.desktop || { echo "FAIL: autostart entry missing"; exit 1; }
             test -x /usr/bin/ncrs-gui || { echo "FAIL: ncrs-gui missing"; exit 1; }
             test -f /usr/share/icons/hicolor/128x128/apps/ncrs.png || { echo "FAIL: icon missing"; exit 1; }
             '

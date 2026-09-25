@@ -17,7 +17,7 @@ sed "s|INSTALL_DIR|$INSTALL_DIR|" "$SCRIPT_DIR/es.rgon.ncrs.SearchProvider.servi
 # .desktop file
 APP_DIR="$HOME/.local/share/applications"
 mkdir -p "$APP_DIR"
-cp "$SCRIPT_DIR/es.rgon.ncrs.desktop" "$APP_DIR/"
+cp "$SCRIPT_DIR/es.rgon.ncrs.SearchProvider.desktop" "$APP_DIR/"
 
 # GNOME Shell search provider registration
 PROVIDER_DIR="$HOME/.local/share/gnome-shell/search-providers"

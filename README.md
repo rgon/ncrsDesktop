@@ -85,7 +85,7 @@ The `.deb` (built by `scripts/build-deb.sh` will allow fleet config. For
 
 - **Config is per-user** at `~/.config/ncrs/config.yaml` (XDG; there is no system-wide config). A template ships at `/usr/share/doc/ncrs/config.yaml.example`, or generate one with `ncrs --print-default-config`.
 - **Push per-user config files** with your config-management tool (e.g. Ansible `template` to each user's `~/.config/ncrs/config.yaml`). You may pre-fill `/etc/skel/.config/ncrs/config.yaml` so new accounts start provisioned. If setting the password on the config file, always use per-user [app passwords](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices) or an `auth_command` — never a shared credential.
-- **The GUI tray app autostarts at login** via `/etc/xdg/autostart/ncrs-gui.desktop` and runs the systemctl service. 
+- **The GUI tray app autostarts at login** via `/etc/xdg/autostart/es.rgon.ncrs.desktop` and runs the systemctl service. 
 - **Headless alternative**: `systemctl --user enable --now ncrs.service` runs the daemon without the GUI. The two coexist: when the GUI starts and finds the service already serving the IPC socket, it attaches as a client — mirroring sync state, errors, and transfers in the tray and forwarding pause/resume — instead of mounting a second time. Quitting an attached tray will unmount it, however.
 
 

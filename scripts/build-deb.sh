@@ -98,12 +98,13 @@ install -Dm755 target/release/ncrs-open                                  "$PKG_D
 install -Dm755 target/release/ncrs-ctl                                   "$PKG_DIR/usr/bin/ncrs-ctl"
 install -Dm644 packaging/ncrs.service                                    "$PKG_DIR/usr/lib/systemd/user/ncrs.service"
 install -Dm644 packaging/05-ncrs-quic.conf                               "$PKG_DIR/usr/lib/sysctl.d/05-ncrs-quic.conf"
-install -Dm644 packaging/ncrs-open.desktop                               "$PKG_DIR/usr/share/applications/ncrs-open.desktop"
+install -Dm644 packaging/es.rgon.ncrs.Open.desktop                        "$PKG_DIR/usr/share/applications/es.rgon.ncrs.Open.desktop"
 install -Dm644 shell_integration/file-managers/nautilus/syncstate.py      "$PKG_DIR/usr/share/nautilus-python/extensions/ncrs-syncstate.py"
 install -Dm755 shell_integration/gnome-search/ncrs-search-provider       "$PKG_DIR/usr/bin/ncrs-search-provider"
 install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.SearchProvider.ini \
                                                                          "$PKG_DIR/usr/share/gnome-shell/search-providers/es.rgon.ncrs.SearchProvider.ini"
-install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.desktop       "$PKG_DIR/usr/share/applications/es.rgon.ncrs.desktop"
+install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.SearchProvider.desktop \
+                                                                         "$PKG_DIR/usr/share/applications/es.rgon.ncrs.SearchProvider.desktop"
 install -Dm644 packaging/es.rgon.ncrs.SearchProvider.service              "$PKG_DIR/usr/share/dbus-1/services/es.rgon.ncrs.SearchProvider.service"
 install -Dm644 packaging/es.rgon.ncrs.metainfo.xml                        "$PKG_DIR/usr/share/metainfo/es.rgon.ncrs.metainfo.xml"
 install -Dm755 shell_integration/thumbnailer/cr3-thumbnailer               "$PKG_DIR/usr/bin/cr3-thumbnailer"
@@ -122,8 +123,12 @@ chmod 644 "$PKG_DIR/usr/share/doc/ncrs/config.yaml.example"
 
 if ! $SKIP_GUI; then
     install -Dm755 target/release/ncrs-gui                               "$PKG_DIR/usr/bin/ncrs-gui"
-    install -Dm644 packaging/ncrs-gui.desktop                            "$PKG_DIR/usr/share/applications/ncrs-gui.desktop"
-    install -Dm644 packaging/ncrs-gui.desktop                            "$PKG_DIR/etc/xdg/autostart/ncrs-gui.desktop"
+    # GNOME Software never reads the metainfo inside a local .deb: it takes
+    # the shortest /usr/share/applications basename as the app id and looks
+    # that up as a metainfo <id>. Keep this the shortest desktop file in the
+    # package so it resolves to es.rgon.ncrs (screenshots, description).
+    install -Dm644 packaging/es.rgon.ncrs.desktop                        "$PKG_DIR/usr/share/applications/es.rgon.ncrs.desktop"
+    install -Dm644 packaging/es.rgon.ncrs.desktop                        "$PKG_DIR/etc/xdg/autostart/es.rgon.ncrs.desktop"
     install -Dm644 ncrs-gui/src-tauri/icons/32x32.png                    "$PKG_DIR/usr/share/icons/hicolor/32x32/apps/ncrs.png"
     install -Dm644 ncrs-gui/src-tauri/icons/64x64.png                    "$PKG_DIR/usr/share/icons/hicolor/64x64/apps/ncrs.png"
     install -Dm644 ncrs-gui/src-tauri/icons/128x128.png                  "$PKG_DIR/usr/share/icons/hicolor/128x128/apps/ncrs.png"
@@ -218,5 +223,5 @@ dpkg-deb --build --root-owner-group "$PKG_DIR" "$DEB_PATH"
 echo ""
 echo "✓ Built: $DEB_PATH"
 echo "  Install with: sudo apt install ./$DEB_PATH"
-echo "  The GUI tray app autostarts at login (/etc/xdg/autostart/ncrs-gui.desktop)."
+echo "  The GUI tray app autostarts at login (/etc/xdg/autostart/es.rgon.ncrs.desktop)."
 echo "  Headless (no-GUI) alternative: systemctl --user enable --now ncrs.service"
