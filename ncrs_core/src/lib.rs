@@ -734,7 +734,8 @@ fn plan_lookahead(of: &mut OpenFile, off: u64, sz: usize, sequential: bool, file
     }
     let start = ra.start + ra.target_len;
     let after = Arc::clone(&ra.stream);
-    let window = next_read_ahead_window(of.read_ahead_window, true, ceiling);
+    let window = streaming_jump(of.read_ahead_window, ra.start, true, file_size, ceiling)
+        .unwrap_or_else(|| next_read_ahead_window(of.read_ahead_window, true, ceiling));
     // Never ask past the end: a range starting beyond EOF is a 416, and a window
     // sized to the file's rest ends exactly where `short_reply_ok` allows a short reply.
     let len = window.min((file_size - start) as usize);
@@ -756,22 +757,24 @@ fn promote_lookahead(of: &mut OpenFile, off: u64) {
     }
 }
 
-/// First read-ahead window for a handle whose first network fetch looks like the
-/// start of a straight read through a large file, or `None` to use the normal ramp.
+/// The window that follows a handle's first one, when that first one showed a
+/// straight read through a large file; `None` to keep the normal ramp.
 ///
-/// Starting such a reader at READ_AHEAD_INITIAL cost it three round trips of
-/// 1, 2 and 4 MB before the ramp reached a size where one GET's latency stops
-/// mattering. So a first fetch at offset 0 of a file at least
-/// SEQUENTIAL_START_MIN_FILE long, asked for in a streaming-sized request
-/// (SEQUENTIAL_START_MIN_READ — dd, cp and players get the kernel's full
-/// read-ahead request), opens at READ_AHEAD_SEQUENTIAL_START instead.
+/// Every handle opens at READ_AHEAD_INITIAL, and the next window is where a
+/// straight read gets fast: one that has read sequentially from offset 0 through
+/// its 1 MB window (or through half of it, when the look-ahead fires) of a file of
+/// at least SEQUENTIAL_START_MIN_FILE jumps straight to READ_AHEAD_SEQUENTIAL_START
+/// instead of ramping 2, 4, 8 MB — three round trips saved.
 ///
-/// Everything else keeps the cheap 1 MB start d91848a introduced: seeks, reads
-/// past offset 0, small files, and small offset-0 reads — a header probe, a
-/// thumbnailer's first look, or a MIME sniff that was not already answered from
-/// the synthetic magic bytes — which read a few KiB and then seek away.
-fn opening_read_ahead_window(off: u64, sz: usize, file_size: u64, ceiling: usize) -> Option<usize> {
-    (off == 0 && sz >= SEQUENTIAL_START_MIN_READ && file_size >= SEQUENTIAL_START_MIN_FILE)
+/// Deciding from the *first* read instead cannot tell a streamer from a probe:
+/// the kernel inflates any app read of 64 KiB or more at offset 0 into a 128 KiB
+/// request, so a header probe, a thumbnailer's first look or a MIME sniff would
+/// each have paid 8 MB (and, segmented, two download slots). Those read a few KiB
+/// to a few hundred KiB and seek away, so they never qualify here, and the 1 MB
+/// opening window is never segmented (see `segment_plan`). Thumbnailers opening an
+/// uncached file are refused before any read anyway (`desktop::thumbguard`).
+fn streaming_jump(current: usize, window_start: u64, sequential: bool, file_size: u64, ceiling: usize) -> Option<usize> {
+    (sequential && window_start == 0 && current <= READ_AHEAD_INITIAL && file_size >= SEQUENTIAL_START_MIN_FILE)
         .then(|| READ_AHEAD_SEQUENTIAL_START.min(ceiling))
 }
 
@@ -819,14 +822,11 @@ fn read_at_full(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<
 /// same large window it had before.
 const READ_AHEAD_INITIAL: usize = 1024 * 1024;
 
-/// Opening window for a handle that starts reading a large file from offset 0 in
-/// streaming-sized requests; see `opening_read_ahead_window`.
+/// Second window of a handle that read straight through its first one from
+/// offset 0 of a large file; see `streaming_jump`.
 const READ_AHEAD_SEQUENTIAL_START: usize = 8 * 1024 * 1024;
-/// Smallest first read that counts as streaming-sized: the kernel's default
-/// 128 KiB read-ahead request. Probes read less.
-const SEQUENTIAL_START_MIN_READ: usize = 128 * 1024;
-/// Smallest file that gets the larger opening window: below this, 8 MB is most of
-/// the file and the ramp gets there almost as fast.
+/// Smallest file that gets the jump: below this, 8 MB is most of the file and the
+/// ramp gets there almost as fast.
 const SEQUENTIAL_START_MIN_FILE: u64 = 32 * 1024 * 1024;
 
 struct ReadAheadBuf {
@@ -6069,14 +6069,10 @@ impl Filesystem for NextCloudFs {
             let mut ofs = self.open_files.safe_lock();
             let window = match ofs.get_mut(&fh.0) {
                 Some(of) => {
-                    // `buf` is only ever set by a network fetch, so None means this is
-                    // the handle's first one.
-                    let opening = if of.buf.is_none() {
-                        opening_read_ahead_window(off, sz, file_size, ceiling)
-                    } else {
-                        None
-                    };
-                    of.read_ahead_window = opening.unwrap_or_else(|| {
+                    let jump = of.buf.as_ref().and_then(|b| {
+                        streaming_jump(of.read_ahead_window, b.start, sequential, file_size, ceiling)
+                    });
+                    of.read_ahead_window = jump.unwrap_or_else(|| {
                         next_read_ahead_window(of.read_ahead_window, sequential, ceiling)
                     });
                     of.read_ahead_window

@@ -1255,31 +1255,32 @@
     }
 
     #[test]
-    fn a_straight_read_of_a_large_file_opens_with_the_larger_window() {
+    fn a_straight_read_from_zero_jumps_to_the_larger_second_window() {
         let ceiling = 64 * MB;
         let big = 256 * MB as u64;
         assert_eq!(
-            opening_read_ahead_window(0, 128 * 1024, big, ceiling),
+            streaming_jump(READ_AHEAD_INITIAL, 0, true, big, ceiling),
             Some(READ_AHEAD_SEQUENTIAL_START),
         );
         // Still capped by the configured read-ahead.
-        assert_eq!(opening_read_ahead_window(0, 128 * 1024, big, 2 * MB), Some(2 * MB));
+        assert_eq!(streaming_jump(READ_AHEAD_INITIAL, 0, true, big, 2 * MB), Some(2 * MB));
     }
 
     #[test]
-    fn probes_and_seeks_keep_the_cheap_opening_window() {
+    fn probes_seeks_and_later_windows_keep_the_normal_ramp() {
         let ceiling = 64 * MB;
         let big = 256 * MB as u64;
-        // A header / MIME / thumbnailer probe: a small read at offset 0.
-        assert_eq!(opening_read_ahead_window(0, 16 * 1024, big, ceiling), None);
-        assert_eq!(opening_read_ahead_window(0, 64 * 1024, big, ceiling), None);
-        // A first read somewhere else in the file is a seek.
-        assert_eq!(opening_read_ahead_window(64 * MB as u64, 128 * 1024, big, ceiling), None);
+        // A seek: not a straight read.
+        assert_eq!(streaming_jump(READ_AHEAD_INITIAL, 0, false, big, ceiling), None);
+        // A first window that did not start at offset 0.
+        assert_eq!(streaming_jump(READ_AHEAD_INITIAL, 64 * MB as u64, true, big, ceiling), None);
+        // Already past the opening window: the ramp takes over.
+        assert_eq!(streaming_jump(8 * MB, 0, true, big, ceiling), None);
         // A small file, or one whose size we do not know.
-        assert_eq!(opening_read_ahead_window(0, 128 * 1024, 4 * MB as u64, ceiling), None);
-        assert_eq!(opening_read_ahead_window(0, 128 * 1024, 0, ceiling), None);
-        // And the ramp itself is unchanged: `None` falls back to it.
-        assert_eq!(next_read_ahead_window(READ_AHEAD_INITIAL, false, ceiling), READ_AHEAD_INITIAL);
+        assert_eq!(streaming_jump(READ_AHEAD_INITIAL, 0, true, 4 * MB as u64, ceiling), None);
+        assert_eq!(streaming_jump(READ_AHEAD_INITIAL, 0, true, 0, ceiling), None);
+        // The opening window itself never splits into segments.
+        assert_eq!(segment_plan(READ_AHEAD_INITIAL, Some(big), 8, 128 * 1024).len(), 1);
     }
 
     #[test]
