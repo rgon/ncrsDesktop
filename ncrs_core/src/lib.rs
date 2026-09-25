@@ -371,6 +371,25 @@ fn next_read_ahead_window(current: usize, sequential: bool, ceiling: usize) -> u
     }
 }
 
+/// First read-ahead window for a handle whose first network fetch looks like the
+/// start of a straight read through a large file, or `None` to use the normal ramp.
+///
+/// Starting such a reader at READ_AHEAD_INITIAL cost it three round trips of
+/// 1, 2 and 4 MB before the ramp reached a size where one GET's latency stops
+/// mattering. So a first fetch at offset 0 of a file at least
+/// SEQUENTIAL_START_MIN_FILE long, asked for in a streaming-sized request
+/// (SEQUENTIAL_START_MIN_READ — dd, cp and players get the kernel's full
+/// read-ahead request), opens at READ_AHEAD_SEQUENTIAL_START instead.
+///
+/// Everything else keeps the cheap 1 MB start d91848a introduced: seeks, reads
+/// past offset 0, small files, and small offset-0 reads — a header probe, a
+/// thumbnailer's first look, or a MIME sniff that was not already answered from
+/// the synthetic magic bytes — which read a few KiB and then seek away.
+fn opening_read_ahead_window(off: u64, sz: usize, file_size: u64, ceiling: usize) -> Option<usize> {
+    (off == 0 && sz >= SEQUENTIAL_START_MIN_READ && file_size >= SEQUENTIAL_START_MIN_FILE)
+        .then(|| READ_AHEAD_SEQUENTIAL_START.min(ceiling))
+}
+
 /// Whether a `read()` may answer a `sz`-byte request at `off` with only `avail`
 /// bytes.
 ///
@@ -414,6 +433,16 @@ fn read_at_full(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<
 /// doublings reach a 64 MB ceiling, so sustained playback still ends up with the
 /// same large window it had before.
 const READ_AHEAD_INITIAL: usize = 1024 * 1024;
+
+/// Opening window for a handle that starts reading a large file from offset 0 in
+/// streaming-sized requests; see `opening_read_ahead_window`.
+const READ_AHEAD_SEQUENTIAL_START: usize = 8 * 1024 * 1024;
+/// Smallest first read that counts as streaming-sized: the kernel's default
+/// 128 KiB read-ahead request. Probes read less.
+const SEQUENTIAL_START_MIN_READ: usize = 128 * 1024;
+/// Smallest file that gets the larger opening window: below this, 8 MB is most of
+/// the file and the ramp gets there almost as fast.
+const SEQUENTIAL_START_MIN_FILE: u64 = 32 * 1024 * 1024;
 
 struct ReadAheadBuf {
     start: u64,
@@ -5581,8 +5610,16 @@ impl Filesystem for NextCloudFs {
             let mut ofs = self.open_files.safe_lock();
             let window = match ofs.get_mut(&fh.0) {
                 Some(of) => {
-                    of.read_ahead_window =
-                        next_read_ahead_window(of.read_ahead_window, sequential, ceiling);
+                    // `buf` is only ever set by a network fetch, so None means this is
+                    // the handle's first one.
+                    let opening = if of.buf.is_none() {
+                        opening_read_ahead_window(off, sz, file_size, ceiling)
+                    } else {
+                        None
+                    };
+                    of.read_ahead_window = opening.unwrap_or_else(|| {
+                        next_read_ahead_window(of.read_ahead_window, sequential, ceiling)
+                    });
                     of.read_ahead_window
                 }
                 None => READ_AHEAD_INITIAL.min(ceiling),

@@ -1254,6 +1254,34 @@
         assert_eq!(next_read_ahead_window(ceiling, true, ceiling), ceiling);
     }
 
+    #[test]
+    fn a_straight_read_of_a_large_file_opens_with_the_larger_window() {
+        let ceiling = 64 * MB;
+        let big = 256 * MB as u64;
+        assert_eq!(
+            opening_read_ahead_window(0, 128 * 1024, big, ceiling),
+            Some(READ_AHEAD_SEQUENTIAL_START),
+        );
+        // Still capped by the configured read-ahead.
+        assert_eq!(opening_read_ahead_window(0, 128 * 1024, big, 2 * MB), Some(2 * MB));
+    }
+
+    #[test]
+    fn probes_and_seeks_keep_the_cheap_opening_window() {
+        let ceiling = 64 * MB;
+        let big = 256 * MB as u64;
+        // A header / MIME / thumbnailer probe: a small read at offset 0.
+        assert_eq!(opening_read_ahead_window(0, 16 * 1024, big, ceiling), None);
+        assert_eq!(opening_read_ahead_window(0, 64 * 1024, big, ceiling), None);
+        // A first read somewhere else in the file is a seek.
+        assert_eq!(opening_read_ahead_window(64 * MB as u64, 128 * 1024, big, ceiling), None);
+        // A small file, or one whose size we do not know.
+        assert_eq!(opening_read_ahead_window(0, 128 * 1024, 4 * MB as u64, ceiling), None);
+        assert_eq!(opening_read_ahead_window(0, 128 * 1024, 0, ceiling), None);
+        // And the ramp itself is unchanged: `None` falls back to it.
+        assert_eq!(next_read_ahead_window(READ_AHEAD_INITIAL, false, ceiling), READ_AHEAD_INITIAL);
+    }
+
     // ── Short replies at read-ahead window boundaries ─────────────────────────
 
     #[test]
