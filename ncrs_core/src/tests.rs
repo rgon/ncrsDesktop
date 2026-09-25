@@ -1308,6 +1308,69 @@
         assert!(!lookahead_due(0, win, win / 2, sz, true, 0));
     }
 
+    // ── Segmented read-ahead windows ──────────────────────────────────────────
+
+    #[test]
+    fn small_windows_probes_and_unknown_sizes_stay_one_request() {
+        let one = |target: usize| vec![Segment { at: 0, len: target as u64, last: true }];
+        // The 1 MB probe window, even with every slot free.
+        assert_eq!(segment_plan(MB, Some(256 * MB as u64), 8, 16 * 1024), one(MB));
+        // Under two segments' worth.
+        assert_eq!(segment_plan(6 * MB, Some(256 * MB as u64), 8, 128 * 1024), one(6 * MB));
+        // No spare slot.
+        assert_eq!(segment_plan(64 * MB, Some(256 * MB as u64), 1, 128 * 1024), one(64 * MB));
+        // Unknown size: a segment could land past the end.
+        assert_eq!(segment_plan(64 * MB, None, 8, 128 * 1024), one(64 * MB));
+    }
+
+    #[test]
+    fn a_large_window_splits_into_contiguous_aligned_segments() {
+        let plan = segment_plan(64 * MB, Some(256 * MB as u64), 8, 128 * 1024);
+        assert_eq!(plan.len(), MAX_WINDOW_SEGMENTS, "capped at MAX_WINDOW_SEGMENTS");
+        let mut at = 0;
+        for (i, seg) in plan.iter().enumerate() {
+            assert_eq!(seg.at, at, "segments are contiguous");
+            assert_eq!(seg.at % SEGMENT_ALIGN, 0);
+            assert!(seg.len >= SEGMENT_MIN_BYTES);
+            assert_eq!(seg.last, i + 1 == plan.len());
+            at += seg.len;
+        }
+        assert_eq!(at, 64 * MB as u64, "together they cover exactly the window");
+        // Two slots → two segments.
+        assert_eq!(segment_plan(64 * MB, Some(256 * MB as u64), 2, 128 * 1024).len(), 2);
+    }
+
+    #[test]
+    fn a_window_reaching_eof_splits_only_what_the_file_has() {
+        // 10 MB left in the file, 64 MB window: two segments over those 10 MB,
+        // never one starting past the end (a 416).
+        let plan = segment_plan(64 * MB, Some(10 * MB as u64), 8, 128 * 1024);
+        assert_eq!(plan.len(), 2);
+        let end = plan.last().map(|s| s.at + s.len).unwrap();
+        assert_eq!(end, 10 * MB as u64);
+        assert!(plan.last().unwrap().last);
+    }
+
+    #[test]
+    fn out_of_order_segments_only_ever_extend_the_contiguous_prefix() {
+        let mut ss = StreamState::new(vec![0u8; 4], 3);
+        // Segment 2 (window offset 12) and 1 (offset 8) arrive before segment 0 is done.
+        ss.push(2, 12, &[2, 2, 2, 2]);
+        ss.push(1, 8, &[1, 1]);
+        assert_eq!(ss.data.len(), 4, "nothing past a hole reaches readers");
+        assert_eq!(ss.received(), 10);
+        // Segment 0 finishes at 8: segment 1's two bytes join, then stop at its own hole.
+        ss.push(0, 4, &[0, 0, 0, 0]);
+        assert_eq!(ss.data.len(), 10);
+        // Segment 1 fills to 12: segment 2's parked bytes follow straight on.
+        ss.push(1, 10, &[1, 1]);
+        assert_eq!(ss.data, [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]);
+        // And a segment at the watermark appends directly from then on.
+        ss.push(2, 16, &[2]);
+        assert_eq!(ss.data.len(), 17);
+        assert_eq!(ss.received(), 17);
+    }
+
     // ── Short replies at read-ahead window boundaries ─────────────────────────
 
     #[test]

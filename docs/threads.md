@@ -2,7 +2,7 @@
 
 Every OS thread the daemon creates comes from [`ncrs_core/src/bg.rs`](../ncrs_core/src/bg.rs). It is either a worker of one of the fixed pools below or one of the named long-lived services. `std::thread::spawn` is banned everywhere else by `ncrs_core/clippy.toml`, and CI enforces this with `clippy -D clippy::disallowed_methods`. `std::thread::scope` stays allowed, because it joins its threads before returning.
 
-This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (166) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 50) + the main thread + reqwest's runtime threads (`MAX_HTTP_CLIENT_THREADS`, 22: 8 singletons plus the extra per-download-slot read clients, 7 per transport — see `http_clients::DOWNLOAD_CONNECTIONS`), which is **263**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
+This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (166) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 57) + the main thread + reqwest's runtime threads (`MAX_HTTP_CLIENT_THREADS`, 22: 8 singletons plus the extra per-download-slot read clients, 7 per transport — see `http_clients::DOWNLOAD_CONNECTIONS`), which is **270**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
 
 Why this matters: 0.1.76 spawned a detached thread per FUSE request and per background revalidation, and took its concurrency permit *inside* the thread. During a `find /` over a server answering 500, 9,800 of those threads parked on a 10-slot throttle. The daemon reached 10,160 threads and ~900 load average (2026-09-24; see `docs/plans/2026-09-24-thread-leak-5xx-walker.md`).
 
@@ -70,10 +70,11 @@ graph LR
 | boot file-cache validation (`bg::run_chunked`) | `BOOT_SCOPE_WIDTH` 16 | once at mount |
 | notify-push proactive refresh (`bg::run_chunked`) | `REFRESH_SCOPE_WIDTH` 4 | one event at a time |
 | unified search providers (`search.rs`) | `SEARCH_WIDTH` 6 | per search |
+| read-ahead window segments (`WindowPump::run`, `lib.rs`) | up to `MAX_WINDOW_SEGMENTS` − 1 = 3 per window | `SEGMENT_SCOPE_WIDTH` 7 in total: each holds a `read_throttle` slot beyond its window's own |
 
 ## Rules
 
 - **Never block `fuser-0` on the network or the kernel.** Anything that can wait goes to a pool. A job that owns a FUSE reply uses `submit_owning` so a refusal is still answered.
-- **Take concurrency permits with a deadline** (`Throttle::acquire_timeout`). `Throttle::acquire` is only for `mutate` jobs, which must finish, and never hold a permit across a retry sleep.
+- **Take concurrency permits with a deadline** (`Throttle::acquire_timeout`). `Throttle::acquire` is only for `mutate` jobs, which must finish, and never hold a permit across a retry sleep — or while waiting for another permit: in 0.1.77 three read-ahead streams each kept their `read_throttle` slot while waiting, untimed, for another to resume, and no slot was ever released again.
 - **A 5xx is an answer, not an outage.** It feeds `backoff.rs` (per-path cooldown and a server-wide breaker), never the offline flag.
 - **Adding a pool or a service:** add it to `bg.rs` (and `POOL_SIZES`) and to the tables above. `scripts/check-thread-sites.sh` fails CI if a name is missing here.
