@@ -117,6 +117,7 @@ impl Pool {
         // A lingering worker with nothing queued ahead for it takes it.
         if st.idle > st.queue.len() {
             st.queue.push_back(job);
+            st.peak_queued = st.peak_queued.max(st.queue.len());
             drop(st);
             self.work_ready.notify_one();
             return Ok(());
@@ -583,7 +584,7 @@ mod tests {
     #[test]
     fn a_request_by_request_stream_stays_on_a_lingering_worker() {
         // Like a sequential writer on DISK: each job is submitted only once the
-        // previous one finished. Without the linger every job started a thread.
+        // previous one answered. Without the linger every job started a thread.
         let p = leak(Pool::new("t-linger", 4, 16));
         let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
@@ -593,8 +594,57 @@ mod tests {
         }
         // One, unless the host descheduled us past a whole LINGER now and then.
         assert!(seen.len() <= 10, "{} threads for 200 back-to-back jobs", seen.len());
+        // Not asserted here: peak_active. The answer leaves from inside the
+        // job, before its worker is back waiting, so a submitter that answers
+        // fast can find no idle worker and start another (measured 2 to 4
+        // under parallel test load). `a_sequential_submitter_never_has_two_workers_at_once`
+        // asserts it for a submitter that waits for the job to be counted done.
         wait_idle(p);
         assert_eq!(p.stats().active, 0, "a lingering worker still exits");
+    }
+
+    #[test]
+    fn a_sequential_submitter_never_has_two_workers_at_once() {
+        // Each job submitted once the pool has counted the previous one done,
+        // which it does in the same critical section that marks the worker
+        // idle: every job must go to that worker, or to a fresh one after it
+        // exited, never to a second one alongside it.
+        let p = leak(Pool::new("t-linger-seq", 4, 16));
+        for i in 1..=200u64 {
+            p.submit(|| {}).unwrap();
+            let t = Instant::now();
+            while p.stats().completed < i {
+                assert!(t.elapsed() < Duration::from_secs(10), "job {i} never ran");
+                std::hint::spin_loop();
+            }
+        }
+        assert_eq!(p.stats().peak_active, 1, "a sequential submitter started a second worker: {:?}", p.stats());
+        wait_idle(p);
+    }
+
+    #[test]
+    fn a_job_handed_to_a_lingering_worker_counts_in_peak_queued() {
+        // One worker and sequential jobs: the only way a job can be queued is
+        // the idle path, a lingering worker taking it.
+        let p = leak(Pool::new("t-peakq", 1, 16));
+        let run = || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            p.submit(move || tx.send(()).unwrap()).unwrap();
+            rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        };
+        // Retried in case the host descheduled us past a whole LINGER.
+        for _ in 0..20 {
+            run();
+            // Well inside LINGER: the worker is waiting for a job.
+            std::thread::sleep(Duration::from_millis(5));
+            run();
+            if p.stats().peak_queued > 0 {
+                break;
+            }
+        }
+        let s = p.stats();
+        assert_eq!((s.peak_queued, s.peak_active), (1, 1), "the idle path queued a job without counting it: {s:?}");
+        wait_idle(p);
     }
 
     #[test]
