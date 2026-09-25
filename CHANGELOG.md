@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.1.77](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.76...ncrs-v0.1.77) (2026-09-25)
+
+
+### Features
+
+* **core:** name and rate-limit processes that crawl the mount, report pool health over IPC and in a minutely log line ([766a1a3](https://github.com/rgon/ncrsDesktop/commit/766a1a33449936e48c248517bd6029c5025b5aa2))
+* **ctl:** add ncrs-ctl CLI client for the IPC socket ([1dab81e](https://github.com/rgon/ncrsDesktop/commit/1dab81e1a8715f650151db43000c4bca0c0e92fb))
+* **desktop:** installation-detected browser profiles (GIO/KIO/Tracker/Baloo components) exposed via INTEGRATIONS/INTEGRATION_SET ([a1de840](https://github.com/rgon/ncrsDesktop/commit/a1de8400c78ec5585bae112a8df3662cdc160da7))
+* **desktop:** refuse thumbnailer opens of uncached files and serve the server preview instead ([c61fcf7](https://github.com/rgon/ncrsDesktop/commit/c61fcf73cb756f73c8b38077da723255116876f6))
+* **desktop:** scope file-type probes by process via a shared process matcher (GLib probe requires libgio) ([0d43157](https://github.com/rgon/ncrsDesktop/commit/0d4315739fadb46e417eaec7f82f8ac1c15245d4))
+* **desktop:** standalone GIO/KIO toolkit profiles required by browser profiles ([6f8d274](https://github.com/rgon/ncrsDesktop/commit/6f8d274a8aa49aa5a492485b01b23b68d4bbbdc4))
+* **dolphin:** KF5/KF6 overlay-icon plugin, ServiceMenu and ncrs-dolphin packaging ([2b46b55](https://github.com/rgon/ncrsDesktop/commit/2b46b55c9a810743d3521c4761778ca948386c7f))
+* **gui:** File browsers settings with one toggle per profile over IPC ([e7462f3](https://github.com/rgon/ncrsDesktop/commit/e7462f3494d0570eb2b84e6ec2f323144c4289e3))
+* **gui:** let users toggle and tune the folder-crawler pace in settings, applied live ([ec678d3](https://github.com/rgon/ncrsDesktop/commit/ec678d3acc6791eaacb3fa4ed663d1e2717eec4b))
+* **ipc:** broadcast change log with per-client cursors, HELLO/CLIENTS/EVENTS/WATCH (protocol v3) ([9c68989](https://github.com/rgon/ncrsDesktop/commit/9c68989eeadf5cd189c4e64183417adb094f4db6))
+* **preview:** pre-fill large freedesktop thumbnails when a KIO profile is active ([da9c796](https://github.com/rgon/ncrsDesktop/commit/da9c7963b72f3d3d74df09d92b4f86d707f7493a))
+
+
+### Bug Fixes
+
+* **core:** cap unified-search fan-out and count scoped threads in the static thread budget ([4a11439](https://github.com/rgon/ncrsDesktop/commit/4a114395f78c854dfd0dafe8ade1013c30aa5eef))
+* **core:** classify PROPFIND failures by status so a 5xx is never offline, retried in the foreground, or misread from the path ([97e20b6](https://github.com/rgon/ncrsDesktop/commit/97e20b6b884aa9af4fe8558c80d44be95ae6852d))
+* **core:** drop a folder's listing cooldown when notify-push reports it changed ([6f8dc79](https://github.com/rgon/ncrsDesktop/commit/6f8dc794c70658eaa887168677e82d3d1a929cc5))
+* **core:** move master's new change-log, desktop-refresh and thumbguard threads onto bg:: and scan subdirs in the thread-site check ([9da32e2](https://github.com/rgon/ncrsDesktop/commit/9da32e2a243bbdc42fad16171458a81110197171))
+* **core:** run every daemon thread from bounded bg:: pools and back off from failing listings instead of re-requesting them ([ef707c4](https://github.com/rgon/ncrsDesktop/commit/ef707c4c4e2bd328224f8df715795d2c90046663))
+* **core:** skip thumbnails and revalidation for requests from a process crawling the mount ([fa50b16](https://github.com/rgon/ncrsDesktop/commit/fa50b16d2d88147a101840f89ab7c0beb517317b))
+* **deb:** tie ncrs-nautilus Replaces/Breaks to the build version ([a31b03b](https://github.com/rgon/ncrsDesktop/commit/a31b03bb09bc260731a0d922f62a1968c07eb138))
+* **ipc:** key legacy change cursors by client process and attach them only for pollers ([1016936](https://github.com/rgon/ncrsDesktop/commit/1016936b8fb4f90a8d01660f8addad62bc32241f))
+* **scripts:** resolve relative globs against the cwd in the Claude Code walk guard ([bf04a0b](https://github.com/rgon/ncrsDesktop/commit/bf04a0b2a3b2b0bc08b24b8b91dbe6da9aa4e73a))
+
 ## [0.1.76](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.75...ncrs-v0.1.76) (2026-09-23)
 
 
