@@ -91,7 +91,8 @@ const EVENTS_PAGE: usize = 1000;
 const QUERY_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ').add(b'#').add(b'%').add(b'&').add(b'+').add(b'=').add(b'?');
 
-pub type KeepCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
+/// Returns whether the path was kept (see `keep_locally_recursive`).
+pub type KeepCallback = Arc<dyn Fn(PathBuf) -> bool + Send + Sync>;
 pub type EvictCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 pub type PrefetchCallback = Arc<dyn Fn(PathBuf) + Send + Sync>;
 /// Synchronously fetch the Nextcloud preview for a remote path and write it to
@@ -885,6 +886,17 @@ fn read_line_bounded<R: BufRead>(reader: &mut R, max_len: usize) -> std::io::Res
     }
 }
 
+/// Put back the status a path had before a KEEP marked it Downloading.
+fn restore_status(status_map: &StatusMap, path: &Path, before: Option<FileStatus>) {
+    let mut sm = status_map.safe_write();
+    if sm.get(path).copied() == Some(FileStatus::Downloading) {
+        match before {
+            Some(st) => { sm.insert(path.to_path_buf(), st); }
+            None => { sm.remove(path); }
+        }
+    }
+}
+
 /// Whether a read failed because the socket's read timeout ran out. Linux reports
 /// an expired `SO_RCVTIMEO` as EAGAIN (`WouldBlock`), not `TimedOut`.
 fn is_idle_timeout(e: &std::io::Error) -> bool {
@@ -1294,25 +1306,40 @@ fn handle_client_loop(
         } else if let Some(path_str) = trimmed.strip_prefix("KEEP ") {
             match (strip_mount(Path::new(path_str), &mount_point), &keep_cb) {
                 (Some(remote), Some(cb)) => {
-                    status_map.safe_write().insert(remote.clone(), FileStatus::Downloading);
+                    let before = status_map.safe_write().insert(remote.clone(), FileStatus::Downloading);
                     dirty_set.safe_lock().insert(remote.clone());
                     let cb = cb.clone();
                     let sm = status_map.clone();
                     let ds = dirty_set.clone();
                     let r = remote.clone();
-                    let _ = crate::bg::USER.submit(move || {
-                        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
-                            log::error!("KEEP callback panicked: {:?}", e);
-                        }
-                        {
+                    let refused_path = remote.clone();
+                    let submitted = crate::bg::USER.submit(move || {
+                        let kept = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
+                            Ok(kept) => kept,
+                            Err(e) => {
+                                log::error!("KEEP callback panicked: {:?}", e);
+                                false
+                            }
+                        };
+                        // Kept only if something was: the status is what file
+                        // managers show, and a failed keep must not claim it.
+                        if kept {
                             let mut sm_w = sm.safe_write();
                             if sm_w.get(&r).copied() == Some(FileStatus::Downloading) {
                                 sm_w.insert(r.clone(), FileStatus::Kept);
                             }
+                        } else {
+                            restore_status(&sm, &r, before);
                         }
                         ds.safe_lock().insert(r);
                     });
-                    "ok".to_string()
+                    if submitted.is_ok() {
+                        "ok".to_string()
+                    } else {
+                        restore_status(&status_map, &refused_path, before);
+                        dirty_set.safe_lock().insert(refused_path);
+                        "error: busy, try again".to_string()
+                    }
                 }
                 (None, _) => "error: path not under mount".to_string(),
                 (_, None) => "error: not supported".to_string(),
@@ -1331,12 +1358,12 @@ fn handle_client_loop(
             match (strip_mount(Path::new(path_str), &mount_point), &prefetch_cb) {
                 (Some(remote), Some(cb)) => {
                     let cb = cb.clone();
-                    let _ = crate::bg::USER.submit(move || {
+                    let submitted = crate::bg::USER.submit(move || {
                         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(remote))) {
                             log::error!("PREFETCH callback panicked: {:?}", e);
                         }
                     });
-                    "ok".to_string()
+                    if submitted.is_ok() { "ok".to_string() } else { "error: busy, try again".to_string() }
                 }
                 (None, _) => "error: path not under mount".to_string(),
                 (_, None) => "error: not supported".to_string(),
@@ -1496,6 +1523,25 @@ mod tests {
         let mut reader = BufReader::new(server);
         let err = read_line_bounded(&mut reader, MAX_IPC_LINE_LEN).unwrap_err();
         assert!(is_idle_timeout(&err), "unexpected error kind: {:?}", err.kind());
+    }
+
+    #[test]
+    fn failed_keep_restores_the_status_it_replaced() {
+        let sm: StatusMap = Arc::new(RwLock::new(HashMap::new()));
+        let p = PathBuf::from("/a.txt");
+        sm.safe_write().insert(p.clone(), FileStatus::Downloading);
+        restore_status(&sm, &p, Some(FileStatus::Synced));
+        assert!(sm.safe_read().get(&p).copied() == Some(FileStatus::Synced));
+
+        // No status before the KEEP: the entry goes away (reads as remote).
+        sm.safe_write().insert(p.clone(), FileStatus::Downloading);
+        restore_status(&sm, &p, None);
+        assert!(sm.safe_read().get(&p).is_none());
+
+        // Something else moved it on meanwhile: leave that alone.
+        sm.safe_write().insert(p.clone(), FileStatus::Kept);
+        restore_status(&sm, &p, Some(FileStatus::Synced));
+        assert!(sm.safe_read().get(&p).copied() == Some(FileStatus::Kept));
     }
 
     #[test]

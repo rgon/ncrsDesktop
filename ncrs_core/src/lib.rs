@@ -222,6 +222,9 @@ const READ_HEADER_TIMEOUT_ERR: &str = "range read: server sent no response heade
 /// Prefix of `read_exact_from_stream`'s error when the body stalled or crawled
 /// before the first bytes a READ needs arrived.
 const READ_BODY_SLOW_PREFIX: &str = "range read too slow";
+/// Error `get_or_list_dir` returns when the path it was asked to list turned out
+/// to be a file (see `FsCache::not_dirs`).
+const NOT_A_DIRECTORY_ERR: &str = "not a directory";
 /// Error for a lookup the DNS pool refused (`http_clients::is_dns_refusal`).
 /// Matches neither network-down classifier: answered EAGAIN, never offline.
 const DNS_BUSY_ERR: &str = "range read: name lookup refused (lookup pool busy)";
@@ -2123,6 +2126,11 @@ pub(crate) struct FsCache {
     // these out so a racing PROPFIND refresh can't re-add them before the
     // server DELETE completes.
     pub(crate) deleting: HashSet<PathBuf>,
+    // Paths a listing found to be files, not directories (the PROPFIND's self
+    // entry had no collection type). put_dir_cache records them instead of
+    // caching an empty "directory", and get_or_list_dir turns that into
+    // NOT_A_DIRECTORY_ERR for whoever asked it to list a file.
+    pub(crate) not_dirs: HashSet<PathBuf>,
     // Set once the user unlinks the synthetic `.trackerignore` overlay entry
     // (see trackerignore_entry()). While set, put_dir_cache stops re-adding it
     // to the root listing — mirrors the old real-file semantics ("stays opted
@@ -2217,6 +2225,17 @@ impl FsCache {
     }
 
     fn put_dir_cache(&mut self, path: PathBuf, etag: Option<String>, self_entry: Option<RemoteEntry>, mut files: Vec<RemoteEntry>) {
+        // A PROPFIND of a *file* answers 207 with just the file itself, which
+        // reads as an empty listing. Cached, it would make the file an empty
+        // directory: getattr answers make_dir_attr for it once its parent
+        // listing is gone, and KEEP/PREFETCH find nothing to fetch in it.
+        if self_entry.as_ref().is_some_and(|se| !se.is_dir) {
+            log::warn!("{} is a file, not a directory — not caching its listing", path.display());
+            self.dir_cache.remove(&path);
+            self.not_dirs.insert(path);
+            return;
+        }
+        self.not_dirs.remove(&path);
         // Re-merge any in-flight uploads missing from the server listing so
         // that concurrent PROPFIND refreshes don't produce ENOENT on stat().
         if let Some(old) = self.dir_cache.get(&path) {
@@ -3340,6 +3359,9 @@ fn list_dir_cached_or_fresh(
                 }
                 Ok(_) => {}
             }
+            if c.not_dirs.remove(&path) {
+                return Err(format!("{}: {}", NOT_A_DIRECTORY_ERR, path.display()));
+            }
             if c.dir_cache.get(&path).map_or(false, |e| !e.invalidated && !e.hard_expired) {
                 let se = c.dir_cache.get(&path).and_then(|e| e.self_entry.clone());
                 if poll_iters > 2 { log::debug!("LIST_PROMOTED_WAIT {} iters for {}", poll_iters, path.display()); }
@@ -3382,6 +3404,9 @@ fn list_dir_cached_or_fresh(
     };
     if finished {
         let se = c.promote_pending(&path)?;
+        if c.not_dirs.remove(&path) {
+            return Err(format!("{}: {}", NOT_A_DIRECTORY_ERR, path.display()));
+        }
         if let Some((files, _)) = c.get_cached_dir(&path, ttl, max_stale) {
             return Ok((files, se));
         }
@@ -3538,6 +3563,9 @@ pub(crate) fn ensure_file_cached_within(
     Ok(local_path)
 }
 
+/// Keeps a file, or a directory and everything under it. Returns whether the
+/// path itself was kept: the file downloaded, or the directory listed. A child
+/// that fails inside a kept directory is logged, not reported here.
 fn keep_locally_recursive(
     conn: &Arc<ConnInfo>,
     cache: &Arc<Mutex<FsCache>>,
@@ -3545,31 +3573,46 @@ fn keep_locally_recursive(
     dirty: &ipc::DirtySet,
     remote_path: PathBuf,
     transfers: Option<&TransferMap>,
-) {
+) -> bool {
     log::info!("KEEP {}", remote_path.display());
+
+    let keep_file = |why: Option<&str>| -> bool {
+        match ensure_file_cached(conn, cache, status, dirty, remote_path.clone(), transfers, true) {
+            Ok(_) => true,
+            Err(e) => {
+                match why {
+                    Some(w) => log::warn!("keep failed {}: {} / {}", remote_path.display(), w, e),
+                    None => log::warn!("keep failed {}: {}", remote_path.display(), e),
+                }
+                false
+            }
+        }
+    };
 
     let known_dir = cache.safe_lock().is_known_directory(&remote_path);
 
     if known_dir == Some(false) {
-        if let Err(e) = ensure_file_cached(conn, cache, status, dirty, remote_path.clone(), transfers, true) {
-            log::warn!("keep failed {}: {}", remote_path.display(), e);
-        }
-        return;
+        return keep_file(None);
     }
 
-    let (entries, _self_entry) = match get_or_list_dir(conn, cache, remote_path.clone(), None) {
+    let (entries, self_entry) = match get_or_list_dir(conn, cache, remote_path.clone(), None) {
         Ok(e) => e,
         Err(e) => {
+            // Type unknown and the listing failed: it may well be a file (a
+            // file's listing now fails with NOT_A_DIRECTORY_ERR).
             if known_dir.is_none() {
-                if let Err(e2) = ensure_file_cached(conn, cache, status, dirty, remote_path.clone(), transfers, true) {
-                    log::warn!("keep failed {}: {} / {}", remote_path.display(), e, e2);
-                }
-            } else {
-                log::warn!("keep dir failed {}: {}", remote_path.display(), e);
+                return keep_file(Some(&e));
             }
-            return;
+            log::warn!("keep dir failed {}: {}", remote_path.display(), e);
+            return false;
         }
     };
+    // A listing cached before files were refused as directories (or answered
+    // from one) can still describe a file as an empty directory.
+    if self_entry.as_ref().is_some_and(|se| !se.is_dir) {
+        cache.safe_lock().dir_cache.remove(&remote_path);
+        return keep_file(None);
+    }
 
     let mut files = Vec::new();
     let mut dirs = Vec::new();
@@ -3602,6 +3645,7 @@ fn keep_locally_recursive(
     for dir in dirs {
         keep_locally_recursive(conn, cache, status, dirty, dir, transfers);
     }
+    true
 }
 
 fn prefetch_list_dir(conn: &ConnInfo, cache: &Mutex<FsCache>, path: &Path) {
@@ -4154,6 +4198,7 @@ impl NextCloudFs {
                     pending_notify: Arc::new((Mutex::new(()), Condvar::new())),
                     uploading: HashSet::new(),
                     deleting: HashSet::new(),
+                    not_dirs: HashSet::new(),
                     trackerignore_hidden: false,
                 }));
                 load_dir_cache(&c);
@@ -4338,7 +4383,7 @@ impl NextCloudFs {
         let dirty = self.dirty.clone();
         let transfers = self.transfer_map.clone();
         Arc::new(move |remote_path| {
-            keep_locally_recursive(&conn, &cache, &status, &dirty, remote_path, Some(&transfers));
+            keep_locally_recursive(&conn, &cache, &status, &dirty, remote_path, Some(&transfers))
         })
     }
 
