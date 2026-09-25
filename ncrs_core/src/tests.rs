@@ -6480,6 +6480,38 @@ mod upload_order_tests {
         }
 
         #[test]
+        fn a_replay_gives_up_entries_and_keeps_their_bytes_off_the_journal_lock() {
+            // Deferred saves on a pool that never runs: nothing but this thread
+            // takes the journal lock, so the watch can tell it is not held.
+            static NEVER: bg::Pool = bg::Pool::new("t-replay-watch", 0, 0);
+            let srv = TreeServer::new(&[], &[]);
+            let mut off = Offline::new();
+            mutation_journal::defer_saves(&off.journal, &NEVER);
+            let _watch = mutation_journal::watch_journal_lock(&off.journal);
+            // A PUT into a folder the server no longer has (a Conflict), and
+            // one out of attempts (given up before it is sent).
+            off.save("/gone/x", "X", None);
+            let z = off.save("/z", "Z", None);
+            {
+                let mut j = off.journal.safe_lock();
+                j.skip_backoff();
+                for _ in 0..mutation_journal::MutationJournal::max_attempts() {
+                    j.mark_failed(z, "refused".into());
+                }
+                j.skip_backoff();
+            }
+            // Each staging move and conflict save panics if made under the lock.
+            let conflicts = off.replay(&srv);
+            assert_eq!(conflicts.len(), 2, "{conflicts:?}");
+            assert_eq!(std::fs::read_to_string(off.dir.path().join("unsynced/x")).unwrap(), "X");
+            assert_eq!(std::fs::read_to_string(off.dir.path().join("unsynced/z")).unwrap(), "Z");
+            // Both conflicts reach the disk through the saver's path, off the lock.
+            mutation_journal::flush_deferred(&off.journal);
+            drop(_watch);
+            assert_eq!(mutation_journal::MutationJournal::load_or_create(off.dir.path()).unresolved_conflicts().len(), 2);
+        }
+
+        #[test]
         fn created_renamed_then_deleted_offline_replays_as_nothing() {
             let srv = TreeServer::new(&[("/keep", "K")], &[]);
             let mut off = Offline::new();

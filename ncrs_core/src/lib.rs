@@ -4681,7 +4681,10 @@ fn seed_from_queue(ctx: &MetaCtx, fh: u64, opened_as: &Path, wp: &Path) -> Resul
                     Ok(_) => return Ok(()),
                     // Named by the journal and still missing a look later: not a
                     // race with its upload (a staging file is deleted only once
-                    // the journal stops naming it); the server's copy is all there is.
+                    // the journal stops naming it, except that a replay giving
+                    // the entry up moves it to `unsynced/` just before dequeuing
+                    // it, and an open looking in between gets what it would get a
+                    // moment later); the server's copy is all there is.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound && missing.as_ref() == Some(&staged) => {
                         return download_seed(ctx, wp, &now_at, false).map_err(SeedFail::from);
                     }
