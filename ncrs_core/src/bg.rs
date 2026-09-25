@@ -325,10 +325,12 @@ pub const USER_WORKERS: usize = 4;
 pub static UPLOAD: Pool = Pool::new("upload", UPLOAD_WORKERS, 1024);
 pub const UPLOAD_WORKERS: usize = 4;
 
-/// Staging-file I/O, none of which may run on the dispatch thread: every
-/// `write()` (a pwrite or append, seeding the staging file from a kept copy on
-/// the first one), a truncate, `flush` and `fsync` of a dirty handle (the
-/// reply travels with the job), and deleting a released handle's staging file.
+/// Staging-file I/O that is quick, none of which may run on the dispatch
+/// thread: every `write()` that does not seed its staging file (a pwrite or
+/// append), a truncate of an already seeded one, and a `release` queued behind
+/// a handle's in-flight step. Each is a lane step that owns its kernel
+/// request's reply. The slow steps go to [`DISK_SLOW`], so a plain pwrite only
+/// ever waits behind other pwrites.
 ///
 /// Never refused, like `MUTATION`: a handle has at most one step submitted at
 /// a time (its lane, `fh_lane.rs`), and each step owns a kernel request's
@@ -338,14 +340,25 @@ pub const UPLOAD_WORKERS: usize = 4;
 pub static DISK: Pool = Pool::new("disk", DISK_WORKERS, usize::MAX);
 pub const DISK_WORKERS: usize = 4;
 
+/// Staging-file I/O that can take seconds on a busy disk: seeding a staging
+/// file from the kept copy (a whole-file copy, on the handle's first write or
+/// truncate), the `sync_all` of a dirty handle's `flush` and `fsync`, and a
+/// released handle's staging delete or move to `recovered/`. Split off `DISK`
+/// so four of these at once can't stall every other file's `write(2)`.
+///
+/// Never refused, for the same reason as `DISK`: the lane steps here own a
+/// reply and a handle has one step submitted at a time.
+pub static DISK_SLOW: Pool = Pool::new("disk-slow", DISK_SLOW_WORKERS, usize::MAX);
+pub const DISK_SLOW_WORKERS: usize = 2;
+
 /// The journal's group commit (`mutation_journal::DeferredSaves`): one saver
 /// job queued or running at a time, on its own worker so a burst of staging
-/// seeds on `disk` never delays the write that makes edits crash-safe, and a
+/// seeds on `disk-slow` never delays the write that makes edits crash-safe, and a
 /// save retrying after ENOSPC never holds a `disk` worker.
 pub static JOURNAL: Pool = Pool::new("journal", JOURNAL_WORKERS, 4);
 pub const JOURNAL_WORKERS: usize = 1;
 
-pub static POOLS: [&Pool; 14] = [&READDIR, &META, &READ, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER, &UPLOAD, &DISK, &JOURNAL];
+pub static POOLS: [&Pool; 15] = [&READDIR, &META, &READ, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER, &UPLOAD, &DISK, &DISK_SLOW, &JOURNAL];
 
 /// Named long-lived threads: the FUSE session, connectivity monitor, push
 /// watcher, IPC accept loop, savers, cleanup. Fixed in number.
@@ -382,7 +395,7 @@ pub const MAX_THREADS: usize = {
 /// fixed handful (metadata, transfers, previews, push). Generous upper bound.
 pub const MAX_HTTP_CLIENT_THREADS: usize = 8;
 
-const POOL_SIZES: [usize; 14] = [
+const POOL_SIZES: [usize; 15] = [
     READDIR_WORKERS,
     META_WORKERS,
     READ_WORKERS,
@@ -396,6 +409,7 @@ const POOL_SIZES: [usize; 14] = [
     USER_WORKERS,
     UPLOAD_WORKERS,
     DISK_WORKERS,
+    DISK_SLOW_WORKERS,
     JOURNAL_WORKERS,
 ];
 

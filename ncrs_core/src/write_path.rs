@@ -9,23 +9,28 @@
 //! `flush`/`fsync`/`release` fsynced whole staging files and the journal there.
 //! Now each handle's work goes through its lane (`fh_lane.rs`), which keeps it
 //! in the order the kernel sent it. Every write, however small, runs on
-//! `bg::DISK` (a chunk graduation on `bg::UPLOAD`), as do a truncate and the
-//! `flush`/`fsync` of a dirty handle, each owning its reply: a pwrite of a few
-//! bytes still updates the file's mtime, and on a slow host disk that waits for
-//! the ext4 journal (`jbd2`), which parked `fuser-0` in D state for seconds
-//! (2026-09-25). What stays on the dispatch thread does no staging-file I/O:
-//! the flush/fsync of a clean handle, and release, whose commit is in memory
-//! (the journal saves on its own thread) and whose staging-file deletes and
-//! moves go to `bg::DISK` after the reply. The handle's state is updated before
-//! the reply goes out, and RELEASE (which the kernel sends only after the
-//! handle's last write was answered) queues behind anything still in flight,
-//! so it always commits the finished file, once. Release's own fsyncs moved
+//! `bg::DISK` (a chunk graduation on `bg::UPLOAD`), as does a truncate, each
+//! owning its reply: a pwrite of a few bytes still updates the file's mtime,
+//! and on a slow host disk that waits for the ext4 journal (`jbd2`), which
+//! parked `fuser-0` in D state for seconds (2026-09-25). The steps that can
+//! take seconds even on a healthy disk run on `bg::DISK_SLOW` instead, so a
+//! plain pwrite never queues behind them: the first write or truncate of a
+//! handle that seeds its staging file from the kept copy (a whole-file copy),
+//! the `flush`/`fsync` of a dirty handle (a `sync_all`), and a released
+//! handle's staging deletes and moves. What stays on the dispatch thread does
+//! no staging-file I/O: the flush/fsync of a clean handle, and release, whose
+//! commit is in memory (the journal saves on its own thread) and whose
+//! staging-file deletes and moves go to `bg::DISK_SLOW` after the reply. The
+//! handle's state is updated before the reply goes out, and RELEASE (which the
+//! kernel sends only after the handle's last write was answered) queues behind
+//! anything still in flight, so it always commits the finished file, once. Release's own fsyncs moved
 //! into the journal's group commit.
 //!
-//! Why `bg::DISK` never refuses (its queue is unbounded): every job on it is a
-//! lane step, which owns a kernel request's reply, or a released handle's
-//! staging cleanup. A lane submits one step at a time, so the queue never holds
-//! more steps than the kernel has requests outstanding on distinct handles.
+//! Why `bg::DISK` and `bg::DISK_SLOW` never refuse (their queues are
+//! unbounded): every job on them is a lane step, which owns a kernel request's
+//! reply, or a released handle's staging cleanup. A lane submits one step at a
+//! time, whichever pool runs it, so the lane steps queued never outnumber the
+//! requests the kernel has outstanding on distinct handles.
 //! Refusing instead would mean running the step on `fuser-0` (the disk wait
 //! this module exists to avoid) or answering EAGAIN, which `write(2)` hands to
 //! the application: `cp` would fail a copy under load.
@@ -48,13 +53,15 @@ pub(crate) struct WriteCtx {
     pub(crate) auto_keep_locally_modified_files: bool,
     // Where staging files live; fixed for the mount, so no `cache` lock.
     pub(crate) cache_dir: PathBuf,
-    // `bg::UPLOAD` and `bg::DISK`; tests swap in pools that refuse or stall.
+    // `bg::UPLOAD`, `bg::DISK` and `bg::DISK_SLOW`; tests swap in pools that
+    // refuse or stall.
     pub(crate) upload_pool: &'static bg::Pool,
     pub(crate) disk_pool: &'static bg::Pool,
+    pub(crate) disk_slow_pool: &'static bg::Pool,
     // Where a graduation goes when `upload_pool` refuses it and the tail
     // already holds `TAIL_CAP_CHUNKS` chunks: `bg::MUTATION`, which never
     // refuses (see `dispatch_write`). Also where staging cleanup goes if
-    // `disk_pool` cannot take it.
+    // `disk_slow_pool` cannot take it.
     pub(crate) spill_pool: &'static bg::Pool,
 }
 
@@ -90,8 +97,9 @@ pub(crate) fn truncate_reply(meta: &MetaCtx, pid: u32, ino: u64, new_size: u64, 
 /// Where a `write()` runs. Never on the dispatch thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteCost {
-    /// A pwrite or append to the staging file, seeding it from the kept copy
-    /// first if this is the handle's first write (`bg::DISK`).
+    /// A pwrite or append to the staging file (`bg::DISK`), seeding it from
+    /// the kept copy first if this is the handle's first write
+    /// (`bg::DISK_SLOW`).
     Stage,
     /// This write fills a chunk of a streamed upload, which is then PUT
     /// (`bg::UPLOAD`; refused, it only appends, on `bg::DISK`).
@@ -151,10 +159,20 @@ fn seed_staging(local: Option<&Path>, wp: &Path) -> std::io::Result<()> {
     copied
 }
 
+/// Whether the handle's next staging step copies the kept copy into a new
+/// staging file (`ensure_staging`): no staging file yet, and a kept copy to
+/// seed it from. Judged on the dispatch thread from the handle alone, no disk
+/// access; a step queued behind the seeding one may still be judged to seed,
+/// which only sends it to the slow pool, in its lane's order all the same.
+fn seeds_staging(of: &OpenFile) -> bool {
+    of.write_path.is_none() && of.local.is_some()
+}
+
 impl WriteCtx {
     /// `write()`: always a step on the handle's lane, owning its reply, on
-    /// `disk_pool` (or `upload_pool` for a graduation). Nothing here touches
-    /// the staging file on the calling thread.
+    /// `disk_pool` (`disk_slow_pool` if it seeds the staging file, or
+    /// `upload_pool` for a graduation). Nothing here touches the staging file
+    /// on the calling thread.
     ///
     /// Only a write classified `Graduate` and running on `upload_pool` (or a
     /// `GraduateCapped` one on its spill pool) may PUT a chunk. Any other
@@ -179,12 +197,13 @@ impl WriteCtx {
         data: &[u8],
         reply: impl FnOnce(Result<u32, Errno>) + Send + 'static,
     ) {
-        let cost = self.classify_write(fh, offset, data.len());
+        let (cost, seeds) = self.classify_write(fh, offset, data.len());
+        let disk = self.disk_for(seeds);
         let (pool, spill) = match cost {
-            // `disk_pool` never refuses (see the module doc).
-            WriteCost::Stage => (self.disk_pool, None),
+            // Neither disk pool refuses (see the module doc).
+            WriteCost::Stage => (disk, None),
             // Refused, it only appends: the next write catches up.
-            WriteCost::Graduate => (self.upload_pool, Some(self.disk_pool)),
+            WriteCost::Graduate => (self.upload_pool, Some(disk)),
             WriteCost::GraduateCapped => (self.upload_pool, Some(self.spill_pool)),
         };
         let (c, data) = (self.clone(), data.to_vec());
@@ -200,22 +219,24 @@ impl WriteCtx {
     }
 
     /// The handle's side of a size-changing `setattr`; `then` answers it. On
-    /// `disk_pool`: it resizes (and may first seed) the staging file.
+    /// `disk_pool`: it resizes the staging file (on `disk_slow_pool` if it
+    /// must seed it first).
     pub(crate) fn dispatch_truncate(
         &self,
         fh: u64,
         new_size: u64,
         then: impl FnOnce(&MetaCtx, Result<(), Errno>) + Send + 'static,
     ) {
+        let seeds = self.open_files.safe_lock().get(&fh).is_some_and(seeds_staging);
         let c = self.clone();
-        self.lanes.run(fh, self.disk_pool, move |_| {
+        self.lanes.run(fh, self.disk_for(seeds), move |_| {
             let r = c.truncate_answer(fh, new_size);
             move || then(&c.meta, r)
         });
     }
 
     /// `flush()`: a clean handle (most closes) is answered inline, which does
-    /// no I/O; a dirty one fsyncs its staging file on `disk_pool` after
+    /// no I/O; a dirty one fsyncs its staging file on `disk_slow_pool` after
     /// anything in flight on it. close() waits for this reply; the dispatch
     /// thread doesn't.
     pub(crate) fn dispatch_flush(&self, fh: u64, reply: impl FnOnce() + Send + 'static) {
@@ -225,14 +246,15 @@ impl WriteCtx {
             }
         }
         let c = self.clone();
-        self.lanes.run(fh, self.disk_pool, move |_| {
+        self.lanes.run(fh, self.disk_slow_pool, move |_| {
             c.flush_answer(fh);
             reply
         });
     }
 
-    /// `fsync()`: answered only once the staged bytes are on disk; inline
-    /// only when there is no staging file to sync.
+    /// `fsync()`: answered only once the staged bytes are on disk (a
+    /// `sync_all` on `disk_slow_pool`); inline only when there is no staging
+    /// file to sync.
     pub(crate) fn dispatch_fsync(&self, fh: u64, reply: impl FnOnce() + Send + 'static) {
         if let Some(_lane) = self.lanes.claim(fh) {
             if !self.fsync_has_work(fh) {
@@ -240,7 +262,7 @@ impl WriteCtx {
             }
         }
         let c = self.clone();
-        self.lanes.run(fh, self.disk_pool, move |_| {
+        self.lanes.run(fh, self.disk_slow_pool, move |_| {
             c.fsync_answer(fh);
             reply
         });
@@ -262,6 +284,12 @@ impl WriteCtx {
             c.release_answer(fh, reply);
             || {}
         });
+    }
+
+    /// The pool for a staging-file step: `disk_slow_pool` when it seeds the
+    /// staging file from the kept copy, else `disk_pool`.
+    fn disk_for(&self, seeds: bool) -> &'static bg::Pool {
+        if seeds { self.disk_slow_pool } else { self.disk_pool }
     }
 
     fn staging_path_for(&self, fh: u64) -> PathBuf {
@@ -291,17 +319,18 @@ impl WriteCtx {
     /// would grow without bound. The confirmed bytes lag too, which only makes
     /// a write `Graduate` that then finds less than a chunk and just appends.
     ///
-    /// Records the write as dispatched. Reads only the handle's state: this
+    /// Records the write as dispatched, and says whether it will seed the
+    /// staging file (`seeds_staging`). Reads only the handle's state: this
     /// runs on the dispatch thread.
-    fn classify_write(&self, fh: u64, offset: u64, len: usize) -> WriteCost {
+    fn classify_write(&self, fh: u64, offset: u64, len: usize) -> (WriteCost, bool) {
         let mut files = self.open_files.safe_lock();
-        let Some(of) = files.get_mut(&fh) else { return WriteCost::Stage };
+        let Some(of) = files.get_mut(&fh) else { return (WriteCost::Stage, false) };
         let cost = self.cost_of(of, offset, len);
         let end = of.dispatched_end.max(of.total_written);
         if offset == end {
             of.dispatched_end = end + len as u64;
         }
-        cost
+        (cost, seeds_staging(of))
     }
 
     fn cost_of(&self, of: &OpenFile, offset: u64, len: usize) -> WriteCost {
@@ -571,7 +600,7 @@ impl WriteCtx {
     /// to disk there: the commit only journals (saved on the journal's
     /// thread) and hands the upload to `bg::MUTATION`, and a staging file that
     /// goes (never written, a failed stream, an unlinked file) is deleted or
-    /// moved to `recovered/` by `off_dispatch`. What it still reads is the
+    /// moved to `recovered/` by `off_dispatch`, on `disk_slow_pool`. What it still reads is the
     /// staging file's length (`metadata`), as `getattr` does: an in-memory
     /// inode, no journal access.
     pub(crate) fn release_answer(&self, fh: u64, reply: impl FnOnce()) {
@@ -654,12 +683,12 @@ impl WriteCtx {
     }
 
     /// Runs `job`, which touches the disk and answers nobody, off the calling
-    /// thread: on `disk_pool`, which never refuses; failing that (the OS
+    /// thread: on `disk_slow_pool`, which never refuses; failing that (the OS
     /// could not start a worker) on `spill_pool`; only if that fails too, here.
     fn off_dispatch(&self, job: impl FnOnce() + Send + 'static) {
         type Job = Box<dyn FnOnce() + Send>;
         let job: Job = Box::new(job);
-        let job = match self.disk_pool.submit_owning(job, |j: Job| j()) {
+        let job = match self.disk_slow_pool.submit_owning(job, |j: Job| j()) {
             Ok(()) => return,
             Err((_, j)) => j,
         };

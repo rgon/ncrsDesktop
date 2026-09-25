@@ -5931,6 +5931,7 @@ impl NextCloudFs {
             cache_dir: self.cache.safe_lock().cache_dir.clone(),
             upload_pool: &bg::UPLOAD,
             disk_pool: &bg::DISK,
+            disk_slow_pool: &bg::DISK_SLOW,
             spill_pool: &bg::MUTATION,
         })
     }

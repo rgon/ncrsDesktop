@@ -18,8 +18,9 @@
 //! A step the pool refuses goes to its spill pool if it has one, and is told
 //! which of the two it runs on ([`Ran`]). The write path gives every step that
 //! touches the disk a pool that never refuses at the end of that chain
-//! (`bg::DISK` and `bg::MUTATION` have unbounded queues), so no staging-file
-//! I/O runs on the FUSE dispatch thread. Only when both refuse, which for
+//! (`bg::DISK`, `bg::DISK_SLOW` and `bg::MUTATION` have unbounded queues),
+//! so no staging-file I/O runs on the FUSE dispatch thread. Only when both
+//! refuse, which for
 //! those pools means the OS could not start a worker thread for either, does
 //! the step run on the thread that tried to start it, as the
 //! last resort that still drops and reorders nothing; that thread can be the
