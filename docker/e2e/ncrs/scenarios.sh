@@ -893,17 +893,29 @@ done
 RK="kept-baseline $(date +%s%N)"
 printf '%s' "$RK" > "$MOUNT/relock/kept.txt"
 wait_dav_sha relock/kept.txt "$(printf '%s' "$RK" | sha)" 60 >/dev/null || no "setup: kept.txt never reached the backend"
+# The backend has the bytes a moment before the daemon has handled its own PUT
+# response, which sets the file's status to synced. A KEEP answered in between
+# is overwritten, and STATUS never says kept. Wait for the daemon's side too.
+for _ in $(seq 1 30); do
+    daemon_logs | grep -q "PUT /relock/kept.txt → new etag" && break
+    sleep 1
+done
 [ -S "$SOCK" ] && [ "$(ipc "KEEP $MOUNT/relock/kept.txt")" = "ok" ] || no "setup: IPC KEEP was not accepted (socket: ${SOCK:-none})"
 kept=""
 for _ in $(seq 1 60); do
-    if [ "$(ipc "STATUS $MOUNT/relock/kept.txt")" = "kept" ] \
+    kept_status="$(ipc "STATUS $MOUNT/relock/kept.txt")"
+    if [ "$kept_status" = "kept" ] \
         && [ -n "$(find "$HOME/.cache/ncrs" -path '*/kept/relock/kept.txt' -type f 2>/dev/null)" ]; then
         kept=1; break
     fi
     sleep 1
 done
 [ -n "$kept" ] && ok "setup: file pinned locally (file-cache entry + kept copy on disk)" \
-    || no "setup: KEEP never produced a kept local copy"
+    || {
+        no "setup: KEEP never produced a kept local copy (last STATUS: ${kept_status:-none})"
+        echo "    kept copies on disk: $(find "$HOME/.cache/ncrs" -path '*/kept/relock/*' -type f 2>/dev/null | tr '\n' ' ')"
+        daemon_logs | grep -E "relock/kept\.txt|keep failed|KEEP callback" | tail -15 | sed 's/^/    /'
+    }
 sleep 11                                          # age the listing past the 10s dir TTL
 bounded 20 ls "$MOUNT/relock" >/dev/null 2>&1     # synchronous re-list: this is old_snap
 [ $? -eq 137 ] && mount_hung "re-list before the server edit"
