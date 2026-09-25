@@ -1282,6 +1282,32 @@
         assert_eq!(next_read_ahead_window(READ_AHEAD_INITIAL, false, ceiling), READ_AHEAD_INITIAL);
     }
 
+    #[test]
+    fn a_sequential_reader_past_half_the_window_makes_the_next_one_due() {
+        let file = 256 * MB as u64;
+        let win = 8 * MB as u64;
+        let sz = 128 * 1024;
+        // First half: not yet.
+        assert!(!lookahead_due(0, win, 0, sz, true, file));
+        assert!(!lookahead_due(0, win, win / 4, sz, true, file));
+        // Second half: due.
+        assert!(lookahead_due(0, win, win / 2, sz, true, file));
+        assert!(lookahead_due(0, win, win - sz as u64, sz, true, file));
+    }
+
+    #[test]
+    fn no_look_ahead_for_seeks_eof_or_unknown_sizes() {
+        let win = 8 * MB as u64;
+        let sz = 128 * 1024;
+        // A seek is not a streaming reader.
+        assert!(!lookahead_due(0, win, win / 2, sz, false, 256 * MB as u64));
+        // The window already reaches the end of the file.
+        assert!(!lookahead_due(0, win, win / 2, sz, true, win));
+        assert!(!lookahead_due(0, win, win / 2, sz, true, win - 1));
+        // Unknown size proves nothing about what lies past the window.
+        assert!(!lookahead_due(0, win, win / 2, sz, true, 0));
+    }
+
     // ── Short replies at read-ahead window boundaries ─────────────────────────
 
     #[test]

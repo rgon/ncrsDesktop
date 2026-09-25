@@ -371,6 +371,61 @@ fn next_read_ahead_window(current: usize, sequential: bool, ceiling: usize) -> u
     }
 }
 
+/// Whether a read at `off..off+sz` inside the window `win_start..+win_len` makes
+/// the next window due: the reader is sequential, has reached the window's second
+/// half, and the file goes on past this window. Pure so the policy is testable.
+fn lookahead_due(win_start: u64, win_len: u64, off: u64, sz: usize, sequential: bool, file_size: u64) -> bool {
+    let win_end = win_start.saturating_add(win_len);
+    sequential
+        && file_size > 0
+        && win_end < file_size
+        && off >= win_start
+        && off.saturating_add(sz as u64) >= win_start.saturating_add(win_len / 2)
+}
+
+/// What a look-ahead job fetches, decided under the `open_files` lock.
+struct LookaheadPlan {
+    /// The window whose reader made this due. The job installs its window only
+    /// while this is still the handle's current one.
+    after: Arc<(Mutex<StreamState>, Condvar)>,
+    start: u64,
+    len: usize,
+}
+
+/// If this read makes a look-ahead due (see `lookahead_due`) and none is in flight
+/// or waiting, marks one in flight and returns what to fetch. The window grows
+/// along the same ramp a foreground fetch would have taken.
+fn plan_lookahead(of: &mut OpenFile, off: u64, sz: usize, sequential: bool, file_size: u64, ceiling: usize) -> Option<LookaheadPlan> {
+    if of.lookahead_inflight || of.next_buf.is_some() {
+        return None;
+    }
+    let ra = of.buf.as_ref()?;
+    if !lookahead_due(ra.start, ra.target_len, off, sz, sequential, file_size) {
+        return None;
+    }
+    let start = ra.start + ra.target_len;
+    let after = Arc::clone(&ra.stream);
+    let window = next_read_ahead_window(of.read_ahead_window, true, ceiling);
+    // Never ask past the end: a range starting beyond EOF is a 416, and a window
+    // sized to the file's rest ends exactly where `short_reply_ok` allows a short reply.
+    let len = window.min((file_size - start) as usize);
+    of.read_ahead_window = window;
+    of.lookahead_inflight = true;
+    Some(LookaheadPlan { after, start, len })
+}
+
+/// Makes the look-ahead window the current one once a read lands in it and no
+/// longer in the current window.
+fn promote_lookahead(of: &mut OpenFile, off: u64) {
+    let covers = move |b: &ReadAheadBuf| off >= b.start && off < b.start + b.target_len;
+    if of.buf.as_ref().is_some_and(covers) {
+        return;
+    }
+    if of.next_buf.as_ref().is_some_and(covers) {
+        of.buf = of.next_buf.take();
+    }
+}
+
 /// First read-ahead window for a handle whose first network fetch looks like the
 /// start of a straight read through a large file, or `None` to use the normal ramp.
 ///
@@ -514,6 +569,14 @@ struct OpenFile {
     // seektable, then the playback position) missed the single per-handle buffer
     // about five times and pulled ~281 MB — 2.2x the file — before it could start.
     read_ahead_window: usize,
+    // The window after `buf`, fetched while a sequential reader is still working
+    // through `buf` so crossing the boundary costs no round trip; promoted into
+    // `buf` by the first read that lands in it. At most one per handle, so a handle
+    // holds at most two windows. Dropped whenever a fetch replaces `buf` (a seek).
+    next_buf: Option<ReadAheadBuf>,
+    // A look-ahead job for this handle is queued, connecting or streaming. Cleared
+    // by the job itself on every exit; keeps a second one from starting meanwhile.
+    lookahead_inflight: bool,
     // Inode and kernel I/O mode this handle was opened with, returned to
     // io_modes in release(). A Passthrough handle's reads bypass ncrs entirely.
     ino: u64,
@@ -3597,6 +3660,35 @@ impl NextCloudFs {
         self.transfer_map.clone()
     }
 
+    /// Fetches `plan`'s window in the background as `fh`'s look-ahead (see
+    /// `OpenFile::next_buf`). Never blocks the caller: it only submits a job, and a
+    /// full pool just means no look-ahead this time.
+    fn start_lookahead(&self, fh: u64, path: &Path, plan: LookaheadPlan) {
+        let conn = self.conn.clone();
+        let open_files = self.open_files.clone();
+        let tmap = self.transfer_map.clone();
+        let cache = self.cache.clone();
+        let dirty = self.dirty.clone();
+        let notifier_slot = self.notifier_slot.clone();
+        let path = path.to_path_buf();
+        let submitted = bg::READ.submit(move || {
+            // Clears `lookahead_inflight` on every exit from here on, unwinding included.
+            let _inflight = LookaheadInflight { open_files: Arc::clone(&open_files), fh };
+            conn.active_streams.fetch_add(1, Ordering::Relaxed);
+            let _stream_guard = StreamActiveGuard {
+                counter: Arc::clone(&conn.active_streams),
+                deferred: Arc::clone(&conn.deferred_invalidation),
+                cache,
+                dirty,
+                notifier_slot,
+            };
+            run_lookahead(&conn, &open_files, &tmap, &path, fh, plan);
+        });
+        if submitted.is_err() {
+            self.open_files.safe_lock().entry(fh).and_modify(|of| of.lookahead_inflight = false);
+        }
+    }
+
     pub fn journal(&self) -> mutation_journal::SharedJournal {
         self.journal.clone()
     }
@@ -5250,6 +5342,8 @@ impl Filesystem for NextCloudFs {
                 cache_fresh,
                 next_expected_off: 0,
                 read_ahead_window: READ_AHEAD_INITIAL,
+                next_buf: None,
+                lookahead_inflight: false,
                 total_written: 0,
                 // Only an empty staging file can stream from offset 0.
                 stream_eligible: !seeded,
@@ -5352,8 +5446,10 @@ impl Filesystem for NextCloudFs {
 
         // Serve from open-file state synchronously (no thread spawn).
         {
-            let files = self.open_files.safe_lock();
-            if let Some(of) = files.get(&fh.0) {
+            let lookahead_ceiling = self.read_ahead_bytes.max(READ_AHEAD_INITIAL);
+            let mut files = self.open_files.safe_lock();
+            if let Some(of) = files.get_mut(&fh.0) {
+                promote_lookahead(of, off);
                 // GLib 2.80+ MIME detection: serve synthetic magic bytes instead of
                 // downloading the file. The content-type was captured at open() from the
                 // PROPFIND dir cache. Zero network I/O; see mime_magic_bytes() for details.
@@ -5412,7 +5508,12 @@ impl Filesystem for NextCloudFs {
                         let s = (off - ra.start) as usize;
                         reply.data(&ss.data[s..s + sz]);
                         drop(ss);
+                        // Rare (once per window) and non-blocking: a pool submit.
+                        let la = plan_lookahead(of, off, sz, sequential, file_size, lookahead_ceiling);
                         drop(files);
+                        if let Some(la) = la {
+                            self.start_lookahead(fh.0, &path, la);
+                        }
                         return;
                     }
                     // Data within target range but not yet downloaded — wait in thread
@@ -5420,7 +5521,13 @@ impl Filesystem for NextCloudFs {
                         let shared = Arc::clone(&ra.stream);
                         let start = ra.start;
                         drop(ss);
+                        // A reader outrunning the download is exactly the one the
+                        // look-ahead helps most: the next GET overlaps this one.
+                        let la = plan_lookahead(of, off, sz, sequential, file_size, lookahead_ceiling);
                         drop(files);
+                        if let Some(la) = la {
+                            self.start_lookahead(fh.0, &path, la);
+                        }
                         run_read_job(reply, move |reply| {
                             let (ref mtx, ref cv) = *shared;
                             let mut guard = mtx.lock().unwrap();
@@ -5486,6 +5593,27 @@ impl Filesystem for NextCloudFs {
                     if off >= ra.start && off < ra.start + ra.target_len {
                         let o = (off - ra.start) as usize;
                         let window_end = ra.start + ra.target_len;
+                        // The straddle runs into the look-ahead window: when this window
+                        // is complete and the look-ahead already holds the rest, stitch
+                        // the two instead of re-fetching (and discarding the look-ahead).
+                        if let Some(ref nb) = of.next_buf {
+                            if nb.start == window_end && ss.done && ra.start + ss.data.len() as u64 == window_end {
+                                // Lock order is always current window, then look-ahead;
+                                // a pump only ever holds its own stream's lock.
+                                let ns = nb.stream.0.lock().unwrap();
+                                let need = (off + sz as u64 - window_end) as usize;
+                                if ns.data.len() >= need {
+                                    let mut out = Vec::with_capacity(sz);
+                                    out.extend_from_slice(&ss.data[o..]);
+                                    out.extend_from_slice(&ns.data[..need]);
+                                    reply.data(&out);
+                                    drop(ns);
+                                    drop(ss);
+                                    drop(files);
+                                    return;
+                                }
+                            }
+                        }
                         if ss.done {
                             let avail = ss.data.len().saturating_sub(o);
                             if short_reply_ok(off, avail, sz, file_size) {
@@ -5728,6 +5856,10 @@ impl Filesystem for NextCloudFs {
                                     stream: Arc::clone(&shared),
                                     target_len: fetch as u64,
                                 });
+                                // A fetch here means the reader left both windows (a
+                                // seek, or a boundary the look-ahead did not cover):
+                                // the look-ahead is for a position nobody is at.
+                                of.next_buf = None;
                             });
                             let total_bytes = WindowPump {
                                 conn: &conn,
@@ -6351,6 +6483,8 @@ impl Filesystem for NextCloudFs {
                                     cache_fresh: true,
                                     next_expected_off: 0,
                                     read_ahead_window: READ_AHEAD_INITIAL,
+                                    next_buf: None,
+                                    lookahead_inflight: false,
                                     total_written: 0,
                                     stream_eligible: false,
                                     chunk_upload: None,
@@ -6437,6 +6571,8 @@ impl Filesystem for NextCloudFs {
                 cache_fresh: true,
                 next_expected_off: 0,
                 read_ahead_window: READ_AHEAD_INITIAL,
+                next_buf: None,
+                lookahead_inflight: false,
                 total_written: 0,
                 stream_eligible: true,
                 chunk_upload: None,
@@ -7247,12 +7383,12 @@ struct WindowPump<'a> {
 
 impl<'a> WindowPump<'a> {
     /// Whether nobody can read this window any more: the handle was released, or
-    /// a seek replaced its buffer.
+    /// a seek replaced its buffer (as the current window or the look-ahead).
     fn superseded(&self) -> bool {
-        self.open_files.safe_lock()
-            .get(&self.fh)
-            .and_then(|of| of.buf.as_ref())
-            .map_or(true, |b| !Arc::ptr_eq(&b.stream, self.shared))
+        let ofs = self.open_files.safe_lock();
+        let Some(of) = ofs.get(&self.fh) else { return true };
+        let holds = |b: &Option<ReadAheadBuf>| b.as_ref().is_some_and(|b| Arc::ptr_eq(&b.stream, self.shared));
+        !(holds(&of.buf) || holds(&of.next_buf))
     }
 
     /// Pumps `resp` (and any resumes) until the window is full, the body ends, or
@@ -7356,6 +7492,106 @@ impl<'a> WindowPump<'a> {
         self.tmap.safe_lock().remove(&self.tkey);
         total_bytes
     }
+}
+
+/// How long a look-ahead may spend getting a slot and response headers. Short: it
+/// is only worth anything if it lands before the reader reaches the boundary.
+const LOOKAHEAD_OPEN_BUDGET: Duration = Duration::from_secs(10);
+/// `read_throttle` slots a look-ahead leaves free for foreground reads, so it can
+/// never be what a READ on another handle is waiting behind.
+const LOOKAHEAD_SPARE_SLOTS: usize = 1;
+
+/// Clears a handle's `lookahead_inflight` when the look-ahead job ends, however
+/// it ends.
+struct LookaheadInflight {
+    open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+    fh: u64,
+}
+
+impl Drop for LookaheadInflight {
+    fn drop(&mut self) {
+        self.open_files.safe_lock().entry(self.fh).and_modify(|of| of.lookahead_inflight = false);
+    }
+}
+
+/// Body of a look-ahead job: open the next window's range, install it as the
+/// handle's `next_buf` if the reader is still where it was, then pump it.
+///
+/// Every step can only give up, never block: the slot wait and connect are bounded
+/// by LOOKAHEAD_OPEN_BUDGET and the body by the pump's stall rules. Nothing here
+/// fails a read — a look-ahead that never lands just leaves the boundary to the
+/// ordinary network fetch.
+fn run_lookahead(
+    conn: &ConnInfo,
+    open_files: &Mutex<HashMap<u64, OpenFile>>,
+    tmap: &TransferMap,
+    path: &Path,
+    fh: u64,
+    plan: LookaheadPlan,
+) {
+    if conn.is_offline.load(Ordering::Relaxed) {
+        return;
+    }
+    let deadline = Instant::now() + LOOKAHEAD_OPEN_BUDGET;
+    let (resp, permit) = match do_range_read_stream(conn, path, plan.start, plan.len, true, LOOKAHEAD_SPARE_SLOTS, deadline) {
+        // Only a 206 is the window asked for; a 200 would be the file from byte 0.
+        Ok((r, p)) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => (r, p),
+        Ok((r, _)) => {
+            log::debug!("look-ahead {} at {}: got {}, not 206 — skipped", path.display(), plan.start, r.status());
+            return;
+        }
+        Err(e) => {
+            log::debug!("look-ahead {} at {} skipped: {}", path.display(), plan.start, e);
+            return;
+        }
+    };
+    let shared = Arc::new((
+        Mutex::new(StreamState { data: Vec::new(), done: false }),
+        Condvar::new(),
+    ));
+    let installed = {
+        let mut ofs = open_files.safe_lock();
+        match ofs.get_mut(&fh) {
+            Some(of) if of.next_buf.is_none()
+                && of.buf.as_ref().is_some_and(|b| Arc::ptr_eq(&b.stream, &plan.after)) =>
+            {
+                of.next_buf = Some(ReadAheadBuf {
+                    start: plan.start,
+                    stream: Arc::clone(&shared),
+                    target_len: plan.len as u64,
+                });
+                true
+            }
+            // Released, or the reader seeked while this was connecting.
+            _ => false,
+        }
+    };
+    if !installed {
+        log::debug!("look-ahead {} at {} no longer wanted", path.display(), plan.start);
+        return;
+    }
+    let tkey: TransferKey = (path.to_path_buf(), next_stream_id());
+    tmap.safe_lock().insert(tkey.clone(), TransferProgress {
+        path: path.to_path_buf(),
+        direction: TransferDirection::Download,
+        bytes_done: 0,
+        total_bytes: plan.len as u64,
+    });
+    let total = WindowPump {
+        conn,
+        path,
+        fh,
+        open_files,
+        tmap,
+        tkey,
+        shared: &shared,
+        start: plan.start,
+        target: plan.len,
+        throttle: true,
+        spare: LOOKAHEAD_SPARE_SLOTS,
+    }
+    .run(resp, permit);
+    log::debug!("look-ahead {} at {}: {} of {} bytes", path.display(), plan.start, total, plan.len);
 }
 
 /// Reads up to `need` bytes, stopping early only at the end of the body.
