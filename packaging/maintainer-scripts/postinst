@@ -19,8 +19,24 @@ reload_nautilus() {
     fi
 }
 
+# Raise a sysctl to at least $2 now, without waiting for the next boot to apply
+# /usr/lib/sysctl.d/05-ncrs-quic.conf. Only ever raises: a value already at or
+# above $2 (an admin's choice) is left alone, which `sysctl -p` on the file would
+# not do. Best-effort — in a container /proc/sys is usually read-only.
+raise_sysctl() {
+    cur=$(sysctl -n "$1" 2>/dev/null) || return 0
+    [ "$cur" -lt "$2" ] 2>/dev/null || return 0
+    sysctl -q -w "$1=$2" >/dev/null 2>&1 || \
+        echo "ncrs: could not raise $1 to $2 — HTTP/3 downloads may drop packets until it is" >&2
+}
+
 case "$1" in
     configure)
+        # Room for the QUIC download sockets' 4 MiB buffers (see the conf file).
+        if command -v sysctl >/dev/null 2>&1; then
+            raise_sysctl net.core.rmem_max 4194304
+            raise_sysctl net.core.wmem_max 4194304
+        fi
         # ncrs.service is no longer enabled by default (the GUI tray app
         # autostarts via /etc/xdg/autostart instead). Clean up the global
         # enable left by <= 0.1.0 installs (the last version whose postinst
