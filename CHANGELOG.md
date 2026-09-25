@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.81](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.80...ncrs-v0.1.81) (2026-09-25)
+
+
+### Bug Fixes
+
+* **deb:** give the metainfo remote icons so Ubuntu Software shows the app icon instead of its image-missing badge ([c290c9e](https://github.com/rgon/ncrsDesktop/commit/c290c9e00f6698c3347f4a4d15e823ed8167a6d1))
+* **search:** remove the pre-rename es.rgon.ncrs.desktop the dev install left behind, add --uninstall, and refuse to shadow the packaged search provider ([129d2ba](https://github.com/rgon/ncrsDesktop/commit/129d2ba8766097dc137c132702c6603e9f719b60))
+
 ## [0.1.80](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.79...ncrs-v0.1.80) (2026-09-25)
 
 
