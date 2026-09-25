@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.80](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.79...ncrs-v0.1.80) (2026-09-25)
+
+
+### Bug Fixes
+
+* **config:** tighten an existing config file to owner-only on start instead of only warning about it ([8f7c4e3](https://github.com/rgon/ncrsDesktop/commit/8f7c4e31ebaa4fe604a562198065d3b2497ce0f3))
+* **deb:** name the launcher es.rgon.ncrs.desktop and declare the ncrs icon so App Center shows the app's icon and metadata for a local .deb ([806873d](https://github.com/rgon/ncrsDesktop/commit/806873d66f94b263e7be4d2f016484914f117c9a))
+* **ipc:** close idle client connections quietly instead of warning that they sent an unreadable request ([b95e5b8](https://github.com/rgon/ncrsDesktop/commit/b95e5b8caa6747756547f46c710342a83fa30a01))
+
 ## [0.1.79](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.78...ncrs-v0.1.79) (2026-09-25)
 
 
