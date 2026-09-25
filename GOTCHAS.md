@@ -134,11 +134,30 @@ HTTP/1.1. The daemon shipped that way for months: every request was h1, and the
 
 All requests therefore go through `http_clients::DavClient`, which stamps
 `Version::HTTP_3` while HTTP/3 is active. Never hand out a raw
-`reqwest::blocking::Client` for server traffic. Two more h3 surprises the
-wrapper's construction accounts for (see `build_pair` in `lib.rs`): the h3 pool
-ignores `pool_max_idle_per_host`, and `connect_timeout` never reaches the QUIC
-connector — the read client's fresh-connect / fail-fast guarantees have to be
-rebuilt with `pool_idle_timeout` + `http3_max_idle_timeout`.
+`reqwest::blocking::Client` for server traffic. More h3 surprises the
+construction accounts for (see `build_pair` in `lib.rs`):
+
+- The h3 pool ignores `pool_max_idle_per_host`, and `connect_timeout` never
+  reaches the QUIC connector, so neither bounds a QUIC read.
+- A request's own `.timeout()` on the *blocking* client is both the async total
+  deadline for the whole exchange and the bound on each blocking `read` call. It
+  cannot catch a stall without also killing a healthy large body. The per-read
+  stall bound is the blocking `ClientBuilder::timeout` (never handed to the async
+  client; it bounds each blocking wait and resets per call, over QUIC too), so the
+  read clients set it (`READ_STALL_TIMEOUT`) and range GETs carry no timeout of
+  their own.
+- The h3 pool keeps exactly one QUIC connection per host and client, and a
+  connection's idle clock is stamped when it is *checked out*, not when the
+  request ends. Parallel downloads therefore get one read client each (one per
+  `read_throttle` slot, `DOWNLOAD_CONNECTIONS`), and warm connections are kept for
+  just under `http3_max_idle_timeout`: a short pool timeout made every window
+  redo the QUIC+TLS handshake and slow start.
+- The connector binds its own UDP socket and exposes no knob for it, so its
+  receive buffer stays at the kernel default and drops datagrams at speed.
+  `http_clients::raise_quic_socket_buffers` finds the sockets via `/proc/self/fd`
+  and enlarges them after each HTTP/3 client is built.
+- No QUIC keep-alive and no 0-RTT are exposed through the blocking builder; TLS
+  session resumption is rustls' default in-memory cache, per client.
 
 HTTP/3 suitability is judged once, at mount time (`NextcloudBackend::new`):
 if the startup probe fails over QUIC while the same probe answers over plain
