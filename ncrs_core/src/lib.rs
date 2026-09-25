@@ -170,6 +170,12 @@ const DOWNLOAD_SLOT_WAIT: Duration = Duration::from_secs(30);
 /// The 0.1.77 hang this closes: four readers on one 256 MB file, one QUIC
 /// connection dies, and every stream's body read fails together.
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// QUIC idle timeout for the read clients: quinn's and Chrome's default. See the
+/// read client's construction for why it is not shorter.
+const H3_MAX_IDLE: Duration = Duration::from_secs(30);
+/// How long a warm QUIC read connection is reused: just under H3_MAX_IDLE, so the
+/// pool never hands out a connection quinn is about to close for idleness.
+const H3_READ_POOL_IDLE: Duration = Duration::from_secs(28);
 /// How long a FUSE READ waits for a `read_throttle` slot before it is answered
 /// EAGAIN. Replaces an untimed `acquire()`, which is how a READ went unanswered
 /// forever (the reader stuck in D state in `folio_wait_bit_common`).
@@ -3409,12 +3415,24 @@ impl NextCloudFs {
             if http3 {
                 meta = meta.http3_prior_knowledge();
                 // The h3 pool ignores pool_max_idle_per_host and connect_timeout
-                // never reaches the QUIC connector, so the read client's two
-                // load-bearing guarantees above — every foreground read connects
-                // fresh, and a dead path surfaces in seconds, not DOWNLOAD_TIMEOUT
-                // — are silently void over QUIC. `pool_idle_timeout(1s)` restores
-                // the "connect fresh" guarantee (a burst still reuses; anything
-                // older redials).
+                // never reaches the QUIC connector, so the TCP read client's
+                // "connect fresh so a dead path fails in seconds" trick has no QUIC
+                // equivalent. It used to be approximated with `pool_idle_timeout(1s)`,
+                // which made every window of a rate-limited reader (a media player)
+                // pay a fresh QUIC+TLS handshake (120-280 ms to this server) and a
+                // new slow start. Worse, reqwest 0.13's h3 pool stamps a connection's
+                // idle clock when it is *checked out*, not when the request ends, so
+                // even a connection busy streaming for over a second counted as
+                // expired at the next window.
+                //
+                // That fail-fast guarantee now comes from the read path itself: the
+                // client-level READ_STALL_TIMEOUT bounds the header wait and every
+                // body read, FIRST_BYTES_DEADLINE bounds what a READ waits for, and a
+                // stalled window aborts and resumes on a fresh request. So warm
+                // connections — and their congestion state — are kept for just under
+                // `http3_max_idle_timeout`, past which quinn would close them anyway.
+                // (reqwest exposes no QUIC keep-alive, so an idle connection does
+                // expire after 30 s of silence; the pool drops it as invalid.)
                 //
                 // `http3_max_idle_timeout` used to also be set to 5s here, to
                 // reproduce the TCP connect_timeout's fail-fast bound. But unlike
@@ -3444,8 +3462,8 @@ impl NextCloudFs {
                 // loss, which CUBIC misreads as congestion and backs off from
                 // unnecessarily).
                 read = read.http3_prior_knowledge()
-                    .pool_idle_timeout(Duration::from_secs(1))
-                    .http3_max_idle_timeout(Duration::from_secs(30))
+                    .pool_idle_timeout(H3_READ_POOL_IDLE)
+                    .http3_max_idle_timeout(H3_MAX_IDLE)
                     .http3_stream_receive_window(4 * 1024 * 1024)
                     .http3_congestion_bbr();
             }
