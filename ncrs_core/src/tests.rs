@@ -184,6 +184,7 @@
                 cache_dir: dir.clone(),
                 upload_pool: &bg::UPLOAD,
                 disk_pool: &bg::DISK,
+                disk_slow_pool: &bg::DISK_SLOW,
                 spill_pool: &bg::MUTATION,
             };
             Rig { ctx, server, dir }
@@ -267,6 +268,10 @@
 
             fn release(&self, fh: u64) -> Receiver<()> {
                 self.empty(fh, |c, fh, r| c.dispatch_release(fh, r))
+            }
+
+            fn fsync(&self, fh: u64) -> Receiver<()> {
+                self.empty(fh, |c, fh, r| c.dispatch_fsync(fh, r))
             }
 
             fn of<T>(&self, fh: u64, f: impl FnOnce(&OpenFile) -> T) -> T {
@@ -578,6 +583,7 @@
             // The policy: `bg::DISK` has no queue cap. A refusal would either
             // run the write on `fuser-0` or answer EAGAIN to the writer.
             assert_eq!(bg::DISK.queue_cap(), usize::MAX);
+            assert_eq!(bg::DISK_SLOW.queue_cap(), usize::MAX);
 
             // A disk pool whose only worker is stuck, as on a host disk parked
             // in the ext4 journal. More handles than the old 4096-deep queue.
@@ -631,6 +637,72 @@
             }
             assert_eq!(stalled.stats().rejected, 0, "the queue held every step");
             assert!(stalled.stats().peak_queued as u64 >= HANDLES, "one step per handle waited in the pool's queue");
+        }
+
+        #[test]
+        fn a_plain_write_never_waits_behind_seeds_fsyncs_and_cleanups_on_the_slow_disk_pool() {
+            // Every worker of the slow pool stuck (a whole-file seed or a
+            // sync_all on a host disk parked in the ext4 journal), with more
+            // seeds, fsyncs and a cleanup queued behind them.
+            let slow: &'static bg::Pool = Box::leak(Box::new(bg::Pool::new("t-disk-slow", 2, usize::MAX)));
+            let (open_gate, gate) = channel::<()>();
+            let gate = Arc::new(Mutex::new(gate));
+            for _ in 0..2 {
+                let g = gate.clone();
+                slow.submit(move || { let _ = g.lock().unwrap().recv(); }).unwrap();
+            }
+            let mut r = rig("slow_disk", ChunkServer::default());
+            r.ctx.disk_slow_pool = slow;
+            let kept = r.dir.join("kept.bin");
+            std::fs::write(&kept, pattern(MIB, 30)).unwrap();
+
+            // A handle already written once, before the pool stalled below.
+            r.open(1, "/a.txt", None);
+            r.open(2, "/b.txt", None);
+            let fresh = r.write(2, "/b.txt", 0, b"first");
+            // Only now: the first write of a fresh file, with no kept copy,
+            // has nothing to seed from and stays on `disk`.
+            assert_eq!(recv(&fresh, "a first write with nothing to seed from"), Ok(5));
+            assert_eq!(recv(&r.write(1, "/a.txt", 0, b"hello"), "write"), Ok(5));
+            // Queued on the stuck slow pool: a seed (first write of a file with
+            // a kept copy), a truncate that seeds, an fsync and a flush of
+            // dirty handles, and a released handle's cleanup.
+            r.open(3, "/k.bin", Some(kept.clone()));
+            let seed = r.write(3, "/k.bin", 0, b"EDIT");
+            r.open(4, "/k.bin", Some(kept.clone()));
+            let seed_truncate = r.truncate(4, 10);
+            let fsync = r.fsync(1);
+            let flush = r.flush(2);
+            r.open(5, "/discard.txt", None);
+            assert_eq!(recv(&r.truncate(5, 0), "truncate"), Ok(()));
+            let wp5 = r.of(5, |of| of.write_path.clone().unwrap());
+            r.ctx.open_files.safe_lock().get_mut(&5).unwrap().dirty = false;
+            recv(&r.release(5), "release of a clean handle");
+
+            // A plain write on another handle lands while all of that waits.
+            r.open(6, "/c.txt", None);
+            assert_eq!(recv(&r.write(6, "/c.txt", 0, b"abc"), "write"), Ok(3));
+            let t = Instant::now();
+            for i in 1..=50u64 {
+                let rx = r.write(6, "/c.txt", 3 * i, b"def");
+                assert_eq!(rx.recv_timeout(Duration::from_secs(2)).expect("a plain write waited behind the slow pool"), Ok(3));
+            }
+            eprintln!("50 plain writes with the slow disk pool stuck: {:?}", t.elapsed());
+            assert!(seed.try_recv().is_err() && seed_truncate.try_recv().is_err(), "a seed ran off the slow pool");
+            assert!(fsync.try_recv().is_err() && flush.try_recv().is_err(), "a sync_all ran off the slow pool");
+            assert!(wp5.exists(), "a release cleanup ran off the slow pool");
+
+            drop(open_gate);
+            assert_eq!(recv(&seed, "seed"), Ok(4));
+            assert_eq!(recv(&seed_truncate, "seeding truncate"), Ok(()));
+            recv(&fsync, "fsync");
+            recv(&flush, "flush");
+            wait_for("the release cleanup", || !wp5.exists());
+            let wp3 = r.of(3, |of| of.write_path.clone().unwrap());
+            let mut expect = pattern(MIB, 30);
+            expect[..4].copy_from_slice(b"EDIT");
+            assert!(std::fs::read(&wp3).unwrap() == expect, "the seed landed before the write behind it");
+            assert_eq!(std::fs::read(r.of(4, |of| of.write_path.clone().unwrap())).unwrap(), pattern(MIB, 30)[..10]);
         }
 
         #[test]
@@ -4798,6 +4870,7 @@ mod upload_order_tests {
                 cache_dir: dir.to_path_buf(),
                 upload_pool: &bg::UPLOAD,
                 disk_pool: &bg::DISK,
+                disk_slow_pool: &bg::DISK_SLOW,
                 spill_pool: &bg::MUTATION,
             }
         }
@@ -5400,7 +5473,7 @@ mod upload_order_tests {
             let (tx, rx) = mpsc::channel();
             w.dispatch_release(fh, Box::new(move || tx.send(()).unwrap()));
             rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            // The move to `recovered/` runs on `bg::DISK`, after the reply.
+            // The move to `recovered/` runs on `bg::DISK_SLOW`, after the reply.
             let t = Instant::now();
             while meta.journal.safe_lock().unresolved_conflicts().is_empty() {
                 assert!(t.elapsed() < Duration::from_secs(10), "the bytes were never moved to recovered/");
