@@ -276,8 +276,13 @@ impl HttpClients {
                 // The HTTP/2 read clients could not be built (this time). The metadata
                 // client stands in, with the read clients' stall bound stamped on as a
                 // per-request timeout: its own client-level one is reqwest's 30 s
-                // default. Per request that bound is a total deadline, so a long body
-                // gets cut and resumed — degraded, but every READ bound still holds.
+                // default. Per request that bound is a *total* deadline, not a stall
+                // bound: every request is cut 15 s after it starts, however well it
+                // is flowing. A window that takes longer (a 64 MB window below
+                // ~4 MB/s) is cut, resumed (≤ 2 stall resumes + 1 retry), and on a
+                // slow enough link stops short, so its waiters get EAGAIN. Degraded
+                // to many short requests, but every READ bound still holds, and it
+                // lasts only until the read clients can be built.
                 None => DavClient { client: self.h2.clone(), version: None, timeout: Some(self.read_fallback_timeout) },
             }
         } else if self.demoted.load(Ordering::Relaxed) {
@@ -460,30 +465,87 @@ pub fn raise_quic_socket_buffers() {
 /// every window, segment and resume connects — and resolves — afresh, and reqwest's
 /// connect timeout includes the lookup. With a bare two-thread pool, a burst of
 /// them queued behind each other past that timeout (and past the connectivity
-/// probe's, whose lookup waited in the same queue), which reads as the network
-/// being down. Now a host is looked up at most once at a time, everyone asking
-/// meanwhile shares the answer, answers are reused for DNS_FRESH, and a failed
-/// lookup falls back to the last good answer (up to DNS_STALE_MAX old). So the pool
-/// sees roughly one job per host per DNS_FRESH, and nothing waits behind it.
+/// probe's), which reads as the network being down. Now:
+/// - an answer is reused for DNS_FRESH without asking again;
+/// - past that, a host with an answer less than DNS_STALE_MAX old gets it *at
+///   once* while one refresh runs in the background, so a slow-but-alive DNS
+///   server can never make a request (or the probe) wait on it;
+/// - only a host with no usable answer waits, sharing the single lookup in flight;
+/// - a failed lookup keeps the old answer for the next caller.
+///
+/// So the pool sees about one job per host per DNS_FRESH and nothing waits behind
+/// it. [`expire_fresh_dns`] ends every answer's fresh period early (on going
+/// offline), so a network switch — VPN, split-horizon DNS — is picked up on the
+/// next request instead of up to DNS_FRESH later.
 pub struct PooledResolver {
     hosts: std::sync::Mutex<std::collections::HashMap<String, HostEntry>>,
 }
 
 /// How long a successful lookup is reused without asking again.
 const DNS_FRESH: Duration = Duration::from_secs(45);
-/// How old an answer may be and still stand in for a lookup that failed.
+/// How old an answer may be and still be served while a refresh runs, or stand in
+/// for a lookup that failed.
 const DNS_STALE_MAX: Duration = Duration::from_secs(3600);
 
-type LookupResult = Result<Vec<std::net::SocketAddr>, String>;
+/// Why a lookup produced no addresses.
+#[derive(Clone, Debug)]
+enum LookupErr {
+    /// The pool refused the job, or the job ended without an answer: our own
+    /// capacity, not the network. Surfaces as the typed [`DnsRefused`].
+    Refused,
+    /// The resolver itself failed.
+    Failed(String),
+}
+
+type LookupResult = Result<Vec<std::net::SocketAddr>, LookupErr>;
 
 #[derive(Default)]
 struct HostEntry {
+    /// The last good answer and when it was resolved.
     last_good: Option<(Instant, Vec<std::net::SocketAddr>)>,
-    /// Callers waiting on the lookup in flight; `None` when none is running.
-    waiting: Option<Vec<tokio::sync::oneshot::Sender<LookupResult>>>,
+    /// Until when `last_good` is served without asking again.
+    fresh_until: Option<Instant>,
+    /// A lookup is running (queued or in getaddrinfo).
+    in_flight: bool,
+    /// Callers with no usable answer, waiting on the lookup in flight.
+    waiting: Vec<tokio::sync::oneshot::Sender<LookupResult>>,
 }
 
-/// The error a lookup reports when the DNS pool refused it. Typed, so the read
+impl HostEntry {
+    fn stale_answer(&self) -> Option<Vec<std::net::SocketAddr>> {
+        self.last_good.as_ref().filter(|(at, _)| at.elapsed() < DNS_STALE_MAX).map(|(_, a)| a.clone())
+    }
+
+    /// Ends the lookup in flight with `result`: records a good answer, falls back
+    /// to the last good one on failure, answers everyone waiting. Called with the
+    /// hosts lock held, so deciding and answering are one step.
+    fn complete(&mut self, host: &str, result: LookupResult) {
+        self.in_flight = false;
+        let answer = match result {
+            Ok(addrs) if !addrs.is_empty() => {
+                self.last_good = Some((Instant::now(), addrs.clone()));
+                self.fresh_until = Some(Instant::now() + DNS_FRESH);
+                Ok(addrs)
+            }
+            other => match self.stale_answer() {
+                Some(addrs) => {
+                    log::warn!("lookup of {} failed ({:?}) — keeping the previous answer", host, other.err());
+                    Ok(addrs)
+                }
+                None => match other {
+                    Ok(_) => Err(LookupErr::Failed("no addresses".into())),
+                    Err(e) => Err(e),
+                },
+            },
+        };
+        for tx in self.waiting.drain(..) {
+            let _ = tx.send(answer.clone());
+        }
+    }
+}
+
+/// The error a lookup reports when our own lookup capacity could not produce an
+/// answer (pool refused the job, or it ended without one). Typed, so the read
 /// path can tell "our own pool is busy" from "the network is down" by walking
 /// the error's sources ([`is_dns_refusal`]) instead of trusting reqwest's text,
 /// which renders every connect failure as "error sending request".
@@ -492,7 +554,7 @@ pub struct DnsRefused;
 
 impl std::fmt::Display for DnsRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("name lookup refused: the daemon's lookup pool is full")
+        f.write_str("name lookup refused: the daemon's lookup pool could not answer")
     }
 }
 
@@ -510,31 +572,76 @@ pub fn is_dns_refusal(e: &reqwest::Error) -> bool {
     false
 }
 
-impl PooledResolver {
-    fn new() -> Self {
-        PooledResolver { hosts: std::sync::Mutex::new(std::collections::HashMap::new()) }
-    }
+/// Completes a host's lookup with `LookupErr::Refused` if the job ends without
+/// having completed it (a panic, an early return): otherwise `in_flight` would
+/// stay set and the host would never be looked up again.
+struct CompleteOnDrop {
+    resolver: &'static PooledResolver,
+    host: String,
+    done: bool,
+}
 
-    /// Finishes the lookup in flight for `host`: records a good answer, falls back
-    /// to the last good one on failure, and answers everyone waiting.
-    fn complete(&self, host: &str, result: LookupResult) {
-        let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = hosts.entry(host.to_string()).or_default();
-        let answer = match result {
-            Ok(addrs) if !addrs.is_empty() => {
-                entry.last_good = Some((Instant::now(), addrs.clone()));
-                Ok(addrs)
-            }
-            other => match &entry.last_good {
-                Some((at, addrs)) if at.elapsed() < DNS_STALE_MAX => {
-                    log::warn!("lookup of {} failed ({:?}) — using the answer from {:?} ago", host, other.err(), at.elapsed());
-                    Ok(addrs.clone())
+impl Drop for CompleteOnDrop {
+    fn drop(&mut self) {
+        if !self.done {
+            let mut hosts = self.resolver.hosts.lock().unwrap_or_else(|e| e.into_inner());
+            hosts.entry(self.host.clone()).or_default().complete(&self.host, Err(LookupErr::Refused));
+        }
+    }
+}
+
+static RESOLVER: std::sync::OnceLock<PooledResolver> = std::sync::OnceLock::new();
+
+fn resolver() -> &'static PooledResolver {
+    RESOLVER.get_or_init(|| PooledResolver { hosts: std::sync::Mutex::new(std::collections::HashMap::new()) })
+}
+
+/// Ends every cached answer's fresh period now, keeping it as the stale fallback.
+/// For when connectivity is lost: the network (or its DNS view) may have changed.
+pub fn expire_fresh_dns() {
+    if let Some(r) = RESOLVER.get() {
+        for entry in r.hosts.lock().unwrap_or_else(|e| e.into_inner()).values_mut() {
+            entry.fresh_until = None;
+        }
+    }
+}
+
+impl PooledResolver {
+    /// Runs one lookup of `host` on the pool (the caller already set `in_flight`).
+    fn spawn_lookup(&'static self, host: String) {
+        let h = host.clone();
+        let submitted = crate::bg::DNS.submit(move || {
+            use std::net::ToSocketAddrs;
+            let mut guard = CompleteOnDrop { resolver: self, host: h.clone(), done: false };
+            {
+                // Everyone who asked may have given up already (their request timed
+                // out) and there is no answer worth refreshing: then nobody needs this
+                // lookup. Decided and completed under one lock hold, so a caller
+                // arriving meanwhile either sees the lookup still running (and is
+                // answered by it) or finds none and starts its own.
+                let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = hosts.entry(h.clone()).or_default();
+                let wanted = entry.last_good.is_some() || entry.waiting.iter().any(|tx| !tx.is_closed());
+                if !wanted {
+                    entry.complete(&h, Err(LookupErr::Refused));
+                    guard.done = true;
+                    return;
                 }
-                _ => other.and_then(|v| if v.is_empty() { Err("no addresses".to_string()) } else { Ok(v) }),
-            },
-        };
-        for tx in entry.waiting.take().unwrap_or_default() {
-            let _ = tx.send(answer.clone());
+            }
+            // Port 0: reqwest substitutes the URL's port.
+            let result = (h.as_str(), 0)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<_>>())
+                .map_err(|e| LookupErr::Failed(e.to_string()));
+            let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+            hosts.entry(h.clone()).or_default().complete(&h, result);
+            guard.done = true;
+        });
+        if submitted.is_err() {
+            // Answer the waiters now: the previous answer if there is one, else the
+            // typed refusal.
+            let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+            hosts.entry(host.clone()).or_default().complete(&host, Err(LookupErr::Refused));
         }
     }
 }
@@ -544,61 +651,41 @@ impl reqwest::dns::Resolve for &'static PooledResolver {
         let this: &'static PooledResolver = self;
         let host = name.as_str().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut start = false;
-        let fresh = {
+        let (immediate, start) = {
             let mut hosts = this.hosts.lock().unwrap_or_else(|e| e.into_inner());
             let entry = hosts.entry(host.clone()).or_default();
-            match &entry.last_good {
-                Some((at, addrs)) if at.elapsed() < DNS_FRESH => Some(addrs.clone()),
-                _ => {
-                    match entry.waiting.as_mut() {
-                        Some(w) => w.push(tx),
-                        None => {
-                            entry.waiting = Some(vec![tx]);
-                            start = true;
-                        }
-                    }
-                    None
+            let fresh = entry.fresh_until.is_some_and(|t| Instant::now() < t);
+            match (fresh, entry.stale_answer()) {
+                (true, Some(addrs)) => (Some(addrs), false),
+                // Stale: answer now, refresh in the background if nobody is yet.
+                (false, Some(addrs)) => {
+                    let start = !entry.in_flight;
+                    entry.in_flight = true;
+                    (Some(addrs), start)
+                }
+                // Nothing usable: wait on the (single) lookup.
+                (_, None) => {
+                    entry.waiting.push(tx);
+                    let start = !entry.in_flight;
+                    entry.in_flight = true;
+                    (None, start)
                 }
             }
         };
-        if let Some(addrs) = fresh {
-            return Box::pin(async move { Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs) });
-        }
         if start {
-            let h = host.clone();
-            let submitted = crate::bg::DNS.submit(move || {
-                use std::net::ToSocketAddrs;
-                // Everyone who asked may have given up already (their request timed
-                // out): then there is nobody to answer, and no reason to block a pool
-                // thread on getaddrinfo for them.
-                let anyone = this.hosts.lock().unwrap_or_else(|e| e.into_inner())
-                    .get(&h)
-                    .and_then(|e| e.waiting.as_ref())
-                    .is_some_and(|w| w.iter().any(|tx| !tx.is_closed()));
-                if !anyone {
-                    this.complete(&h, Err("lookup abandoned".into()));
-                    return;
-                }
-                // Port 0: reqwest substitutes the URL's port.
-                let result = (h.as_str(), 0)
-                    .to_socket_addrs()
-                    .map(|it| it.collect::<Vec<_>>())
-                    .map_err(|e| e.to_string());
-                this.complete(&h, result);
-            });
-            if submitted.is_err() {
-                // Answer the waiters now: a stale answer if there is one, else the
-                // typed refusal.
-                this.complete(&host, Err("refused".into()));
-            }
+            this.spawn_lookup(host);
+        }
+        if let Some(addrs) = immediate {
+            return Box::pin(async move { Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs) });
         }
         Box::pin(async move {
             match rx.await {
                 Ok(Ok(addrs)) => Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs),
-                Ok(Err(e)) if e == "refused" => Err(Box::new(DnsRefused) as Box<dyn std::error::Error + Send + Sync>),
-                Ok(Err(e)) => Err(e.into()),
-                Err(_) => Err("DNS lookup dropped".into()),
+                Ok(Err(LookupErr::Failed(e))) => Err(e.into()),
+                // Refused, or the lookup vanished: our capacity, never "network down".
+                Ok(Err(LookupErr::Refused)) | Err(_) => {
+                    Err(Box::new(DnsRefused) as Box<dyn std::error::Error + Send + Sync>)
+                }
             }
         })
     }
@@ -606,7 +693,5 @@ impl reqwest::dns::Resolve for &'static PooledResolver {
 
 /// `builder` with the process-wide [`PooledResolver`].
 pub fn with_pooled_dns(builder: reqwest::blocking::ClientBuilder) -> reqwest::blocking::ClientBuilder {
-    static RESOLVER: std::sync::OnceLock<PooledResolver> = std::sync::OnceLock::new();
-    let r: &'static PooledResolver = RESOLVER.get_or_init(PooledResolver::new);
-    builder.dns_resolver(Arc::new(r))
+    builder.dns_resolver(Arc::new(resolver()))
 }
