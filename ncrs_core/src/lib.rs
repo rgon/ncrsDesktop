@@ -3833,96 +3833,33 @@ impl NextCloudFs {
         // `read_throttle` slot (see `http_clients::DOWNLOAD_CONNECTIONS`): reqwest's
         // h3 pool keeps a single QUIC connection per host, so one client meant every
         // download shared one congestion controller, one UDP socket and one runtime
-        // thread. They are built here, once, and live as long as the mount.
-        let build_pair = |http3: bool| -> Result<(reqwest::blocking::Client, Vec<reqwest::blocking::Client>), String> {
+        // thread. They are built once (`build_read_clients`) and live as long as the
+        // mount — except the HTTP/2 set under HTTP/3, built only on a demotion.
+        let build_meta = |http3: bool| -> Result<reqwest::blocking::Client, String> {
             let mut meta = crate::http_clients::with_pooled_dns(reqwest::blocking::Client::builder())
                 .pool_max_idle_per_host(16)
                 .connect_timeout(CONNECT_TIMEOUT);
             if http3 {
                 meta = meta.http3_prior_knowledge();
             }
-            // `timeout` here is the per-operation stall bound, not a total deadline;
-            // see READ_STALL_TIMEOUT for why it must live on the client.
-            let read_builder = || {
-                let mut read = crate::http_clients::with_pooled_dns(reqwest::blocking::Client::builder())
-                    .pool_max_idle_per_host(0)
-                    .tcp_nodelay(true)
-                    .connect_timeout(CONNECT_TIMEOUT)
-                    .timeout(READ_STALL_TIMEOUT);
-                if http3 {
-                    // The h3 pool ignores pool_max_idle_per_host and connect_timeout
-                    // never reaches the QUIC connector, so the TCP read client's
-                    // "connect fresh so a dead path fails in seconds" trick has no QUIC
-                    // equivalent. It used to be approximated with `pool_idle_timeout(1s)`,
-                    // which made every window of a rate-limited reader (a media player)
-                    // pay a fresh QUIC+TLS handshake (120-280 ms to this server) and a
-                    // new slow start. Worse, reqwest 0.13's h3 pool stamps a connection's
-                    // idle clock when it is *checked out*, not when the request ends, so
-                    // even a connection busy streaming for over a second counted as
-                    // expired at the next window.
-                    //
-                    // That fail-fast guarantee now comes from the read path itself: the
-                    // client-level READ_STALL_TIMEOUT bounds the header wait and every
-                    // body read, FIRST_BYTES_DEADLINE bounds what a READ waits for, and a
-                    // stalled window aborts and resumes on a fresh request. So warm
-                    // connections — and their congestion state — are kept for just under
-                    // `http3_max_idle_timeout`, past which quinn would close them anyway.
-                    // (reqwest exposes no QUIC keep-alive, so an idle connection does
-                    // expire after 30 s of silence; the pool drops it as invalid.)
-                    //
-                    // `http3_max_idle_timeout` used to also be set to 5s here, to
-                    // reproduce the TCP connect_timeout's fail-fast bound. But unlike
-                    // connect_timeout — which only bounds the connect phase —
-                    // max_idle_timeout governs an *already-established* connection's
-                    // tolerance for silence in either direction for its entire
-                    // lifetime. At 5s, any gap that long during an active read-ahead
-                    // stream (a slow server response under load, a brief network
-                    // hiccup, this process not being scheduled promptly for a few
-                    // seconds) tore down an otherwise-healthy QUIC connection —
-                    // observed live as "read-ahead stream broke: request or response
-                    // body error" during ordinary playback, not just on a dead path.
-                    // quinn's own upstream default is 30s (`quinn_proto::TransportConfig`),
-                    // which is also what Chrome's QUIC stack uses; restoring that
-                    // gives a real connection enough slack to survive realistic
-                    // jitter without materially weakening dead-path detection — the
-                    // periodic connectivity probe (see `http_clients`/offline
-                    // handling) doesn't depend on any single read's timeout, and a
-                    // still-broken stream now retries in-process (see the read-ahead
-                    // body loop) instead of surfacing straight to the caller.
-                    //
-                    // The stream receive window is also bumped: quinn's default
-                    // (~1.25 MB, sized for 100 Mbps at 100 ms RTT) can rate-limit a
-                    // single stream below what a 64 MiB read-ahead window wants on a
-                    // higher-RTT path. BBR is a better fit than the default CUBIC for
-                    // exactly this kind of path (real-world jitter / non-congestion
-                    // loss, which CUBIC misreads as congestion and backs off from
-                    // unnecessarily).
-                    read = read.http3_prior_knowledge()
-                        .pool_idle_timeout(H3_READ_POOL_IDLE)
-                        .http3_max_idle_timeout(H3_MAX_IDLE)
-                        .http3_stream_receive_window(4 * 1024 * 1024)
-                        .http3_congestion_bbr();
-                }
-                read
-            };
-            let reads = (0..crate::http_clients::DOWNLOAD_CONNECTIONS)
-                .map(|_| read_builder().build().map_err(|e| format!("HTTP read client: {}", e)))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((meta.build().map_err(|e| format!("HTTP client: {}", e))?, reads))
+            meta.build().map_err(|e| format!("HTTP client: {}", e))
         };
-        let (http_h2, http_read_h2) = build_pair(false)?;
-        let (http_pref, http_read_pref) = if use_http3 {
-            let pair = build_pair(true)?;
-            // Building the pair bound its QUIC endpoints' UDP sockets; reqwest gives
+        let http_h2 = build_meta(false)?;
+        let clients = if use_http3 {
+            let pref = build_meta(true)?;
+            let reads = build_read_clients(true)?;
+            // Building them bound their QUIC endpoints' UDP sockets; reqwest gives
             // no way to size them, so find and enlarge them now.
             crate::http_clients::raise_quic_socket_buffers();
-            pair
+            // The HTTP/2 read set is only the demotion fallback: built on first use
+            // after a demotion instead of idling eight runtime threads all session.
+            crate::http_clients::HttpClients::with_lazy_h2_reads(
+                pref, reads, http_h2, || build_read_clients(false),
+            )
         } else {
-            (http_h2.clone(), http_read_h2.clone())
-        };
-        let clients = crate::http_clients::HttpClients::new(
-            http_pref, http_read_pref, http_h2, http_read_h2, use_http3,
-        )
+            let reads = build_read_clients(false)?;
+            crate::http_clients::HttpClients::new(http_h2.clone(), reads.clone(), http_h2, reads, false)
+        }
         // Remember a demotion across restarts (per server, in its cache dir):
         // re-arming QUIC every session made each restart on a QUIC-hostile
         // network pay one offline blip before latching onto HTTP/2 again.
@@ -7688,6 +7625,78 @@ impl Filesystem for NextCloudFs {
             });
         }
     }
+}
+
+/// The read clients for one transport: one per download slot (see
+/// `http_clients::DOWNLOAD_CONNECTIONS`), each its own connection.
+fn build_read_clients(http3: bool) -> Result<Vec<reqwest::blocking::Client>, String> {
+    let read_builder = || {
+        // `timeout` here is the per-operation stall bound, not a total deadline;
+        // see READ_STALL_TIMEOUT for why it must live on the client.
+        let mut read = crate::http_clients::with_pooled_dns(reqwest::blocking::Client::builder())
+            .pool_max_idle_per_host(0)
+            .tcp_nodelay(true)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(READ_STALL_TIMEOUT);
+        if http3 {
+            // The h3 pool ignores pool_max_idle_per_host and connect_timeout
+            // never reaches the QUIC connector, so the TCP read client's
+            // "connect fresh so a dead path fails in seconds" trick has no QUIC
+            // equivalent. It used to be approximated with `pool_idle_timeout(1s)`,
+            // which made every window of a rate-limited reader (a media player)
+            // pay a fresh QUIC+TLS handshake (120-280 ms to this server) and a
+            // new slow start. Worse, reqwest 0.13's h3 pool stamps a connection's
+            // idle clock when it is *checked out*, not when the request ends, so
+            // even a connection busy streaming for over a second counted as
+            // expired at the next window.
+            //
+            // That fail-fast guarantee now comes from the read path itself: the
+            // client-level READ_STALL_TIMEOUT bounds the header wait and every
+            // body read, FIRST_BYTES_DEADLINE bounds what a READ waits for, and a
+            // stalled window aborts and resumes on a fresh request. So warm
+            // connections — and their congestion state — are kept for just under
+            // `http3_max_idle_timeout`, past which quinn would close them anyway.
+            // (reqwest exposes no QUIC keep-alive, so an idle connection does
+            // expire after 30 s of silence; the pool drops it as invalid.)
+            //
+            // `http3_max_idle_timeout` used to also be set to 5s here, to
+            // reproduce the TCP connect_timeout's fail-fast bound. But unlike
+            // connect_timeout — which only bounds the connect phase —
+            // max_idle_timeout governs an *already-established* connection's
+            // tolerance for silence in either direction for its entire
+            // lifetime. At 5s, any gap that long during an active read-ahead
+            // stream (a slow server response under load, a brief network
+            // hiccup, this process not being scheduled promptly for a few
+            // seconds) tore down an otherwise-healthy QUIC connection —
+            // observed live as "read-ahead stream broke: request or response
+            // body error" during ordinary playback, not just on a dead path.
+            // quinn's own upstream default is 30s (`quinn_proto::TransportConfig`),
+            // which is also what Chrome's QUIC stack uses; restoring that
+            // gives a real connection enough slack to survive realistic
+            // jitter without materially weakening dead-path detection — the
+            // periodic connectivity probe (see `http_clients`/offline
+            // handling) doesn't depend on any single read's timeout, and a
+            // still-broken stream now retries in-process (see the read-ahead
+            // body loop) instead of surfacing straight to the caller.
+            //
+            // The stream receive window is also bumped: quinn's default
+            // (~1.25 MB, sized for 100 Mbps at 100 ms RTT) can rate-limit a
+            // single stream below what a 64 MiB read-ahead window wants on a
+            // higher-RTT path. BBR is a better fit than the default CUBIC for
+            // exactly this kind of path (real-world jitter / non-congestion
+            // loss, which CUBIC misreads as congestion and backs off from
+            // unnecessarily).
+            read = read.http3_prior_knowledge()
+                .pool_idle_timeout(H3_READ_POOL_IDLE)
+                .http3_max_idle_timeout(H3_MAX_IDLE)
+                .http3_stream_receive_window(4 * 1024 * 1024)
+                .http3_congestion_bbr();
+        }
+        read
+    };
+    (0..crate::http_clients::DOWNLOAD_CONNECTIONS)
+        .map(|_| read_builder().build().map_err(|e| format!("HTTP read client: {}", e)))
+        .collect()
 }
 
 // ── HTTP Range reads ─────────────────────────────────────────────────────────

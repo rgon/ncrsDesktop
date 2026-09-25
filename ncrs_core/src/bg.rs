@@ -359,6 +359,8 @@ pub const MAX_THREADS: usize = {
 /// notifications, search, assets, one read client per transport), plus the
 /// read clients beyond the first for each transport — one per download slot, for
 /// HTTP/3 and for the HTTP/2 fallback (see `http_clients::DOWNLOAD_CONNECTIONS`).
+/// Under HTTP/3 the HTTP/2 read set exists only after a demotion, so this is the
+/// ceiling, reached only then.
 pub const MAX_HTTP_CLIENT_THREADS: usize = 8 + 2 * (crate::http_clients::DOWNLOAD_CONNECTIONS - 1);
 
 const POOL_SIZES: [usize; 12] = [
