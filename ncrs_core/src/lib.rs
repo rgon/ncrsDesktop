@@ -674,7 +674,57 @@ pub struct TransferProgress {
     pub total_bytes: u64,
 }
 
-pub type TransferMap = Arc<Mutex<HashMap<PathBuf, TransferProgress>>>;
+/// One transfer's slot in the [`TransferMap`]: its path plus a stream id.
+///
+/// Whole-file transfers (uploads, full downloads) are one per path and use id 0
+/// ([`whole_file_transfer`]). Each read-ahead stream takes a fresh id
+/// ([`next_stream_id`]). Keyed by path alone, concurrent streams of one file —
+/// four readers of a 256 MB file, each on its own handle — overwrote and removed
+/// each other's entries, which is how a stream stuck for minutes sat in TRANSFERS
+/// as the only survivor while its stuck siblings had vanished from it.
+pub type TransferKey = (PathBuf, u64);
+
+pub type TransferMap = Arc<Mutex<HashMap<TransferKey, TransferProgress>>>;
+
+/// The key of `path`'s whole-file transfer (see [`TransferKey`]).
+pub fn whole_file_transfer(path: &Path) -> TransferKey {
+    (path.to_path_buf(), 0)
+}
+
+/// A fresh, never-zero id for one read-ahead stream's [`TransferKey`].
+fn next_stream_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The transfers as IPC `TRANSFERS` reports them: one entry per path, sorted by
+/// path, exactly the shape the per-path map used to produce.
+///
+/// Clients key rows by path (the GUI's list is a keyed `{#each}`, which throws on
+/// a duplicate key, and its mirror map is keyed by path too), so concurrent streams
+/// of one file are summed into one row rather than listed apiece. An upload
+/// outranks downloads of the same path: it is the newer state of the file.
+pub fn transfer_snapshot(map: &TransferMap) -> Vec<TransferProgress> {
+    let mut by_path: std::collections::BTreeMap<PathBuf, TransferProgress> = std::collections::BTreeMap::new();
+    for tp in map.safe_lock().values() {
+        match by_path.get_mut(&tp.path) {
+            None => {
+                by_path.insert(tp.path.clone(), tp.clone());
+            }
+            Some(agg) => {
+                let agg_up = matches!(agg.direction, TransferDirection::Upload);
+                let tp_up = matches!(tp.direction, TransferDirection::Upload);
+                if agg_up == tp_up {
+                    agg.bytes_done += tp.bytes_done;
+                    agg.total_bytes += tp.total_bytes;
+                } else if tp_up {
+                    *agg = tp.clone();
+                }
+            }
+        }
+    }
+    by_path.into_values().collect()
+}
 
 /// True for a rendered [`backend::BackendReadError::Server`]: the server
 /// answered with an HTTP error status. Not a transport failure, so never a
@@ -1291,7 +1341,7 @@ fn list_dir_propfind(
 
 struct ProgressWriter {
     inner: std::fs::File,
-    path: PathBuf,
+    key: TransferKey,
     transfer_map: TransferMap,
     written: u64,
 }
@@ -1301,7 +1351,7 @@ impl std::io::Write for ProgressWriter {
         let n = self.inner.write(buf)?;
         self.written += n as u64;
         if let Ok(mut map) = self.transfer_map.lock() {
-            if let Some(entry) = map.get_mut(&self.path) {
+            if let Some(entry) = map.get_mut(&self.key) {
                 entry.bytes_done = self.written;
             }
         }
@@ -1325,7 +1375,7 @@ fn open_file_timeout(
         return Err("WebDAV download timeout (no download slot)".into());
     };
     let mut writer: Box<dyn std::io::Write + Send> = if let Some(tm) = transfers {
-        Box::new(ProgressWriter { inner: dest, path: path.clone(), transfer_map: tm, written: 0 })
+        Box::new(ProgressWriter { inner: dest, key: whole_file_transfer(&path), transfer_map: tm, written: 0 })
     } else {
         Box::new(dest)
     };
@@ -2682,7 +2732,7 @@ pub(crate) fn ensure_file_cached(
     dirty.safe_lock().insert(remote_path.clone());
 
     if let Some(tm) = transfers {
-        tm.safe_lock().insert(remote_path.clone(), TransferProgress {
+        tm.safe_lock().insert(whole_file_transfer(&remote_path), TransferProgress {
             path: remote_path.clone(),
             direction: TransferDirection::Download,
             bytes_done: 0,
@@ -2705,7 +2755,7 @@ pub(crate) fn ensure_file_cached(
         match open_file_timeout(conn, remote_path.clone(), file, transfers.cloned()) {
             Ok(()) => break,
             Err(e) => {
-                if let Some(tm) = transfers { tm.safe_lock().remove(&remote_path); }
+                if let Some(tm) = transfers { tm.safe_lock().remove(&whole_file_transfer(&remote_path)); }
                 if let Err(rm_err) = std::fs::remove_file(&local_path) {
                     log::error!("CRITICAL: cannot remove partial download {}: {} — zeroing to prevent serving corrupt data", local_path.display(), rm_err);
                     if let Ok(f) = std::fs::File::create(&local_path) {
@@ -2716,7 +2766,7 @@ pub(crate) fn ensure_file_cached(
                     log::warn!("download {} failed (attempt {}/{}): {} — retrying in {:?}",
                         remote_path.display(), dl_attempt + 1, DOWNLOAD_RETRIES + 1, e, dl_delay);
                     if let Some(tm) = transfers {
-                        tm.safe_lock().insert(remote_path.clone(), TransferProgress {
+                        tm.safe_lock().insert(whole_file_transfer(&remote_path), TransferProgress {
                             path: remote_path.clone(),
                             direction: TransferDirection::Download,
                             bytes_done: 0,
@@ -2736,7 +2786,7 @@ pub(crate) fn ensure_file_cached(
         }
     }
 
-    if let Some(tm) = transfers { tm.safe_lock().remove(&remote_path); }
+    if let Some(tm) = transfers { tm.safe_lock().remove(&whole_file_transfer(&remote_path)); }
 
     let final_status = if kept { FileStatus::Kept } else { FileStatus::Cached };
     {
@@ -4043,7 +4093,7 @@ impl NextCloudFs {
                 }
                 let original_etag = uploads.etag_for(&remote_path, opened_gen, original_etag);
                 let _permit = conn.throttle.acquire();
-                tmap.safe_lock().insert(remote_path.clone(), TransferProgress {
+                tmap.safe_lock().insert(whole_file_transfer(&remote_path), TransferProgress {
                     path: remote_path.clone(),
                     direction: TransferDirection::Upload,
                     bytes_done: 0,
@@ -4052,7 +4102,7 @@ impl NextCloudFs {
                 let etag_ref = original_etag.as_deref();
                 match conn.backend.put_file_from_path(&remote_path, &write_path, etag_ref) {
                     Ok(result) => {
-                        tmap.safe_lock().remove(&remote_path);
+                        tmap.safe_lock().remove(&whole_file_transfer(&remote_path));
                         cache.safe_lock().uploading.remove(&remote_path);
                         log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_change_token);
                         uploads.record(&remote_path, result.new_change_token.clone());
@@ -4107,7 +4157,7 @@ impl NextCloudFs {
                         journal.safe_lock().remove(seq);
                     }
                     Err(backend::BackendWriteError::Conflict) => {
-                        tmap.safe_lock().remove(&remote_path);
+                        tmap.safe_lock().remove(&whole_file_transfer(&remote_path));
                         cache.safe_lock().uploading.remove(&remote_path);
                         smap.safe_write().remove(&remote_path);
                         log::warn!("CONFLICT on PUT {} — creating conflicted copy", remote_path.display());
@@ -4126,7 +4176,7 @@ impl NextCloudFs {
                         let _ = std::fs::remove_file(&write_path);
                     }
                     Err(ref e) => {
-                        tmap.safe_lock().remove(&remote_path);
+                        tmap.safe_lock().remove(&whole_file_transfer(&remote_path));
                         cache.safe_lock().uploading.remove(&remote_path);
                         // Keep the local edit: the staging file and journal entry stay put,
                         // so the content survives and the mutation is retried. Surface it as
@@ -5624,7 +5674,8 @@ impl Filesystem for NextCloudFs {
                                     });
                                 }
                             }
-                            tmap.safe_lock().insert(path.clone(), TransferProgress {
+                            let tkey: TransferKey = (path.clone(), next_stream_id());
+                            tmap.safe_lock().insert(tkey.clone(), TransferProgress {
                                 path: path.clone(),
                                 direction: TransferDirection::Download,
                                 bytes_done: first.len() as u64,
@@ -5647,6 +5698,7 @@ impl Filesystem for NextCloudFs {
                                 fh: fh.0,
                                 open_files: &open_files,
                                 tmap: &tmap,
+                                tkey,
                                 shared: &shared,
                                 start: off,
                                 target: fetch,
@@ -7143,6 +7195,8 @@ struct WindowPump<'a> {
     fh: u64,
     open_files: &'a Mutex<HashMap<u64, OpenFile>>,
     tmap: &'a TransferMap,
+    /// This stream's own TRANSFERS entry, removed when the pump ends.
+    tkey: TransferKey,
     shared: &'a Arc<(Mutex<StreamState>, Condvar)>,
     /// File offset of the window's first byte.
     start: u64,
@@ -7191,7 +7245,7 @@ impl<'a> WindowPump<'a> {
                     if since_check >= 2 * 1024 * 1024 {
                         since_check = 0;
                         if let Ok(mut tm) = self.tmap.lock() {
-                            if let Some(tp) = tm.get_mut(self.path) {
+                            if let Some(tp) = tm.get_mut(&self.tkey) {
                                 tp.bytes_done = mtx.lock().unwrap().data.len() as u64;
                             }
                         }
@@ -7262,7 +7316,7 @@ impl<'a> WindowPump<'a> {
         let total_bytes = ss.data.len();
         drop(ss);
         cv.notify_all();
-        self.tmap.safe_lock().remove(self.path);
+        self.tmap.safe_lock().remove(&self.tkey);
         total_bytes
     }
 }

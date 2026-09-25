@@ -1801,7 +1801,7 @@ fn apply_snapshot(app: &AppHandle, state: &Arc<AppState>, payload: &str, cache: 
                 {
                     let mut map = state.transfer_map.lock().unwrap();
                     map.clear();
-                    map.extend(transfers.iter().cloned().map(|t| (t.path.clone(), t)));
+                    map.extend(transfers.iter().cloned().map(|t| (ncrs_core::whole_file_transfer(&t.path), t)));
                 }
                 app.emit("transfers-updated", &transfers).ok();
                 cache.transfers_json = json.to_string();
@@ -1935,7 +1935,7 @@ async fn attached_poll_loop(
             if let Ok(transfers) = serde_json::from_str::<Vec<TransferProgress>>(json) {
                 let mut map = state.transfer_map.lock().unwrap();
                 map.clear();
-                map.extend(transfers.into_iter().map(|t| (t.path.clone(), t)));
+                map.extend(transfers.into_iter().map(|t| (ncrs_core::whole_file_transfer(&t.path), t)));
             }
         }
 
