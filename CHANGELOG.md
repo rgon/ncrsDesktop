@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.1.78](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.77...ncrs-v0.1.78) (2026-09-25)
+
+
+### Features
+
+* **deb:** raise net.core.rmem_max/wmem_max to 4 MiB so the QUIC socket buffers can take effect ([b6cc79c](https://github.com/rgon/ncrsDesktop/commit/b6cc79cdaebb7a4b900cb08676f7e2b1fd70bdb8))
+
+
+### Bug Fixes
+
+* **dns:** serve stale answers while refreshing, never wedge a host, and re-resolve after going offline ([4bb14d4](https://github.com/rgon/ncrsDesktop/commit/4bb14d4cf201fa698a1fc4066b1e5087ae97ddae))
+* **read:** bound every range-read wait and resume stalled read-ahead bodies ([ec7a8c3](https://github.com/rgon/ncrsDesktop/commit/ec7a8c36657731ff3ab8b3a571453546e9ca7288))
+* **read:** never serve a hole as EOF, keep windows with parked readers, and stop slow links and DNS from reading as offline ([168279a](https://github.com/rgon/ncrsDesktop/commit/168279a2e5b049e22772aef4b5a039d5fc2f71dd))
+* **read:** release idle and superseded windows' memory, keep the segment gate measuring, and stop panicked windows with EAGAIN ([aca47f1](https://github.com/rgon/ncrsDesktop/commit/aca47f115252cac7be2ee6ca714291390136e223))
+* **read:** survive dead QUIC connections, slow servers and trickling bodies with bounded threads, memory and replies ([cfaaef1](https://github.com/rgon/ncrsDesktop/commit/cfaaef18cef6f9b38660195baffd5247e710d8af))
+* **threads:** restore the deep read queue and count every HTTP client runtime in the thread budget ([5adfbfb](https://github.com/rgon/ncrsDesktop/commit/5adfbfb81dfb22f5eb1c11ca81a738de6b11e367))
+* **transfers:** key TRANSFERS entries per stream so concurrent reads of one file stop clobbering each other ([edf45b4](https://github.com/rgon/ncrsDesktop/commit/edf45b4346ef38c4e18bad0a39948bd337610f4f))
+
+
+### Performance Improvements
+
+* **http3:** build the HTTP/2 read clients only when a demotion needs them ([e921ecc](https://github.com/rgon/ncrsDesktop/commit/e921ecc773833f7e550fed10641c844c3d16dc6b))
+* **http3:** keep warm QUIC read connections for just under their idle timeout instead of 1 s ([616c2be](https://github.com/rgon/ncrsDesktop/commit/616c2be04e0e7a9286e6c4ee622867da205de181))
+* **http3:** raise the QUIC UDP sockets' receive and send buffers to 4 MiB ([1012f95](https://github.com/rgon/ncrsDesktop/commit/1012f95ead3a9d4fc1cbc5a9f64724f0360400e3))
+* **read:** fetch a sequential reader's next window while it is halfway through the current one ([1a43891](https://github.com/rgon/ncrsDesktop/commit/1a43891340d199259974e36a5e2f19b473bae78d))
+* **read:** fetch large read-ahead windows as concurrent segments on spare download slots ([800e15e](https://github.com/rgon/ncrsDesktop/commit/800e15e53128397e366308501a10142b5764d1ff))
+* **read:** give each download slot its own read client so parallel downloads use separate QUIC connections ([1684da4](https://github.com/rgon/ncrsDesktop/commit/1684da4a6f9b2f30a02468372b97ea815dbdfa82))
+* **read:** grant the 8 MB window only after a straight read through the first one, not on a first read at offset 0 ([dc4ca00](https://github.com/rgon/ncrsDesktop/commit/dc4ca00eac54f48611cd403668dd578aedb505bd))
+* **read:** open straight reads of large files with an 8 MB read-ahead window ([6036055](https://github.com/rgon/ncrsDesktop/commit/6036055565ba30b23e35f60e32e8ca27e0339c26))
+
 ## [0.1.77](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.76...ncrs-v0.1.77) (2026-09-25)
 
 
