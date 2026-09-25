@@ -216,7 +216,7 @@ fn remember(url: &str, value: Option<String>) {
 fn asset_client() -> crate::http_clients::DavClient {
     static C: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
     let raw = C.get_or_init(|| {
-        reqwest::blocking::Client::builder()
+        crate::http_clients::with_pooled_dns(reqwest::blocking::Client::builder())
             .timeout(ASSET_TIMEOUT)
             .build()
             .expect("reqwest client")

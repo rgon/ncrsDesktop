@@ -1353,20 +1353,25 @@
 
     #[test]
     fn out_of_order_segments_only_ever_extend_the_contiguous_prefix() {
-        let mut ss = StreamState::new(vec![0u8; 4], 3);
+        let plan = [
+            Segment { at: 0, len: 8, last: false },
+            Segment { at: 8, len: 4, last: false },
+            Segment { at: 12, len: 8, last: true },
+        ];
+        let mut ss = StreamState::new(vec![0u8; 4], &plan, BufferReservation::up_to(20, 20));
         // Segment 2 (window offset 12) and 1 (offset 8) arrive before segment 0 is done.
-        ss.push(2, 12, &[2, 2, 2, 2]);
-        ss.push(1, 8, &[1, 1]);
+        ss.push(2, 12, &[2, 2, 2, 2], 8);
+        ss.push(1, 8, &[1, 1], 4);
         assert_eq!(ss.data.len(), 4, "nothing past a hole reaches readers");
         assert_eq!(ss.received(), 10);
         // Segment 0 finishes at 8: segment 1's two bytes join, then stop at its own hole.
-        ss.push(0, 4, &[0, 0, 0, 0]);
+        ss.push(0, 4, &[0, 0, 0, 0], 4);
         assert_eq!(ss.data.len(), 10);
         // Segment 1 fills to 12: segment 2's parked bytes follow straight on.
-        ss.push(1, 10, &[1, 1]);
+        ss.push(1, 10, &[1, 1], 2);
         assert_eq!(ss.data, [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]);
         // And a segment at the watermark appends directly from then on.
-        ss.push(2, 16, &[2]);
+        ss.push(2, 16, &[2], 4);
         assert_eq!(ss.data.len(), 17);
         assert_eq!(ss.received(), 17);
     }

@@ -225,9 +225,27 @@ impl Pool {
 pub static READDIR: Pool = Pool::new("readdir", READDIR_WORKERS, 512);
 pub const READDIR_WORKERS: usize = 24;
 
-/// FUSE read-path waiters: range streams and read-ahead waits.
-pub static READ: Pool = Pool::new("read", READ_WORKERS, 2048);
+/// FUSE read-path jobs that own a reply: opening a range stream up to its first
+/// bytes, and waits on read-ahead windows. Each is time-bounded (see the table in
+/// docs/threads.md), and the queue holds at most one more round of them, so a
+/// queued READ is answered within one job's bound. Window bodies do not run here
+/// (see [`STREAM`]): a slow body must not be what a READ is queued behind.
+pub static READ: Pool = Pool::new("read", READ_WORKERS, READ_WORKERS);
 pub const READ_WORKERS: usize = 32;
+
+/// Read-ahead window bodies (and a sequential reader's look-ahead window) after
+/// the READ that started them was answered. Each holds a `read_throttle` slot when
+/// it starts, so live bodies are bounded by the download slots; a foreground body
+/// the pool refuses runs on in its `read` worker instead.
+pub static STREAM: Pool = Pool::new("stream", STREAM_WORKERS, STREAM_WORKERS);
+pub const STREAM_WORKERS: usize = crate::http_clients::DOWNLOAD_CONNECTIONS;
+
+/// Host lookups for every reqwest client (`http_clients::PooledResolver`).
+/// reqwest's default resolver runs getaddrinfo on each client's own tokio
+/// blocking pool — up to 512 threads per client runtime, a dozen-plus runtimes —
+/// which no static budget could count. Here it is two threads for the process.
+pub static DNS: Pool = Pool::new("dns", DNS_WORKERS, 64);
+pub const DNS_WORKERS: usize = 2;
 
 /// Directory fetches from the server (streaming lists, TTL refreshes,
 /// prefetch). Each fetch also takes a `Throttle` slot, so these are the only
@@ -274,7 +292,7 @@ pub const THUMB_WORKERS: usize = 2;
 pub static USER: Pool = Pool::new("user", USER_WORKERS, 4096);
 pub const USER_WORKERS: usize = 4;
 
-pub static POOLS: [&Pool; 10] = [&READDIR, &READ, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER];
+pub static POOLS: [&Pool; 12] = [&READDIR, &READ, &STREAM, &DNS, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER];
 
 /// Named long-lived threads: the FUSE session, connectivity monitor, push
 /// watcher, IPC accept loop, savers, cleanup. Fixed in number.
@@ -287,10 +305,33 @@ pub const KEEP_SCOPE_WIDTH: usize = 2; // per `user` worker (keep_locally_recurs
 pub const BOOT_SCOPE_WIDTH: usize = 16; // boot file-cache validation, once
 pub const REFRESH_SCOPE_WIDTH: usize = 4; // notify-push proactive refresh, one at a time
 pub const SEARCH_WIDTH: usize = 6; // unified-search providers per search
-/// Extra segments of read-ahead windows (lib.rs `WindowPump::run`). Each holds
-/// one `read_throttle` slot beyond its window's own, so across every window at
-/// once there are at most this many, however many readers there are.
+/// Extra segments of read-ahead windows (lib.rs `WindowPump::run`), across all
+/// windows at once. Enforced by [`SegmentThread`] tokens, not by the slots: a
+/// segment gives its slot back while it resumes, so slots alone would let new
+/// windows start more segment threads meanwhile.
 pub const SEGMENT_SCOPE_WIDTH: usize = crate::http_clients::DOWNLOAD_CONNECTIONS - 1;
+
+static SEGMENT_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// The right to run one scoped segment thread, held for the thread's whole life
+/// (moved into it, dropped as it returns). Only ever *tried* for: a window with no
+/// token free is fetched without that segment, never waits for one.
+pub struct SegmentThread(());
+
+impl SegmentThread {
+    pub fn try_take() -> Option<SegmentThread> {
+        SEGMENT_THREADS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < SEGMENT_SCOPE_WIDTH).then_some(n + 1))
+            .ok()
+            .map(|_| SegmentThread(()))
+    }
+}
+
+impl Drop for SegmentThread {
+    fn drop(&mut self) {
+        SEGMENT_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Upper bound on scoped threads alive at once (assuming one search at a time).
 pub const MAX_SCOPED_THREADS: usize = THUMB_WORKERS * THUMB_SCOPE_WIDTH
@@ -320,9 +361,11 @@ pub const MAX_THREADS: usize = {
 /// HTTP/3 and for the HTTP/2 fallback (see `http_clients::DOWNLOAD_CONNECTIONS`).
 pub const MAX_HTTP_CLIENT_THREADS: usize = 8 + 2 * (crate::http_clients::DOWNLOAD_CONNECTIONS - 1);
 
-const POOL_SIZES: [usize; 10] = [
+const POOL_SIZES: [usize; 12] = [
     READDIR_WORKERS,
     READ_WORKERS,
+    STREAM_WORKERS,
+    DNS_WORKERS,
     LISTING_WORKERS,
     BACKGROUND_WORKERS,
     MUTATION_WORKERS,
