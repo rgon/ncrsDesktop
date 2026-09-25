@@ -107,6 +107,8 @@ impl DavClient {
 /// built once, at mount, for both transports, and never added to afterwards.
 pub const DOWNLOAD_CONNECTIONS: usize = 8;
 
+type ReadSetBuilder = dyn Fn() -> Result<Vec<reqwest::blocking::Client>, String> + Send + Sync;
+
 #[derive(Clone)]
 pub struct HttpClients {
     /// Preferred clients: HTTP/3 when configured, otherwise clones of the
@@ -116,7 +118,11 @@ pub struct HttpClients {
     read_pref: Arc<[reqwest::blocking::Client]>,
     /// Always-usable HTTP/2 clients, and the target of a demotion.
     h2: reqwest::blocking::Client,
-    read_h2: Arc<[reqwest::blocking::Client]>,
+    /// The HTTP/2 read set. While HTTP/3 is active it is only the demotion target,
+    /// so it is built on first use after a demotion (once: `OnceLock`) rather than
+    /// holding a runtime thread per slot all session.
+    read_h2: Arc<std::sync::OnceLock<Arc<[reqwest::blocking::Client]>>>,
+    build_read_h2: Option<Arc<ReadSetBuilder>>,
     demoted: Arc<AtomicBool>,
     http3: bool,
     /// Where a demotion is recorded so the next session starts on HTTP/2
@@ -136,15 +142,59 @@ impl HttpClients {
         http3: bool,
     ) -> Self {
         assert!(!read_pref.is_empty() && !read_h2.is_empty(), "a read client set cannot be empty");
+        let built = std::sync::OnceLock::new();
+        let _ = built.set(read_h2.into());
         HttpClients {
             pref,
             read_pref: read_pref.into(),
             h2,
-            read_h2: read_h2.into(),
+            read_h2: Arc::new(built),
+            build_read_h2: None,
             demoted: Arc::new(AtomicBool::new(false)),
             http3,
             marker: None,
         }
+    }
+
+    /// An HTTP/3 set whose HTTP/2 read clients are built by `build_read_h2` only
+    /// if a demotion ever needs them.
+    pub fn with_lazy_h2_reads(
+        pref: reqwest::blocking::Client,
+        read_pref: Vec<reqwest::blocking::Client>,
+        h2: reqwest::blocking::Client,
+        build_read_h2: impl Fn() -> Result<Vec<reqwest::blocking::Client>, String> + Send + Sync + 'static,
+    ) -> Self {
+        assert!(!read_pref.is_empty(), "a read client set cannot be empty");
+        HttpClients {
+            pref,
+            read_pref: read_pref.into(),
+            h2,
+            read_h2: Arc::new(std::sync::OnceLock::new()),
+            build_read_h2: Some(Arc::new(build_read_h2)),
+            demoted: Arc::new(AtomicBool::new(false)),
+            http3: true,
+            marker: None,
+        }
+    }
+
+    /// The HTTP/2 read set, building it on first use. Should building fail, the
+    /// HTTP/2 metadata client stands in for every slot rather than reads failing.
+    fn h2_reads(&self) -> &Arc<[reqwest::blocking::Client]> {
+        self.read_h2.get_or_init(|| {
+            let built = self.build_read_h2.as_ref().map(|b| b());
+            match built {
+                Some(Ok(v)) if !v.is_empty() => {
+                    log::info!("built the {} HTTP/2 read clients for the demotion", v.len());
+                    v.into()
+                }
+                other => {
+                    if let Some(Err(e)) = other {
+                        log::warn!("could not build the HTTP/2 read clients ({}) — using the metadata client for reads", e);
+                    }
+                    vec![self.h2.clone()].into()
+                }
+            }
+        })
     }
 
     /// Persist demotions to `path`, and honour a demotion a previous session
@@ -196,8 +246,12 @@ impl HttpClients {
     /// connection. See the construction in `lib.rs` for how the set is tuned.
     pub fn read(&self, slot: usize) -> DavClient {
         // Both sets are the same size; the modulo only keeps a stray index in range.
-        if self.demoted.load(Ordering::Relaxed) {
-            DavClient { client: self.read_h2[slot % self.read_h2.len()].clone(), version: None }
+        if self.demoted.load(Ordering::Relaxed) && self.http3 {
+            let set = self.h2_reads();
+            DavClient { client: set[slot % set.len()].clone(), version: None }
+        } else if self.demoted.load(Ordering::Relaxed) {
+            // Without HTTP/3 the preferred set already is the HTTP/2 one.
+            DavClient { client: self.read_pref[slot % self.read_pref.len()].clone(), version: None }
         } else {
             DavClient { client: self.read_pref[slot % self.read_pref.len()].clone(), version: self.pref_version() }
         }
