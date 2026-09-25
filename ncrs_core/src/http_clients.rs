@@ -91,15 +91,32 @@ impl DavClient {
     }
 }
 
+/// How many downloads may run at once, and so how many read clients each
+/// transport gets: `read_throttle` has this many slots, and slot `i` always uses
+/// read client `i`.
+///
+/// One client per slot, because a client is one connection: reqwest's h3 pool
+/// keeps exactly one QUIC connection per host, so with a single read client every
+/// download shared one congestion controller, one UDP socket and one runtime
+/// thread (4 parallel readers got ~31 MB/s together, where one stream alone bursts
+/// to 36-44 MB/s). Tying a connection to a slot makes it 1:1 — two concurrent
+/// downloads never share one — and bounds the connections by the slots.
+///
+/// Each client costs one reqwest runtime thread (and, over HTTP/3, one UDP socket)
+/// for the life of the mount; `bg::MAX_HTTP_CLIENT_THREADS` counts them. They are
+/// built once, at mount, for both transports, and never added to afterwards.
+pub const DOWNLOAD_CONNECTIONS: usize = 8;
+
 #[derive(Clone)]
 pub struct HttpClients {
     /// Preferred clients: HTTP/3 when configured, otherwise clones of the
-    /// HTTP/2 pair (a `Client` is `Arc`-based, so the clone shares one pool).
+    /// HTTP/2 set (a `Client` is `Arc`-based, so the clone shares one pool).
     pref: reqwest::blocking::Client,
-    read_pref: reqwest::blocking::Client,
+    /// One read client per download slot; see [`DOWNLOAD_CONNECTIONS`].
+    read_pref: Arc<[reqwest::blocking::Client]>,
     /// Always-usable HTTP/2 clients, and the target of a demotion.
     h2: reqwest::blocking::Client,
-    read_h2: reqwest::blocking::Client,
+    read_h2: Arc<[reqwest::blocking::Client]>,
     demoted: Arc<AtomicBool>,
     http3: bool,
     /// Where a demotion is recorded so the next session starts on HTTP/2
@@ -109,15 +126,25 @@ pub struct HttpClients {
 
 impl HttpClients {
     /// `pref`/`read_pref` must be the HTTP/3 clients when `http3` is true; pass
-    /// clones of the HTTP/2 pair when it is false.
+    /// clones of the HTTP/2 set when it is false. The read sets hold one client per
+    /// download slot and must not be empty.
     pub fn new(
         pref: reqwest::blocking::Client,
-        read_pref: reqwest::blocking::Client,
+        read_pref: Vec<reqwest::blocking::Client>,
         h2: reqwest::blocking::Client,
-        read_h2: reqwest::blocking::Client,
+        read_h2: Vec<reqwest::blocking::Client>,
         http3: bool,
     ) -> Self {
-        HttpClients { pref, read_pref, h2, read_h2, demoted: Arc::new(AtomicBool::new(false)), http3, marker: None }
+        assert!(!read_pref.is_empty() && !read_h2.is_empty(), "a read client set cannot be empty");
+        HttpClients {
+            pref,
+            read_pref: read_pref.into(),
+            h2,
+            read_h2: read_h2.into(),
+            demoted: Arc::new(AtomicBool::new(false)),
+            http3,
+            marker: None,
+        }
     }
 
     /// Persist demotions to `path`, and honour a demotion a previous session
@@ -164,13 +191,15 @@ impl HttpClients {
         }
     }
 
-    /// The read client, which deliberately keeps no idle pool (see the comment
-    /// at its construction in `lib.rs`).
-    pub fn read(&self) -> DavClient {
+    /// The read client for download slot `slot` (a `read_throttle` permit's
+    /// [`slot`](crate::ThrottleGuard::slot)), so each slot always talks over its own
+    /// connection. See the construction in `lib.rs` for how the set is tuned.
+    pub fn read(&self, slot: usize) -> DavClient {
+        // Both sets are the same size; the modulo only keeps a stray index in range.
         if self.demoted.load(Ordering::Relaxed) {
-            DavClient { client: self.read_h2.clone(), version: None }
+            DavClient { client: self.read_h2[slot % self.read_h2.len()].clone(), version: None }
         } else {
-            DavClient { client: self.read_pref.clone(), version: self.pref_version() }
+            DavClient { client: self.read_pref[slot % self.read_pref.len()].clone(), version: self.pref_version() }
         }
     }
 

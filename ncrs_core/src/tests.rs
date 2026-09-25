@@ -2398,9 +2398,9 @@ password: "pass"
 
     fn test_clients(http3: bool) -> crate::http_clients::HttpClients {
         let mk = || reqwest::blocking::Client::builder().build().unwrap();
-        let (h2, read_h2) = (mk(), mk());
-        // Stand-ins for the QUIC pair: we only assert which slot is handed out.
-        let (pref, read_pref) = if http3 { (mk(), mk()) } else { (h2.clone(), read_h2.clone()) };
+        let (h2, read_h2) = (mk(), vec![mk(), mk()]);
+        // Stand-ins for the QUIC set: we only assert which slot is handed out.
+        let (pref, read_pref) = if http3 { (mk(), vec![mk(), mk()]) } else { (h2.clone(), read_h2.clone()) };
         crate::http_clients::HttpClients::new(pref, read_pref, h2, read_h2, http3)
     }
 
@@ -2474,14 +2474,16 @@ password: "pass"
         let c = test_clients(true);
         assert!(c.http3_active());
         assert!(c.get().is_h3(), "before demotion requests are stamped Version::HTTP_3");
-        assert!(c.read().is_h3(), "the read client is stamped too");
+        assert!(c.read(0).is_h3(), "the read client is stamped too");
+        assert!(c.read(1).is_h3(), "every slot's read client");
         assert!(!c.h2().is_h3(), "the escape-hatch client never stamps HTTP/3");
 
         c.demote();
 
         assert!(!c.http3_active());
         assert!(!c.get().is_h3(), "after demotion every request goes out unstamped over TCP");
-        assert!(!c.read().is_h3(), "reads too");
+        assert!(!c.read(0).is_h3(), "reads too");
+        assert!(!c.read(1).is_h3(), "on every slot");
     }
 
     #[test]
@@ -2740,8 +2742,8 @@ mod http3_available_tests {
 
     fn clients(http3: bool) -> HttpClients {
         let mk = || reqwest::blocking::Client::builder().build().unwrap();
-        let (h2, read_h2) = (mk(), mk());
-        let (pref, read_pref) = if http3 { (mk(), mk()) } else { (h2.clone(), read_h2.clone()) };
+        let (h2, read_h2) = (mk(), vec![mk()]);
+        let (pref, read_pref) = if http3 { (mk(), vec![mk()]) } else { (h2.clone(), read_h2.clone()) };
         HttpClients::new(pref, read_pref, h2, read_h2, http3)
     }
 

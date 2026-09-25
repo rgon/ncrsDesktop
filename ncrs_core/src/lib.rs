@@ -233,18 +233,46 @@ const PATH_ENCODE: &AsciiSet = &CONTROLS
 // ── HTTP request throttle ────────────────────────────────────────────────────
 
 pub struct Throttle {
-    state: Mutex<usize>,
+    state: Mutex<Slots>,
     cv: Condvar,
     max: usize,
 }
 
+/// Which of a throttle's slots are taken. Slots are numbered so a holder can own
+/// a resource per slot — `read_throttle` slot `i` downloads over read client `i`
+/// (see `http_clients::DOWNLOAD_CONNECTIONS`).
+struct Slots {
+    in_use: usize,
+    busy: Vec<bool>,
+}
+
+impl Slots {
+    fn take(&mut self) -> usize {
+        let slot = self.busy.iter().position(|b| !b).expect("in_use < max implies a free slot");
+        self.busy[slot] = true;
+        self.in_use += 1;
+        slot
+    }
+}
+
+/// A held throttle slot, given back on drop. RAII is the only way to release one,
+/// so a slot cannot outlive its holder on any path, unwinding included.
 pub struct ThrottleGuard<'a> {
     throttle: &'a Throttle,
+    slot: usize,
+}
+
+impl ThrottleGuard<'_> {
+    /// This permit's slot number, in `0..max`. No other live permit of the same
+    /// throttle has the same one.
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
 }
 
 impl Throttle {
     pub fn new(max: usize) -> Self {
-        Throttle { state: Mutex::new(0), cv: Condvar::new(), max }
+        Throttle { state: Mutex::new(Slots { in_use: 0, busy: vec![false; max] }), cv: Condvar::new(), max }
     }
 
     /// For callers on the FUSE dispatch thread, which must never wait unbounded for a slot.
@@ -255,43 +283,45 @@ impl Throttle {
     /// Like [`acquire_timeout`](Self::acquire_timeout), but only takes a slot while
     /// at least `spare` others stay free afterwards.
     ///
-    /// For speculative work (a sequential reader's look-ahead window) that must
-    /// never be the reason a foreground read waits for a slot: it only runs on
-    /// capacity nobody is asking for.
+    /// For speculative work (a sequential reader's look-ahead window, a window's
+    /// extra segments) that must never be the reason a foreground read waits for a
+    /// slot: it only runs on capacity nobody is asking for. A zero `timeout` is a
+    /// pure try.
     pub fn acquire_leaving(&self, spare: usize, timeout: Duration) -> Option<ThrottleGuard<'_>> {
         let limit = self.max.saturating_sub(spare);
-        let count = self.state.safe_lock();
-        let (mut count, _) = self.cv
-            .wait_timeout_while(count, timeout, |c| *c >= limit)
+        let st = self.state.safe_lock();
+        let (mut st, _) = self.cv
+            .wait_timeout_while(st, timeout, |s| s.in_use >= limit)
             .unwrap_or_else(|e| e.into_inner());
-        if *count >= limit {
+        if st.in_use >= limit {
             return None;
         }
-        *count += 1;
-        Some(ThrottleGuard { throttle: self })
+        let slot = st.take();
+        Some(ThrottleGuard { throttle: self, slot })
     }
 
     pub fn acquire(&self) -> ThrottleGuard<'_> {
-        let mut count = self.state.safe_lock();
-        if *count >= self.max {
+        let mut st = self.state.safe_lock();
+        if st.in_use >= self.max {
             let t = Instant::now();
-            while *count >= self.max {
-                count = self.cv.wait(count).unwrap();
+            while st.in_use >= self.max {
+                st = self.cv.wait(st).unwrap();
             }
             let waited = t.elapsed();
             if waited.as_millis() > 5 {
-                log::debug!("throttle: waited {:?} for slot (in_flight={})", waited, *count);
+                log::debug!("throttle: waited {:?} for slot (in_flight={})", waited, st.in_use);
             }
         }
-        *count += 1;
-        ThrottleGuard { throttle: self }
+        let slot = st.take();
+        ThrottleGuard { throttle: self, slot }
     }
 }
 
 impl Drop for ThrottleGuard<'_> {
     fn drop(&mut self) {
-        let mut count = self.throttle.state.safe_lock();
-        *count -= 1;
+        let mut st = self.throttle.state.safe_lock();
+        st.busy[self.slot] = false;
+        st.in_use -= 1;
         // notify_all, not notify_one: waiters no longer share one predicate (an
         // `acquire_leaving` caller needs more than one free slot), so the single
         // waiter notify_one picked could be one that goes straight back to sleep,
@@ -1477,7 +1507,7 @@ fn open_file_timeout(
     } else {
         Box::new(dest)
     };
-    conn.backend.download_file(&path, &mut *writer, DOWNLOAD_TIMEOUT)
+    conn.backend.download_file(&path, &mut *writer, DOWNLOAD_TIMEOUT, _permit.slot())
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
@@ -3401,76 +3431,87 @@ impl NextCloudFs {
         // every request fails at the transport layer and the daemon mistakes that for
         // "server unreachable". The HTTP/2 pair is the escape hatch the connectivity
         // probe demotes to; see `http_clients`.
-        let build_pair = |http3: bool| -> Result<(reqwest::blocking::Client, reqwest::blocking::Client), String> {
+        //
+        // The read side is not one client but DOWNLOAD_CONNECTIONS of them, one per
+        // `read_throttle` slot (see `http_clients::DOWNLOAD_CONNECTIONS`): reqwest's
+        // h3 pool keeps a single QUIC connection per host, so one client meant every
+        // download shared one congestion controller, one UDP socket and one runtime
+        // thread. They are built here, once, and live as long as the mount.
+        let build_pair = |http3: bool| -> Result<(reqwest::blocking::Client, Vec<reqwest::blocking::Client>), String> {
             let mut meta = reqwest::blocking::Client::builder()
                 .pool_max_idle_per_host(16)
                 .connect_timeout(CONNECT_TIMEOUT);
-            // `timeout` here is the per-operation stall bound, not a total deadline;
-            // see READ_STALL_TIMEOUT for why it must live on the client.
-            let mut read = reqwest::blocking::Client::builder()
-                .pool_max_idle_per_host(0)
-                .tcp_nodelay(true)
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(READ_STALL_TIMEOUT);
             if http3 {
                 meta = meta.http3_prior_knowledge();
-                // The h3 pool ignores pool_max_idle_per_host and connect_timeout
-                // never reaches the QUIC connector, so the TCP read client's
-                // "connect fresh so a dead path fails in seconds" trick has no QUIC
-                // equivalent. It used to be approximated with `pool_idle_timeout(1s)`,
-                // which made every window of a rate-limited reader (a media player)
-                // pay a fresh QUIC+TLS handshake (120-280 ms to this server) and a
-                // new slow start. Worse, reqwest 0.13's h3 pool stamps a connection's
-                // idle clock when it is *checked out*, not when the request ends, so
-                // even a connection busy streaming for over a second counted as
-                // expired at the next window.
-                //
-                // That fail-fast guarantee now comes from the read path itself: the
-                // client-level READ_STALL_TIMEOUT bounds the header wait and every
-                // body read, FIRST_BYTES_DEADLINE bounds what a READ waits for, and a
-                // stalled window aborts and resumes on a fresh request. So warm
-                // connections — and their congestion state — are kept for just under
-                // `http3_max_idle_timeout`, past which quinn would close them anyway.
-                // (reqwest exposes no QUIC keep-alive, so an idle connection does
-                // expire after 30 s of silence; the pool drops it as invalid.)
-                //
-                // `http3_max_idle_timeout` used to also be set to 5s here, to
-                // reproduce the TCP connect_timeout's fail-fast bound. But unlike
-                // connect_timeout — which only bounds the connect phase —
-                // max_idle_timeout governs an *already-established* connection's
-                // tolerance for silence in either direction for its entire
-                // lifetime. At 5s, any gap that long during an active read-ahead
-                // stream (a slow server response under load, a brief network
-                // hiccup, this process not being scheduled promptly for a few
-                // seconds) tore down an otherwise-healthy QUIC connection —
-                // observed live as "read-ahead stream broke: request or response
-                // body error" during ordinary playback, not just on a dead path.
-                // quinn's own upstream default is 30s (`quinn_proto::TransportConfig`),
-                // which is also what Chrome's QUIC stack uses; restoring that
-                // gives a real connection enough slack to survive realistic
-                // jitter without materially weakening dead-path detection — the
-                // periodic connectivity probe (see `http_clients`/offline
-                // handling) doesn't depend on any single read's timeout, and a
-                // still-broken stream now retries in-process (see the read-ahead
-                // body loop) instead of surfacing straight to the caller.
-                //
-                // The stream receive window is also bumped: quinn's default
-                // (~1.25 MB, sized for 100 Mbps at 100 ms RTT) can rate-limit a
-                // single stream below what a 64 MiB read-ahead window wants on a
-                // higher-RTT path. BBR is a better fit than the default CUBIC for
-                // exactly this kind of path (real-world jitter / non-congestion
-                // loss, which CUBIC misreads as congestion and backs off from
-                // unnecessarily).
-                read = read.http3_prior_knowledge()
-                    .pool_idle_timeout(H3_READ_POOL_IDLE)
-                    .http3_max_idle_timeout(H3_MAX_IDLE)
-                    .http3_stream_receive_window(4 * 1024 * 1024)
-                    .http3_congestion_bbr();
             }
-            Ok((
-                meta.build().map_err(|e| format!("HTTP client: {}", e))?,
-                read.build().map_err(|e| format!("HTTP read client: {}", e))?,
-            ))
+            // `timeout` here is the per-operation stall bound, not a total deadline;
+            // see READ_STALL_TIMEOUT for why it must live on the client.
+            let read_builder = || {
+                let mut read = reqwest::blocking::Client::builder()
+                    .pool_max_idle_per_host(0)
+                    .tcp_nodelay(true)
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .timeout(READ_STALL_TIMEOUT);
+                if http3 {
+                    // The h3 pool ignores pool_max_idle_per_host and connect_timeout
+                    // never reaches the QUIC connector, so the TCP read client's
+                    // "connect fresh so a dead path fails in seconds" trick has no QUIC
+                    // equivalent. It used to be approximated with `pool_idle_timeout(1s)`,
+                    // which made every window of a rate-limited reader (a media player)
+                    // pay a fresh QUIC+TLS handshake (120-280 ms to this server) and a
+                    // new slow start. Worse, reqwest 0.13's h3 pool stamps a connection's
+                    // idle clock when it is *checked out*, not when the request ends, so
+                    // even a connection busy streaming for over a second counted as
+                    // expired at the next window.
+                    //
+                    // That fail-fast guarantee now comes from the read path itself: the
+                    // client-level READ_STALL_TIMEOUT bounds the header wait and every
+                    // body read, FIRST_BYTES_DEADLINE bounds what a READ waits for, and a
+                    // stalled window aborts and resumes on a fresh request. So warm
+                    // connections — and their congestion state — are kept for just under
+                    // `http3_max_idle_timeout`, past which quinn would close them anyway.
+                    // (reqwest exposes no QUIC keep-alive, so an idle connection does
+                    // expire after 30 s of silence; the pool drops it as invalid.)
+                    //
+                    // `http3_max_idle_timeout` used to also be set to 5s here, to
+                    // reproduce the TCP connect_timeout's fail-fast bound. But unlike
+                    // connect_timeout — which only bounds the connect phase —
+                    // max_idle_timeout governs an *already-established* connection's
+                    // tolerance for silence in either direction for its entire
+                    // lifetime. At 5s, any gap that long during an active read-ahead
+                    // stream (a slow server response under load, a brief network
+                    // hiccup, this process not being scheduled promptly for a few
+                    // seconds) tore down an otherwise-healthy QUIC connection —
+                    // observed live as "read-ahead stream broke: request or response
+                    // body error" during ordinary playback, not just on a dead path.
+                    // quinn's own upstream default is 30s (`quinn_proto::TransportConfig`),
+                    // which is also what Chrome's QUIC stack uses; restoring that
+                    // gives a real connection enough slack to survive realistic
+                    // jitter without materially weakening dead-path detection — the
+                    // periodic connectivity probe (see `http_clients`/offline
+                    // handling) doesn't depend on any single read's timeout, and a
+                    // still-broken stream now retries in-process (see the read-ahead
+                    // body loop) instead of surfacing straight to the caller.
+                    //
+                    // The stream receive window is also bumped: quinn's default
+                    // (~1.25 MB, sized for 100 Mbps at 100 ms RTT) can rate-limit a
+                    // single stream below what a 64 MiB read-ahead window wants on a
+                    // higher-RTT path. BBR is a better fit than the default CUBIC for
+                    // exactly this kind of path (real-world jitter / non-congestion
+                    // loss, which CUBIC misreads as congestion and backs off from
+                    // unnecessarily).
+                    read = read.http3_prior_knowledge()
+                        .pool_idle_timeout(H3_READ_POOL_IDLE)
+                        .http3_max_idle_timeout(H3_MAX_IDLE)
+                        .http3_stream_receive_window(4 * 1024 * 1024)
+                        .http3_congestion_bbr();
+                }
+                read
+            };
+            let reads = (0..crate::http_clients::DOWNLOAD_CONNECTIONS)
+                .map(|_| read_builder().build().map_err(|e| format!("HTTP read client: {}", e)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((meta.build().map_err(|e| format!("HTTP client: {}", e))?, reads))
         };
         let (http_h2, http_read_h2) = build_pair(false)?;
         let (http_pref, http_read_pref) = if use_http3 {
@@ -3519,7 +3560,9 @@ impl NextCloudFs {
             clients,
             offline_since: Arc::new(Mutex::new(options.offline.then(Instant::now))),
             throttle: Arc::new(Throttle::new(max_req)),
-            read_throttle: Arc::new(Throttle::new(3)),
+            // One slot per read client: a slot's index picks its connection, so a
+            // connection is never shared by two concurrent downloads.
+            read_throttle: Arc::new(Throttle::new(crate::http_clients::DOWNLOAD_CONNECTIONS)),
             prefetch_throttle: Arc::new(Throttle::new(5)),
             is_offline,
             optimistic_listing: options.optimistic_listing,
@@ -5791,7 +5834,7 @@ impl Filesystem for NextCloudFs {
             } else {
                 None
             };
-            match do_range_read_stream(&conn, &path, off, fetch, use_throttle, 0, Instant::now() + RANGE_OPEN_BUDGET) {
+            match do_range_read_stream(&conn, &path, off, fetch, Slot::Take { spare: 0 }, Instant::now() + RANGE_OPEN_BUDGET) {
                 Ok((mut resp, _permit)) => {
                     let t0 = Instant::now();
                     // The authoritative current size, read from the response headers
@@ -5893,10 +5936,9 @@ impl Filesystem for NextCloudFs {
                                 shared: &shared,
                                 start: off,
                                 target: fetch,
-                                throttle: use_throttle,
                                 spare: 0,
                             }
-                            .run(resp, _permit);
+                            .run(resp, Some(_permit));
                             let (ref mtx, _) = *shared;
                             let total_ms = t0.elapsed().as_millis();
                             if total_ms > 0 {
@@ -7287,22 +7329,31 @@ fn webdav_file_url(base: &str, remote_path: &Path) -> String {
     format!("{}/{}", base.trim_end_matches('/'), encoded)
 }
 
+/// The `read_throttle` slot a range request goes out on.
+enum Slot<'a> {
+    /// Take one (timed, see `do_range_read_stream`), leaving `spare` free.
+    Take { spare: usize },
+    /// Already taken by the caller, who sized the request knowing it had this slot.
+    /// Used for the first attempt; a retry gives it back and takes one like `Take`.
+    Held { permit: ThrottleGuard<'a>, spare: usize },
+}
+
 /// Opens a range GET for `size` bytes at `offset`, retrying transport failures.
 ///
-/// With `throttle`, each attempt holds a `read_throttle` slot, taken with a
-/// timeout while at least `spare` other slots stay free (0 for a foreground
+/// Every attempt holds a `read_throttle` slot and goes out on that slot's own read
+/// client, so it never shares a connection with another download. Slots are taken
+/// with a timeout while at least `spare` others stay free (0 for a foreground
 /// read). Everything here — slot waits, attempts, backoff — is bounded by
-/// `deadline`, so a caller holding a FUSE reply always gets an answer; running
-/// out of slots returns [`READ_SLOTS_BUSY_ERR`].
+/// `deadline`, so a caller holding a FUSE reply always gets an answer; running out
+/// of slots returns [`READ_SLOTS_BUSY_ERR`].
 fn do_range_read_stream<'a>(
     conn: &'a ConnInfo,
     path: &Path,
     offset: u64,
     size: usize,
-    throttle: bool,
-    spare: usize,
+    slot: Slot<'a>,
     deadline: Instant,
-) -> Result<(reqwest::blocking::Response, Option<ThrottleGuard<'a>>), String> {
+) -> Result<(reqwest::blocking::Response, ThrottleGuard<'a>), String> {
     // Offline is not a verdict on this read yet: give a blip the remainder of the
     // grace window to clear before refusing, and refuse with a *transient* error so
     // callers retry instead of treating the file as unreadable.
@@ -7312,24 +7363,29 @@ fn do_range_read_stream<'a>(
     let url = webdav_file_url(&conn.webdav_url, path);
     let end = offset + size as u64 - 1;
     let mut delay = Duration::from_millis(500);
+    let (mut held, spare) = match slot {
+        Slot::Take { spare } => (None, spare),
+        Slot::Held { permit, spare } => (Some(permit), spare),
+    };
     for attempt in 0u32..=2 {
         // Timed, never `acquire()`: an untimed wait here left READs unanswered for
         // good once every slot's holder was itself stuck.
-        let permit = if throttle {
-            let wait = READ_SLOT_WAIT.min(deadline.saturating_duration_since(Instant::now()));
-            match conn.read_throttle.acquire_leaving(spare, wait) {
-                Some(p) => Some(p),
-                None => return Err(READ_SLOTS_BUSY_ERR.into()),
+        let permit = match held.take() {
+            Some(p) => p,
+            None => {
+                let wait = READ_SLOT_WAIT.min(deadline.saturating_duration_since(Instant::now()));
+                match conn.read_throttle.acquire_leaving(spare, wait) {
+                    Some(p) => p,
+                    None => return Err(READ_SLOTS_BUSY_ERR.into()),
+                }
             }
-        } else {
-            None
         };
         // Re-read the client each attempt so a demotion to HTTP/2 (see `http_clients`)
         // takes effect on the retry rather than only on the next read.
         //
         // No `.timeout()`: that would also be a total deadline on the body. The read
         // client's READ_STALL_TIMEOUT bounds the header wait and every body read.
-        let req = conn.clients.read()
+        let req = conn.clients.read(permit.slot())
             .get(&url)
             .header("Range", format!("bytes={}-{}", offset, end));
         match conn.creds.apply(req).send() {
@@ -7397,9 +7453,8 @@ struct WindowPump<'a> {
     start: u64,
     /// Bytes the window was asked to hold.
     target: usize,
-    /// Whether resume requests take a `read_throttle` slot, and how many slots
-    /// they must leave free (see `do_range_read_stream`).
-    throttle: bool,
+    /// How many `read_throttle` slots resume requests must leave free (see
+    /// `do_range_read_stream`).
     spare: usize,
 }
 
@@ -7487,12 +7542,12 @@ impl<'a> WindowPump<'a> {
                         thread::sleep(Duration::from_millis(300 * retries as u64));
                     }
                     let deadline = Instant::now() + RANGE_OPEN_BUDGET;
-                    match do_range_read_stream(self.conn, self.path, self.start + have, remaining as usize, self.throttle, self.spare, deadline) {
+                    match do_range_read_stream(self.conn, self.path, self.start + have, remaining as usize, Slot::Take { spare: self.spare }, deadline) {
                         // Only a 206 is the tail we asked for. A 200 is the whole file
                         // from byte 0, and appending it here would corrupt the window.
                         Ok((new_resp, new_permit)) if new_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
                             resp = Some(new_resp);
-                            _permit = new_permit;
+                            _permit = Some(new_permit);
                         }
                         Ok((new_resp, _)) => {
                             log::warn!("read-ahead resume for {} got {} instead of 206, giving up", self.path.display(), new_resp.status());
@@ -7555,7 +7610,7 @@ fn run_lookahead(
         return;
     }
     let deadline = Instant::now() + LOOKAHEAD_OPEN_BUDGET;
-    let (resp, permit) = match do_range_read_stream(conn, path, plan.start, plan.len, true, LOOKAHEAD_SPARE_SLOTS, deadline) {
+    let (resp, permit) = match do_range_read_stream(conn, path, plan.start, plan.len, Slot::Take { spare: LOOKAHEAD_SPARE_SLOTS }, deadline) {
         // Only a 206 is the window asked for; a 200 would be the file from byte 0.
         Ok((r, p)) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => (r, p),
         Ok((r, _)) => {
@@ -7609,10 +7664,9 @@ fn run_lookahead(
         shared: &shared,
         start: plan.start,
         target: plan.len,
-        throttle: true,
         spare: LOOKAHEAD_SPARE_SLOTS,
     }
-    .run(resp, permit);
+    .run(resp, Some(permit));
     log::debug!("look-ahead {} at {}: {} of {} bytes", path.display(), plan.start, total, plan.len);
 }
 
