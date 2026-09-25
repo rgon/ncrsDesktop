@@ -11,8 +11,11 @@
 //! and its format, but hands each formatted record to a bounded queue instead
 //! of stderr. The `log` service writes the queue out. A record that finds the
 //! queue full is dropped and counted, and the writer reports the count in one
-//! line once it catches up: a caller never waits for the sink. [`flush`]
-//! waits, bounded, for what is queued to be written, for the exit paths.
+//! line once it catches up: a caller never waits for the sink. Once the queue
+//! is three quarters full, only warnings and errors are still taken, so a
+//! debug storm cannot crowd out the lines that say what went wrong. [`flush`]
+//! waits, bounded, for what is queued to be written, for the exit paths and
+//! for a panic (the hook [`init`] installs).
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,10 +26,21 @@ use std::time::{Duration, Instant};
 /// Records the queue holds before a new one is dropped.
 pub const QUEUE_LINES: usize = 8192;
 
+/// How long a panic waits for queued log lines to reach stderr.
+const PANIC_FLUSH_WAIT: Duration = Duration::from_millis(250);
+
+thread_local! {
+    // The level of the record `Leveled` is handing to env_logger on this
+    // thread, for `QueueWriter`, which only sees the formatted bytes. A write
+    // from anywhere else counts as a warning: kept unless the queue is full.
+    static RECORD_LEVEL: std::cell::Cell<log::Level> = const { std::cell::Cell::new(log::Level::Warn) };
+}
+
 /// The shared side of the queue: what callers push into and what `flush`
 /// waits on.
 pub struct LogQueue {
     tx: SyncSender<Vec<u8>>,
+    capacity: usize,
     /// Pushed and not yet written.
     pending: Mutex<usize>,
     written: Condvar,
@@ -41,14 +55,25 @@ impl LogQueue {
     /// A queue of `capacity` records and the receiving end its writer drains.
     pub fn new(capacity: usize) -> (Arc<LogQueue>, Receiver<Vec<u8>>) {
         let (tx, rx) = sync_channel(capacity);
-        let q = LogQueue { tx, pending: Mutex::new(0), written: Condvar::new(), unreported: AtomicU64::new(0), dropped: AtomicU64::new(0), closed: Default::default() };
+        let q = LogQueue { tx, capacity, pending: Mutex::new(0), written: Condvar::new(), unreported: AtomicU64::new(0), dropped: AtomicU64::new(0), closed: Default::default() };
         (Arc::new(q), rx)
     }
 
-    /// Queues one record, or drops it when the queue is full. Never blocks
-    /// on the writer (the `pending` lock is only ever held for a counter update).
-    pub fn push(&self, line: Vec<u8>) {
-        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    /// Queues one record of `level`, or drops it: any record when the queue
+    /// is full, and one less severe than a warning once it is three quarters
+    /// full. Never blocks on the writer (the `pending` lock is only ever held
+    /// for a counter update).
+    pub fn push(&self, level: log::Level, line: Vec<u8>) {
+        {
+            let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if level > log::Level::Warn && *p * 4 >= self.capacity * 3 {
+                drop(p);
+                self.unreported.fetch_add(1, Ordering::Relaxed);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            *p += 1;
+        }
         match self.tx.try_send(line) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
@@ -143,13 +168,46 @@ struct QueueWriter(Arc<LogQueue>);
 
 impl Write for QueueWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.push(buf.to_vec());
+        self.0.push(RECORD_LEVEL.with(|l| l.get()), buf.to_vec());
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// env_logger's logger, telling `QueueWriter` each record's level.
+struct Leveled(env_logger::Logger);
+
+impl log::Log for Leveled {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.0.matches(record) {
+            return;
+        }
+        let before = RECORD_LEVEL.with(|l| l.replace(record.level()));
+        self.0.log(record);
+        RECORD_LEVEL.with(|l| l.set(before));
+    }
+
+    fn flush(&self) {
+        self.0.flush()
+    }
+}
+
+/// Installs a panic hook that runs the one there was, then `flush`: the
+/// lines queued before a panic that ends the process reach stderr first
+/// (bounded by what `flush` waits).
+fn chain_panic_flush(flush: impl Fn() + Send + Sync + 'static) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        flush();
+    }));
 }
 
 static QUEUE: OnceLock<Arc<LogQueue>> = OnceLock::new();
@@ -169,7 +227,12 @@ pub fn init(default_filter: &str) {
         builder.target(env_logger::Target::Pipe(Box::new(QueueWriter(queue.clone()))));
         let _ = QUEUE.set(queue);
     }
-    builder.init();
+    let logger = builder.build();
+    let max = logger.filter();
+    if log::set_boxed_logger(Box::new(Leveled(logger))).is_ok() {
+        log::set_max_level(max);
+    }
+    chain_panic_flush(|| flush(PANIC_FLUSH_WAIT));
 }
 
 /// Waits, at most `timeout`, for queued log lines to reach stderr. For exit
@@ -220,7 +283,7 @@ mod tests {
                 rep.fetch_add(n, Ordering::Relaxed);
             }));
             // The writer is inside its first write, holding one record.
-            q.push(b"first\n".to_vec());
+            q.push(log::Level::Warn, b"first\n".to_vec());
             entered.recv().unwrap();
             let t = Instant::now();
             let callers: Vec<_> = (0..4)
@@ -228,7 +291,7 @@ mod tests {
                     let q = q.clone();
                     s.spawn(move || {
                         for i in 0..250 {
-                            q.push(format!("{c}-{i}\n").into_bytes());
+                            q.push(log::Level::Warn, format!("{c}-{i}\n").into_bytes());
                         }
                     })
                 })
@@ -275,5 +338,117 @@ mod tests {
         let got = String::from_utf8(got.lock().unwrap().clone()).unwrap();
         let want: String = (0..5000).map(|i| format!("[line {i}] x\n")).collect();
         assert_eq!(got, want);
+    }
+
+    /// A queue of `cap` whose writer is stuck inside its first write, holding
+    /// one warning: what the tests below push into.
+    fn stuck(cap: usize, f: impl FnOnce(&Arc<LogQueue>)) -> String {
+        let (q, rx) = LogQueue::new(cap);
+        let (release, gate) = channel();
+        let (entered_tx, entered) = channel();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        std::thread::scope(|s| {
+            let sink = Sink { got: got.clone(), gate: Some((entered_tx, gate)) };
+            let qd = q.clone();
+            s.spawn(move || qd.drain(rx, sink, |_| {}));
+            q.push(log::Level::Warn, b"first\n".to_vec());
+            entered.recv().unwrap();
+            f(&q);
+            release.send(()).unwrap();
+            assert!(q.flush(Duration::from_secs(5)));
+            q.close();
+        });
+        let got = String::from_utf8(got.lock().unwrap().clone()).unwrap();
+        got
+    }
+
+    #[test]
+    fn past_three_quarters_full_only_warnings_and_errors_are_queued() {
+        let got = stuck(8, |q| {
+            // 1 of 8 held by the writer: debug and info fill it to 6 of 8.
+            for i in 0..20 {
+                let level = if i % 2 == 0 { log::Level::Debug } else { log::Level::Info };
+                q.push(level, format!("chatter {i}\n").into_bytes());
+            }
+            assert_eq!(q.dropped(), 15, "chatter queued past three quarters");
+            // Warnings and errors still take the rest, until the queue is full.
+            q.push(log::Level::Trace, b"trace\n".to_vec());
+            q.push(log::Level::Warn, b"warn\n".to_vec());
+            q.push(log::Level::Error, b"error\n".to_vec());
+            q.push(log::Level::Error, b"error 2\n".to_vec());
+            q.push(log::Level::Error, b"lost: full\n".to_vec());
+            assert_eq!(q.dropped(), 15 + 2);
+        });
+        let lines: Vec<&str> = got.lines().collect();
+        assert_eq!(lines, ["first", "chatter 0", "chatter 1", "chatter 2", "chatter 3", "chatter 4", "warn", "error", "error 2"]);
+    }
+
+    #[test]
+    fn the_logger_tells_the_queue_each_records_level() {
+        use log::Log;
+        let got = stuck(4, |q| {
+            let logger = Leveled(
+                env_logger::Builder::new()
+                    .filter_level(log::LevelFilter::Trace)
+                    .format(|f, r| writeln!(f, "{} {}", r.level(), r.args()))
+                    .target(env_logger::Target::Pipe(Box::new(QueueWriter(q.clone()))))
+                    .build(),
+            );
+            // 1 of 4 held, so the queue is at the three-quarter mark after two more.
+            logger.log(&log::Record::builder().level(log::Level::Info).args(format_args!("a")).build());
+            logger.log(&log::Record::builder().level(log::Level::Info).args(format_args!("b")).build());
+            logger.log(&log::Record::builder().level(log::Level::Debug).args(format_args!("dropped")).build());
+            logger.log(&log::Record::builder().level(log::Level::Error).args(format_args!("kept")).build());
+            assert_eq!(q.dropped(), 1);
+        });
+        assert_eq!(got, "first\nINFO a\nINFO b\nERROR kept\n");
+    }
+
+    #[test]
+    fn a_panic_flushes_the_queue_after_running_the_previous_hook() {
+        // The hook is process-wide: other tests' panics meanwhile go through
+        // it too, which only runs a counter and a flush of this queue.
+        let (q, rx) = LogQueue::new(QUEUE_LINES);
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let previous_ran = Arc::new(AtomicU64::new(0));
+        let original = std::panic::take_hook();
+        std::thread::scope(|s| {
+            let sink = Sink { got: got.clone(), gate: None };
+            let qd = q.clone();
+            // A slow sink: each batch takes a while to reach it.
+            struct Slow(Sink);
+            impl Write for Slow {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    std::thread::sleep(Duration::from_millis(20));
+                    self.0.write(buf)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            s.spawn(move || qd.drain(rx, Slow(sink), |_| {}));
+            let ran = previous_ran.clone();
+            std::panic::set_hook(Box::new(move |_| {
+                ran.fetch_add(1, Ordering::SeqCst);
+            }));
+            let fq = q.clone();
+            chain_panic_flush(move || {
+                fq.flush(Duration::from_secs(5));
+            });
+            for i in 0..50 {
+                q.push(log::Level::Error, format!("before the panic {i}\n").into_bytes());
+            }
+            let got_at_panic = got.clone();
+            let panicked = s.spawn(move || -> usize {
+                let seen = std::panic::catch_unwind(|| panic!("boom")).is_err();
+                assert!(seen);
+                // The hook ran (and returned) before the unwind got here.
+                String::from_utf8(got_at_panic.lock().unwrap().clone()).unwrap().lines().count()
+            });
+            assert_eq!(panicked.join().unwrap(), 50, "the panic hook returned before the queued lines were written");
+            q.close();
+        });
+        std::panic::set_hook(original);
+        assert!(previous_ran.load(Ordering::SeqCst) >= 1, "the previous hook was not chained");
     }
 }
