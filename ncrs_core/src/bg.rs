@@ -16,13 +16,21 @@
 //! the caller's thread, where it can still pick a fallback (serve the cache,
 //! reply EAGAIN, drop a background refresh).
 //!
-//! Workers start lazily and exit when their queue is empty, so an idle daemon
-//! holds no pool threads at all.
+//! Workers start lazily and exit once their queue has stayed empty for
+//! [`LINGER`], so an idle daemon holds no pool threads at all. The linger
+//! keeps a request-by-request stream (a sequential writer's `write()`s on
+//! `DISK`, each submitted only after the previous one was answered) on one
+//! warm worker instead of starting a thread per request.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// How long a worker whose queue ran dry waits for the next job before it
+/// exits.
+pub const LINGER: Duration = Duration::from_millis(50);
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -32,10 +40,15 @@ pub struct Pool {
     max_workers: usize,
     queue_cap: usize,
     state: Mutex<State>,
+    // Wakes a lingering worker for a job queued for it.
+    work_ready: Condvar,
 }
 
 struct State {
+    // Workers alive, lingering ones included.
     active: usize,
+    // Of those, lingering: waiting on `work_ready` for a job.
+    idle: usize,
     queue: VecDeque<Job>,
     peak_active: usize,
     peak_queued: usize,
@@ -78,8 +91,10 @@ impl Pool {
             name,
             max_workers,
             queue_cap,
+            work_ready: Condvar::new(),
             state: Mutex::new(State {
                 active: 0,
+                idle: 0,
                 queue: VecDeque::new(),
                 peak_active: 0,
                 peak_queued: 0,
@@ -99,6 +114,13 @@ impl Pool {
     pub fn submit(&'static self, job: impl FnOnce() + Send + 'static) -> Result<(), Rejected> {
         let job: Job = Box::new(job);
         let mut st = self.lock();
+        // A lingering worker with nothing queued ahead for it takes it.
+        if st.idle > st.queue.len() {
+            st.queue.push_back(job);
+            drop(st);
+            self.work_ready.notify_one();
+            return Ok(());
+        }
         if st.active < self.max_workers {
             st.active += 1;
             st.peak_active = st.peak_active.max(st.active);
@@ -183,14 +205,21 @@ impl Pool {
                 st.panicked += 1;
                 log::error!("{} pool: a job panicked; the worker carries on", self.name);
             }
-            match st.queue.pop_front() {
-                Some(next) => job = next,
-                None => {
+            let linger_until = Instant::now() + LINGER;
+            job = loop {
+                if let Some(next) = st.queue.pop_front() {
+                    break next;
+                }
+                let left = linger_until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
                     st.active -= 1;
                     slot.1 = false;
                     return;
                 }
-            }
+                st.idle += 1;
+                st = self.work_ready.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+                st.idle -= 1;
+            };
         }
     }
 
@@ -549,6 +578,23 @@ mod tests {
         p.submit(move || r.store(true, Ordering::SeqCst)).unwrap();
         wait_idle(p);
         assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_request_by_request_stream_stays_on_a_lingering_worker() {
+        // Like a sequential writer on DISK: each job is submitted only once the
+        // previous one finished. Without the linger every job started a thread.
+        let p = leak(Pool::new("t-linger", 4, 16));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            p.submit(move || tx.send(std::thread::current().id()).unwrap()).unwrap();
+            seen.insert(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        }
+        // One, unless the host descheduled us past a whole LINGER now and then.
+        assert!(seen.len() <= 10, "{} threads for 200 back-to-back jobs", seen.len());
+        wait_idle(p);
+        assert_eq!(p.stats().active, 0, "a lingering worker still exits");
     }
 
     #[test]
