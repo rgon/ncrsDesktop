@@ -151,6 +151,43 @@ fn effective_dir_ttl(optimistic_listing: bool, notify_push_connected: &AtomicBoo
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a download waits for one of the `read_throttle` slots.
 const DOWNLOAD_SLOT_WAIT: Duration = Duration::from_secs(30);
+
+/// Longest any single operation on the *read* client may go without progress:
+/// waiting for the response headers, or one `Read::read` of a body.
+///
+/// This is what bounds a stalled read-ahead body, and it has to be a client-level
+/// setting. On reqwest 0.13's blocking client a request's own `.timeout()` becomes
+/// both the async *total* deadline for the whole exchange and the bound on each
+/// blocking read call, so a value short enough to catch a stall would also kill a
+/// healthy 64 MB window on a slow link. `blocking::ClientBuilder::timeout`, by
+/// contrast, is never handed to the async client: it only bounds each blocking
+/// wait (`execute_request`, `Response::read`) and resets on every call, which is a
+/// true per-read stall timeout — and, because it sits above the transport, it
+/// holds over QUIC exactly as over TCP. Range streams therefore carry no request
+/// timeout of their own and get this one; `download_file`/`read_file_range` keep
+/// their explicit per-request timeouts, which take precedence over it.
+///
+/// The 0.1.77 hang this closes: four readers on one 256 MB file, one QUIC
+/// connection dies, and every stream's body read fails together.
+const READ_STALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a FUSE READ waits for a `read_throttle` slot before it is answered
+/// EAGAIN. Replaces an untimed `acquire()`, which is how a READ went unanswered
+/// forever (the reader stuck in D state in `folio_wait_bit_common`).
+const READ_SLOT_WAIT: Duration = Duration::from_secs(15);
+/// Budget for opening one range stream: slot waits, attempts and backoff. The
+/// final attempt can overrun it by at most one READ_STALL_TIMEOUT header wait.
+const RANGE_OPEN_BUDGET: Duration = Duration::from_secs(30);
+/// Budget for the bytes a READ is actually waiting for, once headers are in.
+const FIRST_BYTES_DEADLINE: Duration = Duration::from_secs(30);
+/// Longest a job may sit in the `read` pool's queue and still be worth running.
+/// Past this the kernel has waited long enough; answer EAGAIN and move on, so a
+/// backlog drains in bounded time instead of each queued read doing its full wait.
+const READ_QUEUE_MAX_WAIT: Duration = Duration::from_secs(30);
+/// Error `do_range_read_stream` returns when no `read_throttle` slot freed up in
+/// time. Deliberately matches neither `is_transient_network_err` nor
+/// `is_timeout_err`: a busy daemon is not an unreachable server, so it must not
+/// flip the mount offline or fall back to a whole-file download.
+const READ_SLOTS_BUSY_ERR: &str = "range read: all read slots busy";
 // Bounds only the TCP/TLS connect phase, independent of the (longer) per-request
 // body timeouts. Keeps a legitimately slow large download alive while making a
 // dead network surface in seconds instead of after the full request timeout.
@@ -206,11 +243,22 @@ impl Throttle {
 
     /// For callers on the FUSE dispatch thread, which must never wait unbounded for a slot.
     pub fn acquire_timeout(&self, timeout: Duration) -> Option<ThrottleGuard<'_>> {
+        self.acquire_leaving(0, timeout)
+    }
+
+    /// Like [`acquire_timeout`](Self::acquire_timeout), but only takes a slot while
+    /// at least `spare` others stay free afterwards.
+    ///
+    /// For speculative work (a sequential reader's look-ahead window) that must
+    /// never be the reason a foreground read waits for a slot: it only runs on
+    /// capacity nobody is asking for.
+    pub fn acquire_leaving(&self, spare: usize, timeout: Duration) -> Option<ThrottleGuard<'_>> {
+        let limit = self.max.saturating_sub(spare);
         let count = self.state.safe_lock();
         let (mut count, _) = self.cv
-            .wait_timeout_while(count, timeout, |c| *c >= self.max)
+            .wait_timeout_while(count, timeout, |c| *c >= limit)
             .unwrap_or_else(|e| e.into_inner());
-        if *count >= self.max {
+        if *count >= limit {
             return None;
         }
         *count += 1;
@@ -238,7 +286,11 @@ impl Drop for ThrottleGuard<'_> {
     fn drop(&mut self) {
         let mut count = self.throttle.state.safe_lock();
         *count -= 1;
-        self.throttle.cv.notify_one();
+        // notify_all, not notify_one: waiters no longer share one predicate (an
+        // `acquire_leaving` caller needs more than one free slot), so the single
+        // waiter notify_one picked could be one that goes straight back to sleep,
+        // leaving a foreground read that *could* have run parked until its timeout.
+        self.throttle.cv.notify_all();
     }
 }
 
@@ -1183,7 +1235,21 @@ pub(crate) fn notify_later(job: impl FnOnce() + Send + 'static) {
 
 /// Runs a read that has to wait for bytes off the FUSE dispatch thread. When
 /// the read pool is full the kernel gets EAGAIN rather than an unbounded thread.
+///
+/// A job that only starts after sitting in the queue for READ_QUEUE_MAX_WAIT is
+/// answered EAGAIN instead of run: every job ahead of it is itself bounded, so
+/// this caps how long any queued READ can go unanswered.
 fn run_read_job(reply: ReplyData, job: impl FnOnce(ReplyData) + Send + 'static) {
+    let queued_at = Instant::now();
+    let job = move |reply: ReplyData| {
+        let waited = queued_at.elapsed();
+        if waited > READ_QUEUE_MAX_WAIT {
+            log::warn!("read job waited {:?} in the queue — answering EAGAIN", waited);
+            reply.error(Errno::EAGAIN);
+            return;
+        }
+        job(reply)
+    };
     if let Err((_, reply)) = bg::READ.submit_owning(reply, job) {
         reply.error(Errno::EAGAIN);
     }
@@ -3191,10 +3257,13 @@ impl NextCloudFs {
             let mut meta = reqwest::blocking::Client::builder()
                 .pool_max_idle_per_host(16)
                 .connect_timeout(CONNECT_TIMEOUT);
+            // `timeout` here is the per-operation stall bound, not a total deadline;
+            // see READ_STALL_TIMEOUT for why it must live on the client.
             let mut read = reqwest::blocking::Client::builder()
                 .pool_max_idle_per_host(0)
                 .tcp_nodelay(true)
-                .connect_timeout(CONNECT_TIMEOUT);
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(READ_STALL_TIMEOUT);
             if http3 {
                 meta = meta.http3_prior_knowledge();
                 // The h3 pool ignores pool_max_idle_per_host and connect_timeout
@@ -5485,8 +5554,8 @@ impl Filesystem for NextCloudFs {
             } else {
                 None
             };
-            match do_range_read_stream(&conn, &path, off, fetch, use_throttle) {
-                Ok((mut resp, mut _permit)) => {
+            match do_range_read_stream(&conn, &path, off, fetch, use_throttle, 0, Instant::now() + RANGE_OPEN_BUDGET) {
+                Ok((mut resp, _permit)) => {
                     let t0 = Instant::now();
                     // The authoritative current size, read from the response headers
                     // before the body is consumed (see the reconciliation after
@@ -5496,7 +5565,7 @@ impl Filesystem for NextCloudFs {
                         .and_then(|v| v.to_str().ok())
                         .and_then(parse_content_range_total)
                         .or_else(|| if off == 0 { resp.content_length() } else { None });
-                    match read_exact_from_stream(&mut resp, sz) {
+                    match read_exact_from_stream(&mut resp, sz, Instant::now() + FIRST_BYTES_DEADLINE) {
                         Ok(first) => {
                             // Content-Range is authoritative for the file's length, with
                             // the dir-cache size as fallback. A body that stops before
@@ -5572,82 +5641,20 @@ impl Filesystem for NextCloudFs {
                                     target_len: fetch as u64,
                                 });
                             });
-                            let (ref mtx, ref cv) = *shared;
-                            let mut chunk = [0u8; 256 * 1024];
-                            let mut since_check = 0usize;
-                            // A body read error mid-stream is usually a transient blip
-                            // (dropped connection, reset stream) rather than the server
-                            // actually having nothing left to give — resume with a fresh
-                            // Range request for exactly the missing tail instead of
-                            // giving up immediately. Readers parked on this window would
-                            // otherwise get EIO (see the waiters in read()), which every
-                            // player has to notice and recover from itself; VLC in
-                            // particular does this slowly enough to look like a stall.
-                            const MAX_BODY_RETRIES: u32 = 1;
-                            let mut retries = 0u32;
-                            loop {
-                                use std::io::Read;
-                                match resp.read(&mut chunk) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        mtx.lock().unwrap().data.extend_from_slice(&chunk[..n]);
-                                        cv.notify_all();
-                                        since_check += n;
-                                        if since_check >= 2 * 1024 * 1024 {
-                                            since_check = 0;
-                                            if let Ok(mut tm) = tmap.lock() {
-                                                if let Some(tp) = tm.get_mut(&path) {
-                                                    tp.bytes_done = mtx.lock().unwrap().data.len() as u64;
-                                                }
-                                            }
-                                            let superseded = open_files.safe_lock()
-                                                .get(&fh.0)
-                                                .and_then(|of| of.buf.as_ref())
-                                                .map_or(true, |b| !Arc::ptr_eq(&b.stream, &shared));
-                                            if superseded {
-                                                log::debug!("read-ahead stream for {} superseded, stopping early",
-                                                    path.display());
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let have = mtx.lock().unwrap().data.len() as u64;
-                                        let remaining = (fetch as u64).saturating_sub(have);
-                                        if retries < MAX_BODY_RETRIES && remaining > 0 {
-                                            retries += 1;
-                                            log::warn!(
-                                                "read-ahead stream for {} broke after {} of {} bytes (retry {}/{}): {:?}",
-                                                path.display(), have, fetch, retries, MAX_BODY_RETRIES, e,
-                                            );
-                                            thread::sleep(Duration::from_millis(300 * retries as u64));
-                                            match do_range_read_stream(&conn, &path, off + have, remaining as usize, use_throttle) {
-                                                Ok((new_resp, new_permit)) => {
-                                                    resp = new_resp;
-                                                    _permit = new_permit;
-                                                    continue;
-                                                }
-                                                Err(resume_err) => {
-                                                    log::warn!("read-ahead resume for {} failed: {}", path.display(), resume_err);
-                                                }
-                                            }
-                                        } else {
-                                            // Stops the window short of target_len. Readers
-                                            // parked on it get EIO rather than a phantom EOF
-                                            // (see the waiters in read()).
-                                            log::warn!("read-ahead stream for {} broke after {} of {} bytes, giving up: {:?}",
-                                                path.display(), have, fetch, e);
-                                        }
-                                        break;
-                                    }
-                                }
+                            let total_bytes = WindowPump {
+                                conn: &conn,
+                                path: &path,
+                                fh: fh.0,
+                                open_files: &open_files,
+                                tmap: &tmap,
+                                shared: &shared,
+                                start: off,
+                                target: fetch,
+                                throttle: use_throttle,
+                                spare: 0,
                             }
-                            let mut ss = mtx.lock().unwrap();
-                            ss.done = true;
-                            let total_bytes = ss.data.len();
-                            drop(ss);
-                            cv.notify_all();
-                            tmap.safe_lock().remove(&path);
+                            .run(resp, _permit);
+                            let (ref mtx, _) = *shared;
                             let total_ms = t0.elapsed().as_millis();
                             if total_ms > 0 {
                                 let mbps = total_bytes as f64 / 1_048_576.0 / (total_ms as f64 / 1000.0);
@@ -5711,6 +5718,14 @@ impl Filesystem for NextCloudFs {
                         }
                     }
                 }
+                Err(e) if e == READ_SLOTS_BUSY_ERR => {
+                    // Every read slot stayed taken for READ_SLOT_WAIT. The server may
+                    // be fine — this daemon is just saturated — so neither go offline
+                    // nor fall back to a whole-file download (which needs the same
+                    // slots). "Try again", like a full read pool.
+                    log::warn!("read {} at {}: no read slot within {:?} — EAGAIN", path.display(), off, READ_SLOT_WAIT);
+                    reply.error(Errno::EAGAIN);
+                }
                 Err(e) => {
                     // This read just proved the server is unreachable. Flip offline
                     // now so the rest of the save's reads/writes take the instant
@@ -5747,7 +5762,10 @@ impl Filesystem for NextCloudFs {
                         Ok(local) => {
                             if let Ok(f) = std::fs::File::open(&local) {
                                 let mut buf = vec![0u8; sz];
-                                match f.read_at(&mut buf, off) {
+                                // The whole file was just downloaded, so a short fill
+                                // is its real end. A bare `read_at` may come back short
+                                // anywhere, and a short reply latches EOF on the inode.
+                                match read_at_full(&f, &mut buf, off) {
                                     Ok(n) => {
                                         buf.truncate(n);
                                         reply.data(&buf);
@@ -7022,12 +7040,21 @@ fn webdav_file_url(base: &str, remote_path: &Path) -> String {
     format!("{}/{}", base.trim_end_matches('/'), encoded)
 }
 
+/// Opens a range GET for `size` bytes at `offset`, retrying transport failures.
+///
+/// With `throttle`, each attempt holds a `read_throttle` slot, taken with a
+/// timeout while at least `spare` other slots stay free (0 for a foreground
+/// read). Everything here — slot waits, attempts, backoff — is bounded by
+/// `deadline`, so a caller holding a FUSE reply always gets an answer; running
+/// out of slots returns [`READ_SLOTS_BUSY_ERR`].
 fn do_range_read_stream<'a>(
     conn: &'a ConnInfo,
     path: &Path,
     offset: u64,
     size: usize,
     throttle: bool,
+    spare: usize,
+    deadline: Instant,
 ) -> Result<(reqwest::blocking::Response, Option<ThrottleGuard<'a>>), String> {
     // Offline is not a verdict on this read yet: give a blip the remainder of the
     // grace window to clear before refusing, and refuse with a *transient* error so
@@ -7039,12 +7066,24 @@ fn do_range_read_stream<'a>(
     let end = offset + size as u64 - 1;
     let mut delay = Duration::from_millis(500);
     for attempt in 0u32..=2 {
-        let permit = if throttle { Some(conn.read_throttle.acquire()) } else { None };
+        // Timed, never `acquire()`: an untimed wait here left READs unanswered for
+        // good once every slot's holder was itself stuck.
+        let permit = if throttle {
+            let wait = READ_SLOT_WAIT.min(deadline.saturating_duration_since(Instant::now()));
+            match conn.read_throttle.acquire_leaving(spare, wait) {
+                Some(p) => Some(p),
+                None => return Err(READ_SLOTS_BUSY_ERR.into()),
+            }
+        } else {
+            None
+        };
         // Re-read the client each attempt so a demotion to HTTP/2 (see `http_clients`)
         // takes effect on the retry rather than only on the next read.
+        //
+        // No `.timeout()`: that would also be a total deadline on the body. The read
+        // client's READ_STALL_TIMEOUT bounds the header wait and every body read.
         let req = conn.clients.read()
             .get(&url)
-            .timeout(DOWNLOAD_TIMEOUT)
             .header("Range", format!("bytes={}-{}", offset, end));
         match conn.creds.apply(req).send() {
             Ok(resp) => {
@@ -7057,7 +7096,8 @@ fn do_range_read_stream<'a>(
             }
             Err(e) => {
                 let msg = e.to_string();
-                if attempt < 2 && (is_transient_network_err(&msg) || is_timeout_err(&msg)) {
+                let time_left = deadline.saturating_duration_since(Instant::now()) > delay;
+                if attempt < 2 && time_left && (is_transient_network_err(&msg) || is_timeout_err(&msg)) {
                     log::warn!("range read {} failed (attempt {}/3): {} — retrying in {:?}",
                         path.display(), attempt + 1, msg, delay);
                     drop(permit);
@@ -7082,11 +7122,166 @@ fn parse_content_range_total(v: &str) -> Option<u64> {
     total.parse::<u64>().ok()
 }
 
-fn read_exact_from_stream(resp: &mut reqwest::blocking::Response, need: usize) -> Result<Vec<u8>, String> {
+/// Transport breaks resumed per read-ahead window. A body read error mid-stream is
+/// usually a transient blip (dropped connection, reset stream) rather than the
+/// server actually having nothing left to give — resume with a fresh Range request
+/// for exactly the missing tail instead of giving up immediately. Readers parked on
+/// the window would otherwise get EIO (see the waiters in read()), which every
+/// player has to notice and recover from itself; VLC in particular does this slowly
+/// enough to look like a stall.
+const MAX_BODY_RETRIES: u32 = 1;
+/// Stalls (READ_STALL_TIMEOUT with no bytes) resumed per read-ahead window. Kept
+/// separate from MAX_BODY_RETRIES: a stall costs READ_STALL_TIMEOUT already, so it
+/// resumes without backoff, and a QUIC stream that went silent says nothing about
+/// whether a fresh request will.
+const MAX_STALL_RESUMES: u32 = 2;
+
+/// Streams the rest of one read-ahead window's body into its shared buffer.
+struct WindowPump<'a> {
+    conn: &'a ConnInfo,
+    path: &'a Path,
+    fh: u64,
+    open_files: &'a Mutex<HashMap<u64, OpenFile>>,
+    tmap: &'a TransferMap,
+    shared: &'a Arc<(Mutex<StreamState>, Condvar)>,
+    /// File offset of the window's first byte.
+    start: u64,
+    /// Bytes the window was asked to hold.
+    target: usize,
+    /// Whether resume requests take a `read_throttle` slot, and how many slots
+    /// they must leave free (see `do_range_read_stream`).
+    throttle: bool,
+    spare: usize,
+}
+
+impl<'a> WindowPump<'a> {
+    /// Whether nobody can read this window any more: the handle was released, or
+    /// a seek replaced its buffer.
+    fn superseded(&self) -> bool {
+        self.open_files.safe_lock()
+            .get(&self.fh)
+            .and_then(|of| of.buf.as_ref())
+            .map_or(true, |b| !Arc::ptr_eq(&b.stream, self.shared))
+    }
+
+    /// Pumps `resp` (and any resumes) until the window is full, the body ends, or
+    /// it gives up; then marks the stream done, wakes its waiters and returns how
+    /// many bytes the window holds.
+    ///
+    /// Every exit is bounded: a body that goes READ_STALL_TIMEOUT without a byte
+    /// errors out of `read`, and each resume is bounded by RANGE_OPEN_BUDGET. So a
+    /// dead stream always gives back its throttle slot and its `read` worker.
+    fn run(&self, resp: reqwest::blocking::Response, permit: Option<ThrottleGuard<'a>>) -> usize {
+        let (ref mtx, ref cv) = **self.shared;
+        let mut resp = Some(resp);
+        let mut _permit = permit;
+        let mut chunk = [0u8; 256 * 1024];
+        let mut since_check = 0usize;
+        let mut retries = 0u32;
+        let mut stalls = 0u32;
+        while let Some(r) = resp.as_mut() {
+            use std::io::Read;
+            let t = Instant::now();
+            match r.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    mtx.lock().unwrap().data.extend_from_slice(&chunk[..n]);
+                    cv.notify_all();
+                    since_check += n;
+                    if since_check >= 2 * 1024 * 1024 {
+                        since_check = 0;
+                        if let Ok(mut tm) = self.tmap.lock() {
+                            if let Some(tp) = tm.get_mut(self.path) {
+                                tp.bytes_done = mtx.lock().unwrap().data.len() as u64;
+                            }
+                        }
+                        if self.superseded() {
+                            log::debug!("read-ahead stream for {} superseded, stopping early",
+                                self.path.display());
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let have = mtx.lock().unwrap().data.len() as u64;
+                    let remaining = (self.target as u64).saturating_sub(have);
+                    // A read that failed only once the stall timeout ran out is a
+                    // stall; anything faster is the transport breaking.
+                    let stalled = t.elapsed() + Duration::from_millis(500) >= READ_STALL_TIMEOUT;
+                    let budget_left = if stalled { stalls < MAX_STALL_RESUMES } else { retries < MAX_BODY_RETRIES };
+                    // Abort this response and hand its slot back *before* waiting for
+                    // a new one. Holding it across that wait was the 0.1.77 hang: one
+                    // QUIC connection died under three streams, each kept its slot
+                    // while waiting (untimed) for another, and with every slot held by
+                    // a waiter nothing was ever released again.
+                    resp = None;
+                    _permit = None;
+                    if !budget_left || remaining == 0 || self.superseded() {
+                        // Stops the window short of its target. Readers parked on it
+                        // get EIO rather than a phantom EOF (see the waiters in read()).
+                        log::warn!("read-ahead stream for {} broke after {} of {} bytes, giving up (stalled={}): {:?}",
+                            self.path.display(), have, self.target, stalled, e);
+                        break;
+                    }
+                    if stalled {
+                        stalls += 1;
+                        log::warn!(
+                            "read-ahead stream for {} stalled {:?} after {} of {} bytes — resuming (stall {}/{})",
+                            self.path.display(), READ_STALL_TIMEOUT, have, self.target, stalls, MAX_STALL_RESUMES,
+                        );
+                    } else {
+                        retries += 1;
+                        log::warn!(
+                            "read-ahead stream for {} broke after {} of {} bytes (retry {}/{}): {:?}",
+                            self.path.display(), have, self.target, retries, MAX_BODY_RETRIES, e,
+                        );
+                        thread::sleep(Duration::from_millis(300 * retries as u64));
+                    }
+                    let deadline = Instant::now() + RANGE_OPEN_BUDGET;
+                    match do_range_read_stream(self.conn, self.path, self.start + have, remaining as usize, self.throttle, self.spare, deadline) {
+                        // Only a 206 is the tail we asked for. A 200 is the whole file
+                        // from byte 0, and appending it here would corrupt the window.
+                        Ok((new_resp, new_permit)) if new_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                            resp = Some(new_resp);
+                            _permit = new_permit;
+                        }
+                        Ok((new_resp, _)) => {
+                            log::warn!("read-ahead resume for {} got {} instead of 206, giving up", self.path.display(), new_resp.status());
+                        }
+                        Err(resume_err) => {
+                            log::warn!("read-ahead resume for {} failed: {}", self.path.display(), resume_err);
+                        }
+                    }
+                }
+            }
+        }
+        drop(resp);
+        drop(_permit);
+        let mut ss = mtx.lock().unwrap();
+        ss.done = true;
+        let total_bytes = ss.data.len();
+        drop(ss);
+        cv.notify_all();
+        self.tmap.safe_lock().remove(self.path);
+        total_bytes
+    }
+}
+
+/// Reads up to `need` bytes, stopping early only at the end of the body.
+///
+/// Each `read` is bounded by the read client's READ_STALL_TIMEOUT; `deadline`
+/// bounds the sum, so a body trickling in just fast enough to dodge the stall
+/// timeout still cannot hold the READ that is waiting on these bytes.
+fn read_exact_from_stream(resp: &mut reqwest::blocking::Response, need: usize, deadline: Instant) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut buf = vec![0u8; need];
     let mut filled = 0;
     while filled < need {
+        if Instant::now() >= deadline {
+            // Worded to match neither network-down classifier: a slow body is not
+            // an unreachable server and must not flip the mount offline.
+            return Err(format!("range read too slow: {} of {} bytes within {:?}", filled, need, FIRST_BYTES_DEADLINE));
+        }
         match resp.read(&mut buf[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
