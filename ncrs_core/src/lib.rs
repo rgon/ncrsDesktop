@@ -2230,7 +2230,7 @@ impl FsCache {
         // directory: getattr answers make_dir_attr for it once its parent
         // listing is gone, and KEEP/PREFETCH find nothing to fetch in it.
         if self_entry.as_ref().is_some_and(|se| !se.is_dir) {
-            log::warn!("{} is a file, not a directory — not caching its listing", path.display());
+            log::info!("{} is a file, not a directory — not caching its listing", path.display());
             self.dir_cache.remove(&path);
             self.not_dirs.insert(path);
             return;
@@ -4387,21 +4387,67 @@ impl NextCloudFs {
         })
     }
 
+    /// Evict a file, or a folder and every cached file under it: remove the local
+    /// copies, set them back to remote, and drop the directories left empty in
+    /// the kept and auto-cache trees.
     pub fn evict_callback(&self) -> ipc::EvictCallback {
         let cache = self.cache.clone();
         let status = self.status.clone();
+        let dirty = self.dirty.clone();
+        let journal = self.journal.clone();
         Arc::new(move |remote_path| {
-            let local = {
-                let mut c = cache.safe_lock();
-                c.file_cache.remove(&remote_path).map(|e| e.local_path)
+            // Like purge: a file with a queued upload keeps its local bytes, which
+            // may be the only copy of an unsynced edit. Journal lock alone, first.
+            let pending: std::collections::HashSet<PathBuf> = {
+                let j = journal.safe_lock();
+                j.entries().iter().filter(|e| e.op.staging_path().is_some()).map(|e| e.op.path().to_path_buf()).collect()
             };
-            if let Some(local_path) = local {
-                if let Err(e) = std::fs::remove_file(&local_path) {
-                    log::warn!("evict: failed to remove cached file {}: {} — orphaned on disk", local_path.display(), e);
+            let (removed, roots) = {
+                let mut c = cache.safe_lock();
+                let under: Vec<PathBuf> = c.file_cache.keys()
+                    .filter(|p| p.starts_with(&remote_path) && !pending.contains(*p))
+                    .cloned()
+                    .collect();
+                let removed: Vec<(PathBuf, PathBuf)> = under.into_iter()
+                    .filter_map(|p| c.file_cache.remove(&p).map(|e| (p, e.local_path)))
+                    .collect();
+                (removed, [c.kept_dir.clone(), c.auto_cache_dir.clone()])
+            };
+            for (_, local_path) in &removed {
+                match std::fs::remove_file(local_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => log::warn!("evict: failed to remove cached file {}: {} — orphaned on disk", local_path.display(), e),
+                }
+                if let (Some(parent), Some(root)) = (local_path.parent(), roots.iter().find(|r| local_path.starts_with(r))) {
+                    remove_empty_parents(parent, root);
+                }
+            }
+            // The folder's own mirror in each tree, including empty subfolders.
+            let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
+            if !rel.as_os_str().is_empty() {
+                for root in &roots {
+                    let mirror = root.join(rel);
+                    remove_empty_tree(&mirror);
+                    if let Some(parent) = mirror.parent() {
+                        remove_empty_parents(parent, root);
+                    }
                 }
             }
             save_file_cache(&cache);
-            status.safe_write().insert(remote_path, FileStatus::Remote);
+            {
+                let mut st = status.safe_write();
+                for (p, _) in &removed {
+                    st.insert(p.clone(), FileStatus::Remote);
+                }
+                if !pending.contains(&remote_path) {
+                    st.insert(remote_path.clone(), FileStatus::Remote);
+                }
+            }
+            let mut d = dirty.safe_lock();
+            for (p, _) in removed {
+                d.insert(p);
+            }
         })
     }
 
@@ -8844,6 +8890,34 @@ fn read_exact_from_stream(resp: &mut reqwest::blocking::Response, need: usize, d
     }
     buf.truncate(filled);
     Ok(buf)
+}
+
+/// Remove `dir` if it holds nothing but (recursively) empty directories. A
+/// directory that still has a file in it, anywhere below, is left alone.
+fn remove_empty_tree(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_empty_tree(&entry.path());
+            }
+        }
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// Remove `start` and its ancestors while they are empty, stopping below `stop`,
+/// which is never removed.
+fn remove_empty_parents(start: &Path, stop: &Path) {
+    let mut cur = start;
+    while cur != stop && cur.starts_with(stop) {
+        if std::fs::remove_dir(cur).is_err() {
+            break;
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
 }
 
 /// Whether a body read failed because a timeout ran out, judged from the error
