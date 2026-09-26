@@ -248,6 +248,34 @@
     }
 
     #[test]
+    fn evict_cleanup_removes_only_empty_directories_below_the_root() {
+        let root = std::env::temp_dir().join(format!("ncrs-evict-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // root/a/b/c (empty), root/a/keep/f.txt (still has a file)
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+        std::fs::create_dir_all(root.join("a/keep")).unwrap();
+        std::fs::write(root.join("a/keep/f.txt"), b"x").unwrap();
+
+        remove_empty_tree(&root.join("a"));
+        assert!(!root.join("a/b").exists(), "empty subtree removed");
+        assert!(root.join("a/keep/f.txt").exists(), "a directory with a file is kept");
+
+        // Walking up from an emptied leaf stops at the first non-empty parent
+        // and never removes the root itself.
+        std::fs::remove_file(root.join("a/keep/f.txt")).unwrap();
+        remove_empty_parents(&root.join("a/keep"), &root);
+        assert!(!root.join("a").exists(), "emptied parents removed");
+        assert!(root.exists(), "the cache root is never removed");
+
+        // Nothing outside the root is touched.
+        std::fs::create_dir_all(root.join("x")).unwrap();
+        remove_empty_parents(&std::env::temp_dir(), &root);
+        assert!(root.join("x").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn listing_of_a_file_is_never_cached_as_a_directory() {
         let mut cache = make_test_cache();
         let path = PathBuf::from("/relock/kept.txt");
