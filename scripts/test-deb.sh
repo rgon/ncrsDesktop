@@ -116,6 +116,10 @@ done
 if ! $SKIP_DOLPHIN; then
     check "Dolphin plugin (KF6)" grep -q '/qt6/plugins/kf6/overlayicon/ncrsoverlayplugin\.so$' <<<"$CONTENTS"
     check "Dolphin plugin (KF5)" grep -q '/qt5/plugins/kf5/overlayicon/ncrsoverlayplugin\.so$' <<<"$CONTENTS"
+    # Dolphin only reads plugins at startup, so postinst must quit any
+    # running instance the same way it reloads Nautilus.
+    check "postinst reloads Dolphin" \
+        sh -c "dpkg-deb --ctrl-tarfile '$DEB' | tar -xO ./postinst | grep -q 'reload_dolphin$'"
 fi
 
 # GNOME Software (Ubuntu Software) derives a local .deb's app id from the
