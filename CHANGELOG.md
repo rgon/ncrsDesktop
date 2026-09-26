@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.83](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.82...ncrs-v0.1.83) (2026-09-26)
+
+
+### Bug Fixes
+
+* **deb:** reload Dolphin on install so the overlay plugin loads immediately ([0b0fb41](https://github.com/rgon/ncrsDesktop/commit/0b0fb4190ce7fbe97600cd85b12345e8df2758c9))
+* **evict:** evict every cached file under a folder, drop the empty directories left in the local cache, and log a prefetched file at info ([56134ba](https://github.com/rgon/ncrsDesktop/commit/56134baf096bed1fcedacd9ffab3cb36ebb9159f))
+
 ## [0.1.82](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.81...ncrs-v0.1.82) (2026-09-25)
 
 
