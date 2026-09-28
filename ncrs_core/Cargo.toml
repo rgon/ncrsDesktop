@@ -36,6 +36,13 @@ tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 keyring = "2"
 seccompiler = "0.5.0"
 
+# Replace the system (glibc) allocator in the `ncrs` daemon on Unix — see the
+# `#[global_allocator]` in src/main.rs. unprefixed_malloc_on_supported_platforms
+# makes jemalloc export the plain `malloc`/`malloc_conf` symbols, so the
+# `malloc_conf` tuning there is the one it reads. MSVC is excluded (unsupported).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
+
 [[bin]]
 name = "ncrs-open"
 path = "src/bin/ncrs_open.rs"

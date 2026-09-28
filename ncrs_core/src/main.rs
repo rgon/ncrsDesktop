@@ -1,6 +1,26 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+// Use jemalloc instead of glibc malloc. This daemon serves the FUSE mount and
+// churns large read-ahead, thumbnail and dir-cache-save buffers across its
+// worker threads; glibc keeps that freed memory resident in per-thread arenas,
+// so one burst (a crawler walking the mount) left it idling at ~680 MB for
+// days. Same tuning as ncrs-gui (see its main.rs for the rationale):
+// background purge thread, ~1 s decay, narenas capped at 4.
+//
+// `#[used]` and the `unprefixed_malloc_on_supported_platforms` feature are both
+// required, or jemalloc never sees the `malloc_conf` symbol.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[used]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4\0";
+
 #[derive(Parser)]
 #[command(name = "ncrs", about = "Nextcloud FUSE virtual filesystem")]
 struct Cli {
