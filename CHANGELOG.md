@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.84](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.83...ncrs-v0.1.84) (2026-09-28)
+
+
+### Bug Fixes
+
+* **core:** use jemalloc in the ncrs daemon so a crawl burst no longer leaves it idling at ~680 MB ([b5a9263](https://github.com/rgon/ncrsDesktop/commit/b5a926390d68defc4ddbc63c00191d702481da31))
+
 ## [0.1.83](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.82...ncrs-v0.1.83) (2026-09-26)
 
 
