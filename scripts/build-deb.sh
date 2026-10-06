@@ -91,65 +91,20 @@ if $SKIP_BUILD; then
 fi
 
 # ── Assemble staging tree ─────────────────────────────────────────────────────
-echo "→ Assembling package tree..."
-rm -rf "$PKG_DIR"
-install -Dm755 target/release/ncrs                                       "$PKG_DIR/usr/bin/ncrs"
-install -Dm755 target/release/ncrs-open                                  "$PKG_DIR/usr/bin/ncrs-open"
-install -Dm755 target/release/ncrs-ctl                                   "$PKG_DIR/usr/bin/ncrs-ctl"
-install -Dm644 packaging/ncrs.service                                    "$PKG_DIR/usr/lib/systemd/user/ncrs.service"
-install -Dm644 packaging/05-ncrs-quic.conf                               "$PKG_DIR/usr/lib/sysctl.d/05-ncrs-quic.conf"
-install -Dm644 packaging/es.rgon.ncrs.Open.desktop                        "$PKG_DIR/usr/share/applications/es.rgon.ncrs.Open.desktop"
-install -Dm644 shell_integration/file-managers/nautilus/syncstate.py      "$PKG_DIR/usr/share/nautilus-python/extensions/ncrs-syncstate.py"
-install -Dm755 shell_integration/gnome-search/ncrs-search-provider       "$PKG_DIR/usr/bin/ncrs-search-provider"
-install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.SearchProvider.ini \
-                                                                         "$PKG_DIR/usr/share/gnome-shell/search-providers/es.rgon.ncrs.SearchProvider.ini"
-install -Dm644 shell_integration/gnome-search/es.rgon.ncrs.SearchProvider.desktop \
-                                                                         "$PKG_DIR/usr/share/applications/es.rgon.ncrs.SearchProvider.desktop"
-install -Dm644 packaging/es.rgon.ncrs.SearchProvider.service              "$PKG_DIR/usr/share/dbus-1/services/es.rgon.ncrs.SearchProvider.service"
-install -Dm644 packaging/es.rgon.ncrs.metainfo.xml                        "$PKG_DIR/usr/share/metainfo/es.rgon.ncrs.metainfo.xml"
-install -Dm755 shell_integration/thumbnailer/cr3-thumbnailer               "$PKG_DIR/usr/bin/cr3-thumbnailer"
-install -Dm644 shell_integration/thumbnailer/cr3.thumbnailer               "$PKG_DIR/usr/share/thumbnailers/cr3.thumbnailer"
-
-# Example config for provisioning, generated from the binary's built-in
-# template. This executes the staged binary, so it must be runnable on the
-# build host (cross-built packages need a matching host or qemu-user).
-mkdir -p "$PKG_DIR/usr/share/doc/ncrs"
-install -Dm644 packaging/copyright "$PKG_DIR/usr/share/doc/ncrs/copyright"
-if ! target/release/ncrs --print-default-config > "$PKG_DIR/usr/share/doc/ncrs/config.yaml.example"; then
-    echo "error: 'target/release/ncrs --print-default-config' failed (stale or non-host-arch binary?)" >&2
-    exit 1
-fi
-chmod 644 "$PKG_DIR/usr/share/doc/ncrs/config.yaml.example"
-
-if ! $SKIP_GUI; then
-    install -Dm755 target/release/ncrs-gui                               "$PKG_DIR/usr/bin/ncrs-gui"
-    # GNOME Software never reads the metainfo inside a local .deb: it takes
-    # the shortest /usr/share/applications basename as the app id and looks
-    # that up as a metainfo <id>. Keep this the shortest desktop file in the
-    # package so it resolves to es.rgon.ncrs (screenshots, description).
-    install -Dm644 packaging/es.rgon.ncrs.desktop                        "$PKG_DIR/usr/share/applications/es.rgon.ncrs.desktop"
-    install -Dm644 packaging/es.rgon.ncrs.desktop                        "$PKG_DIR/etc/xdg/autostart/es.rgon.ncrs.desktop"
-    install -Dm644 ncrs-gui/src-tauri/icons/32x32.png                    "$PKG_DIR/usr/share/icons/hicolor/32x32/apps/ncrs.png"
-    install -Dm644 ncrs-gui/src-tauri/icons/64x64.png                    "$PKG_DIR/usr/share/icons/hicolor/64x64/apps/ncrs.png"
-    install -Dm644 ncrs-gui/src-tauri/icons/128x128.png                  "$PKG_DIR/usr/share/icons/hicolor/128x128/apps/ncrs.png"
-    install -Dm644 "ncrs-gui/src-tauri/icons/128x128@2x.png"             "$PKG_DIR/usr/share/icons/hicolor/256x256/apps/ncrs.png"
-    install -Dm644 ncrs-gui/src-tauri/icons/icon.png                     "$PKG_DIR/usr/share/icons/hicolor/512x512/apps/ncrs.png"
-fi
-
-# ── Dolphin plugin (KF5 and/or KF6 builds, staged by build-dolphin-plugin.sh) ─
+# The payload (service, CLI tools, adapters, GUI, Dolphin plugin) is staged by
+# packaging/install-tree.sh, shared with the .rpm build. Resolve the default
+# Dolphin stage set here and pass it explicitly; install-tree.sh also
+# auto-detects when called directly, but this script must not rely on that.
 if [[ ${#DOLPHIN_STAGES[@]} -eq 0 ]]; then
     for d in dist/dolphin/*/; do [[ -d "$d" ]] && DOLPHIN_STAGES+=("$d"); done
 fi
+ARGS=(--dest "$PKG_DIR" --bin-dir target/release)
+$SKIP_GUI && ARGS+=(--skip-gui)
 for stage in ${DOLPHIN_STAGES[@]+"${DOLPHIN_STAGES[@]}"}; do
-    [[ -d "$stage" ]] || { echo "error: --dolphin-stage $stage is not a directory" >&2; exit 1; }
-    cp -a "$stage/." "$PKG_DIR/"
+    ARGS+=(--dolphin-stage "$stage")
 done
-if [[ -z "$(find "$PKG_DIR" -path '*/overlayicon/ncrsoverlayplugin.so' -print -quit)" ]]; then
-    $REQUIRE_DOLPHIN && { echo "error: no Dolphin plugin staged (run scripts/build-dolphin-plugin.sh)" >&2; exit 1; }
-    echo "  warning: no Dolphin plugin staged; the package will have no Dolphin emblems"
-else
-    echo "  Dolphin plugin: $(find "$PKG_DIR" -path '*/overlayicon/ncrsoverlayplugin.so' -printf '%P ')"
-fi
+$REQUIRE_DOLPHIN && ARGS+=(--require-dolphin)
+bash "$REPO_ROOT/packaging/install-tree.sh" "${ARGS[@]}"
 
 # ── Write DEBIAN/control ──────────────────────────────────────────────────────
 # ncrs links libssl at build time; ncrs-gui dlopens libayatana-appindicator3

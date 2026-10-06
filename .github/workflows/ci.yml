@@ -175,6 +175,64 @@ jobs:
           PREBUILT_BINARY: "1"
         run: scripts/e2e.sh
 
+  # ── RPM ─────────────────────────────────────────────────────────────────────
+  # Builds the openSUSE .rpm FROM SOURCE inside a Tumbleweed container: the
+  # target/release binaries in the cache were compiled on Ubuntu, and their
+  # glibc/openssl/webkit sonames differ from openSUSE's, so repackaging them
+  # (build-rpm.sh --skip-build) would produce a broken package. cargo, pnpm and
+  # the KF6 Dolphin plugin all run in the container instead.
+  #
+  # The .rpm is deliberately NOT handed on through the binary cache: that cache
+  # is saved by the build job and merely restored by later jobs, so anything
+  # this job adds to dist/ would never be persisted. build-release rebuilds the
+  # .rpm itself with the same container command (the duplication is intended).
+  rpm:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install RPM tooling
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y rpm cpio desktop-file-utils rpmlint
+
+      # Install the spec's BuildRequires (design doc §6.2) and build from
+      # source. $(id -u)/$(id -g) are expanded by the HOST shell (the whole
+      # docker command is one double-quoted host string), so the root-owned
+      # files rpmbuild drops into the bind-mounted dist/ come back
+      # runner-owned — same trick as the KF6-in-trixie step above.
+      # keep in sync with packaging/ncrs.spec §6.2 BuildRequires
+      - name: Build RPM from source (Tumbleweed)
+        run: |
+          docker run --rm -v "$PWD":/src -w /src opensuse/tumbleweed bash -ec "
+            zypper -n install --no-recommends \
+              rpm-build cargo rust gcc gcc-c++ make pkgconf-pkg-config \
+              fuse3-devel libopenssl-devel gtk3-devel webkitgtk3-devel \
+              librsvg-devel cmake kf6-extra-cmake-modules qt6-base-devel \
+              kf6-kio-devel kf6-kcoreaddons-devel nodejs pnpm git
+            git config --global --add safe.directory /src
+            bash scripts/build-rpm.sh --out-dir dist
+            chown -R $(id -u):$(id -g) dist"
+
+      - name: Test RPM (Tumbleweed)
+        run: bash scripts/test-rpm.sh --container --image opensuse/tumbleweed
+
+      # Best-effort cross-release install test: the same Tumbleweed-built .rpm
+      # is installed on Leap 16 to catch Leap-16-specific dependency gaps (notably libayatana-appindicator3). These are NOT
+      # per-target builds — a failure here may be a glibc/WebKit/Qt ABI mismatch
+      # unrelated to this packaging, and means per-target builds are needed (the
+      # deferred OBS path), not that the packaging is broken. If the Leap 16 tag
+      # differs, use the best available opensuse/leap:16* image.
+      - name: Test RPM install (Leap 16)
+        run: bash scripts/test-rpm.sh --container --image opensuse/leap:16.0
+
+      # No Slowroll job: there is no published Slowroll container image
+      # (registry.opensuse.org/v2/opensuse/slowroll/tags/list -> 404, and no
+      # opensuse/slowroll on Docker Hub). Slowroll is a Tumbleweed derivative,
+      # so the Tumbleweed build above covers it; the author also builds and runs
+      # the RPM on a Slowroll host directly.
+
   # ── Release ──────────────────────────────────────────────────────────────────
   # release-please runs TWICE per master push, as two separate jobs, and the
   # order between them is the whole point:
@@ -241,6 +299,9 @@ jobs:
             libssl-dev \
             dpkg-dev \
             desktop-file-utils \
+            rpm \
+            cpio \
+            rpmlint \
             lintian
 
       - name: Restore release binaries
@@ -260,12 +321,31 @@ jobs:
       - name: Test .deb
         run: bash scripts/test-deb.sh --container
 
-      - name: Upload .deb and publish release
+      # Rebuild the .rpm from source, exactly as the `rpm` job does. The binary
+      # cache only restores what the build job saved, so the .rpm that job built
+      # never reaches here; this job has to produce its own before uploading.
+      # keep in sync with packaging/ncrs.spec §6.2 BuildRequires
+      - name: Build RPM from source (Tumbleweed)
+        run: |
+          docker run --rm -v "$PWD":/src -w /src opensuse/tumbleweed bash -ec "
+            zypper -n install --no-recommends \
+              rpm-build cargo rust gcc gcc-c++ make pkgconf-pkg-config \
+              fuse3-devel libopenssl-devel gtk3-devel webkitgtk3-devel \
+              librsvg-devel cmake kf6-extra-cmake-modules qt6-base-devel \
+              kf6-kio-devel kf6-kcoreaddons-devel nodejs pnpm git
+            git config --global --add safe.directory /src
+            bash scripts/build-rpm.sh --out-dir dist
+            chown -R $(id -u):$(id -g) dist"
+
+      - name: Test RPM
+        run: bash scripts/test-rpm.sh --container --image opensuse/tumbleweed
+
+      - name: Upload .deb and .rpm, publish release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ needs.release-please.outputs.tag_name }}"
-          gh release upload "$tag" dist/*.deb
+          gh release upload "$tag" dist/*.deb dist/*.rpm
           gh release edit "$tag" --draft=false
 
       - name: Delete draft release on failure
