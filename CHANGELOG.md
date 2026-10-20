@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.85](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.84...ncrs-v0.1.85) (2026-10-20)
+
+
+### Bug Fixes
+
+* **core:** report a written file's true size and serve its own uncommitted bytes so a LibreOffice save no longer corrupts ([f60969f](https://github.com/rgon/ncrsDesktop/commit/f60969f99358fdd2588e34fe3f6d96f691d43ccd))
+
 ## [0.1.84](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.83...ncrs-v0.1.84) (2026-09-28)
 
 
