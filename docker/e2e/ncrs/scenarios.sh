@@ -860,6 +860,134 @@ done
 [ "$landed" = 8 ] && ok "all 8 files uploaded into their just-created folders" \
     || no "only $landed of 8 files reached their just-created folders"
 
+echo "→ 28. READ-YOUR-OWN-WRITES while a file is open (LibreOffice zip-save pattern)"
+# Regression for the corrupted LibreOffice save. LibreOffice builds a zip in a temp file
+# on the mount and, after each entry, re-reads the partially written last page before
+# writing it out whole. getattr used to report the dir-cache size (0 for a new file) and
+# read() never served the handle's own staged bytes, so the kernel shrank the file and
+# the re-read came back empty: the page was then written with stale buffer contents.
+mkdir -p "$MOUNT/ryw"
+head -c 60000 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 10000 > /tmp/ryw.src
+tail -c 1808 /tmp/ryw.src > /tmp/ryw.tail
+RYW="$(cat /tmp/ryw.src)"
+exec 3<>"$MOUNT/ryw/temp.bin"
+printf '%s' "${RYW:0:8192}" >&3
+printf '%s' "${RYW:8192}" >&3
+# Opening /proc/<pid>/fd/3 is a second open of the file: another handle, same inode.
+dd if=/proc/$$/fd/3 bs=4096 skip=0 count=1 2>/dev/null | cmp -s - <(head -c 4096 /tmp/ryw.src) \
+    && ok "a second handle reads a full page the writer wrote" \
+    || no "a second handle did not get a full page the writer wrote"
+cmp -s "$MOUNT/ryw/temp.bin" /tmp/ryw.src \
+    && ok "a second handle reads the writer's bytes before they are committed" \
+    || no "a second handle did not see the uncommitted bytes"
+exec 3>&-
+wait_dav_sha ryw/temp.bin "$(sha < /tmp/ryw.src)" 60 \
+    && ok "the staged-then-re-read file reached the backend byte-exact" \
+    || no "backend copy of the re-read file differs (corrupted save)"
+
+# The LibreOffice save itself, step for step: entries of awkward lengths appended to one
+# handle, and after each one the size is checked and the partial last page is re-read
+# and rewritten whole. Any wrong answer here becomes stale bytes in the saved file.
+if command -v python3 >/dev/null; then
+    python3 - "$MOUNT/ryw/lo.bin" /tmp/ryw.lo.expect <<'PY'
+import os, sys
+path, expect_path = sys.argv[1], sys.argv[2]
+def blob(n, salt):
+    return bytes(((i * 7 + salt) & 0xff) for i in range(n))
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+model, bad = bytearray(), []
+for k, n in enumerate([4096, 4143, 16839, 13832, 30173, 23545, 29211, 13693, 3000, 1999, 41000]):
+    chunk = blob(n, k + 3)
+    os.pwrite(fd, chunk, len(model))
+    model += chunk
+    size = os.fstat(fd).st_size
+    if size != len(model):
+        bad.append("entry %d: fstat says %d, %d were written" % (k, size, len(model)))
+    page = len(model) // 4096 * 4096
+    want = bytes(model[page:])
+    got = os.pread(fd, 4096, page)
+    if got != want:
+        bad.append("entry %d: re-read of the last page returned %d bytes, %d were written" % (k, len(got), len(want)))
+    # LibreOffice writes that page back whole, with the next entry's first bytes behind it.
+    rewrite = got + blob(4096 - len(got), 50 + k) if len(got) < 4096 else got
+    os.pwrite(fd, rewrite, page)
+    model[page:] = rewrite
+whole = os.pread(fd, len(model) + 4096, 0)
+if whole != bytes(model):
+    bad.append("the file read back differs from what was written")
+os.close(fd)
+after = os.stat(path).st_size
+if after != len(model):
+    bad.append("after close the size is %d, %d were written" % (after, len(model)))
+open(expect_path, "wb").write(bytes(model))
+for b in bad[:6]:
+    print("    " + b)
+sys.exit(1 if bad else 0)
+PY
+    rc=$?
+else
+    rc=2
+    echo "    python3 is missing from the e2e image"
+fi
+[ "$rc" = 0 ] && ok "LibreOffice's write / size / page re-read / page rewrite loop gets true answers throughout" \
+    || no "LibreOffice's save loop was given a wrong size or page re-read (rc=$rc)"
+wait_dav_sha ryw/lo.bin "$(sha < /tmp/ryw.lo.expect)" 60 \
+    && ok "the file that loop produced reached the backend byte-exact" \
+    || no "the file from the LibreOffice save loop is corrupt on the backend"
+
+# In place over an existing, already-uploaded file: the kernel knows the right size,
+# so this isolates read() — it used to answer from the server with the OLD bytes.
+head -c 20000 /dev/urandom > /tmp/ryw.old
+cp /tmp/ryw.old "$MOUNT/ryw/existing.bin"
+wait_dav_sha ryw/existing.bin "$(sha < /tmp/ryw.old)" 60 || no "setup: existing.bin never reached the backend"
+head -c 100 /dev/zero | tr '\0' X > /tmp/ryw.patch
+cp /tmp/ryw.old /tmp/ryw.expect1
+dd if=/tmp/ryw.patch of=/tmp/ryw.expect1 bs=1 seek=19900 conv=notrunc 2>/dev/null
+exec 4<>"$MOUNT/ryw/existing.bin"
+dd if=/tmp/ryw.patch bs=1 seek=19900 conv=notrunc >&4 2>/dev/null
+dd if=/proc/$$/fd/4 bs=1 skip=19900 count=100 2>/dev/null | cmp -s - /tmp/ryw.patch \
+    && ok "an in-place overwrite reads back as written through a second handle" \
+    || no "an in-place overwrite read back the OLD bytes through a second handle"
+dd if=/proc/$$/fd/4 bs=1 skip=0 count=100 2>/dev/null | cmp -s - <(head -c 100 /tmp/ryw.old) \
+    && ok "untouched bytes of the file still read back correctly" \
+    || no "untouched bytes read back wrong after the in-place write"
+exec 4>&-
+wait_dav_sha ryw/existing.bin "$(sha < /tmp/ryw.expect1)" 60 \
+    && ok "the in-place edit reached the backend byte-exact" \
+    || no "backend copy of the in-place edit differs"
+# The same through ONE handle, with explicit offsets (bash can't seek a shared fd):
+# write in place, read the write back, and read an earlier edit that is already on the server.
+if command -v python3 >/dev/null; then
+    python3 - "$MOUNT/ryw/existing.bin" /tmp/ryw.old <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+old = open(sys.argv[2], "rb").read()
+patch = b"Y" * 100
+os.pwrite(fd, patch, 5000)
+checks = [
+    ("the bytes just written at 5000", os.pread(fd, 100, 5000) == patch),
+    ("an untouched range", os.pread(fd, 100, 0) == old[:100]),
+    ("the earlier edit at 19900", os.pread(fd, 100, 19900) == b"X" * 100),
+    ("the file size", os.fstat(fd).st_size == 20000),
+]
+os.close(fd)
+bad = [n for n, ok in checks if not ok]
+for n in bad:
+    print("    wrong: " + n)
+sys.exit(1 if bad else 0)
+PY
+    rc=$?
+else
+    rc=2
+fi
+cp /tmp/ryw.expect1 /tmp/ryw.expect2
+head -c 100 /dev/zero | tr '\0' Y | dd of=/tmp/ryw.expect2 bs=1 seek=5000 conv=notrunc 2>/dev/null
+[ "$rc" = 0 ] && ok "one handle reads back its own in-place write, an earlier edit and the true size" \
+    || no "an in-place write was not read back correctly through its own handle (rc=$rc)"
+wait_dav_sha ryw/existing.bin "$(sha < /tmp/ryw.expect2)" 60 \
+    && ok "both in-place edits reached the backend byte-exact" \
+    || no "backend copy after the second in-place edit differs"
+
 echo "→ 22. SERVER EDIT of a KEPT file — the refresh that evicts it must not freeze the mount"
 # Regression for the v0.1.73 freeze: a read-triggered refresh that found a locally
 # cached (kept) file changed on the server evicted it while holding the cache lock,
