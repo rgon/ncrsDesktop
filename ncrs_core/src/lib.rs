@@ -1000,6 +1000,83 @@ fn read_at_full(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<
     Ok(filled)
 }
 
+/// The file's length as its writers see it: the staged length while a handle on `ino`
+/// holds uncommitted writes, `None` when none does.
+///
+/// The dir cache only learns the new size at flush()/release(), so answering from it
+/// mid-write told the kernel the file was still empty (or at its old size). The kernel
+/// then shrank its own size and dropped its cached pages, and a writer that re-read the
+/// tail page it had just written (LibreOffice does this after every zip entry) got 0
+/// bytes back and wrote the page out again with stale buffer contents.
+fn live_write_size(open_files: &Mutex<HashMap<u64, OpenFile>>, ino: u64) -> Option<u64> {
+    enum Source {
+        Streamed(u64),
+        Staged(PathBuf),
+    }
+    // Collected under the lock, measured outside it: stat(2) must not hold up every handle.
+    let sources: Vec<Source> = open_files.safe_lock().values()
+        .filter(|of| of.ino == ino && of.dirty)
+        .filter_map(|of| match (&of.chunk_upload, &of.write_path) {
+            (Some(_), _) => Some(Source::Streamed(of.total_written)),
+            (None, Some(wp)) => Some(Source::Staged(wp.clone())),
+            (None, None) => None,
+        })
+        .collect();
+    sources.iter()
+        .filter_map(|s| match s {
+            Source::Streamed(n) => Some(*n),
+            Source::Staged(wp) => std::fs::metadata(wp).ok().map(|m| m.len()),
+        })
+        .max()
+}
+
+/// `attr` with its size replaced by the live written size when its inode has uncommitted
+/// writes; the flag says whether it was, so callers can skip the attribute cache for it.
+fn overlay_live_size(open_files: &Mutex<HashMap<u64, OpenFile>>, mut attr: FileAttr) -> (FileAttr, bool) {
+    if attr.kind != FileType::RegularFile {
+        return (attr, false);
+    }
+    match live_write_size(open_files, attr.ino.0) {
+        Some(size) => {
+            attr.size = size;
+            attr.blocks = size.div_ceil(512);
+            (attr, true)
+        }
+        None => (attr, false),
+    }
+}
+
+/// Where the current bytes of the file live for a reader holding `fh` on `ino`, when a
+/// handle (its own, else the newest sibling) has uncommitted writes: the staging file,
+/// and the file offset its first byte stands for. Staged bytes are newer than the cache
+/// and the server, which hold nothing of them until release().
+fn staged_source(files: &HashMap<u64, OpenFile>, fh: u64, ino: u64) -> Option<(PathBuf, u64)> {
+    let of_source = |of: &OpenFile| {
+        if !of.dirty {
+            return None;
+        }
+        // After chunks went out the staging file is only the unsent tail.
+        let skip = of.chunk_upload.as_ref().map_or(0, |c| c.bytes_confirmed);
+        of.write_path.clone().map(|wp| (wp, skip))
+    };
+    files.get(&fh).and_then(of_source).or_else(|| {
+        files.iter()
+            .filter(|(k, of)| **k != fh && of.ino == ino)
+            .max_by_key(|(k, _)| **k)
+            .and_then(|(_, of)| of_source(of))
+    })
+}
+
+/// `sz` bytes of the file at `off`, out of a staging file whose first byte is file
+/// offset `skip`. Short only at the staged end, which is the file's real end.
+fn read_staged(staging: &Path, skip: u64, off: u64, sz: usize) -> std::io::Result<Vec<u8>> {
+    let f = std::fs::File::open(staging)?;
+    let mut buf = vec![0u8; sz];
+    let n = read_at_full(&f, &mut buf, off.saturating_sub(skip))?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
 /// First read-ahead window on a handle, and the window a seek falls back to.
 ///
 /// Small enough that a stray seek costs ~1 MB instead of the full configured
@@ -5159,6 +5236,7 @@ impl NextCloudFs {
         let refresh_debounce = self.refresh_debounce.clone();
         let file_change_queue = self.file_change_queue.clone();
         let open_dirs = self.open_dirs.clone();
+        let open_files = self.open_files.clone();
 
         // A bounded pool worker, with the reply travelling in the job: fuser's one
         // dispatch thread never blocks on a directory's network round trip, and
@@ -5243,6 +5321,8 @@ impl NextCloudFs {
                     None => vec![],
                 };
                 for (ino, off, kind, name, attr) in rows {
+                    // Outside the cache lock: open_files is taken first elsewhere.
+                    let (attr, _) = overlay_live_size(&open_files, attr);
                     if reply.add(ino, off, kind, &name, &attr) { break; }
                 }
                 reply.ok();
@@ -5445,6 +5525,7 @@ impl NextCloudFs {
                         }).collect()
                     };
                     for (ino, off, kind, name, attr) in reply_rows {
+                        let (attr, _) = overlay_live_size(&open_files, attr);
                         if reply.add(ino, off, kind, &name, &attr) { break; }
                     }
 
@@ -5674,7 +5755,7 @@ impl Filesystem for NextCloudFs {
         if let Some(entry) = found {
             let target_path = parent_path.join(&name_str);
             let ino = self.cache.safe_lock().allocate_inode(target_path.clone());
-            let attr = make_file_attr(ino, entry);
+            let (attr, live) = overlay_live_size(&self.open_files, make_file_attr(ino, entry));
             if entry.ext.flag("is_shared") {
                 self.shared.safe_write().insert(target_path.clone());
             }
@@ -5697,7 +5778,8 @@ impl Filesystem for NextCloudFs {
             if !entry.is_dir {
                 self.status.safe_write().entry(target_path).or_insert(FileStatus::Remote);
             }
-            reply.entry(&TTL, &attr, Generation(0));
+            // A file with uncommitted writes changes under the kernel: no attr caching.
+            reply.entry(if live { &Duration::ZERO } else { &TTL }, &attr, Generation(0));
             return;
         }
         reply.error(Errno::ENOENT);
@@ -5765,7 +5847,10 @@ impl Filesystem for NextCloudFs {
 
         for entry in entries.iter() {
             if entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("") == file_name {
-                reply.attr(&TTL, &make_file_attr(ino.0, entry));
+                // A file with uncommitted writes is longer than the listing says, and
+                // changing every few ms: never let the kernel cache that attr.
+                let (attr, live) = overlay_live_size(&self.open_files, make_file_attr(ino.0, entry));
+                reply.attr(if live { &Duration::ZERO } else { &TTL }, &attr);
                 return;
             }
         }
@@ -6134,6 +6219,28 @@ impl Filesystem for NextCloudFs {
                 None => false,
             }
         };
+
+        // Bytes written through an open handle exist only in its staging file until
+        // release(): the server and the caches hold the old content, or nothing for a
+        // file created a moment ago. A writer must read back what it wrote (an editor
+        // re-reading a page to patch it, a zip being finished in place), and so must
+        // a second handle on the same inode.
+        {
+            let staged = staged_source(&self.open_files.safe_lock(), fh.0, ino.0);
+            if let Some((staging, skip)) = staged.filter(|(_, skip)| off >= *skip) {
+                match read_staged(&staging, skip, off, sz) {
+                    Ok(buf) => {
+                        reply.data(&buf);
+                        return;
+                    }
+                    Err(e) => {
+                        log::error!("read {}: staged bytes unreadable at {}: {}", path.display(), staging.display(), e);
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                }
+            }
+        }
 
         // A locally-written-but-not-yet-uploaded edit is the newest version of the
         // file and MUST win over any cached/kept copy or the server copy. Serve it

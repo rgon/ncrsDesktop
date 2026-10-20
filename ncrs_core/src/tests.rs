@@ -3107,3 +3107,217 @@ mod upload_order_tests {
         assert_eq!(backend::server_error_code("PROPFIND /server error 500"), None);
         assert_eq!(backend::server_error_code("server error x"), None);
     }
+
+    // ── read-your-own-writes on a handle that is still being written ─────────
+    //
+    // LibreOffice builds the zip in a temp file on the mount and, after every entry,
+    // re-reads the partially written last 4 KiB page before writing it out whole. The
+    // mount used to answer getattr with the dir-cache size (0 for a new file) and read()
+    // from the server, so the re-read came back empty and the page was written with
+    // stale buffer contents under the real data.
+
+    fn writer_handle(ino: u64, dirty: bool, staging: Option<PathBuf>) -> OpenFile {
+        OpenFile {
+            remote_path: PathBuf::from("/doc.tmp"),
+            local: None,
+            buf: None,
+            write_path: staging,
+            dirty,
+            original_etag: None,
+            total_written: 0,
+            stream_eligible: false,
+            chunk_upload: None,
+            cache_fresh: true,
+            mime_detect_ct: None,
+            mime_detect_max_read: 0,
+            next_expected_off: 0,
+            read_ahead_window: READ_AHEAD_INITIAL,
+            next_buf: None,
+            prev_buf: None,
+            last_read: Instant::now(),
+            lookahead_inflight: false,
+            ino,
+            io_kind: iomode::IoKind::Cached,
+            upload_failed: false,
+            created: true,
+            unlinked: false,
+            opened_gen: 0,
+        }
+    }
+
+    fn staging_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ncrs-own-writes-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 7 + 3) & 0xff) as u8).collect()
+    }
+
+    fn stat_attr(ino: u64, kind: FileType, size: u64) -> FileAttr {
+        let mut e = make_dav_entry("doc.tmp", None);
+        e.is_dir = kind == FileType::Directory;
+        e.size = size;
+        make_file_attr(ino, &e)
+    }
+
+    #[test]
+    fn live_size_is_the_staged_length_not_the_listing_size() {
+        let dir = staging_dir("live-size");
+        let wp = dir.join("write_1");
+        std::fs::write(&wp, pattern(10_000)).unwrap();
+        let files = Mutex::new(HashMap::from([(1, writer_handle(7, true, Some(wp.clone())))]));
+
+        assert_eq!(live_write_size(&files, 7), Some(10_000));
+        // It tracks further writes and truncation, not a snapshot.
+        std::fs::write(&wp, pattern(12_345)).unwrap();
+        assert_eq!(live_write_size(&files, 7), Some(12_345));
+        std::fs::write(&wp, pattern(100)).unwrap();
+        assert_eq!(live_write_size(&files, 7), Some(100));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_size_ignores_clean_handles_and_other_inodes() {
+        let dir = staging_dir("live-size-scope");
+        let wp = dir.join("write_1");
+        std::fs::write(&wp, pattern(500)).unwrap();
+        // Opened writable but nothing written: the staging copy is just the current
+        // content, and the listing is already right.
+        let clean = Mutex::new(HashMap::from([(1, writer_handle(7, false, Some(wp.clone())))]));
+        assert_eq!(live_write_size(&clean, 7), None);
+        let dirty = Mutex::new(HashMap::from([(1, writer_handle(7, true, Some(wp)))]));
+        assert_eq!(live_write_size(&dirty, 8), None);
+        assert_eq!(live_write_size(&Mutex::new(HashMap::new()), 7), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_size_of_a_streamed_upload_is_what_was_written_not_the_unsent_tail() {
+        // After chunks went out the staging file only holds the unsent tail.
+        let dir = staging_dir("live-size-streamed");
+        let wp = dir.join("write_1");
+        std::fs::write(&wp, pattern(1_000)).unwrap();
+        let mut of = writer_handle(7, true, Some(wp));
+        of.chunk_upload = Some(ChunkUploadState { uploads_base: "x".into(), next_index: 3, bytes_confirmed: 30_000 });
+        of.total_written = 31_000;
+        let files = Mutex::new(HashMap::from([(1, of)]));
+
+        assert_eq!(live_write_size(&files, 7), Some(31_000));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attr_size_is_overlaid_for_regular_files_with_uncommitted_writes_only() {
+        let dir = staging_dir("overlay");
+        let wp = dir.join("write_1");
+        std::fs::write(&wp, pattern(10_000)).unwrap();
+        let files = Mutex::new(HashMap::from([(1, writer_handle(7, true, Some(wp)))]));
+
+        // The listing still says 0, as it does for a file created a moment ago.
+        let (attr, live) = overlay_live_size(&files, stat_attr(7, FileType::RegularFile, 0));
+        assert!(live, "the kernel must not cache an attr that changes with every write");
+        assert_eq!(attr.size, 10_000);
+        assert_eq!(attr.blocks, 20);
+
+        let (attr, live) = overlay_live_size(&files, stat_attr(9, FileType::RegularFile, 42));
+        assert!(!live);
+        assert_eq!(attr.size, 42, "another file keeps its listed size");
+
+        let (attr, live) = overlay_live_size(&files, stat_attr(7, FileType::Directory, 0));
+        assert!(!live);
+        assert_eq!(attr.size, 0, "a directory is never resized");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_writer_reads_back_its_own_staged_bytes() {
+        let dir = staging_dir("own-read");
+        let wp = dir.join("write_1");
+        let data = pattern(10_000);
+        std::fs::write(&wp, &data).unwrap();
+        let files = HashMap::from([(1, writer_handle(7, true, Some(wp.clone())))]);
+
+        let (src, skip) = staged_source(&files, 1, 7).expect("a dirty writer reads from its staging file");
+        assert_eq!((src.as_path(), skip), (wp.as_path(), 0));
+        // A full page, and the partial last page: short exactly at the staged end.
+        assert_eq!(read_staged(&src, skip, 4096, 4096).unwrap(), data[4096..8192]);
+        assert_eq!(read_staged(&src, skip, 8192, 4096).unwrap(), data[8192..]);
+        assert!(read_staged(&src, skip, 10_000, 4096).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_handle_on_the_same_file_sees_the_writers_bytes() {
+        let dir = staging_dir("sibling-read");
+        let wp = dir.join("write_1");
+        std::fs::write(&wp, pattern(300)).unwrap();
+        let reader = writer_handle(7, false, None);
+        let files = HashMap::from([(1, writer_handle(7, true, Some(wp.clone()))), (2, reader)]);
+
+        assert_eq!(staged_source(&files, 2, 7), Some((wp, 0)));
+        // …but not another file's.
+        assert_eq!(staged_source(&files, 2, 8), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_handle_with_no_uncommitted_writes_reads_the_normal_way() {
+        let dir = staging_dir("clean-read");
+        let wp = dir.join("write_1");
+        std::fs::write(&wp, pattern(300)).unwrap();
+        let files = HashMap::from([(1, writer_handle(7, false, Some(wp))), (2, writer_handle(7, false, None))]);
+
+        assert_eq!(staged_source(&files, 1, 7), None);
+        assert_eq!(staged_source(&files, 2, 7), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_streamed_upload_serves_only_the_bytes_it_still_holds() {
+        let dir = staging_dir("streamed-read");
+        let wp = dir.join("write_1");
+        let tail = pattern(1_000);
+        std::fs::write(&wp, &tail).unwrap();
+        let mut of = writer_handle(7, true, Some(wp.clone()));
+        of.chunk_upload = Some(ChunkUploadState { uploads_base: "x".into(), next_index: 3, bytes_confirmed: 30_000 });
+        let files = HashMap::from([(1, of)]);
+
+        let (src, skip) = staged_source(&files, 1, 7).unwrap();
+        assert_eq!(skip, 30_000, "the staging file starts at the first unsent byte");
+        assert_eq!(read_staged(&src, skip, 30_500, 100).unwrap(), tail[500..600]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn libreoffice_tail_page_reread_returns_what_was_just_written() {
+        // The sequence that corrupted the document: write a zip entry so that it ends
+        // part-way into a page, then pread that whole page. The size the kernel was
+        // told and the bytes it gets back must both include the entry's tail.
+        let dir = staging_dir("lo-pattern");
+        let wp = dir.join("write_1");
+        let zip = pattern(3 * 4096 + 1_653);
+        let files = Mutex::new(HashMap::from([(1, writer_handle(7, true, Some(wp.clone())))]));
+        std::fs::write(&wp, &zip).unwrap();
+
+        let page = (zip.len() / 4096 * 4096) as u64;
+        let size = live_write_size(&files, 7).expect("a file being written has a live size");
+        assert_eq!(size, zip.len() as u64, "the kernel must not be told the file is empty");
+
+        let (src, skip) = staged_source(&files.lock().unwrap(), 1, 7).unwrap();
+        let reread = read_staged(&src, skip, page, 4096).unwrap();
+        assert_eq!(reread.len(), 1_653, "the partial last page comes back, not nothing");
+        assert_eq!(reread, zip[page as usize..], "and it holds the bytes that were written");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
