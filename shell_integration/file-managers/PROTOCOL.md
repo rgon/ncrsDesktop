@@ -158,3 +158,9 @@ components are internal to the service.
 `ERRORS`, `TRANSFERS`, `JOURNAL`, `CONFLICTS`, `STORAGE`, `STATE`, `PAUSE`,
 `RESUME`, `PASSTHROUGH_ON|OFF|STATUS`, `PURGE_CACHE`, `SUBSCRIBE`, `CLIENTS`
 (JSON list of `HELLO`ed clients), `LOG <msg>`. See `ncrs_core/src/ipc.rs`.
+
+`RESTART_HANDOFF` → `ok` | `error: <reason>`: the service re-executes itself in
+place (same PID, picking up an upgraded binary) and takes its live FUSE
+connection over, so programs keep their open files. The reply comes first;
+the socket then closes and reappears within a few seconds — reconnect and
+`HELLO` again. See `ncrs_core/src/handoff.rs`.

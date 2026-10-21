@@ -8,7 +8,15 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/bin/ncrs
 Restart=on-failure
-RestartSec=30
+# Programs on the mount block (rather than fail) while it restarts — see below —
+# so come back quickly.
+RestartSec=3
+# Daemon-restart survival: ncrs parks its live FUSE descriptor in the fd store
+# (sd_notify FDSTORE=1) and takes it back from LISTEN_FDS after a crash or a
+# `systemctl --user restart`, so the mount and open files survive. NotifyAccess
+# is what exports NOTIFY_SOCKET to a Type=simple service.
+NotifyAccess=main
+FileDescriptorStoreMax=4
 
 [Install]
 WantedBy=default.target

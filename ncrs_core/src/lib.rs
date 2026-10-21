@@ -13,6 +13,9 @@ pub mod fuse_notify;
 mod fuse_dispatch;
 mod fuse_sched;
 pub mod change_log;
+// Daemon-restart survival (keep the FUSE connection, restore what the kernel references).
+pub mod handoff;
+mod state_snapshot;
 pub mod ipc;
 pub mod http_clients;
 mod iomode;
@@ -2320,11 +2323,15 @@ impl FsCache {
                 _ => to.to_path_buf(),
             };
             self.inodes.insert(ino, new.clone());
-            if let Some(displaced) = self.paths.insert(new, ino) {
+            let mut dropped = None;
+            if let Some(displaced) = self.paths.insert(new.clone(), ino) {
                 if displaced != ino {
                     self.inodes.remove(&displaced);
+                    dropped = Some(displaced);
                 }
             }
+            // Daemon-restart survival: mirror each move (cache lock held by the caller).
+            state_snapshot::inode_moved(ino, &new, dropped);
         }
     }
 
@@ -2334,6 +2341,8 @@ impl FsCache {
         }
         let ino = self.next_inode;
         self.next_inode += 1;
+        // Daemon-restart survival: logged before any reply can carry it to the kernel.
+        state_snapshot::inode_allocated(ino, &path);
         self.paths.insert(path.clone(), ino);
         self.inodes.insert(ino, path);
         ino
@@ -4202,7 +4211,8 @@ impl NextCloudFs {
                 for entry in dir_entries.flatten() {
                     if entry.file_name().to_str().map_or(false, |n| n.starts_with("write_")) {
                         let path = entry.path();
-                        if !referenced.contains(&path) {
+                        // Daemon-restart survival: a reattached handle still writes there.
+                        if !referenced.contains(&path) && !state_snapshot::protects_staging(&path) {
                             let _ = std::fs::remove_file(&path);
                             stale_count += 1;
                         }
@@ -4829,6 +4839,8 @@ impl NextCloudFs {
                 let session = retry_chunk_write("chunked-upload open", || {
                     self.conn.backend.open_chunked_upload(remote_path)
                 }).map_err(|e| (e.to_string(), None))?;
+                // Daemon-restart survival: from here the staging file may stop holding every byte.
+                state_snapshot::stream_started(wp, &session.uploads_base);
                 state = Some(ChunkUploadState {
                     uploads_base: session.uploads_base,
                     next_index: 0,
@@ -6292,6 +6304,16 @@ impl NextCloudFs {
                 opened_gen: self.uploads.generation(),
             },
         );
+        // Daemon-restart survival: logged before the reply hands fh to the kernel.
+        {
+            let backing = match &grant {
+                iomode::IoGrant::Passthrough(id) => Some(id.raw_id()),
+                _ => None,
+            };
+            if let Some(of) = self.open_files.safe_lock().get(&fh) {
+                state_snapshot::handle_opened(fh, of, backing);
+            }
+        }
         // io_modes keeps the BackingId alive until the inode's last passthrough
         // handle is released (the crate warns dropping it right after replying
         // can make the kernel return EIO).
@@ -6959,9 +6981,12 @@ impl NextCloudFs {
     ) {
         // The last close of the handle: the only point where no further write can arrive.
         let Some(of) = self.open_files.safe_lock().remove(&fh.0) else {
+            // A handle a reattach could not restore: drop its EIO marker.
+            state_snapshot::handle_released(fh.0);
             reply.ok();
             return;
         };
+        state_snapshot::handle_released(fh.0);
         self.io_modes.safe_lock().release(of.ino, of.io_kind);
         reply.ok();
 
@@ -7355,6 +7380,16 @@ impl NextCloudFs {
         // a forked child or a shell's per-command redirect exiting mid-write included — so
         // it is never the end of the file: committing here uploaded half-written snapshots
         // and deleted the staging file under a writer. release() commits.
+        //
+        // A handle whose upload already failed (a write returned EIO, or a reattach
+        // could not resume its streamed upload) reports it here too, so close() does
+        // not tell a program its data was saved.
+        if state_snapshot::is_lost_fh(fh.0)
+            || self.open_files.safe_lock().get(&fh.0).is_some_and(|of| of.upload_failed)
+        {
+            reply.error(Errno::EIO);
+            return;
+        }
         let staged = self.open_files.safe_lock().get(&fh.0).filter(|of| of.dirty).and_then(|of| {
             let streamed_size = of.chunk_upload.as_ref().map(|_| of.total_written);
             of.write_path.clone().map(|wp| (wp, of.remote_path.clone(), streamed_size))
@@ -7381,6 +7416,10 @@ impl NextCloudFs {
     }
 
     fn fsync(&self, _req: &Req, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        if state_snapshot::is_lost_fh(fh.0) {
+            reply.error(Errno::EIO);
+            return;
+        }
         let wp = self.open_files.safe_lock().get(&fh.0).and_then(|of| of.write_path.clone());
         if let Some(Ok(f)) = wp.map(std::fs::File::open) {
             if let Err(e) = f.sync_all() {
@@ -7454,6 +7493,9 @@ impl NextCloudFs {
                                     unlinked: false,
                                     opened_gen: self.uploads.generation(),
                                 });
+                                if let Some(of) = self.open_files.safe_lock().get(&fh) {
+                                    state_snapshot::handle_opened(fh, of, None);
+                                }
                                 log::info!("ghost create: {} (inotify trigger)", full_path.display());
                                 reply.created(&TTL, &attr, Generation(0), FileHandle(fh), plain_open_flags(io_kind));
                                 return;
@@ -7545,6 +7587,9 @@ impl NextCloudFs {
                 opened_gen: self.uploads.generation(),
             },
         );
+        if let Some(of) = self.open_files.safe_lock().get(&fh) {
+            state_snapshot::handle_opened(fh, of, None);
+        }
 
         let attr = make_file_attr(ino, &new_entry);
         reply.created(&TTL, &attr, Generation(0), FileHandle(fh), plain_open_flags(io_kind));
@@ -7779,9 +7824,10 @@ impl NextCloudFs {
         }
 
         // A handle still open on the deleted file must not re-create it when it is released.
-        for of in self.open_files.safe_lock().values_mut() {
+        for (fh, of) in self.open_files.safe_lock().iter_mut() {
             if of.remote_path == remote_path {
                 of.unlinked = true;
+                state_snapshot::handle_unlinked(*fh);
             }
         }
 
@@ -8125,7 +8171,7 @@ impl NextCloudFs {
         let mut uncommitted_source = false;
         {
             let mut files = self.open_files.safe_lock();
-            for of in files.values_mut() {
+            for (fh, of) in files.iter_mut() {
                 if let Ok(suffix) = of.remote_path.strip_prefix(&from) {
                     if suffix.as_os_str().is_empty() {
                         uncommitted_source |= of.created && !of.unlinked;
@@ -8133,6 +8179,7 @@ impl NextCloudFs {
                     } else {
                         of.remote_path = to.join(suffix);
                     }
+                    state_snapshot::handle_retargeted(*fh, &of.remote_path);
                 }
             }
         }
@@ -9347,7 +9394,28 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     // cache dirs, journal): a refused second instance must leave the running
     // daemon's state untouched.
     let cache_dir = ncrs_cache_dir(&options.url);
-    let adopted = prepare_mount_point(&options.mount_point, &cache_dir)?;
+    // Daemon-restart survival: a previous daemon's live FUSE connection (left by
+    // our own re-exec, the fd holder or systemd's fd store) is taken over instead
+    // of mounting afresh, so programs keep their open files. Must run before
+    // prepare_mount_point, which would stat — and block on — the unserved mount.
+    // A connection whose node ids and handles cannot be restored is let go.
+    let reattach = handoff::try_reattach(&options.mount_point).and_then(|ra| {
+        match state_snapshot::load(&cache_dir, ra.dev, &options.mount_point) {
+            Ok(restored) => Some((ra, restored)),
+            Err(e) => {
+                log::warn!("handoff: cannot restore the previous daemon's state ({}) — mounting afresh", e);
+                handoff::abandon(ra, &options.mount_point);
+                None
+            }
+        }
+    });
+    let adopted = match reattach {
+        Some(_) => Vec::new(),
+        None => prepare_mount_point(&options.mount_point, &cache_dir)?,
+    };
+    if let Some((_, restored)) = &reattach {
+        state_snapshot::stage(restored);
+    }
 
     let mut filesystem = NextCloudFs::new(options.clone())?;
     if let Some(el) = error_log {
@@ -9358,6 +9426,16 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     }
     if let Some(j) = journal {
         filesystem.journal = j;
+    }
+    // Daemon-restart survival: install the previous daemon's node ids and handles
+    // before any thread can allocate new ones, and keep logging where it left off.
+    if let Some((ra, restored)) = &reattach {
+        let report = state_snapshot::apply(&filesystem, restored);
+        log::info!(
+            "handoff: restored {} node ids and {} open handles ({} exact, {} failed, {} lost)",
+            report.inodes, report.handles, report.exact, report.failed, report.lost,
+        );
+        state_snapshot::start_resumed(&cache_dir, ra.dev, &options.mount_point, restored);
     }
     // One shared pause flag for the FUSE connection, background workers, and
     // the IPC PAUSE/RESUME verbs — callers without their own flag get one.
@@ -9812,8 +9890,40 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         c.mount_options = fuse_options;
         c
     };
-    let session = fuser::Session::new(fuse_dispatch::SchedFs::new(filesystem), &options.mount_point, &fuse_config)
-        .map_err(|e| format!("FUSE session init failed: {}", e))?;
+    // Daemon-restart survival: what a planned restart and the handoff log need
+    // once `filesystem` has moved into the session.
+    let handoff_cache = filesystem.cache_ref();
+    let handoff_open_files = filesystem.open_files.clone();
+    let handoff_next_fh = filesystem.next_fh.clone();
+
+    let reattached = reattach.is_some();
+    let session = match reattach {
+        Some((ra, _)) => {
+            log::info!("Reattaching to the live FUSE connection on {} ({:?})", options.mount_point.display(), ra.source);
+            let (fd, dev, source, lease) = ra.into_parts();
+            let own = fd.try_clone().map_err(|e| format!("FUSE reattach: cannot dup the descriptor: {}", e))?;
+            // No FUSE_INIT on a live connection: init() is not called again, and the
+            // capabilities the first daemon negotiated stay in force.
+            let session = fuser::Session::from_fd_initialized(fuse_dispatch::SchedFs::new(filesystem), fd, fuse_config.acl, fuse_config.clone());
+            handoff::adopt_reattached(own, dev, source, lease, &options.mount_point);
+            session
+        }
+        None => {
+            use std::os::fd::AsFd;
+            let session = fuser::Session::new(fuse_dispatch::SchedFs::new(filesystem), &options.mount_point, &fuse_config)
+                .map_err(|e| format!("FUSE session init failed: {}", e))?;
+            if let Some(dev) = handoff::adopt_fresh(session.as_fd(), &options.mount_point) {
+                state_snapshot::start_fresh(&cache_dir, dev, &options.mount_point, &handoff_cache);
+            }
+            session
+        }
+    };
+    {
+        let cd = cache_dir.clone();
+        let open_files = handoff_open_files.clone();
+        handoff::set_snapshot_hook(move || state_snapshot::write_handles_snapshot(&cd, &open_files));
+    }
+    state_snapshot::spawn_ticker(handoff_cache, handoff_next_fh, shutdown_flag.clone());
 
     // The kernel accepted the mount — record that ncrs now owns this exact
     // path so a later restart on it (rather than a fresh setup elsewhere) is
@@ -9824,6 +9934,10 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     log::info!("FUSE notifier ready");
 
     let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;
+    if reattached {
+        // The session reads now: re-queue what the previous daemon left unanswered.
+        handoff::resend_in_flight();
+    }
 
     let result = bg.guard.join().map_err(|panic_payload| {
         let msg = panic_payload
@@ -9836,6 +9950,13 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     shutdown_flag.store(true, Ordering::Relaxed);
     log::info!("FUSE session ended — shutdown signal sent to background threads");
+
+    // Daemon-restart survival: a clean end means unmounted, so nothing will take
+    // the connection over; an error leaves it to the keeper for a successor.
+    if result.is_ok() {
+        handoff::release_connection();
+        state_snapshot::stop(&cache_dir);
+    }
 
     // Remove the IPC socket so a subsequent remount doesn't mistake the
     // still-running server thread for an external daemon and enter attach mode.

@@ -45,6 +45,9 @@ enum Cmd {
     Clients,
     /// Print the change feed as it happens (WATCH)
     Watch,
+    /// Restart the service in place (e.g. after an upgrade), keeping the mount
+    /// and every program's open files
+    Restart,
     /// Send one raw protocol line and print the reply
     Raw { line: Vec<String> },
 }
@@ -180,6 +183,9 @@ fn run(cli: Cli) -> Result<(), String> {
                     println!("{}", line.replace('\t', "\n  "));
                 }
             }
+        }
+        Cmd::Restart => {
+            check(c.request("RESTART_HANDOFF")?)?;
         }
         Cmd::Raw { line } => println!("{}", c.request(&line.join(" "))?),
     }

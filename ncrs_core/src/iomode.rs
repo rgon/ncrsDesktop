@@ -53,6 +53,10 @@ impl<B> IoGrant<B> {
 enum Mode<B> {
     Passthrough { backing: Arc<B>, file: FileId, opens: usize },
     Cached { opens: usize },
+    /// Passthrough handles a previous daemon opened on this connection (see
+    /// [`InodeIoModes::adopt`]): their backing belongs to that registration, not
+    /// to this process, so no new open can share it.
+    Foreign { opens: usize },
 }
 
 pub(crate) struct InodeIoModes<B> {
@@ -87,6 +91,7 @@ impl<B> InodeIoModes<B> {
                 *opens += 1;
                 (IoGrant::Cached, None)
             }
+            Some(Mode::Foreign { .. }) => (IoGrant::DirectIo, None),
             None => {
                 let mut err = None;
                 if let Some((file, register)) = passthrough {
@@ -114,6 +119,7 @@ impl<B> InodeIoModes<B> {
     pub(crate) fn release(&mut self, ino: u64, kind: IoKind) {
         let now_unused = match (self.modes.get_mut(&ino), kind) {
             (Some(Mode::Passthrough { opens, .. }), IoKind::Passthrough)
+            | (Some(Mode::Foreign { opens }), IoKind::Passthrough)
             | (Some(Mode::Cached { opens }), IoKind::Cached) => {
                 *opens = opens.saturating_sub(1);
                 *opens == 0
@@ -122,6 +128,25 @@ impl<B> InodeIoModes<B> {
         };
         if now_unused {
             self.modes.remove(&ino);
+        }
+    }
+
+    /// Counts a handle a previous daemon opened on this connection and the kernel
+    /// still holds in `kind` (daemon-restart survival, see state_snapshot). A
+    /// passthrough one makes every new open on the inode direct I/O until all
+    /// such handles are released, exactly as if it had been opened here.
+    pub(crate) fn adopt(&mut self, ino: u64, kind: IoKind) {
+        match kind {
+            IoKind::DirectIo => {}
+            IoKind::Cached => match self.modes.entry(ino).or_insert(Mode::Cached { opens: 0 }) {
+                Mode::Cached { opens } => *opens += 1,
+                // The kernel never lets cached and passthrough opens coexist.
+                Mode::Passthrough { .. } | Mode::Foreign { .. } => {}
+            },
+            IoKind::Passthrough => match self.modes.entry(ino).or_insert(Mode::Foreign { opens: 0 }) {
+                Mode::Foreign { opens } => *opens += 1,
+                Mode::Passthrough { .. } | Mode::Cached { .. } => {}
+            },
         }
     }
 }
@@ -194,6 +219,30 @@ mod tests {
         m.release(1, b.kind());
         let (d, _) = m.acquire(1, None::<(FileId, Reg)>);
         assert_eq!(d.kind(), IoKind::Cached);
+    }
+
+    #[test]
+    fn adopted_passthrough_handle_forces_direct_io_until_released() {
+        let mut m = InodeIoModes::<u32>::default();
+        m.adopt(1, IoKind::Passthrough);
+        let (g, _) = m.acquire(1, Some((fid(9), ok_reg as Reg)));
+        assert_eq!(g.kind(), IoKind::DirectIo, "the inherited backing cannot be shared");
+        m.release(1, g.kind());
+        m.release(1, IoKind::Passthrough);
+        let (g, _) = m.acquire(1, Some((fid(9), ok_reg as Reg)));
+        assert_eq!(g.kind(), IoKind::Passthrough, "free again once the inherited handle is released");
+    }
+
+    #[test]
+    fn adopted_cached_handle_keeps_passthrough_off() {
+        let mut m = InodeIoModes::<u32>::default();
+        m.adopt(1, IoKind::Cached);
+        let (g, _) = m.acquire(1, Some((fid(9), ok_reg as Reg)));
+        assert_eq!(g.kind(), IoKind::Cached);
+        m.release(1, g.kind());
+        m.release(1, IoKind::Cached);
+        let (g, _) = m.acquire(1, Some((fid(9), ok_reg as Reg)));
+        assert_eq!(g.kind(), IoKind::Passthrough);
     }
 
     #[test]
