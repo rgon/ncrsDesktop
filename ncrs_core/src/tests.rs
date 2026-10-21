@@ -3355,3 +3355,20 @@ mod upload_order_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn streaming_waits_for_the_threshold_then_sends_every_full_chunk() {
+        let chunk = webdav_ops::CHUNK_SIZE as u64;
+        let threshold = 100 * 1024 * 1024;
+        // No session yet: a file a few chunks long stays local in full.
+        assert!(!stream_should_graduate(chunk, None, threshold));
+        assert!(!stream_should_graduate(threshold - 1, None, threshold));
+        assert!(stream_should_graduate(threshold, None, threshold));
+        // A threshold below one chunk still waits for a full chunk.
+        assert!(!stream_should_graduate(chunk - 1, None, 0));
+        assert!(stream_should_graduate(chunk, None, 0));
+        // Session open: graduation follows the unsent tail, not the threshold.
+        let s = ChunkUploadState { uploads_base: "x".into(), next_index: 10, bytes_confirmed: 10 * chunk };
+        assert!(!stream_should_graduate(11 * chunk - 1, Some(&s), threshold));
+        assert!(stream_should_graduate(11 * chunk, Some(&s), threshold));
+    }

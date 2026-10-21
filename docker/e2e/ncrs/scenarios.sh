@@ -996,6 +996,7 @@ echo "→ 29. LARGE LIBREOFFICE SAVE over chunked upload — a rewrite of the un
 # in the local tail, yet any out-of-order write after the first chunk failed the handle
 # with EIO. rclone has no chunked uploads, so this runs a second daemon against
 # chunkdav.py, which adds Nextcloud's uploads collection in front of the same server.
+# Streaming normally starts at 100 MiB; the threshold is lowered to one chunk here.
 CD_PORT=8090
 CD_LOG=/tmp/chunkdav.log
 CD_HOME=/tmp/ncrs-chunked
@@ -1017,6 +1018,7 @@ allow_insecure_http: true
 http3: false
 optimistic_listing: false
 auto_keep_cached_files: false
+stream_upload_threshold_mb: 10
 EOF
 cd_ncrs() { HOME="$CD_HOME" XDG_RUNTIME_DIR="$CD_HOME/run" XDG_CACHE_HOME="$CD_HOME/cache" \
     XDG_CONFIG_HOME="$CD_HOME/.config" "$@"; }
@@ -1025,13 +1027,18 @@ for _ in $(seq 1 20); do
         "http://127.0.0.1:${CD_PORT}/remote.php/dav/files/${U}/" && break
     sleep 0.5
 done
-RUST_LOG="${RUST_LOG:-info}" cd_ncrs ncrs --config "$CD_HOME/.config/ncrs/config.yaml" >"$CD_NLOG" 2>&1 &
-CD_DAEMON=$!
-for _ in $(seq 1 60); do
-    mountpoint -q "$CD_MOUNT" && break
-    kill -0 "$CD_DAEMON" 2>/dev/null || break
-    sleep 1
-done
+cd_start() {
+    RUST_LOG="${RUST_LOG:-info}" cd_ncrs ncrs --config "$CD_HOME/.config/ncrs/config.yaml" >>"$CD_NLOG" 2>&1 &
+    CD_DAEMON=$!
+    for _ in $(seq 1 60); do
+        mountpoint -q "$CD_MOUNT" && return 0
+        kill -0 "$CD_DAEMON" 2>/dev/null || return 1
+        sleep 1
+    done
+    return 1
+}
+: > "$CD_NLOG"
+cd_start
 if ! mountpoint -q "$CD_MOUNT"; then
     no "setup: the chunked-upload mount never appeared"
     tail -20 "$CD_NLOG" | sed 's/^/    /'
@@ -1112,11 +1119,45 @@ PY
     [ -n "$t_lo" ] && [ "$(date -u -d "$srv" +%s 2>/dev/null)" = "$t_lo" ] \
         && ok "the chunked upload kept the save's mtime on the server" \
         || no "the chunked upload's server mtime (${srv:-none}) is not the save's ($(date -u -d "@${t_lo:-0}" +%T))"
+
+    # With stream_uploads off, the whole file is staged locally, so a rewrite of offset 0
+    # after more than a threshold's worth was written (an MP4/WAV header patch) must work.
+    fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
+    kill "$CD_DAEMON" 2>/dev/null; wait "$CD_DAEMON" 2>/dev/null
+    echo "stream_uploads: false" >> "$CD_HOME/.config/ncrs/config.yaml"
+    if ! cd_start; then
+        no "setup: the chunked-upload mount did not come back with stream_uploads off"
+        tail -20 "$CD_NLOG" | sed 's/^/    /'
+    else
+        python3 - "$CD_MOUNT/chunked/header.bin" /tmp/chunked.hdr.expect <<'PY'
+import os, sys
+path, expect_path = sys.argv[1], sys.argv[2]
+data = bytearray(os.urandom(24 * 1048576))
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+try:
+    for off in range(0, len(data), 65536):
+        os.pwrite(fd, bytes(data[off:off + 65536]), off)
+    data[0:4096] = os.urandom(4096)
+    os.pwrite(fd, bytes(data[0:4096]), 0)
+    os.close(fd)
+except OSError as e:
+    print("    write: %s" % e)
+    sys.exit(1)
+open(expect_path, "wb").write(bytes(data))
+PY
+        hrc=$?
+        [ "$hrc" = 0 ] && ok "streaming off: rewriting offset 0 of a 24 MiB new file got no write error" \
+            || no "streaming off: rewriting offset 0 of a 24 MiB new file failed (rc=$hrc)"
+        # With streaming on, this rewrite would hit an already-sent chunk and fail.
+        wait_dav_sha chunked/header.bin "$(sha < /tmp/chunked.hdr.expect 2>/dev/null)" 90 \
+            && ok "streaming off: the header-patched file reached the backend byte-exact" \
+            || no "streaming off: the header-patched file never reached the backend intact"
+    fi
 fi
 fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
 kill "$CD_DAEMON" "$CD_PID" 2>/dev/null
 wait "$CD_DAEMON" "$CD_PID" 2>/dev/null
-rm -f /tmp/chunked.seq /tmp/chunked.lo.expect
+rm -f /tmp/chunked.seq /tmp/chunked.lo.expect /tmp/chunked.hdr.expect
 
 echo "→ 30. MODIFICATION TIME is the same after the upload as right after the save"
 # LibreOffice remembers a document's mtime right after saving it and, before the next save,
