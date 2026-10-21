@@ -23,6 +23,7 @@
         walker_listings_per_sec: number;
         stream_uploads: boolean;
         stream_upload_threshold_mb: number;
+        stream_disk_reserve_mb: number;
     }
 
     // One desktop profile, as reported by the service (`INTEGRATIONS`):
@@ -269,7 +270,7 @@
                 <div class="sv-toggle">
                     <div>
                         <label class="sv-toggle-label" for="stream-uploads">Upload large files while they are being written</label>
-                        <p class="sv-hint">Files over {settings.stream_upload_threshold_mb} MB are sent to the server piece by piece as they are written, instead of being saved on this computer first. Saves disk space for big copies. Turn off if a program (video recorder, audio editor, office suite) shows write errors when saving large files to the Nextcloud folder.</p>
+                        <p class="sv-hint">When this computer is low on disk space, files over {settings.stream_upload_threshold_mb} MB are sent to the server piece by piece as they are written, instead of being saved here first, so big copies still fit. Turn off if a program shows write errors when saving large files to the Nextcloud folder while the disk is nearly full.</p>
                     </div>
                     <input id="stream-uploads" type="checkbox" class="sv-check" bind:checked={settings.stream_uploads} />
                 </div>

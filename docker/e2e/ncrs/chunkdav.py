@@ -104,7 +104,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if len(parts) < 2 or any(p in ("", ".", "..") for p in parts):
             return self.reply(400)
         session = os.path.join(STORE, parts[0], parts[1])
-        log("%s %s" % (self.command, "/".join(parts[1:])))
+        log("%s %s %d" % (self.command, "/".join(parts[1:]), len(data)))
         if self.command == "MKCOL" and len(parts) == 2:
             os.makedirs(session, exist_ok=True)
             return self.reply(201)

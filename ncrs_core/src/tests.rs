@@ -3315,6 +3315,14 @@ mod upload_order_tests {
     }
 
     #[test]
+    fn the_automatic_disk_reserve_is_the_larger_of_2_gib_and_5_percent() {
+        let gib = 1u64 << 30;
+        assert_eq!(stream_reserve_bytes(0, 10 * gib), 2 * gib, "small disk: 2 GiB floor");
+        assert_eq!(stream_reserve_bytes(0, 466 * gib), 466 * gib / 20, "big disk: 5%");
+        assert_eq!(stream_reserve_bytes(500, 466 * gib), 500 * 1024 * 1024, "configured MiB wins");
+    }
+
+    #[test]
     fn a_moved_folder_takes_its_subtree_along_in_the_inode_map() {
         let mut c = make_test_cache();
         let dir = c.allocate_inode(PathBuf::from("/a"));

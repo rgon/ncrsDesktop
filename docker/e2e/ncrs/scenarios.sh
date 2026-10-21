@@ -1019,6 +1019,9 @@ http3: false
 optimistic_listing: false
 auto_keep_cached_files: false
 stream_upload_threshold_mb: 10
+# Streaming only happens while the disk is low; a reserve far above any real disk makes
+# this mount stream regardless, so the checks below exercise the streaming path.
+stream_disk_reserve_mb: 99999999
 EOF
 cd_ncrs() { HOME="$CD_HOME" XDG_RUNTIME_DIR="$CD_HOME/run" XDG_CACHE_HOME="$CD_HOME/cache" \
     XDG_CONFIG_HOME="$CD_HOME/.config" "$@"; }
@@ -1120,10 +1123,64 @@ PY
         && ok "the chunked upload kept the save's mtime on the server" \
         || no "the chunked upload's server mtime (${srv:-none}) is not the save's ($(date -u -d "@${t_lo:-0}" +%T))"
 
+    cd_restart() {  # <sed expression for the config>: remount with a changed setting
+        fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
+        kill "$CD_DAEMON" 2>/dev/null; wait "$CD_DAEMON" 2>/dev/null
+        sed -i "$1" "$CD_HOME/.config/ncrs/config.yaml"
+        cd_start || { no "setup: the chunked-upload mount did not come back ($1)"; tail -20 "$CD_NLOG" | sed 's/^/    /'; return 1; }
+    }
+    # A tail bigger than one chunk at close (threshold 30 MiB: 20-30 MiB unsent) goes up
+    # in chunk-sized pieces read one at a time, not as one body held in memory.
+    if cd_restart 's/^stream_upload_threshold_mb: .*/stream_upload_threshold_mb: 30/'; then
+        mark=$(wc -l < "$CD_LOG")
+        head -c $((50 * 1048576 + 4321)) /dev/urandom > /tmp/chunked.big
+        cp /tmp/chunked.big "$CD_MOUNT/chunked/big-tail.bin"
+        if wait_dav_sha chunked/big-tail.bin "$(sha < /tmp/chunked.big)" 120; then
+            biggest=$(tail -n +"$((mark + 1))" "$CD_LOG" | awk '$1 == "PUT" { if ($3 > m) m = $3 } END { print m + 0 }')
+            [ "$biggest" -le 10485760 ] && [ "$biggest" -gt 0 ] \
+                && ok "a 20-30 MiB tail at close went up in pieces of at most one chunk, byte-exact" \
+                || no "the tail at close went up as a ${biggest}-byte chunk (expected at most 10485760)"
+        else
+            no "a 50 MiB streamed file with a large tail at close never reached the backend intact"
+        fi
+    fi
+    # With room on the disk (reserve 1 MiB) nothing streams: a 24 MiB file stays local
+    # until close, so a rewrite of offset 0 works and no chunk is sent while it is open.
+    if cd_restart 's/^stream_upload_threshold_mb: .*/stream_upload_threshold_mb: 10/; s/^stream_disk_reserve_mb: .*/stream_disk_reserve_mb: 1/'; then
+        python3 - "$CD_MOUNT/chunked/roomy.bin" /tmp/chunked.roomy.expect "$CD_LOG" "$(wc -l < "$CD_LOG")" <<'PY'
+import os, sys
+path, expect_path, log, mark = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+data = bytearray(os.urandom(24 * 1048576))
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+try:
+    for off in range(0, len(data), 65536):
+        os.pwrite(fd, bytes(data[off:off + 65536]), off)
+    data[0:4096] = os.urandom(4096)
+    os.pwrite(fd, bytes(data[0:4096]), 0)
+except OSError as e:
+    print("    write: %s" % e)
+    sys.exit(1)
+sent = [l for l in open(log).read().splitlines()[mark:] if l.startswith("PUT ")]
+os.close(fd)
+open(expect_path, "wb").write(bytes(data))
+if sent:
+    print("    %d chunk(s) were sent while the file was still open" % len(sent))
+    sys.exit(2)
+PY
+        rrc=$?
+        [ "$rrc" = 0 ] && ok "plenty of disk: a 24 MiB file was not streamed, and rewriting its offset 0 worked" \
+            || no "plenty of disk: the 24 MiB file was streamed or its rewrite failed (rc=$rrc)"
+        wait_dav_sha chunked/roomy.bin "$(sha < /tmp/chunked.roomy.expect 2>/dev/null)" 90 \
+            && ok "plenty of disk: the file reached the backend byte-exact after close" \
+            || no "plenty of disk: the file never reached the backend intact"
+    fi
+
     # With stream_uploads off, the whole file is staged locally, so a rewrite of offset 0
-    # after more than a threshold's worth was written (an MP4/WAV header patch) must work.
+    # after more than a threshold's worth was written (an MP4/WAV header patch) must work,
+    # even while the disk counts as low (the reserve is set back far above any disk).
     fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
     kill "$CD_DAEMON" 2>/dev/null; wait "$CD_DAEMON" 2>/dev/null
+    sed -i 's/^stream_disk_reserve_mb: .*/stream_disk_reserve_mb: 99999999/' "$CD_HOME/.config/ncrs/config.yaml"
     echo "stream_uploads: false" >> "$CD_HOME/.config/ncrs/config.yaml"
     if ! cd_start; then
         no "setup: the chunked-upload mount did not come back with stream_uploads off"
@@ -1157,7 +1214,7 @@ fi
 fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
 kill "$CD_DAEMON" "$CD_PID" 2>/dev/null
 wait "$CD_DAEMON" "$CD_PID" 2>/dev/null
-rm -f /tmp/chunked.seq /tmp/chunked.lo.expect /tmp/chunked.hdr.expect
+rm -f /tmp/chunked.seq /tmp/chunked.lo.expect /tmp/chunked.hdr.expect /tmp/chunked.big /tmp/chunked.roomy.expect
 
 echo "→ 30. MODIFICATION TIME is the same after the upload as right after the save"
 # LibreOffice remembers a document's mtime right after saving it and, before the next save,

@@ -863,7 +863,38 @@ fn execute_op(
     }
 }
 
-/// Uploads the tail of a streamed upload as its last chunk and assembles the session.
+/// Reads the staging tail in `chunk`-sized pieces (the last may be shorter) and hands
+/// each to `put` with its index from 0, so a tail of any length is never in memory whole:
+/// once streaming only starts when the disk is low, a session's tail can be gigabytes.
+fn each_tail_chunk<E>(
+    tail_path: &Path,
+    tail_len: u64,
+    chunk: usize,
+    local: impl Fn(String) -> E,
+    mut put: impl FnMut(u64, Vec<u8>) -> Result<(), E>,
+) -> Result<(), E> {
+    use std::io::Read;
+    let fault = |e: std::io::Error| local(format!("staging tail {}: {}", tail_path.display(), e));
+    let mut f = std::fs::File::open(tail_path).map_err(fault)?;
+    let len = f.metadata().map_err(fault)?.len();
+    if len != tail_len {
+        return Err(local(format!(
+            "staging tail is {} bytes, expected {} — refusing to assemble a truncated file",
+            len, tail_len,
+        )));
+    }
+    let (mut left, mut index) = (tail_len, 0u64);
+    while left > 0 {
+        let mut body = vec![0u8; (chunk as u64).min(left) as usize];
+        f.read_exact(&mut body).map_err(fault)?;
+        left -= body.len() as u64;
+        put(index, body)?;
+        index += 1;
+    }
+    Ok(())
+}
+
+/// Uploads the tail of a streamed upload as its last chunks and assembles the session.
 /// Re-running it is safe: a chunk PUT to the same index replaces the earlier one.
 pub(crate) fn finish_chunked(
     backend: &dyn crate::backend::CloudBackend,
@@ -883,15 +914,9 @@ pub(crate) fn finish_chunked(
     let tail_len = total_len.saturating_sub(bytes_confirmed);
     if tail_len > 0 {
         // Server(0, _): a local fault, never transient, so it is not retried forever.
-        let tail = std::fs::read(tail_path)
-            .map_err(|e| BackendWriteError::Server(0, format!("staging tail {}: {}", tail_path.display(), e)))?;
-        if tail.len() as u64 != tail_len {
-            return Err(BackendWriteError::Server(0, format!(
-                "staging tail is {} bytes, expected {} — refusing to assemble a truncated file",
-                tail.len(), tail_len,
-            )));
-        }
-        crate::retry_chunk_write("final chunk upload", || backend.put_chunk(&session, next_index, tail.clone()))?;
+        each_tail_chunk(tail_path, tail_len, crate::webdav_ops::CHUNK_SIZE, |m| BackendWriteError::Server(0, m), |i, body| {
+            crate::retry_chunk_write("final chunk upload", || backend.put_chunk(&session, next_index + i, body.clone()))
+        })?;
     }
     crate::retry_chunk_write("chunked-upload finish", || backend.finish_chunked_upload(&session, remote_path, if_match, mtime))
 }
@@ -900,6 +925,24 @@ pub(crate) fn finish_chunked(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn a_tail_is_uploaded_in_chunk_sized_pieces_read_one_at_a_time() {
+        let dir = temp_dir("tail-chunks");
+        let tail = dir.join("write_1");
+        let data: Vec<u8> = (0..25u8).collect();
+        fs::write(&tail, &data).unwrap();
+        let mut got = Vec::new();
+        each_tail_chunk(&tail, 25, 10, |m| m, |i, body| {
+            got.push((i, body));
+            Ok::<(), String>(())
+        }).unwrap();
+        assert_eq!(got, vec![(0, data[..10].to_vec()), (1, data[10..20].to_vec()), (2, data[20..].to_vec())]);
+        // A tail shorter than the journal says is never assembled.
+        let err = each_tail_chunk(&tail, 30, 10, |m| m, |_, _| Ok::<(), String>(())).unwrap_err();
+        assert!(err.contains("refusing to assemble"), "{}", err);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ncrs_journal_test_{}_{}", std::process::id(), name));
