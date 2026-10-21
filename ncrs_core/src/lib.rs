@@ -10,6 +10,8 @@ pub mod login_flow;
 pub mod edit_locally;
 pub mod filename_validation;
 pub mod fuse_notify;
+mod fuse_dispatch;
+mod fuse_sched;
 pub mod change_log;
 pub mod ipc;
 pub mod http_clients;
@@ -35,10 +37,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    BackingId, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    BackingId, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, FopenFlags,
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    ReplyOpen, ReplyWrite, ReplyXattr, TimeOrNow, WriteFlags,
 };
 
 pub use config::{configuration_parser, MountOptions};
@@ -79,6 +81,7 @@ pub fn mount_local_path(mount_point: &Path, remote_path: &str) -> Option<PathBuf
     // assumed because the cost of being wrong here is arbitrary-path access.
     joined.starts_with(mount_point).then_some(joined)
 }
+use fuse_dispatch::Req;
 use ipc::{FileStatus, StatusMap};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use backend::RemoteEntry;
@@ -1989,8 +1992,13 @@ fn relist_errno(err: Option<&str>) -> Errno {
     }
 }
 
-/// Queues a server mutation. Its `PathSeq` ticket was taken on the FUSE thread
-/// before this call, which is what keeps the FIFO pool deadlock-free. The
+/// Held from taking a mutation's `PathSeq` ticket until its job is queued on `mutate`,
+/// so that pool's FIFO order stays ticket order now that several FUSE workers take
+/// tickets at once — the order `path_seq.rs`'s deadlock freedom rests on.
+static MUTATION_ORDER: Mutex<()> = Mutex::new(());
+
+/// Queues a server mutation. Its `PathSeq` ticket was taken just before this call,
+/// under `MUTATION_ORDER`, which is what keeps the FIFO pool deadlock-free. The
 /// queue is unbounded, so this only fails if the OS refuses a thread; the
 /// operation is then still in the journal and replays on the next reconnect.
 fn submit_mutation(job: impl FnOnce() + Send + 'static) {
@@ -4862,6 +4870,7 @@ impl NextCloudFs {
         let journal = self.journal.clone();
         let smap = self.status.clone();
         let uploads = self.uploads.clone();
+        let order = MUTATION_ORDER.safe_lock();
         let ticket = uploads.ticket_entry(&remote_path);
         submit_mutation(move || {
             ticket.wait();
@@ -4945,6 +4954,7 @@ impl NextCloudFs {
             dirty.safe_lock().insert(remote_path.clone());
             dirty.safe_lock().insert(parent);
         });
+        drop(order);
         Ok(())
     }
 
@@ -5058,6 +5068,7 @@ impl NextCloudFs {
             // evict it from a concurrent PROPFIND refresh before the PUT lands.
             self.cache.safe_lock().uploading.insert(remote_path.clone());
             let uploads = self.uploads.clone();
+            let order = MUTATION_ORDER.safe_lock();
             let ticket = uploads.ticket_entry(&remote_path);
 
             submit_mutation(move || {
@@ -5200,6 +5211,7 @@ impl NextCloudFs {
                     }
                 }
             });
+            drop(order);
         }
         Ok(())
     }
@@ -5776,8 +5788,13 @@ impl NextCloudFs {
     }
 }
 
-impl Filesystem for NextCloudFs {
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+// The FUSE request bodies. `fuse_dispatch::SchedFs` is the `Filesystem`: it queues
+// each request on the inodes it touches and runs these on `bg::FUSE` workers, one
+// at a time per inode in arrival order (shared reads together), so a body may wait
+// on the network without freezing requests for other files.
+#[allow(clippy::too_many_arguments)]
+impl NextCloudFs {
+    fn lookup(&self, _req: &Req, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let (parent_path, name_str) = {
             let c = self.cache.safe_lock();
             match (c.get_path(parent.0), name.to_str()) {
@@ -5852,7 +5869,7 @@ impl Filesystem for NextCloudFs {
         reply.error(Errno::ENOENT);
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Req, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino.0 == 1 {
             reply.attr(&TTL, &root_attr());
             return;
@@ -5924,7 +5941,7 @@ impl Filesystem for NextCloudFs {
         reply.error(Errno::ENOENT);
     }
 
-    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+    fn getxattr(&self, _req: &Req, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         // The MIME-type xattr a toolkit checks before sniffing (GLib:
         // `user.xdg.mime.type`), served while that toolkit's probe is declared
         // by an enabled profile (desktop::sniff).
@@ -5963,7 +5980,7 @@ impl Filesystem for NextCloudFs {
         }
     }
 
-    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, _req: &Req, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let path = match self.cache.safe_lock().get_path(ino.0) {
             Some(p) => p,
             None => { reply.error(Errno::ENOENT); return; }
@@ -5997,7 +6014,7 @@ impl Filesystem for NextCloudFs {
         }
     }
 
-    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, req: &Req, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let (path, local, etag, nc_permissions, remote_size) = {
             let c = self.cache.safe_lock();
             let path = match c.get_path(ino.0) {
@@ -6235,7 +6252,7 @@ impl Filesystem for NextCloudFs {
 
     fn read(
         &self,
-        _req: &Request,
+        _req: &Req,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -6880,7 +6897,7 @@ impl Filesystem for NextCloudFs {
 
     fn release(
         &self,
-        _req: &Request,
+        _req: &Req,
         _ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
@@ -6932,7 +6949,7 @@ impl Filesystem for NextCloudFs {
         }
     }
 
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn opendir(&self, _req: &Req, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let path = match self.cache.safe_lock().get_path(ino.0) {
             Some(p) => p,
             None => { reply.error(Errno::ENOENT); return; }
@@ -6947,20 +6964,20 @@ impl Filesystem for NextCloudFs {
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
-    fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+    fn releasedir(&self, _req: &Req, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
         self.open_dirs.safe_lock().remove(&fh.0);
         reply.ok();
     }
 
-    fn readdir(&self, req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectory) {
+    fn readdir(&self, req: &Req, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectory) {
         self.readdir_common(req.pid(), ino, fh.0, offset, DirReply::Plain(reply));
     }
 
-    fn readdirplus(&self, req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectoryPlus) {
+    fn readdirplus(&self, req: &Req, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectoryPlus) {
         self.readdir_common(req.pid(), ino, fh.0, offset, DirReply::Plus(reply));
     }
 
-    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+    fn init(&self, _req: &Req, config: &mut KernelConfig) -> std::io::Result<()> {
         // readdirplus bundles each entry's attributes into the directory read
         // (readdir + lookup in one), and READDIRPLUS_AUTO lets the kernel fall
         // back to plain readdir when a listing does not stat its entries. A file
@@ -6971,6 +6988,10 @@ impl Filesystem for NextCloudFs {
         // Deliver O_TRUNC to open() rather than as a follow-up setattr, so open() knows
         // not to stage (download) content that is about to be discarded.
         let _ = config.add_capabilities(InitFlags::FUSE_ATOMIC_O_TRUNC);
+        // Let the kernel send lookups and readdirs in one directory concurrently
+        // instead of serialising them on the directory's lock: requests are ordered
+        // per inode by fuse_sched, and reads of a directory run there together.
+        let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
         // Negotiate FUSE_PASSTHROUGH support unconditionally — cheap and
         // harmless if unused. Whether any given open() actually hands the
         // kernel a backing fd is decided per-open against passthrough_enabled/
@@ -6995,7 +7016,7 @@ impl Filesystem for NextCloudFs {
 
     fn setattr(
         &self,
-        _req: &Request,
+        _req: &Req,
         ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
@@ -7110,7 +7131,7 @@ impl Filesystem for NextCloudFs {
 
     fn write(
         &self,
-        _req: &Request,
+        _req: &Req,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -7277,7 +7298,7 @@ impl Filesystem for NextCloudFs {
         }
     }
 
-    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(&self, _req: &Req, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
         // Durability only. FLUSH is sent on every close() of any fd sharing this handle —
         // a forked child or a shell's per-command redirect exiting mid-write included — so
         // it is never the end of the file: committing here uploaded half-written snapshots
@@ -7307,7 +7328,7 @@ impl Filesystem for NextCloudFs {
         reply.ok();
     }
 
-    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(&self, _req: &Req, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
         let wp = self.open_files.safe_lock().get(&fh.0).and_then(|of| of.write_path.clone());
         if let Some(Ok(f)) = wp.map(std::fs::File::open) {
             if let Err(e) = f.sync_all() {
@@ -7319,7 +7340,7 @@ impl Filesystem for NextCloudFs {
 
     fn create(
         &self,
-        _req: &Request,
+        _req: &Req,
         parent: INodeNo,
         name: &OsStr,
         _mode: u32,
@@ -7479,7 +7500,7 @@ impl Filesystem for NextCloudFs {
 
     fn mkdir(
         &self,
-        _req: &Request,
+        _req: &Req,
         parent: INodeNo,
         name: &OsStr,
         _mode: u32,
@@ -7550,7 +7571,6 @@ impl Filesystem for NextCloudFs {
             ino
         };
         self.dirty.safe_lock().insert(parent_path);
-        reply.entry(&TTL, &make_dir_attr(ino), Generation(0));
 
         let seq = self.journal.safe_lock().enqueue(
             mutation_journal::MutationOp::MkDir { path: remote_path.clone() },
@@ -7561,6 +7581,7 @@ impl Filesystem for NextCloudFs {
             let journal = self.journal.clone();
             let elog = self.error_log.clone();
             let cache = self.cache.clone();
+            let order = MUTATION_ORDER.safe_lock();
             let ticket = self.uploads.ticket_entry(&remote_path);
             submit_mutation(move || {
                 ticket.wait();
@@ -7583,10 +7604,15 @@ impl Filesystem for NextCloudFs {
                     }
                 }
             });
+            drop(order);
         }
+        // Replied only now that the MKCOL holds its ticket: what the caller does next
+        // in the new folder is queued on the folder's own inode, which this request
+        // was not ordered on, and its uploads must queue behind the MKCOL.
+        reply.entry(&TTL, &make_dir_attr(ino), Generation(0));
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Req, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         // Guard: NC 'D' (delete) flag must be present on the parent directory.
         // Blocks unlink even when the parent directory mode is 0o755 due to having 'C'.
         if let Some(p) = self.cache.safe_lock().nc_dir_perms(parent.0) {
@@ -7622,9 +7648,9 @@ impl Filesystem for NextCloudFs {
             let child_ino = self.cache.safe_lock().get_inode(&remote_path).unwrap_or(0);
             reply.ok();
             // Off the fuser worker thread and after the reply: notify_* blocks on the
-            // kernel dentry/inode lock and this is the only FUSE request-servicing
-            // thread (n_threads=1), so calling it inline here can deadlock the whole
-            // mount against a concurrent lookup on the same directory. See the read()
+            // kernel dentry/inode lock while this worker holds the directory's queue
+            // (fuse_sched), so calling it inline here can deadlock the mount against a
+            // concurrent lookup on the same directory queued behind it. See the read()
             // handler's notify_inval_inode comment for the full explanation.
             let notifier_slot = self.notifier_slot.clone();
             notify_later(move || {
@@ -7682,11 +7708,11 @@ impl Filesystem for NextCloudFs {
         // invalidate their dentry cache immediately, without waiting for the background
         // PROPFIND to complete.  Matches what proactive_refresh does for remote changes.
         //
-        // MUST run off this thread and after the reply: this is the only FUSE
-        // request-servicing thread (n_threads=1), and notify_inval_inode/delete block
-        // on the kernel dentry/inode lock. Calling them inline here deadlocks the
-        // whole mount as soon as another process has a lookup pending against the
-        // same directory — see the identical fix and full explanation on read().
+        // MUST run off this thread and after the reply: this worker holds the
+        // directory's queue (fuse_sched), and notify_inval_inode/delete block on the
+        // kernel dentry/inode lock. Calling them inline here deadlocks as soon as
+        // another process has a lookup pending against the same directory, queued
+        // behind this request — see the identical fix and full explanation on read().
         {
             let notifier_slot = self.notifier_slot.clone();
             let file_name = file_name.clone();
@@ -7717,6 +7743,7 @@ impl Filesystem for NextCloudFs {
             let elog = self.error_log.clone();
             let cache = self.cache.clone();
             let uploads = self.uploads.clone();
+            let order = MUTATION_ORDER.safe_lock();
             let ticket = uploads.ticket_entry(&remote_path);
             submit_mutation(move || {
                 ticket.wait();
@@ -7769,6 +7796,7 @@ impl Filesystem for NextCloudFs {
                     }
                 }
             });
+            drop(order);
         } else {
             // Offline: the DELETE is journaled for later replay. Clear the guard now
             // so it doesn't persist across a reconnect unnecessarily — the journal
@@ -7777,7 +7805,7 @@ impl Filesystem for NextCloudFs {
         }
     }
 
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Req, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         if let Some(p) = self.cache.safe_lock().nc_dir_perms(parent.0) {
             if !p.contains('D') {
                 reply.error(Errno::EACCES);
@@ -7835,7 +7863,7 @@ impl Filesystem for NextCloudFs {
 
         // MUST run off this thread and after the reply — same deadlock hazard as
         // unlink()/read(): notify_inval_inode/delete block on the kernel dentry/inode
-        // lock, and this is the only FUSE request-servicing thread (n_threads=1).
+        // lock, and this worker holds the directory's queue (fuse_sched).
         {
             let notifier_slot = self.notifier_slot.clone();
             let dir_name = dir_name.clone();
@@ -7859,6 +7887,7 @@ impl Filesystem for NextCloudFs {
             let cache = self.cache.clone();
             let elog = self.error_log.clone();
             // Waits for every upload inside the folder (they hold it Shared).
+            let order = MUTATION_ORDER.safe_lock();
             let ticket = self.uploads.ticket_entry(&remote_path);
             submit_mutation(move || {
                 ticket.wait();
@@ -7886,6 +7915,7 @@ impl Filesystem for NextCloudFs {
                     }
                 }
             });
+            drop(order);
         } else {
             self.cache.safe_lock().deleting.remove(&remote_path);
         }
@@ -7893,7 +7923,7 @@ impl Filesystem for NextCloudFs {
 
     fn rename(
         &self,
-        _req: &Request,
+        _req: &Req,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -8040,8 +8070,10 @@ impl Filesystem for NextCloudFs {
         if !same_parent {
             self.dirty.safe_lock().insert(new_parent_path);
         }
-        reply.ok();
 
+        // Replied below, once open handles point at the destination and the MOVE holds
+        // its ticket: a request the caller sends next on a file inside a moved folder
+        // is queued on that file's inode only, not on this rename's.
         // Handles still open under the source now commit to the destination. One made by
         // create() means the server has no copy of the source yet, so there is nothing to MOVE.
         let mut uncommitted_source = false;
@@ -8064,6 +8096,8 @@ impl Filesystem for NextCloudFs {
             if c.uploading.remove(&from) {
                 c.uploading.insert(to.clone());
             }
+            drop(c);
+            reply.ok();
             return;
         }
 
@@ -8078,6 +8112,7 @@ impl Filesystem for NextCloudFs {
             let cache = self.cache.clone();
             let uploads = self.uploads.clone();
             let root = Path::new("/");
+            let order = MUTATION_ORDER.safe_lock();
             let ticket = uploads.seq.ticket(&[
                 (from.as_path(), path_seq::Access::Exclusive),
                 (to.as_path(), path_seq::Access::Exclusive),
@@ -8141,7 +8176,9 @@ impl Filesystem for NextCloudFs {
                     }
                 }
             });
+            drop(order);
         }
+        reply.ok();
     }
 }
 
@@ -9729,7 +9766,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
         c.mount_options = fuse_options;
         c
     };
-    let session = fuser::Session::new(filesystem, &options.mount_point, &fuse_config)
+    let session = fuser::Session::new(fuse_dispatch::SchedFs::new(filesystem), &options.mount_point, &fuse_config)
         .map_err(|e| format!("FUSE session init failed: {}", e))?;
 
     // The kernel accepted the mount — record that ncrs now owns this exact
