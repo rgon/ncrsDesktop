@@ -988,6 +988,128 @@ wait_dav_sha ryw/existing.bin "$(sha < /tmp/ryw.expect2)" 60 \
     && ok "both in-place edits reached the backend byte-exact" \
     || no "backend copy after the second in-place edit differs"
 
+echo "→ 29. LARGE LIBREOFFICE SAVE over chunked upload — a rewrite of the unsent tail must not fail"
+# Regression for "General input/output error" saving a 33 MB .odt. A new file written
+# sequentially streams to the server in 10 MiB chunks once it passes one chunk. LibreOffice
+# then goes back to the start of the 4 KiB block it is in the middle of and writes that
+# block again (seen live: offset=15527936 with 15531976 written). Those bytes were still
+# in the local tail, yet any out-of-order write after the first chunk failed the handle
+# with EIO. rclone has no chunked uploads, so this runs a second daemon against
+# chunkdav.py, which adds Nextcloud's uploads collection in front of the same server.
+CD_PORT=8090
+CD_LOG=/tmp/chunkdav.log
+CD_HOME=/tmp/ncrs-chunked
+CD_MOUNT=/mnt/ncrs-chunked
+CD_NLOG=/tmp/ncrs-chunked.log
+CD_HOST="$(printf '%s' "$URL" | sed -E 's#^https?://([^/]+)/.*#\1#')"
+: > "$CD_LOG"
+python3 /e2e/chunkdav.py "$CD_PORT" "$CD_HOST" "$CD_LOG" 2>/tmp/chunkdav.err &
+CD_PID=$!
+mkdir -p "$CD_MOUNT" "$CD_HOME/.config/ncrs" "$CD_HOME/run" "$CD_HOME/cache"
+chmod 700 "$CD_HOME/run"
+cat > "$CD_HOME/.config/ncrs/config.yaml" <<EOF
+url: "http://127.0.0.1:${CD_PORT}/remote.php/dav/files/${U}/"
+username: "${U}"
+password: "${P}"
+user: "${U}"
+mount_point: "${CD_MOUNT}"
+allow_insecure_http: true
+http3: false
+optimistic_listing: false
+auto_keep_cached_files: false
+EOF
+cd_ncrs() { HOME="$CD_HOME" XDG_RUNTIME_DIR="$CD_HOME/run" XDG_CACHE_HOME="$CD_HOME/cache" \
+    XDG_CONFIG_HOME="$CD_HOME/.config" "$@"; }
+for _ in $(seq 1 20); do
+    curl -s -o /dev/null -u "$U:$P" -X PROPFIND -H 'Depth: 0' \
+        "http://127.0.0.1:${CD_PORT}/remote.php/dav/files/${U}/" && break
+    sleep 0.5
+done
+RUST_LOG="${RUST_LOG:-info}" cd_ncrs ncrs --config "$CD_HOME/.config/ncrs/config.yaml" >"$CD_NLOG" 2>&1 &
+CD_DAEMON=$!
+for _ in $(seq 1 60); do
+    mountpoint -q "$CD_MOUNT" && break
+    kill -0 "$CD_DAEMON" 2>/dev/null || break
+    sleep 1
+done
+if ! mountpoint -q "$CD_MOUNT"; then
+    no "setup: the chunked-upload mount never appeared"
+    tail -20 "$CD_NLOG" | sed 's/^/    /'
+    tail -5 /tmp/chunkdav.err 2>/dev/null | sed 's/^/    /'
+else
+    mkdir -p "$CD_MOUNT/chunked"
+    # Setup guard: a plain sequential copy must really go through chunks, or the
+    # LibreOffice case below would pass without ever reaching the streaming path.
+    head -c $((16 * 1048576)) /dev/urandom > /tmp/chunked.seq
+    cp /tmp/chunked.seq "$CD_MOUNT/chunked/seq.bin"; crc=$?
+    if wait_dav_sha chunked/seq.bin "$(sha < /tmp/chunked.seq)" 90 && [ "$crc" -eq 0 ]; then
+        if grep -q "ASSEMBLED .* -> .*/chunked/seq.bin (HTTP 2" "$CD_LOG"; then
+            ok "setup: a 16 MiB sequential copy streamed through chunked upload byte-exact"
+        else
+            no "setup: the sequential copy never used chunked upload — the scenario below would not test the streaming path"
+            tail -10 "$CD_LOG" | sed 's/^/    /'
+        fi
+    else
+        no "setup: a 16 MiB sequential copy over chunked upload did not reach the backend intact (cp rc=$crc)"
+        grep -E "seq.bin" "$CD_NLOG" | tail -10 | sed 's/^/    /'
+        tail -15 /tmp/chunkdav.err 2>/dev/null | sed 's/^/    chunkdav: /'
+    fi
+
+    python3 - "$CD_MOUNT/chunked/lo-save.tmp" /tmp/chunked.lo.expect <<'PY'
+import os, sys
+path, expect_path = sys.argv[1], sys.argv[2]
+total = 16 * 1048576 + 777
+data = bytearray(os.urandom(total))
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+bad = []
+def put(buf, off, what):
+    try:
+        n = os.pwrite(fd, buf, off)
+        if n != len(buf):
+            bad.append("%s: short write %d of %d at %d" % (what, n, len(buf), off))
+    except OSError as e:
+        bad.append("%s at offset %d: %s" % (what, off, e))
+# Sequential, as LibreOffice streams the zip, stopping mid-block exactly as seen live.
+stop, off = 15531976, 0
+while off < stop:
+    n = min(65536, stop - off)
+    put(bytes(data[off:off + n]), off, "sequential write")
+    off += n
+# Back to the start of that 4 KiB block: rewrite it with changed bytes and carry on
+# past the old end, so a fix that skips already-written bytes is caught too.
+block = stop // 4096 * 4096
+for i in range(block, stop):
+    data[i] ^= 0x5a
+put(bytes(data[block:block + 8192]), block, "rewrite of the partly written block")
+off = block + 8192
+while off < total and len(bad) < 3:
+    n = min(65536, total - off)
+    put(bytes(data[off:off + n]), off, "sequential write after the rewrite")
+    off += n
+try:
+    os.close(fd)
+except OSError as e:
+    bad.append("close: %s" % e)
+open(expect_path, "wb").write(bytes(data))
+for b in bad[:4]:
+    print("    " + b)
+sys.exit(1 if bad else 0)
+PY
+    lrc=$?
+    [ "$lrc" = 0 ] && ok "LibreOffice's large save (rewrite of the block in progress) got no write error" \
+        || {
+            no "LibreOffice's large save failed with a write error (rc=$lrc) — the 'General input/output error'"
+            grep -E "lo-save.tmp" "$CD_NLOG" | grep -E "non-sequential|abandon|abort" | tail -4 | sed 's/^/    /'
+        }
+    wait_dav_sha chunked/lo-save.tmp "$(sha < /tmp/chunked.lo.expect)" 90 \
+        && ok "the large LibreOffice save reached the backend byte-exact" \
+        || no "the large LibreOffice save never reached the backend intact ($(curl -s -u "$U:$P" "${URL}chunked/lo-save.tmp" | wc -c) of $(stat -c %s /tmp/chunked.lo.expect) bytes)"
+fi
+fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
+kill "$CD_DAEMON" "$CD_PID" 2>/dev/null
+wait "$CD_DAEMON" "$CD_PID" 2>/dev/null
+rm -f /tmp/chunked.seq /tmp/chunked.lo.expect
+
 echo "→ 22. SERVER EDIT of a KEPT file — the refresh that evicts it must not freeze the mount"
 # Regression for the v0.1.73 freeze: a read-triggered refresh that found a locally
 # cached (kept) file changed on the server evicted it while holding the cache lock,

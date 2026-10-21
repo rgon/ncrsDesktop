@@ -30,12 +30,12 @@ FROM build-${PREBUILT_BINARY} AS binary
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         fuse3 libfuse3-3 libssl3 ca-certificates curl coreutils iptables procps netcat-openbsd \
-        libglib2.0-0 python3-minimal \
+        libglib2.0-0 python3 \
     && rm -rf /var/lib/apt/lists/* \
     && echo user_allow_other >> /etc/fuse.conf
 
 COPY --from=binary /ncrs /usr/local/bin/ncrs
-COPY docker/e2e/ncrs/entrypoint.sh docker/e2e/ncrs/scenarios.sh /e2e/
-RUN chmod +x /usr/local/bin/ncrs /e2e/entrypoint.sh /e2e/scenarios.sh
+COPY docker/e2e/ncrs/entrypoint.sh docker/e2e/ncrs/scenarios.sh docker/e2e/ncrs/chunkdav.py /e2e/
+RUN chmod +x /usr/local/bin/ncrs /e2e/entrypoint.sh /e2e/scenarios.sh /e2e/chunkdav.py
 
 ENTRYPOINT ["/e2e/entrypoint.sh"]

@@ -3300,6 +3300,25 @@ mod upload_order_tests {
     }
 
     #[test]
+    fn a_rewrite_into_the_unsent_tail_lands_at_its_file_offset() {
+        // LibreOffice rewrites the 4 KiB block it is in the middle of; past the first
+        // chunk that block is in the tail, which starts at file offset bytes_confirmed.
+        let dir = staging_dir("tail-rewrite");
+        let wp = dir.join("write_1");
+        std::fs::write(&wp, pattern(1_000)).unwrap();
+        let confirmed = 30_000;
+        let block = vec![0xAB; 600];
+        write_into_tail_file(&wp, 30_800 - confirmed, &block).unwrap();
+
+        let mut want = pattern(1_000)[..800].to_vec();
+        want.extend_from_slice(&block);
+        assert_eq!(std::fs::read(&wp).unwrap(), want, "overwrote 200 bytes and extended by 400");
+        assert_eq!(read_staged(&wp, confirmed, 30_800, 600).unwrap(), block);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn libreoffice_tail_page_reread_returns_what_was_just_written() {
         // The sequence that corrupted the document: write a zip entry so that it ends
         // part-way into a page, then pread that whole page. The size the kernel was

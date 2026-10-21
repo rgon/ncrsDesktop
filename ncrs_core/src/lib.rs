@@ -1099,11 +1099,12 @@ struct ReadAheadBuf {
 }
 
 // State for the bounded chunked-upload streaming path (see write()'s
-// stream_eligible handling): once a purely-sequential write on a file with no
+// stream_eligible handling): once a sequential write on a file with no
 // pre-existing content crosses one CHUNK_SIZE, chunks are pushed to Nextcloud
-// as they fill instead of the whole file landing on local disk first. There is
+// as they fill instead of the whole file landing on local disk first. Writes
+// back into the unsent tail are fine; it is still on disk. There is
 // deliberately no journal entry for this: unlike the legacy staging path, a
-// crash or a non-sequential write while a session is open cannot be resumed
+// crash or a write into already-sent bytes while a session is open cannot be resumed
 // or safely unwound (the already-uploaded prefix is no longer held locally),
 // so those cases fail the handle outright rather than risk silent corruption
 // or data loss. A plain sequential copy — the case this exists for — never
@@ -1127,7 +1128,7 @@ struct OpenFile {
     total_written: u64,
     // Candidate for chunked streaming: starts true only when there is no
     // pre-existing content to seed from, and is permanently cleared on the
-    // first non-sequential write or explicit truncate.
+    // first write outside the unsent tail or explicit truncate.
     stream_eligible: bool,
     chunk_upload: Option<ChunkUploadState>,
     // Freshness of the on-disk cached copy, decided ONCE at open() and pinned for
@@ -1251,6 +1252,12 @@ fn append_to_tail_file(wp: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(wp)?;
     f.write_all(data)
+}
+
+/// Overwrites (and possibly extends) the tail staging file at `tail_off`, an offset
+/// relative to the tail's first byte, for a write back into bytes not yet sent.
+fn write_into_tail_file(wp: &Path, tail_off: u64, data: &[u8]) -> std::io::Result<()> {
+    std::fs::OpenOptions::new().write(true).open(wp)?.write_all_at(data, tail_off)
 }
 
 /// Rewrites the tail staging file down to just the bytes from `skip` onward,
@@ -7100,18 +7107,28 @@ impl Filesystem for NextCloudFs {
         // actually begun, let the tail keep buffering locally and let the next
         // real network call (graduate_chunk, which now retries transient
         // failures) be the one to decide whether the server is actually gone.
+        //
+        // A write back into the unsent tail is placed there rather than failing the
+        // handle: LibreOffice rewrites the 4 KiB block it is in the middle of, so a large
+        // save always comes back a few KiB behind the end, and those bytes are still local.
         let blocked_by_offline =
             of.chunk_upload.is_none() && self.conn.is_offline.load(Ordering::Relaxed);
-        if of.stream_eligible && offset == of.total_written && !blocked_by_offline {
-            if let Err(e) = append_to_tail_file(&wp, data) {
+        let bytes_confirmed = of.chunk_upload.as_ref().map_or(0, |c| c.bytes_confirmed);
+        let in_tail = offset >= bytes_confirmed && offset <= of.total_written;
+        if of.stream_eligible && in_tail && !blocked_by_offline {
+            let res = if offset == of.total_written {
+                append_to_tail_file(&wp, data)
+            } else {
+                write_into_tail_file(&wp, offset - bytes_confirmed, data)
+            };
+            if let Err(e) = res {
                 log::error!("write to staging tail file: {}", e);
                 reply.error(Errno::EIO);
                 return;
             }
             of.dirty = true;
-            of.total_written += data.len() as u64;
+            of.total_written = of.total_written.max(offset + data.len() as u64);
 
-            let bytes_confirmed = of.chunk_upload.as_ref().map_or(0, |c| c.bytes_confirmed);
             if of.total_written - bytes_confirmed >= webdav_ops::CHUNK_SIZE as u64 {
                 let total_written = of.total_written;
                 let existing_session = of.chunk_upload.clone();
@@ -7153,8 +7170,8 @@ impl Filesystem for NextCloudFs {
 
         if of.chunk_upload.is_some() {
             // At least one chunk is already sitting on the server with nothing
-            // local to reconstruct it from — a non-sequential write, a resize,
-            // or going offline mid-copy cannot be reconciled here. Fail the
+            // local to reconstruct it from — a write into those sent bytes or
+            // past the end, a resize, or going offline mid-copy cannot be reconciled here. Fail the
             // write rather than misplace bytes in the small tail file or lose
             // the already-uploaded prefix silently. A plain sequential copy
             // never reaches this.
