@@ -1470,6 +1470,61 @@ done
 [ "$stuck" = 0 ] && ok "no FUSE requests left waiting on the daemon" \
     || no "$stuck FUSE request(s) still waiting on the daemon at suite end"
 
+echo "→ 32. DAEMON RESTART — the mount and programs' open files survive a planned restart and a crash"
+# LibreOffice keeps its document open (read-write, with a lock) for the whole session, so
+# a restarted daemon used to leave it with a dead descriptor: every save failed with
+# ENOTCONN until the program reopened the file. The kernel keeps a FUSE connection alive
+# while any process holds /dev/fuse, so the daemon now hands it on (re-exec for a planned
+# restart, the fd holder after a crash) and the successor serves the same open files.
+daemon_pid() {
+    local p
+    for p in $(pgrep -x ncrs); do
+        tr '\0' ' ' < "/proc/$p/cmdline" | grep -q -- '--fd-holder' || { echo "$p"; return; }
+    done
+}
+SOCK="$(ls "${XDG_RUNTIME_DIR:-/nonexistent}/ncrs.sock" /tmp/ncrs-"$(id -u)"/ncrs.sock 2>/dev/null | head -1)"
+mkdir -p "$MOUNT/hold"
+printf 'reader-content' > "$MOUNT/hold/r.txt"
+wait_dav_sha hold/r.txt "$(printf 'reader-content' | sha)" 60 >/dev/null || no "setup: hold/r.txt never reached the backend"
+exec 5>"$MOUNT/hold/w.txt"
+exec 6<"$MOUNT/hold/r.txt"
+printf 'part1-' >&5
+pid0="$(daemon_pid)"
+reply="$(ipc RESTART_HANDOFF)"
+sleep 3
+pid1="$(daemon_pid)"
+if [ "$reply" = ok ] && [ -n "$pid1" ] && bounded 10 ls "$MOUNT/hold" >/dev/null 2>&1; then
+    ok "planned restart: the daemon re-executed (pid ${pid0} → ${pid1}) and the mount kept answering"
+else
+    no "planned restart failed (reply '${reply}', pid ${pid0:-none} → ${pid1:-none}, mounted: $(mountpoint -q "$MOUNT" && echo yes || echo no))"
+    daemon_logs | grep -iE "handoff|reattach|restart" | tail -8 | sed 's/^/    /'
+fi
+printf 'part2-' >&5 2>/dev/null && ok "a descriptor opened before the planned restart still writes" \
+    || no "a descriptor opened before the planned restart can no longer write"
+[ "$(python3 -c 'import os; print(os.pread(6, 64, 0).decode(), end="")' 2>/dev/null)" = reader-content ] \
+    && ok "a descriptor opened before the planned restart still reads" \
+    || no "a descriptor opened before the planned restart can no longer read"
+
+kill -9 "$pid1" 2>/dev/null
+pid2=""
+for _ in $(seq 1 20); do
+    sleep 1
+    pid2="$(daemon_pid)"
+    [ -n "$pid2" ] && [ "$pid2" != "$pid1" ] && bounded 5 ls "$MOUNT/hold" >/dev/null 2>&1 && break
+    pid2=""
+done
+[ -n "$pid2" ] && ok "after a crash the holder started a daemon (pid ${pid2}) that took the live mount over" \
+    || {
+        no "after a crash no daemon took the mount over (mounted: $(mountpoint -q "$MOUNT" && echo yes || echo no))"
+        daemon_logs | grep -iE "holder|handoff|reattach|respawn" | tail -8 | sed 's/^/    /'
+    }
+printf 'part3' >&5 2>/dev/null && ok "a descriptor opened before the crash still writes" \
+    || no "a descriptor opened before the crash can no longer write"
+exec 5>&- 6<&-
+wait_dav_sha hold/w.txt "$(printf 'part1-part2-part3' | sha)" 90 \
+    && ok "everything written across both restarts reached the backend in order" \
+    || no "the file written across the restarts is wrong on the backend: '$(curl -s -u "$U:$P" "${URL}hold/w.txt" | head -c 80)'"
+
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
