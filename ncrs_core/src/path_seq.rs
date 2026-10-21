@@ -1,5 +1,6 @@
-//! Per-path FIFO ordering of server mutations: tickets are taken on the FUSE thread in
-//! operation order and a worker waits for its ticket before the network call. Ids come from
+//! Per-path FIFO ordering of server mutations: tickets are taken in operation order (under
+//! `MUTATION_ORDER` in lib.rs, together with queueing the job, since FUSE requests now run
+//! on several workers) and a worker waits for its ticket before the network call. Ids come from
 //! one global counter, so the oldest live ticket is always runnable and waits cannot deadlock.
 
 use std::collections::{HashMap, VecDeque};

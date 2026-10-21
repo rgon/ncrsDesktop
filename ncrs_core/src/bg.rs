@@ -16,13 +16,14 @@
 //! the caller's thread, where it can still pick a fallback (serve the cache,
 //! reply EAGAIN, drop a background refresh).
 //!
-//! Workers start lazily and exit when their queue is empty, so an idle daemon
-//! holds no pool threads at all.
+//! Workers start lazily and exit when their queue is empty (a lingering pool's
+//! after a short wait for more work), so an idle daemon holds no pool threads.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -31,11 +32,16 @@ pub struct Pool {
     name: &'static str,
     max_workers: usize,
     queue_cap: usize,
+    // How long an idle worker waits for the next job before exiting (zero: at once).
+    linger: Duration,
+    wake: Condvar,
     state: Mutex<State>,
 }
 
 struct State {
     active: usize,
+    // Workers waiting out `linger` with nothing to do; a submit hands them the job.
+    idle: usize,
     queue: VecDeque<Job>,
     peak_active: usize,
     peak_queued: usize,
@@ -78,8 +84,11 @@ impl Pool {
             name,
             max_workers,
             queue_cap,
+            linger: Duration::ZERO,
+            wake: Condvar::new(),
             state: Mutex::new(State {
                 active: 0,
+                idle: 0,
                 queue: VecDeque::new(),
                 peak_active: 0,
                 peak_queued: 0,
@@ -88,6 +97,14 @@ impl Pool {
                 panicked: 0,
             }),
         }
+    }
+
+    /// A pool whose idle workers wait up to `linger` for the next job, for a pool fed a
+    /// steady trickle of short jobs (FUSE requests) that would otherwise start a thread
+    /// for nearly every one.
+    pub const fn lingering(mut self, linger: Duration) -> Pool {
+        self.linger = linger;
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -99,6 +116,13 @@ impl Pool {
     pub fn submit(&'static self, job: impl FnOnce() + Send + 'static) -> Result<(), Rejected> {
         let job: Job = Box::new(job);
         let mut st = self.lock();
+        if st.idle > st.queue.len() {
+            // A lingering worker is free: queue the job for it instead of starting a thread.
+            st.queue.push_back(job);
+            drop(st);
+            self.wake.notify_one();
+            return Ok(());
+        }
         if st.active < self.max_workers {
             st.active += 1;
             st.peak_active = st.peak_active.max(st.active);
@@ -183,6 +207,14 @@ impl Pool {
                 st.panicked += 1;
                 log::error!("{} pool: a job panicked; the worker carries on", self.name);
             }
+            if st.queue.is_empty() && !self.linger.is_zero() {
+                st.idle += 1;
+                let (guard, _) = self.wake
+                    .wait_timeout_while(st, self.linger, |st| st.queue.is_empty())
+                    .unwrap_or_else(|e| e.into_inner());
+                st = guard;
+                st.idle -= 1;
+            }
             match st.queue.pop_front() {
                 Some(next) => job = next,
                 None => {
@@ -223,8 +255,10 @@ impl Pool {
 /// thread only orders them). Small and fixed: a request that waits on the
 /// network holds one of these and only its own inodes' queues. The queue holds
 /// every task the scheduler lets be in flight, so a runnable one is never refused.
-pub static FUSE: Pool = Pool::new("fuse", FUSE_WORKERS, FUSE_MAX_INFLIGHT);
-pub const FUSE_WORKERS: usize = 8;
+/// Workers linger a few seconds so an interactive trickle of requests reuses them
+/// instead of starting a thread per request.
+pub static FUSE: Pool = Pool::new("fuse", FUSE_WORKERS, FUSE_MAX_INFLIGHT).lingering(Duration::from_secs(5));
+pub const FUSE_WORKERS: usize = 16;
 /// Requests queued or running at once; past it the dispatch thread waits.
 pub const FUSE_MAX_INFLIGHT: usize = 4096;
 
@@ -562,6 +596,27 @@ mod tests {
         assert!(ran.load(Ordering::SeqCst));
         let s = p.stats();
         assert_eq!((s.panicked, s.completed, s.active), (1, 2, 0));
+    }
+
+    #[test]
+    fn a_lingering_worker_takes_the_next_job_instead_of_a_new_thread() {
+        let p = leak(Pool::new("t-linger", 4, 4).lingering(Duration::from_secs(5)));
+        let threads = std::sync::Arc::new(Mutex::new(std::collections::HashSet::new()));
+        for _ in 0..5 {
+            let t = threads.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            p.submit(move || {
+                t.lock().unwrap().insert(std::thread::current().id());
+                tx.send(()).unwrap();
+            }).unwrap();
+            rx.recv().unwrap();
+            // Let the worker reach its linger wait before the next submit.
+            while p.lock().idle == 0 {
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(threads.lock().unwrap().len(), 1, "one lingering worker ran every job");
+        assert_eq!(p.stats().active, 1);
     }
 
     #[test]

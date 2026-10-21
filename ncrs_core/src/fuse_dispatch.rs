@@ -151,7 +151,15 @@ impl Filesystem for SchedFs {
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let mut keys = vec![(Key::Ino(parent.0), S)];
+        // A lookup in a folder with no usable listing waits on its PROPFIND. Taking the
+        // folder exclusively parks the other lookups for it in its queue instead of on
+        // workers, so a burst of them (a file manager stat'ing every entry) holds one
+        // worker rather than all of them, and they then run together from that listing.
+        let listed = {
+            let c = self.fs.cache.safe_lock();
+            c.get_path(parent.0).is_none_or(|p| c.get_cached_dir_readonly(&p).is_some())
+        };
+        let mut keys = vec![(Key::Ino(parent.0), if listed { S } else { X })];
         keys.extend(self.child(parent, name).map(|c| (Key::Ino(c), S)));
         let (r, name) = (Req::of(req), name.to_os_string());
         self.queue(keys, move |fs| fs.lookup(&r, parent, &name, reply));
