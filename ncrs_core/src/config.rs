@@ -81,17 +81,23 @@ pub struct MountOptions {
     pub walker_rate_limit: bool,
     #[serde(default = "default_walker_listings_per_sec")]
     pub walker_listings_per_sec: u32,
-    /// Send a new file to the server in chunks while it is still being written,
-    /// once it passes `stream_upload_threshold_mb`, instead of staging all of it
-    /// on local disk first. Off means every write is staged in full: costs disk
-    /// space, but a program that goes back and rewrites early bytes of a big
-    /// file (video/audio trailers, office saves) can never hit already-sent data.
+    /// When the disk is low (see `stream_disk_reserve_mb`), send a new file to the
+    /// server in chunks while it is still being written, once it passes
+    /// `stream_upload_threshold_mb`, instead of staging all of it on local disk
+    /// first. Off means every write is staged in full: costs disk space, but a
+    /// program that goes back and rewrites early bytes of a big file (office
+    /// saves, zip writers) can never hit already-sent data.
     #[serde(default = "default_true")]
     pub stream_uploads: bool,
     /// How far (MiB) a new file must be written before streaming starts. Below
     /// it the whole file stays local, so writes anywhere in it work.
     #[serde(default = "default_stream_upload_threshold_mb")]
     pub stream_upload_threshold_mb: u64,
+    /// Streaming only happens while free space on the cache's filesystem is below
+    /// this (MiB); with room to spare every file is staged in full, which works for
+    /// any write pattern. 0 means automatic: the larger of 2 GiB and 5% of the disk.
+    #[serde(default)]
+    pub stream_disk_reserve_mb: u64,
 }
 
 pub fn default_walker_listings_per_sec() -> u32 {
@@ -254,8 +260,9 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let stream_upload_threshold_mb = doc["stream_upload_threshold_mb"].as_i64()
         .map(|v| v.max(0) as u64)
         .unwrap_or_else(default_stream_upload_threshold_mb);
+    let stream_disk_reserve_mb = doc["stream_disk_reserve_mb"].as_i64().map(|v| v.max(0) as u64).unwrap_or(0);
 
-    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough, allow_insecure_http, walker_rate_limit, walker_listings_per_sec, stream_uploads, stream_upload_threshold_mb })
+    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough, allow_insecure_http, walker_rate_limit, walker_listings_per_sec, stream_uploads, stream_upload_threshold_mb, stream_disk_reserve_mb })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
@@ -520,6 +527,8 @@ pub struct ConfigSettings {
     pub stream_uploads: bool,
     #[serde(default = "default_stream_upload_threshold_mb")]
     pub stream_upload_threshold_mb: u64,
+    #[serde(default)]
+    pub stream_disk_reserve_mb: u64,
 }
 
 impl Default for ConfigSettings {
@@ -550,6 +559,7 @@ impl Default for ConfigSettings {
             walker_listings_per_sec: default_walker_listings_per_sec(),
             stream_uploads: true,
             stream_upload_threshold_mb: default_stream_upload_threshold_mb(),
+            stream_disk_reserve_mb: 0,
         }
     }
 }
@@ -577,6 +587,7 @@ pub fn config_settings_from_opts(opts: &MountOptions) -> ConfigSettings {
         walker_listings_per_sec: opts.walker_listings_per_sec,
         stream_uploads: opts.stream_uploads,
         stream_upload_threshold_mb: opts.stream_upload_threshold_mb,
+        stream_disk_reserve_mb: opts.stream_disk_reserve_mb,
     }
 }
 
@@ -687,13 +698,16 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# the local cache are never slowed. Applies immediately, no remount needed.\n");
     content.push_str(&format!("walker_rate_limit: {}\n", settings.walker_rate_limit));
     content.push_str(&format!("walker_listings_per_sec: {}\n", settings.walker_listings_per_sec));
-    content.push_str("# Once a new file has been written past stream_upload_threshold_mb (MiB), send\n");
-    content.push_str("# it to the server in 10 MiB pieces while it is still being written instead of\n");
-    content.push_str("# saving all of it locally first. Saves disk space on big copies; a program\n");
-    content.push_str("# that later rewrites the already-sent start of the file gets a write error.\n");
+    content.push_str("# When the disk is low, once a new file has been written past\n");
+    content.push_str("# stream_upload_threshold_mb (MiB), send it to the server in 10 MiB pieces while\n");
+    content.push_str("# it is still being written instead of saving all of it locally first. Saves disk\n");
+    content.push_str("# space on big copies; a program that later rewrites an already-sent part of the\n");
+    content.push_str("# file gets a write error. 'Low' is free space under stream_disk_reserve_mb\n");
+    content.push_str("# (MiB; 0 = automatic, the larger of 2 GiB and 5% of the disk).\n");
     content.push_str("# Set false to always stage the whole file locally. Applies to files opened after the change.\n");
     content.push_str(&format!("stream_uploads: {}\n", settings.stream_uploads));
     content.push_str(&format!("stream_upload_threshold_mb: {}\n", settings.stream_upload_threshold_mb));
+    content.push_str(&format!("stream_disk_reserve_mb: {}\n", settings.stream_disk_reserve_mb));
 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
@@ -819,6 +833,9 @@ mod tests {
         o.remove("stream_upload_threshold_mb");
         let s: ConfigSettings = serde_json::from_value(v).unwrap();
         assert_eq!((s.stream_uploads, s.stream_upload_threshold_mb), (true, 100));
+        assert_eq!(opts.stream_disk_reserve_mb, 0, "automatic reserve by default");
+        let forced = minimal_config("password: \"p\"\nstream_disk_reserve_mb: 99999999");
+        assert_eq!(config_settings_from_opts(&forced).stream_disk_reserve_mb, 99_999_999);
     }
 
     #[test]

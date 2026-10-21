@@ -762,9 +762,10 @@ fn save_config_values(values: ncrs_core::config::ConfigSettings) -> Result<(), S
         values.walker_listings_per_sec,
     );
     let stream = format!(
-        "STREAM_UPLOADS {} {}",
+        "STREAM_UPLOADS {} {} {}",
         if values.stream_uploads { "on" } else { "off" },
         values.stream_upload_threshold_mb,
+        values.stream_disk_reserve_mb,
     );
     for verb in [limit, stream] {
         if ipc_request(&[verb.as_str()]).is_none() {

@@ -1125,28 +1125,84 @@ struct ChunkUploadState {
     bytes_confirmed: u64,
 }
 
-/// Whether write()'s streaming fast path should PUT a chunk now: when the unsent tail
-/// reaches `threshold` (never less than one chunk). Its oldest chunk then goes out, so
-/// the tail slides along behind the writer at just under the threshold. A file smaller
-/// than that never meets already-sent data, and a larger one can still be rewritten in
-/// its last threshold-minus-a-chunk bytes (a zip entry's header, LibreOffice's block).
-/// One chunk per write also bounds how long write() holds a fuse worker and the file's queue.
 // The streamed-upload settings, read per open and per write so a change in Settings
 // applies to files opened after it without a remount (the GUI forwards it over IPC as
 // STREAM_UPLOADS). Seeded from the config at mount.
 static STREAM_UPLOADS: AtomicBool = AtomicBool::new(true);
 static STREAM_UPLOAD_THRESHOLD_MB: AtomicU64 = AtomicU64::new(100);
+// Free space (MiB) under which streaming starts; 0 = automatic (see stream_reserve_bytes).
+static STREAM_DISK_RESERVE_MB: AtomicU64 = AtomicU64::new(0);
+// The staging files' directory: the filesystem whose free space decides it.
+static STREAM_DISK_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+// The last verdict and when it was taken, so writes past the threshold don't each statvfs.
+static STREAM_DISK_LOW: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 
 /// Applies the streamed-upload settings to the running daemon.
-pub fn set_stream_uploads(enabled: bool, threshold_mb: u64) {
+pub fn set_stream_uploads(enabled: bool, threshold_mb: u64, disk_reserve_mb: u64) {
     STREAM_UPLOADS.store(enabled, Ordering::Relaxed);
     STREAM_UPLOAD_THRESHOLD_MB.store(threshold_mb, Ordering::Relaxed);
+    STREAM_DISK_RESERVE_MB.store(disk_reserve_mb, Ordering::Relaxed);
+    *STREAM_DISK_LOW.safe_lock() = None;
+}
+
+/// The configured disk reserve (MiB, 0 = automatic).
+pub fn stream_disk_reserve_mb() -> u64 {
+    STREAM_DISK_RESERVE_MB.load(Ordering::Relaxed)
 }
 
 fn stream_upload_threshold() -> u64 {
     STREAM_UPLOAD_THRESHOLD_MB.load(Ordering::Relaxed).saturating_mul(1024 * 1024)
 }
 
+/// The free space under which a file streams instead of being staged in full: the
+/// configured MiB, or with 0 the larger of 2 GiB and 5% of the filesystem.
+fn stream_reserve_bytes(configured_mb: u64, fs_size: u64) -> u64 {
+    if configured_mb > 0 {
+        configured_mb.saturating_mul(1024 * 1024)
+    } else {
+        (2u64 << 30).max(fs_size / 20)
+    }
+}
+
+/// Free and total bytes of the filesystem holding `path`, for an unprivileged writer.
+fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs only writes the struct; `c` is NUL-terminated and outlives the call.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let block = st.f_frsize as u64;
+    Some((st.f_bavail as u64 * block, st.f_blocks as u64 * block))
+}
+
+/// Whether the staging disk is low enough that a big file should stream. With room to
+/// spare every file is staged in full, which any write pattern survives (a video
+/// muxer's trailer, a zip writer's header fix-ups); streaming is the fallback for a
+/// file the disk cannot hold. Re-checked at most every 2 s; an unreadable filesystem
+/// counts as not low, i.e. the file is staged in full.
+fn stream_disk_low() -> bool {
+    let mut cached = STREAM_DISK_LOW.safe_lock();
+    if let Some((at, low)) = *cached {
+        if at.elapsed() < Duration::from_secs(2) {
+            return low;
+        }
+    }
+    let reserve_mb = STREAM_DISK_RESERVE_MB.load(Ordering::Relaxed);
+    let low = STREAM_DISK_PATH.safe_lock().as_deref().and_then(disk_space)
+        .is_some_and(|(free, size)| free < stream_reserve_bytes(reserve_mb, size));
+    *cached = Some((Instant::now(), low));
+    low
+}
+
+/// Whether write()'s streaming fast path should PUT a chunk now: when the unsent tail
+/// reaches `threshold` (never less than one chunk). Its oldest chunk then goes out, so
+/// the tail slides along behind the writer at just under the threshold. A file smaller
+/// than that never meets already-sent data, and a larger one can still be rewritten in
+/// its last threshold-minus-a-chunk bytes (a zip entry's header, LibreOffice's block).
+/// One chunk per write also bounds how long write() holds a fuse worker and the file's queue.
+/// Only while the disk is low (stream_disk_low); otherwise the tail just keeps growing.
 fn stream_should_graduate(total_written: u64, session: Option<&ChunkUploadState>, threshold: u64) -> bool {
     let unsent = total_written - session.map_or(0, |s| s.bytes_confirmed);
     unsent >= threshold.max(webdav_ops::CHUNK_SIZE as u64)
@@ -4169,7 +4225,7 @@ pub struct NextCloudFs {
 impl NextCloudFs {
     pub fn new(options: MountOptions) -> Result<Self, String> {
         let creds = options.credentials()?;
-        set_stream_uploads(options.stream_uploads, options.stream_upload_threshold_mb);
+        set_stream_uploads(options.stream_uploads, options.stream_upload_threshold_mb, options.stream_disk_reserve_mb);
 
         let exclude_folders: HashSet<PathBuf> = options.exclude_folders.iter().map(|s| {
             let s = s.trim();
@@ -4186,6 +4242,7 @@ impl NextCloudFs {
         }
 
         let cache_dir = ncrs_cache_dir(&options.url);
+        *STREAM_DISK_PATH.safe_lock() = Some(cache_dir.clone());
         let kept_dir = cache_dir.join("kept");
         let auto_cache_dir = cache_dir.join("cache");
         std::fs::create_dir_all(&cache_dir)
@@ -7301,7 +7358,10 @@ impl NextCloudFs {
             of.dirty = true;
             of.total_written = of.total_written.max(offset + data.len() as u64);
 
-            if stream_should_graduate(of.total_written, of.chunk_upload.as_ref(), stream_upload_threshold()) {
+            if stream_should_graduate(of.total_written, of.chunk_upload.as_ref(), stream_upload_threshold()) && stream_disk_low() {
+                if of.chunk_upload.is_none() {
+                    log::info!("write: disk is low — streaming {} to the server as it is written", path.display());
+                }
                 let total_written = of.total_written;
                 let existing_session = of.chunk_upload.clone();
                 let had_session = existing_session.is_some();
