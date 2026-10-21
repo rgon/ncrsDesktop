@@ -103,6 +103,12 @@ impl SchedFs {
         }
     }
 
+    /// The scheduler's drain for a planned daemon restart (see `handoff::set_quiesce_hook`).
+    pub(crate) fn quiesce_hook(&self) -> impl Fn(std::time::Duration) -> bool + Send + 'static {
+        let sched = Arc::clone(&self.sched);
+        move |budget| sched.quiesce(budget)
+    }
+
     /// Queues `job` on `keys` (plus any moved folder they sit under) and returns.
     fn queue(&self, mut keys: Vec<(Key, Mode)>, job: impl FnOnce(&NextCloudFs) + Send + 'static) {
         self.order_under_moves(&mut keys);
