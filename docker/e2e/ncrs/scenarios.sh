@@ -1470,60 +1470,171 @@ done
 [ "$stuck" = 0 ] && ok "no FUSE requests left waiting on the daemon" \
     || no "$stuck FUSE request(s) still waiting on the daemon at suite end"
 
-echo "→ 32. DAEMON RESTART — the mount and programs' open files survive a planned restart and a crash"
+echo "→ 32. DAEMON RESTART — the mount and programs' open files survive restarts under systemd"
 # LibreOffice keeps its document open (read-write, with a lock) for the whole session, so
 # a restarted daemon used to leave it with a dead descriptor: every save failed with
 # ENOTCONN until the program reopened the file. The kernel keeps a FUSE connection alive
-# while any process holds /dev/fuse, so the daemon now hands it on (re-exec for a planned
-# restart, the fd holder after a crash) and the successor serves the same open files.
-daemon_pid() {
-    local p
-    for p in $(pgrep -x ncrs); do
-        tr '\0' ' ' < "/proc/$p/cmdline" | grep -q -- '--fd-holder' || { echo "$p"; return; }
-    done
-}
-SOCK="$(ls "${XDG_RUNTIME_DIR:-/nonexistent}/ncrs.sock" /tmp/ncrs-"$(id -u)"/ncrs.sock 2>/dev/null | head -1)"
-mkdir -p "$MOUNT/hold"
-printf 'reader-content' > "$MOUNT/hold/r.txt"
-wait_dav_sha hold/r.txt "$(printf 'reader-content' | sha)" 60 >/dev/null || no "setup: hold/r.txt never reached the backend"
-exec 5>"$MOUNT/hold/w.txt"
-exec 6<"$MOUNT/hold/r.txt"
-printf 'part1-' >&5
-pid0="$(daemon_pid)"
-reply="$(ipc RESTART_HANDOFF)"
-sleep 3
-pid1="$(daemon_pid)"
-if [ "$reply" = ok ] && [ -n "$pid1" ] && bounded 10 ls "$MOUNT/hold" >/dev/null 2>&1; then
-    ok "planned restart: the daemon re-executed (pid ${pid0} → ${pid1}) and the mount kept answering"
-else
-    no "planned restart failed (reply '${reply}', pid ${pid0:-none} → ${pid1:-none}, mounted: $(mountpoint -q "$MOUNT" && echo yes || echo no))"
-    daemon_logs | grep -iE "handoff|reattach|restart" | tail -8 | sed 's/^/    /'
-fi
-printf 'part2-' >&5 2>/dev/null && ok "a descriptor opened before the planned restart still writes" \
-    || no "a descriptor opened before the planned restart can no longer write"
-[ "$(python3 -c 'import os; print(os.pread(6, 64, 0).decode(), end="")' 2>/dev/null)" = reader-content ] \
-    && ok "a descriptor opened before the planned restart still reads" \
-    || no "a descriptor opened before the planned restart can no longer read"
-
-kill -9 "$pid1" 2>/dev/null
-pid2=""
+# while any process holds /dev/fuse, so the daemon hands it on: re-exec for a planned
+# restart, systemd's fd store across a stop/start, a crash or a watchdog kill. A fourth
+# daemon runs here under fake_systemd.py (what systemd does for packaging/ncrs.service)
+# against chunkdav.py, which holds GETs of "slowpoke" paths so a read is in flight when
+# the daemon freezes.
+RS_PORT=8092
+RS_LOG=/tmp/chunkdav-restart.log
+RS_HOME=/tmp/ncrs-restart
+RS_MOUNT=/mnt/ncrs-restart
+RS_NLOG=/tmp/ncrs-restart.log
+RS_FSLOG=/tmp/fake-systemd.log
+RS_SLOW=8
+: > "$RS_LOG"; : > "$RS_NLOG"; : > "$RS_FSLOG"
+python3 /e2e/chunkdav.py "$RS_PORT" "$CD_HOST" "$RS_LOG" --slow "slowpoke:$RS_SLOW" 2>/tmp/chunkdav-restart.err &
+RS_PID=$!
+head -c 2000000 /dev/urandom > /tmp/restart.slow
+curl -s -u "$U:$P" -X MKCOL "${URL}hold/" -o /dev/null
+curl -s -u "$U:$P" -T /tmp/restart.slow "${URL}hold/slowpoke.bin" -o /dev/null
+printf 'reader-content' | curl -s -u "$U:$P" -T - "${URL}hold/r.txt" -o /dev/null
+mkdir -p "$RS_MOUNT" "$RS_HOME/.config/ncrs" "$RS_HOME/run" "$RS_HOME/cache"
+chmod 700 "$RS_HOME/run"
+cat > "$RS_HOME/.config/ncrs/config.yaml" <<EOF
+url: "http://127.0.0.1:${RS_PORT}/remote.php/dav/files/${U}/"
+username: "${U}"
+password: "${P}"
+user: "${U}"
+mount_point: "${RS_MOUNT}"
+allow_insecure_http: true
+http3: false
+optimistic_listing: false
+auto_keep_cached_files: false
+EOF
 for _ in $(seq 1 20); do
-    sleep 1
-    pid2="$(daemon_pid)"
-    [ -n "$pid2" ] && [ "$pid2" != "$pid1" ] && bounded 5 ls "$MOUNT/hold" >/dev/null 2>&1 && break
-    pid2=""
+    curl -s -o /dev/null -u "$U:$P" -X PROPFIND -H 'Depth: 0' \
+        "http://127.0.0.1:${RS_PORT}/remote.php/dav/files/${U}/" && break
+    sleep 0.5
 done
-[ -n "$pid2" ] && ok "after a crash the holder started a daemon (pid ${pid2}) that took the live mount over" \
-    || {
-        no "after a crash no daemon took the mount over (mounted: $(mountpoint -q "$MOUNT" && echo yes || echo no))"
-        daemon_logs | grep -iE "holder|handoff|reattach|respawn" | tail -8 | sed 's/^/    /'
-    }
-printf 'part3' >&5 2>/dev/null && ok "a descriptor opened before the crash still writes" \
-    || no "a descriptor opened before the crash can no longer write"
-exec 5>&- 6<&-
-wait_dav_sha hold/w.txt "$(printf 'part1-part2-part3' | sha)" 90 \
-    && ok "everything written across both restarts reached the backend in order" \
-    || no "the file written across the restarts is wrong on the backend: '$(curl -s -u "$U:$P" "${URL}hold/w.txt" | head -c 80)'"
+RS_SOCK="$RS_HOME/run/ncrs.sock"
+fsd() { python3 /e2e/fake_systemd.py ctl "$RS_HOME/fsd" "$1"; }
+rs_pid() { fsd status | sed -n 's/.*pid=\([0-9]*\).*/\1/p'; }
+rs_mark() { RS_MARK=$(($(wc -l < "$RS_NLOG") + 1)); RS_FMARK=$(($(wc -l < "$RS_FSLOG") + 1)); }
+rs_since() { tail -n +"$RS_MARK" "$RS_NLOG"; }
+rs_fs_since() { tail -n +"$RS_FMARK" "$RS_FSLOG"; }
+rs_wait_log() {  # <regex> <seconds>: the daemon logged it since the mark
+    for _ in $(seq 1 "$2"); do rs_since | grep -qE "$1" && return 0; sleep 1; done; return 1
+}
+rs_show() { rs_since | grep -iE "handoff|SIGTERM|watchdog|reattach|restored|error" | tail -8 | sed 's/^/    /'
+    rs_fs_since | tail -6 | sed 's/^/    fake systemd: /'; }
+rs_held() {  # <step> <chunk>: held descriptors write and read, the mount answers
+    printf '%s' "$2" >&7 2>/dev/null && ok "$1: the descriptor opened before it still writes" \
+        || no "$1: the descriptor opened before it can no longer write"
+    [ "$(python3 -c 'import os; print(os.pread(8, 64, 0).decode(), end="")' 2>/dev/null)" = reader-content ] \
+        && ok "$1: the descriptor opened before it still reads" \
+        || no "$1: the descriptor opened before it can no longer read"
+    bounded 10 ls "$RS_MOUNT/hold" >/dev/null 2>&1 && ok "$1: the mount answers" || no "$1: the mount does not answer"
+}
+HOME="$RS_HOME" XDG_RUNTIME_DIR="$RS_HOME/run" XDG_CACHE_HOME="$RS_HOME/cache" XDG_CONFIG_HOME="$RS_HOME/.config" \
+    RUST_LOG="${RUST_LOG:-info}" python3 /e2e/fake_systemd.py run --dir "$RS_HOME/fsd" --log "$RS_FSLOG" \
+    --watchdog-sec 6 --restart-sec 1 -- ncrs --config "$RS_HOME/.config/ncrs/config.yaml" >>"$RS_NLOG" 2>&1 &
+RS_FSD=$!
+for _ in $(seq 1 60); do
+    mountpoint -q "$RS_MOUNT" && grep -q "FDSTORE ncrsfuse-.* kept" "$RS_FSLOG" && break
+    kill -0 "$RS_FSD" 2>/dev/null || break
+    sleep 1
+done
+if ! mountpoint -q "$RS_MOUNT" || ! grep -q "FDSTORE ncrsfuse-.* kept" "$RS_FSLOG"; then
+    no "setup: the supervised mount never appeared, or never put its connection in the fd store"
+    tail -20 "$RS_NLOG" | sed 's/^/    /'; tail -10 "$RS_FSLOG" | sed 's/^/    fake systemd: /'
+else
+    exec 7>"$RS_MOUNT/hold/w.txt"
+    exec 8<"$RS_MOUNT/hold/r.txt"
+    printf 'p0-' >&7
+
+    # 1. Planned restart: the same process re-executes with the connection.
+    rs_mark; p0="$(rs_pid)"
+    reply="$(printf 'RESTART_HANDOFF\n' | timeout 10 nc -U -N "$RS_SOCK" 2>/dev/null)"
+    if [ "$reply" = ok ] && rs_wait_log "took over FUSE connection .* from this daemon's previous image" 20 \
+        && rs_wait_log "handoff: restored .* open handles" 20 && [ "$(rs_pid)" = "$p0" ]; then
+        ok "planned restart: pid ${p0} re-executed and its new image took the live connection over"
+    else
+        no "planned restart: no re-exec took the connection over (reply '${reply}', pid ${p0} → $(rs_pid))"; rs_show
+    fi
+    rs_held "planned restart" "p1-"
+
+    # 2. systemctl restart: SIGTERM drains and exits without unmounting; the next
+    #    daemon gets the connection from the fd store and the exact handle state.
+    rs_mark
+    fsd restart >/dev/null
+    if rs_wait_log "took over FUSE connection .* from the systemd fd store" 30 \
+        && rs_since | grep -q "SIGTERM: drained; exact handle snapshot written" \
+        && rs_wait_log "handoff: restored .* \([1-9][0-9]* exact" 10; then
+        ok "SIGTERM restart: drained, snapshot written, the next daemon (pid $(rs_pid)) restored the write handle exactly"
+    else
+        no "SIGTERM restart: the connection or the exact handle state did not reach the next daemon"; rs_show
+    fi
+    rs_held "SIGTERM restart" "p2-"
+
+    # 3. Crash: kill -9. systemd restarts it with the stored connection; handle state
+    #    comes from the log alone.
+    rs_mark; p2="$(rs_pid)"
+    kill -9 "$p2"
+    if rs_wait_log "took over FUSE connection .* from the systemd fd store" 30 \
+        && rs_wait_log "handoff: restored .* \(0 exact, 0 failed, 0 lost\)" 10 \
+        && rs_fs_since | grep -q "ended: signal SIGKILL"; then
+        ok "crash: after kill -9 the restarted daemon (pid $(rs_pid)) restored every handle from the log"
+    else
+        no "crash: no restarted daemon took the connection over with its handles"; rs_show
+    fi
+    rs_held "crash" "p3-"
+
+    # 4. Watchdog: freeze the daemon with a read in flight. The pings stop, fake systemd
+    #    kills and restarts it, and the next daemon has the kernel resend that read.
+    #    A mkdir issued during the freeze runs exactly once (no EEXIST from a replay).
+    rs_mark; p3="$(rs_pid)"
+    ( timeout 90 sha256sum "$RS_MOUNT/hold/slowpoke.bin" 2>/tmp/restart.read.err | awk '{print $1}' > /tmp/restart.read ) &
+    rd=$!
+    for _ in $(seq 1 20); do grep -q "SLOW GET .*slowpoke.bin" "$RS_LOG" && break; sleep 0.5; done
+    kill -STOP "$p3"
+    ( timeout 90 mkdir "$RS_MOUNT/hold/frozen-dir" 2>/tmp/restart.mkdir.err; echo $? > /tmp/restart.mkdir.rc ) &
+    md=$!
+    wait "$rd" "$md"
+    if rs_fs_since | grep -q "watchdog timeout: no WATCHDOG=1 from pid $p3" \
+        && rs_since | grep -q "asked the kernel to resend requests the previous daemon left unanswered"; then
+        ok "watchdog: the frozen daemon was killed and its successor (pid $(rs_pid)) had the kernel resend what it left unanswered"
+    else
+        no "watchdog: the frozen daemon was not replaced by one that resent its requests"; rs_show
+    fi
+    [ "$(cat /tmp/restart.read)" = "$(sha < /tmp/restart.slow)" ] \
+        && ok "watchdog: the read in flight when the daemon froze completed with the right bytes" \
+        || no "watchdog: the read in flight did not complete correctly ($(cat /tmp/restart.read.err 2>/dev/null | head -1))"
+    [ "$(cat /tmp/restart.mkdir.rc)" = 0 ] && [ -d "$RS_MOUNT/hold/frozen-dir" ] \
+        && ok "watchdog: a mkdir issued during the freeze ran exactly once" \
+        || no "watchdog: the mkdir issued during the freeze failed (rc $(cat /tmp/restart.mkdir.rc): $(cat /tmp/restart.mkdir.err))"
+    rs_held "watchdog restart" "p4"
+
+    exec 7>&-
+    wait_dav_sha hold/w.txt "$(printf 'p0-p1-p2-p3-p4' | sha)" 90 \
+        && ok "everything written across all four restarts reached the backend in order" \
+        || no "the file written across the restarts is wrong on the backend: '$(curl -s -u "$U:$P" "${URL}hold/w.txt" | head -c 80)'"
+
+    # 5. systemctl stop: the deliberate end. The fd store is dropped and the mount fails
+    #    ENOTCONN rather than hanging.
+    exec 9>"$RS_MOUNT/hold/after-stop.txt"
+    fsd stop >/dev/null
+    err="$(bounded 10 stat "$RS_MOUNT/hold" 2>&1 >/dev/null)"
+    case "$err" in
+        *"not connected"*) ok "stop: after a deliberate stop the mount fails ENOTCONN" ;;
+        *) no "stop: the mount did not fail ENOTCONN after a deliberate stop (${err:-it still answers})" ;;
+    esac
+    # (A read can still be served from the page cache; a write always reaches the daemon.)
+    werr="$( (printf 'x' >&9) 2>&1)"
+    case "$werr" in
+        *"not connected"*) ok "stop: a held descriptor's write fails ENOTCONN once the mount is stopped" ;;
+        *) no "stop: a held descriptor's write did not fail ENOTCONN after the stop (${werr:-it succeeded})" ;;
+    esac
+    exec 8<&- 9>&-
+fi
+kill "$RS_FSD" 2>/dev/null; wait "$RS_FSD" 2>/dev/null
+umount -l "$RS_MOUNT" 2>/dev/null
+kill "$RS_PID" 2>/dev/null; wait "$RS_PID" 2>/dev/null
+rm -f /tmp/restart.slow /tmp/restart.read* /tmp/restart.mkdir*
 
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
