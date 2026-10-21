@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.86](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.85...ncrs-v0.1.86) (2026-10-21)
+
+
+### Bug Fixes
+
+* **core:** accept a rewrite of the not-yet-sent tail during a streamed upload so a large LibreOffice save no longer fails with an I/O error ([0371b37](https://github.com/rgon/ncrsDesktop/commit/0371b37d09fee4472fe02b8f041f51f4265f075c))
+* **core:** stamp a save with its own mtime and send it as X-OC-Mtime so LibreOffice no longer warns the file was modified by others ([d4ca38c](https://github.com/rgon/ncrsDesktop/commit/d4ca38c3e12e74f846297c9a11903ba711e8851f))
+
 ## [0.1.85](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.84...ncrs-v0.1.85) (2026-10-20)
 
 
