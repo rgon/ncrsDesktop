@@ -3300,6 +3300,21 @@ mod upload_order_tests {
     }
 
     #[test]
+    fn a_save_is_stamped_with_its_staging_mtime_in_whole_seconds() {
+        // The server keeps whole seconds; reporting the same value from commit on is
+        // what keeps LibreOffice's "modified by others" check quiet after the upload.
+        let dir = staging_dir("staged-mtime");
+        let wp = dir.join("write_1");
+        std::fs::write(&wp, b"x").unwrap();
+        let set = UNIX_EPOCH + Duration::new(1_577_934_245, 987_654_321);
+        std::fs::File::options().write(true).open(&wp).unwrap().set_modified(set).unwrap();
+        assert_eq!(staged_mtime(&wp), Some(UNIX_EPOCH + Duration::from_secs(1_577_934_245)));
+        assert_eq!(staged_mtime(&dir.join("missing")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_rewrite_into_the_unsent_tail_lands_at_its_file_offset() {
         // LibreOffice rewrites the 4 KiB block it is in the middle of; past the first
         // chunk that block is in the tail, which starts at file offset bytes_confirmed.

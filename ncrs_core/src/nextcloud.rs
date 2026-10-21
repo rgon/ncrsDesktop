@@ -280,6 +280,7 @@ impl CloudBackend for NextcloudBackend {
             path,
             body,
             if_match,
+            None,
         )
         .map(PutResult::from)
         .map_err(BackendWriteError::from)
@@ -324,6 +325,7 @@ impl CloudBackend for NextcloudBackend {
         session: &crate::backend::ChunkedUploadSession,
         path: &Path,
         if_match: Option<&str>,
+        mtime: Option<std::time::SystemTime>,
     ) -> Result<PutResult, BackendWriteError> {
         webdav_ops::finish_chunked_upload(
             &self.clients.get(),
@@ -332,6 +334,7 @@ impl CloudBackend for NextcloudBackend {
             &session.uploads_base,
             path,
             if_match,
+            mtime,
         )
         .map(PutResult::from)
         .map_err(BackendWriteError::from)

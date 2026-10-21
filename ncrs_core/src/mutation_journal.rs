@@ -704,6 +704,7 @@ fn execute_op(
                 }
             };
             let etag_ref = if_match_etag.as_deref();
+            let saved_mtime = crate::staged_mtime(staging_path).unwrap_or_else(SystemTime::now);
             match ctx.backend.put_file_from_path(remote_path, staging_path, etag_ref) {
                 Ok(result) => {
                     log::info!("JOURNAL replay: PUT {} → token {:?}", remote_path.display(), result.new_change_token);
@@ -714,7 +715,7 @@ fn execute_op(
                         if let Some(e) = files.iter_mut().find(|e| e.path == *remote_path) {
                             e.change_token = result.new_change_token;
                             e.size = file_size;
-                            e.modified = Some(SystemTime::now());
+                            e.modified = Some(saved_mtime);
                         }
                         dir.files = Arc::new(files);
                     }
@@ -808,6 +809,7 @@ fn execute_op(
             }
         }
         MutationOp::FinishChunked { remote_path, uploads_base, next_index, bytes_confirmed, total_len, tail_path, if_match_etag } => {
+            let saved_mtime = crate::staged_mtime(tail_path).unwrap_or_else(SystemTime::now);
             let result = finish_chunked(
                 &*ctx.backend, uploads_base, *next_index, *bytes_confirmed, *total_len,
                 tail_path, remote_path, if_match_etag.as_deref(),
@@ -823,7 +825,7 @@ fn execute_op(
                             if let Some(e) = files.iter_mut().find(|e| e.path == *remote_path) {
                                 e.change_token = result.new_change_token;
                                 e.size = *total_len;
-                                e.modified = Some(SystemTime::now());
+                                e.modified = Some(saved_mtime);
                             }
                             dir.files = Arc::new(files);
                         }
@@ -842,7 +844,7 @@ fn execute_op(
                     log::warn!("JOURNAL replay: streamed upload {} conflict — assembling a conflicted copy", remote_path.display());
                     let conflict_name = crate::make_conflict_name(remote_path);
                     let session = crate::backend::ChunkedUploadSession { uploads_base: uploads_base.clone() };
-                    let _ = ctx.backend.finish_chunked_upload(&session, &conflict_name, None);
+                    let _ = ctx.backend.finish_chunked_upload(&session, &conflict_name, None, None);
                     crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                     ReplayResult::Conflict(ConflictKind::EditConflict {
                         local_path: remote_path.clone(),
@@ -875,6 +877,9 @@ pub(crate) fn finish_chunked(
 ) -> Result<crate::backend::PutResult, crate::backend::BackendWriteError> {
     use crate::backend::BackendWriteError;
     let session = crate::backend::ChunkedUploadSession { uploads_base: uploads_base.to_string() };
+    // Read before the final chunk: the tail's mtime is the save's, and it is the one the
+    // commit already reported for the file.
+    let mtime = crate::staged_mtime(tail_path);
     let tail_len = total_len.saturating_sub(bytes_confirmed);
     if tail_len > 0 {
         // Server(0, _): a local fault, never transient, so it is not retried forever.
@@ -888,7 +893,7 @@ pub(crate) fn finish_chunked(
         }
         crate::retry_chunk_write("final chunk upload", || backend.put_chunk(&session, next_index, tail.clone()))?;
     }
-    crate::retry_chunk_write("chunked-upload finish", || backend.finish_chunked_upload(&session, remote_path, if_match))
+    crate::retry_chunk_write("chunked-upload finish", || backend.finish_chunked_upload(&session, remote_path, if_match, mtime))
 }
 
 #[cfg(test)]

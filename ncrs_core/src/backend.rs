@@ -449,11 +449,13 @@ pub trait CloudBackend: Send + Sync + 'static {
         Err(BackendWriteError::Unsupported)
     }
 
+    /// `mtime` becomes the file's modification time on the server (see webdav_ops::with_mtime).
     fn finish_chunked_upload(
         &self,
         _session: &ChunkedUploadSession,
         _path: &Path,
         _if_match: Option<&str>,
+        _mtime: Option<SystemTime>,
     ) -> Result<PutResult, BackendWriteError> {
         Err(BackendWriteError::Unsupported)
     }

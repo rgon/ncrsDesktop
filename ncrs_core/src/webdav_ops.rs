@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -58,6 +58,17 @@ fn dav_url(base_url: &str, username: &str, path: &Path) -> String {
     )
 }
 
+/// `X-OC-Mtime` asks Nextcloud to store `mtime` as the file's modification time instead of
+/// the moment the upload landed, so the mtime the mount reported right after the save is
+/// still the one the server lists afterwards (LibreOffice warns "modified by others" when
+/// it moves). Whole seconds, which is all the server keeps.
+fn with_mtime(req: reqwest::blocking::RequestBuilder, mtime: Option<SystemTime>) -> reqwest::blocking::RequestBuilder {
+    match mtime.and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()) {
+        Some(d) => req.header("X-OC-Mtime", d.as_secs().to_string()),
+        None => req,
+    }
+}
+
 pub fn put_file(
     client: &crate::http_clients::DavClient,
     base_url: &str,
@@ -65,12 +76,13 @@ pub fn put_file(
     path: &Path,
     body: Vec<u8>,
     if_match_etag: Option<&str>,
+    mtime: Option<SystemTime>,
 ) -> Result<PutResult, WriteError> {
     let url = dav_url(base_url, creds.username(), path);
-    let mut req = creds.apply(client
+    let mut req = with_mtime(creds.apply(client
         .put(&url)
         .timeout(WRITE_TIMEOUT))
-        .body(body);
+        .body(body), mtime);
 
     if let Some(etag) = if_match_etag {
         req = req.header("If-Match", format!("\"{}\"", etag.trim_matches('"')));
@@ -88,16 +100,17 @@ fn put_file_streamed(
     staging_path: &Path,
     file_size: usize,
     if_match_etag: Option<&str>,
+    mtime: Option<SystemTime>,
 ) -> Result<PutResult, WriteError> {
     let file = std::fs::File::open(staging_path)
         .map_err(|e| WriteError::Network(format!("staging open: {}", e)))?;
     // The whole file rides one request, so the budget scales with its size (>= 512 KiB/s).
     let timeout = WRITE_TIMEOUT + std::time::Duration::from_secs(file_size as u64 / (512 * 1024));
     let url = dav_url(base_url, creds.username(), path);
-    let mut req = creds.apply(client
+    let mut req = with_mtime(creds.apply(client
         .put(&url)
         .timeout(timeout))
-        .body(reqwest::blocking::Body::sized(file, file_size as u64));
+        .body(reqwest::blocking::Body::sized(file, file_size as u64)), mtime);
     if let Some(etag) = if_match_etag {
         req = req.header("If-Match", format!("\"{}\"", etag.trim_matches('"')));
     }
@@ -281,14 +294,15 @@ pub fn finish_chunked_upload(
     uploads_base: &str,
     path: &Path,
     if_match_etag: Option<&str>,
+    mtime: Option<SystemTime>,
 ) -> Result<PutResult, WriteError> {
     let dest_url = dav_url(base_url, creds.username(), path);
     let assemble_url = format!("{}/.file", uploads_base);
-    let mut req = creds.apply(client
+    let mut req = with_mtime(creds.apply(client
         .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &assemble_url)
         .timeout(WRITE_TIMEOUT))
         .header("Destination", &dest_url)
-        .header("Overwrite", "T");
+        .header("Overwrite", "T"), mtime);
 
     if let Some(etag) = if_match_etag {
         // Nextcloud checks If-Match on this MOVE against the source (.file), so it 412s even
@@ -330,9 +344,10 @@ pub fn put_file_chunked(
     path: &Path,
     body: Vec<u8>,
     if_match_etag: Option<&str>,
+    mtime: Option<SystemTime>,
 ) -> Result<PutResult, WriteError> {
     if body.len() <= CHUNK_SIZE {
-        return put_file(client, base_url, creds, path, body, if_match_etag);
+        return put_file(client, base_url, creds, path, body, if_match_etag, mtime);
     }
 
     let uploads_base = open_chunked_session(client, base_url, creds)?;
@@ -345,7 +360,7 @@ pub fn put_file_chunked(
         }
     }
 
-    finish_chunked_upload(client, base_url, creds, &uploads_base, path, if_match_etag)
+    finish_chunked_upload(client, base_url, creds, &uploads_base, path, if_match_etag, mtime)
 }
 
 pub fn put_file_from_path(
@@ -359,11 +374,12 @@ pub fn put_file_from_path(
     let file_size = std::fs::metadata(staging_path)
         .map_err(|e| WriteError::Network(format!("staging stat: {}", e)))?
         .len() as usize;
+    let mtime = crate::staged_mtime(staging_path);
 
     if file_size <= CHUNK_SIZE {
         let body = std::fs::read(staging_path)
             .map_err(|e| WriteError::Network(format!("staging read: {}", e)))?;
-        return put_file(client, base_url, creds, path, body, if_match_etag);
+        return put_file(client, base_url, creds, path, body, if_match_etag, mtime);
     }
 
     let uploads_base = match open_chunked_session(client, base_url, creds) {
@@ -371,7 +387,7 @@ pub fn put_file_from_path(
         // A plain WebDAV server without Nextcloud's chunked uploads rejects the session.
         Err(WriteError::Server(404 | 501, _)) => {
             log::info!("chunked upload unavailable — sending {} as a single PUT", path.display());
-            return put_file_streamed(client, base_url, creds, path, staging_path, file_size, if_match_etag);
+            return put_file_streamed(client, base_url, creds, path, staging_path, file_size, if_match_etag, mtime);
         }
         Err(e) => return Err(e),
     };
@@ -394,7 +410,7 @@ pub fn put_file_from_path(
         }
     }
 
-    finish_chunked_upload(client, base_url, creds, &uploads_base, path, if_match_etag)
+    finish_chunked_upload(client, base_url, creds, &uploads_base, path, if_match_etag, mtime)
 }
 
 fn cleanup_chunked_upload(

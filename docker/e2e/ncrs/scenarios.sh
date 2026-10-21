@@ -1096,6 +1096,7 @@ for b in bad[:4]:
 sys.exit(1 if bad else 0)
 PY
     lrc=$?
+    t_lo="$(stat -c %Y "$CD_MOUNT/chunked/lo-save.tmp" 2>/dev/null)"
     [ "$lrc" = 0 ] && ok "LibreOffice's large save (rewrite of the block in progress) got no write error" \
         || {
             no "LibreOffice's large save failed with a write error (rc=$lrc) — the 'General input/output error'"
@@ -1104,11 +1105,71 @@ PY
     wait_dav_sha chunked/lo-save.tmp "$(sha < /tmp/chunked.lo.expect)" 90 \
         && ok "the large LibreOffice save reached the backend byte-exact" \
         || no "the large LibreOffice save never reached the backend intact ($(curl -s -u "$U:$P" "${URL}chunked/lo-save.tmp" | wc -c) of $(stat -c %s /tmp/chunked.lo.expect) bytes)"
+    # The assembling MOVE carries the save's mtime (X-OC-Mtime), so the server lists the
+    # time the mount reported right after the save, not when the chunks were assembled.
+    srv="$(curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}chunked/lo-save.tmp" \
+        | grep -o 'getlastmodified>[^<]*' | head -1 | cut -d'>' -f2)"
+    [ -n "$t_lo" ] && [ "$(date -u -d "$srv" +%s 2>/dev/null)" = "$t_lo" ] \
+        && ok "the chunked upload kept the save's mtime on the server" \
+        || no "the chunked upload's server mtime (${srv:-none}) is not the save's ($(date -u -d "@${t_lo:-0}" +%T))"
 fi
 fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
 kill "$CD_DAEMON" "$CD_PID" 2>/dev/null
 wait "$CD_DAEMON" "$CD_PID" 2>/dev/null
 rm -f /tmp/chunked.seq /tmp/chunked.lo.expect
+
+echo "→ 30. MODIFICATION TIME is the same after the upload as right after the save"
+# LibreOffice remembers a document's mtime right after saving it and, before the next save,
+# compares it (year down to the second) with the current one; any difference makes it warn
+# that the file was modified by someone else. ncrs answered with its own clock at commit
+# and, once the listing refreshed, with the time the server received the upload, since no
+# upload carried X-OC-Mtime. A save that reaches the server in a later second therefore
+# moved the mtime under the editor. Saving while the server is unreachable makes that gap
+# certain here; a large upload over a real network does the same.
+mt_stat() { stat -c %Y "$MOUNT/$1" 2>/dev/null || echo MISSING; }
+mt_dav() {
+    curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${URL}$1" \
+        | grep -o 'getlastmodified>[^<]*' | head -1 | cut -d'>' -f2
+}
+mt_settle() {  # <path> <seconds>: last mtime seen while re-listing past the dir TTL
+    local i
+    for i in $(seq 1 "$2"); do ls "$MOUNT/$(dirname "$1")" >/dev/null 2>&1; sleep 1; done
+    mt_stat "$1"
+}
+mkdir -p "$MOUNT/mtime"
+printf 'v1' > "$MOUNT/mtime/doc.odt"
+wait_dav_sha mtime/doc.odt "$(printf 'v1' | sha)" 60 >/dev/null || no "setup: mtime/doc.odt never reached the backend"
+server_down
+head -c 300000 /dev/urandom > /tmp/mtime.v2
+cp /tmp/mtime.v2 "$MOUNT/mtime/doc.odt"
+t_saved="$(mt_stat mtime/doc.odt)"          # what LibreOffice records after the save
+sleep 3
+server_up
+wait_dav_sha mtime/doc.odt "$(sha < /tmp/mtime.v2)" 120 >/dev/null \
+    || no "setup: the offline save never reached the backend"
+t_later="$(mt_settle mtime/doc.odt 15)"     # what it finds before the next save
+if [ "$t_saved" = "$t_later" ]; then
+    ok "a saved file's mtime did not move once its upload landed (no 'modified by others' warning)"
+else
+    no "a saved file's mtime moved from $(date -u -d "@$t_saved" +%T) to $(date -u -d "@$t_later" +%T) after its upload landed — LibreOffice warns the file was modified by others"
+    echo "    server getlastmodified: $(mt_dav mtime/doc.odt)"
+fi
+
+# The time a writer sets explicitly (cp -p, rsync -t, an archive extract) should reach the
+# server too, which is what X-OC-Mtime is for.
+head -c 5000 /dev/urandom > /tmp/mtime.old
+touch -m -d '2020-01-02 03:04:05 UTC' /tmp/mtime.old
+cp -p /tmp/mtime.old "$MOUNT/mtime/kept-time.bin"
+wait_dav_sha mtime/kept-time.bin "$(sha < /tmp/mtime.old)" 60 >/dev/null \
+    || no "setup: mtime/kept-time.bin never reached the backend"
+t_kept="$(mt_settle mtime/kept-time.bin 13)"
+srv="$(mt_dav mtime/kept-time.bin)"
+if [ "$t_kept" = "$(stat -c %Y /tmp/mtime.old)" ] && [ "$(date -u -d "$srv" +%s 2>/dev/null)" = "$t_kept" ]; then
+    ok "cp -p kept the source mtime on the mount and on the server"
+else
+    no "cp -p lost the source mtime 2020-01-02 03:04:05 (mount: $(date -u -d "@$t_kept" '+%F %T' 2>/dev/null || echo "$t_kept"), server: ${srv:-none})"
+fi
+rm -f /tmp/mtime.v2 /tmp/mtime.old
 
 echo "→ 22. SERVER EDIT of a KEPT file — the refresh that evicts it must not freeze the mount"
 # Regression for the v0.1.73 freeze: a read-triggered refresh that found a locally

@@ -1254,6 +1254,16 @@ fn append_to_tail_file(wp: &Path, data: &[u8]) -> std::io::Result<()> {
     f.write_all(data)
 }
 
+/// The time a save is stamped with: the staging file's mtime (its last write, or the time a
+/// writer set through utimens), in whole seconds since that is all the server stores. It is
+/// reported from commit on and sent with the upload as X-OC-Mtime, so the mtime an editor
+/// sees right after saving is still the server's once the upload lands and the listing is
+/// refreshed. LibreOffice compares the two and warns "modified by others" when they differ.
+pub(crate) fn staged_mtime(staging: &Path) -> Option<SystemTime> {
+    let t = std::fs::metadata(staging).ok()?.modified().ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(t.duration_since(UNIX_EPOCH).ok()?.as_secs()))
+}
+
 /// Overwrites (and possibly extends) the tail staging file at `tail_off`, an offset
 /// relative to the tail's first byte, for a write back into bytes not yet sent.
 fn write_into_tail_file(wp: &Path, tail_off: u64, data: &[u8]) -> std::io::Result<()> {
@@ -4799,12 +4809,14 @@ impl NextCloudFs {
             }
         }
         let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let saved_mtime = staged_mtime(&tail_path).unwrap_or_else(SystemTime::now);
         {
             let mut c = self.cache.safe_lock();
             if let Some(dir) = c.dir_cache.get_mut(&parent) {
                 let mut files = (*dir.files).clone();
                 if let Some(e) = files.iter_mut().find(|e| e.path == remote_path) {
                     e.size = total_len;
+                    e.modified = Some(saved_mtime);
                 }
                 dir.files = Arc::new(files);
             }
@@ -4862,7 +4874,7 @@ impl NextCloudFs {
                             if let Some(entry) = files.iter_mut().find(|e| e.path == remote_path) {
                                 entry.change_token = result.new_change_token;
                                 entry.size = total_len;
-                                entry.modified = Some(SystemTime::now());
+                                entry.modified = Some(saved_mtime);
                             }
                             dir.files = Arc::new(files);
                             dir.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
@@ -4877,7 +4889,7 @@ impl NextCloudFs {
                     // Every chunk is already on the server: assemble ours as a conflicted copy.
                     let conflict_name = make_conflict_name(&remote_path);
                     let session = backend::ChunkedUploadSession { uploads_base: cs.uploads_base.clone() };
-                    match conn.backend.finish_chunked_upload(&session, &conflict_name, None) {
+                    match conn.backend.finish_chunked_upload(&session, &conflict_name, None, None) {
                         Ok(_) => log::info!("conflicted copy assembled as {}", conflict_name.display()),
                         Err(e) => log::error!("failed to assemble conflicted copy {}: {}", conflict_name.display(), e),
                     }
@@ -4922,6 +4934,36 @@ impl NextCloudFs {
 
     /// Uploads a handle's staged bytes once release() has removed it. FLUSH is sent on
     /// every close() of any fd sharing the handle, so only RELEASE marks the end of a file.
+    /// An mtime a writer sets on a file it is still writing (cp -p, rsync -t, tar) goes on
+    /// the staging file of each such handle, which is what the save is stamped with (see
+    /// staged_mtime); a later write moves it on, as on a local disk. The kernel sends
+    /// futimens without a file handle, so the handles are found by inode. A file with no
+    /// uncommitted writes keeps its server mtime: there is no upload to carry the new one.
+    fn set_pending_mtime(&self, ino: u64, t: SystemTime) {
+        let staging: Vec<PathBuf> = self.open_files.safe_lock().values()
+            .filter(|of| of.ino == ino && of.dirty)
+            .filter_map(|of| of.write_path.clone())
+            .collect();
+        let mut stamped = None;
+        for wp in &staging {
+            match std::fs::File::options().write(true).open(wp).and_then(|f| f.set_modified(t)) {
+                Ok(()) => stamped = staged_mtime(wp),
+                Err(e) => log::warn!("setattr: cannot set mtime on staging {}: {}", wp.display(), e),
+            }
+        }
+        let Some(stamped) = stamped else { return };
+        let mut c = self.cache.safe_lock();
+        let Some(path) = c.get_path(ino) else { return };
+        let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        if let Some(dir) = c.dir_cache.get_mut(&parent) {
+            let mut files = (*dir.files).clone();
+            if let Some(e) = files.iter_mut().find(|e| e.path == path) {
+                e.modified = Some(stamped);
+            }
+            dir.files = Arc::new(files);
+        }
+    }
+
     fn commit_released(&self, fh: FileHandle, of: OpenFile) -> Result<(), Errno> {
         let OpenFile { remote_path, write_path, original_etag, chunk_upload, total_written, opened_gen, .. } = of;
         let Some(write_path) = write_path else { return Ok(()) };
@@ -4950,8 +4992,9 @@ impl NextCloudFs {
             }
         }
 
-        // Update dir_cache size synchronously so getattr returns the correct size
+        // Update dir_cache size and mtime synchronously so getattr returns them
         // before the background PUT thread has a chance to run.
+        let saved_mtime = staged_mtime(&write_path).unwrap_or_else(SystemTime::now);
         {
             let mut c = self.cache.safe_lock();
             let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
@@ -4959,6 +5002,7 @@ impl NextCloudFs {
                 let mut files = (*dir.files).clone();
                 if let Some(e) = files.iter_mut().find(|e| e.path == remote_path) {
                     e.size = upload_size;
+                    e.modified = Some(saved_mtime);
                 }
                 dir.files = Arc::new(files);
             }
@@ -5033,7 +5077,7 @@ impl NextCloudFs {
                                 if let Some(entry) = files.iter_mut().find(|e| e.path == remote_path) {
                                     entry.change_token = result.new_change_token.clone();
                                     entry.size = new_size;
-                                    entry.modified = Some(SystemTime::now());
+                                    entry.modified = Some(saved_mtime);
                                 }
                                 dir.files = Arc::new(files);
                                 // Expire the cache so the next readdir triggers a PROPFIND
@@ -5055,7 +5099,7 @@ impl NextCloudFs {
                             if std::fs::copy(&write_path, &keep_path).is_ok() {
                                 cache.safe_lock().file_cache.insert(remote_path.clone(), FileCacheEntry {
                                     local_path: keep_path,
-                                    remote_modified: Some(SystemTime::now()),
+                                    remote_modified: Some(saved_mtime),
                                     etag: result.new_change_token,
                                     kept: true,
                                     size: upload_size,
@@ -6942,7 +6986,7 @@ impl Filesystem for NextCloudFs {
         _gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
@@ -6951,6 +6995,12 @@ impl Filesystem for NextCloudFs {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        if let Some(t) = mtime {
+            self.set_pending_mtime(ino.0, match t {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => SystemTime::now(),
+            });
+        }
         if let Some(new_size) = size {
             if let Some(fh) = fh {
                 let fh_raw = fh.0;

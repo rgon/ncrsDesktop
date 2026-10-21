@@ -111,6 +111,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     whole += f.read()
             headers = {"Content-Type": "application/octet-stream",
                        "Authorization": self.headers.get("Authorization", "")}
+            if self.headers.get("X-OC-Mtime"):
+                # Nextcloud takes the file's mtime from the assembling MOVE.
+                headers["X-OC-Mtime"] = self.headers["X-OC-Mtime"]
             m = re.search(r'\(\["([^"]*)"\]\)', self.headers.get("If", ""))
             if m:
                 headers["If-Match"] = '"%s"' % m.group(1)
