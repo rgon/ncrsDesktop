@@ -286,7 +286,7 @@ pub fn socket_path() -> PathBuf {
 /// surface exposes file metadata and `PAUSE`/`PURGE_CACHE` — and would let one
 /// pre-create the path to deny or intercept the channel. So when there is no
 /// runtime dir, use a private per-uid subdirectory instead of the shared root.
-fn socket_dir() -> PathBuf {
+pub(crate) fn socket_dir() -> PathBuf {
     if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
         if !d.is_empty() {
             return PathBuf::from(d);
@@ -1457,6 +1457,13 @@ fn handle_client_loop(
             paused.store(false, Ordering::Relaxed);
             log::info!("sync resumed via IPC");
             "ok".to_string()
+        } else if trimmed == "RESTART_HANDOFF" {
+            // Re-execute the daemon in place (e.g. onto an upgraded binary), keeping
+            // the FUSE connection so programs keep their open files. See handoff.rs.
+            match crate::handoff::request_planned_restart() {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("error: {}", e),
+            }
         } else if trimmed == "PASSTHROUGH_ON" {
             passthrough_enabled.store(true, Ordering::Relaxed);
             log::info!("FUSE passthrough enabled via IPC");

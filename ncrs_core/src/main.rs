@@ -73,12 +73,21 @@ struct Cli {
     /// scripts/mime_audit.py to verify the intercept against real GLib.
     #[arg(long, hide = true)]
     dump_mime_magic: bool,
+
+    /// Internal: run as the FUSE descriptor holder listening on SOCKET, which
+    /// keeps the mount alive across a daemon crash (see ncrs_core::handoff).
+    #[arg(long, hide = true, value_name = "SOCKET")]
+    fd_holder: Option<PathBuf>,
 }
 
 fn main() {
     // The GUI spawns the daemon without RUST_LOG; bare env_logger::init() would then log nothing.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = Cli::parse();
+
+    if let Some(socket) = cli.fd_holder {
+        std::process::exit(ncrs_core::handoff::run_holder(&socket));
+    }
 
     if cli.print_default_config {
         print!("{}", ncrs_core::config::DEFAULT_CONFIG);
