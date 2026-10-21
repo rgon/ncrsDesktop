@@ -1212,6 +1212,165 @@ else
 fi
 rm -f /tmp/mtime.v2 /tmp/mtime.old
 
+echo "→ 31. ONE SLOW REQUEST must not freeze the mount; save-by-rename stays ordered"
+# The daemon served every FUSE request on one thread, so one request waiting on the
+# server (a writable open staging an uncached file, a lookup listing an uncached
+# folder) froze every other file on the mount until it returned. Requests now run on
+# a small pool, ordered per inode. A third daemon is pointed at chunkdav.py, which
+# here holds every GET/PROPFIND of a path containing "slowpoke" for 8 s.
+# The second half is the ordering that pool must keep: LibreOffice closes its temp
+# file and renames it over the document at once, so RELEASE and RENAME arrive back
+# to back. Run concurrently, the rename could slip into the middle of the release's
+# commit and the save went up under the temp name.
+SC_PORT=8091
+SC_LOG=/tmp/chunkdav-slow.log
+SC_HOME=/tmp/ncrs-sched
+SC_MOUNT=/mnt/ncrs-sched
+SC_NLOG=/tmp/ncrs-sched.log
+SC_SLOW=8
+: > "$SC_LOG"
+python3 /e2e/chunkdav.py "$SC_PORT" "$CD_HOST" "$SC_LOG" --slow "slowpoke:$SC_SLOW" 2>/tmp/chunkdav-slow.err &
+SC_PID=$!
+# Seeded straight on the backend, so the daemon has none of it cached.
+head -c 3000000 /dev/urandom > /tmp/sched.slow
+curl -s -u "$U:$P" -X MKCOL "${URL}sched/" -o /dev/null
+curl -s -u "$U:$P" -X MKCOL "${URL}sched/other/" -o /dev/null
+curl -s -u "$U:$P" -X MKCOL "${URL}sched/slowpoke-dir/" -o /dev/null
+curl -s -u "$U:$P" -T /tmp/sched.slow "${URL}sched/slowpoke.bin" -o /dev/null
+printf 'inside' | curl -s -u "$U:$P" -T - "${URL}sched/slowpoke-dir/x.txt" -o /dev/null
+printf 'unrelated' | curl -s -u "$U:$P" -T - "${URL}sched/other/a.txt" -o /dev/null
+mkdir -p "$SC_MOUNT" "$SC_HOME/.config/ncrs" "$SC_HOME/run" "$SC_HOME/cache"
+chmod 700 "$SC_HOME/run"
+cat > "$SC_HOME/.config/ncrs/config.yaml" <<EOF
+url: "http://127.0.0.1:${SC_PORT}/remote.php/dav/files/${U}/"
+username: "${U}"
+password: "${P}"
+user: "${U}"
+mount_point: "${SC_MOUNT}"
+allow_insecure_http: true
+http3: false
+optimistic_listing: false
+auto_keep_cached_files: false
+EOF
+for _ in $(seq 1 20); do
+    curl -s -o /dev/null -u "$U:$P" -X PROPFIND -H 'Depth: 0' \
+        "http://127.0.0.1:${SC_PORT}/remote.php/dav/files/${U}/" && break
+    sleep 0.5
+done
+: > "$SC_NLOG"
+HOME="$SC_HOME" XDG_RUNTIME_DIR="$SC_HOME/run" XDG_CACHE_HOME="$SC_HOME/cache" XDG_CONFIG_HOME="$SC_HOME/.config" \
+    RUST_LOG="${RUST_LOG:-info}" ncrs --config "$SC_HOME/.config/ncrs/config.yaml" >>"$SC_NLOG" 2>&1 &
+SC_DAEMON=$!
+for _ in $(seq 1 60); do
+    mountpoint -q "$SC_MOUNT" && break
+    kill -0 "$SC_DAEMON" 2>/dev/null || break
+    sleep 1
+done
+ms_now() { date +%s%3N; }
+if ! mountpoint -q "$SC_MOUNT"; then
+    no "setup: the slow-proxy mount never appeared"
+    tail -20 "$SC_NLOG" | sed 's/^/    /'
+else
+    timeout -s KILL 20 stat "$SC_MOUNT/sched/slowpoke.bin" >/dev/null 2>&1 \
+        || no "setup: sched/slowpoke.bin is not visible on the slow-proxy mount"
+    # A writable open of an uncached file downloads it before open() returns; a
+    # lookup in an uncached folder lists it. Both now wait SC_SLOW seconds on the proxy.
+    t0=$(ms_now)
+    ( python3 -c 'import sys; f = open(sys.argv[1], "r+b"); f.read(1); f.close()' "$SC_MOUNT/sched/slowpoke.bin"
+      echo "$? $(( $(ms_now) - t0 ))" > /tmp/sched.open.rc ) &
+    SO_PID=$!
+    ( stat "$SC_MOUNT/sched/slowpoke-dir/x.txt" >/dev/null 2>&1
+      echo "$? $(( $(ms_now) - t0 ))" > /tmp/sched.lookup.rc ) &
+    SL_PID=$!
+    sleep 1
+    t1=$(ms_now)
+    timeout -s KILL 2 ls "$SC_MOUNT/sched/other" >/dev/null 2>&1; lrc=$?
+    timeout -s KILL 2 stat "$SC_MOUNT/sched/other/a.txt" >/dev/null 2>&1; src=$?
+    t2=$(ms_now)
+    grep -q "SLOW GET .*slowpoke.bin" "$SC_LOG" && grep -q "SLOW PROPFIND .*slowpoke-dir" "$SC_LOG" \
+        || no "setup: the proxy never held the slow requests — the check below would prove nothing"
+    if [ "$lrc" = 0 ] && [ "$src" = 0 ] && [ $((t2 - t1)) -lt 2000 ]; then
+        ok "ls/stat of an unrelated folder answered in $((t2 - t1)) ms while an open and a lookup waited on the server"
+    else
+        no "ls/stat of an unrelated folder blocked behind a slow request (ls rc=$lrc, stat rc=$src, $((t2 - t1)) ms; 137 = still blocked when killed)"
+    fi
+    wait "$SO_PID" "$SL_PID"
+    read -r orc oms < /tmp/sched.open.rc
+    read -r krc kms < /tmp/sched.lookup.rc
+    if [ "$orc" = 0 ] && [ "$krc" = 0 ] && [ "$oms" -ge $(( (SC_SLOW - 2) * 1000 )) ]; then
+        ok "the slow open (${oms} ms) and slow lookup (${kms} ms) still completed"
+    else
+        no "the slow requests did not complete as expected (open rc=$orc ${oms} ms, lookup rc=$krc ${kms} ms)"
+        grep -E "slowpoke" "$SC_NLOG" | tail -6 | sed 's/^/    /'
+    fi
+
+    # Save-by-rename, 25 times back to back, while other files in the folder are read.
+    # The folder is made through the mount: plain WebDAV lists no Nextcloud permissions
+    # for a folder made on the server, and the rename guard then refuses with EACCES.
+    mkdir -p "$SC_MOUNT/sched/lo"
+    for i in 1 2 3 4; do
+        head -c 400000 /dev/urandom > "/tmp/sched.peer$i"
+        cp "/tmp/sched.peer$i" "$SC_MOUNT/sched/lo/peer$i.bin"
+        wait_dav_sha "sched/lo/peer$i.bin" "$(sha < "/tmp/sched.peer$i")" 60 >/dev/null \
+            || no "setup: sched/lo/peer$i.bin never reached the backend"
+    done
+    : > /tmp/sched.readers.bad
+    rm -f /tmp/sched.readers.stop
+    SR_PIDS=""
+    for i in 1 2 3 4; do
+        ( want="$(sha < "/tmp/sched.peer$i")"
+          while [ ! -e /tmp/sched.readers.stop ]; do
+              got="$(timeout -s KILL 30 sha256sum "$SC_MOUNT/sched/lo/peer$i.bin" 2>/dev/null | awk '{print $1}')"
+              [ "$got" = "$want" ] || echo "peer$i: ${got:-unreadable}" >> /tmp/sched.readers.bad
+          done ) &
+        SR_PIDS="$SR_PIDS $!"
+    done
+    python3 - "$SC_MOUNT/sched/lo" 25 /tmp/sched.doc.expect <<'PY'
+import os, sys
+d, n, expect = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+bad = 0
+for i in range(n):
+    data = os.urandom(150000 + 997 * i)
+    tmp = os.path.join(d, "lu%d.tmp" % i)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.rename(tmp, os.path.join(d, "doc.odt"))
+    except OSError as e:
+        print("    save %d: %s" % (i, e))
+        bad += 1
+open(expect, "wb").write(data)
+sys.exit(1 if bad else 0)
+PY
+    prc=$?
+    touch /tmp/sched.readers.stop
+    wait $SR_PIDS
+    [ "$prc" = 0 ] && ok "25 save-by-rename cycles ran without an error" \
+        || no "save-by-rename cycles failed (rc=$prc)"
+    [ ! -s /tmp/sched.readers.bad ] && ok "parallel reads of the folder's other files stayed byte-exact" \
+        || { no "parallel reads returned wrong bytes"; head -4 /tmp/sched.readers.bad | sed 's/^/    /'; }
+    want="$(sha < /tmp/sched.doc.expect)"
+    wait_dav_sha sched/lo/doc.odt "$want" 90 \
+        && ok "the last save reached the backend byte-exact under the document's name" \
+        || no "the backend document is not the last save ($(curl -s -u "$U:$P" "${URL}sched/lo/doc.odt" | wc -c) of $(stat -c %s /tmp/sched.doc.expect) bytes)"
+    got="$(timeout -s KILL 30 sha256sum "$SC_MOUNT/sched/lo/doc.odt" 2>/dev/null | awk '{print $1}')"
+    [ "$got" = "$want" ] && ok "the mount reads the document back as the last save" \
+        || no "the mount reads the document back as ${got:-nothing}, not the last save"
+    stray=""
+    for _ in $(seq 1 30); do
+        stray="$(curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 1' "${URL}sched/lo/" | grep -o 'lu[0-9]*\.tmp' | sort -u | tr '\n' ' ')"
+        [ -z "$stray" ] && break
+        sleep 1
+    done
+    mstray="$(ls "$SC_MOUNT/sched/lo" 2>/dev/null | grep '\.tmp$' | tr '\n' ' ')"
+    [ -z "$stray" ] && [ -z "$mstray" ] && ok "no temp file was left behind on the backend or the mount" \
+        || no "temp files left behind (backend: ${stray:-none}; mount: ${mstray:-none})"
+fi
+fusermount3 -u "$SC_MOUNT" 2>/dev/null || umount "$SC_MOUNT" 2>/dev/null
+kill "$SC_DAEMON" "$SC_PID" 2>/dev/null
+wait "$SC_DAEMON" "$SC_PID" 2>/dev/null
+rm -f /tmp/sched.slow /tmp/sched.peer* /tmp/sched.doc.expect /tmp/sched.*.rc /tmp/sched.readers.*
+
 echo "→ 22. SERVER EDIT of a KEPT file — the refresh that evicts it must not freeze the mount"
 # Regression for the v0.1.73 freeze: a read-triggered refresh that found a locally
 # cached (kept) file changed on the server evicted it while holding the cache lock,

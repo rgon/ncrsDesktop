@@ -9,7 +9,11 @@ other request to the real server unchanged, so a mount pointed at it exercises
 the streaming path. Each uploads request is logged, one line each, so a
 scenario can prove the chunks really went this way.
 
-Usage: chunkdav.py <listen-port> <upstream-host> <log-file>
+With --slow MARKER:SECONDS, a GET or PROPFIND whose path contains MARKER is held
+that long before it is forwarded (logged as SLOW), so a scenario can keep one
+request deliberately stuck on the network while it checks everything else.
+
+Usage: chunkdav.py <listen-port> <upstream-host> <log-file> [--slow MARKER:SECONDS]
 """
 import http.client
 import http.server
@@ -18,9 +22,14 @@ import re
 import shutil
 import sys
 import threading
+import time
 import urllib.parse
 
 PORT, UPSTREAM, LOG = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+SLOW_MARK, SLOW_SECS = None, 0.0
+if len(sys.argv) > 5 and sys.argv[4] == "--slow":
+    SLOW_MARK, _, secs = sys.argv[5].rpartition(":")
+    SLOW_SECS = float(secs)
 STORE = "/tmp/chunkdav-sessions"
 UPLOADS = "/remote.php/dav/uploads/"
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "host"}
@@ -75,10 +84,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         if path.startswith(UPLOADS):
             return self.uploads(path[len(UPLOADS):], data)
+        if SLOW_MARK and SLOW_MARK in path and self.command in ("GET", "PROPFIND"):
+            log("SLOW %s %s" % (self.command, path))
+            time.sleep(SLOW_SECS)
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         headers["Host"] = UPSTREAM
-        if "Destination" in headers:
-            d = urllib.parse.urlsplit(headers["Destination"])
+        # reqwest sends header names in lower case; a MOVE whose Destination still
+        # names this proxy is refused by the server (502, another host).
+        dest = [k for k in headers if k.lower() == "destination"]
+        if dest:
+            d = urllib.parse.urlsplit(headers.pop(dest[0]))
             headers["Destination"] = urllib.parse.urlunsplit(("http", UPSTREAM, d.path, d.query, ""))
         status, rh, rd = self.upstream(self.command, self.path, headers, data)
         self.reply(status, rh, rd)
