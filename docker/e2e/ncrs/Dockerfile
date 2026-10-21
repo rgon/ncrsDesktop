@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo user_allow_other >> /etc/fuse.conf
 
 COPY --from=binary /ncrs /usr/local/bin/ncrs
-COPY docker/e2e/ncrs/entrypoint.sh docker/e2e/ncrs/scenarios.sh docker/e2e/ncrs/chunkdav.py /e2e/
-RUN chmod +x /usr/local/bin/ncrs /e2e/entrypoint.sh /e2e/scenarios.sh /e2e/chunkdav.py
+COPY docker/e2e/ncrs/entrypoint.sh docker/e2e/ncrs/scenarios.sh docker/e2e/ncrs/chunkdav.py docker/e2e/ncrs/fake_systemd.py /e2e/
+RUN chmod +x /usr/local/bin/ncrs /e2e/entrypoint.sh /e2e/scenarios.sh /e2e/chunkdav.py /e2e/fake_systemd.py
 
 ENTRYPOINT ["/e2e/entrypoint.sh"]
