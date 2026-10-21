@@ -1,4 +1,9 @@
-# PATCHES.md — upstream fixes worth submitting to reqwest
+# PATCHES.md — upstream fixes worth submitting (reqwest, fuser)
+
+The reqwest items below are worked around in-tree. The fuser item at the end
+("fuser: reattach") is the one patch ncrs actually carries: `vendor/fuser` is
+fuser 0.17.0 plus that change, wired in with `[patch.crates-io]` in the root
+`Cargo.toml`.
 
 Findings from the 2026-09-01 HTTP/3 investigation (see `GOTCHAS.md` §3). ncrs
 works around all of them in-tree (`http_clients::DavClient` stamps request
@@ -222,3 +227,48 @@ read client if the field shows silent-path-death windows in practice.
 - [ ] After either patch lands: drop the corresponding workaround note from
       `GOTCHAS.md` §3 and, for Patch 1, the stamp in `DavClient` can become a
       no-op on that reqwest version.
+
+---
+
+# fuser: reattach (carried as `vendor/fuser`)
+
+**Target:** `cberner/fuser`, version `0.17.0`. Needed by daemon-restart
+survival (`ncrs_core/src/handoff.rs`, `state_snapshot.rs`): a restarted ncrs
+takes over the *live* `/dev/fuse` connection (from its own re-exec, from the
+fd-holder process, or from systemd's fd store) instead of mounting afresh, so
+programs keep their open file descriptors.
+
+### The gap
+
+`Session::from_fd` is the only way to run a session on an existing fd, and it
+calls `handshake()`, which blocks reading the next request and fails unless it
+is `FUSE_INIT`. The kernel sends `FUSE_INIT` once per connection, so on a
+connection a previous session already initialised the first request is an
+ordinary operation: `handshake()` answers it EIO and returns
+`InvalidData("Received non-init FUSE operation during handshake")`. Nothing
+after the handshake depends on it (`proto_version` is stored, never read), so
+a session that skips it runs normally.
+
+Separately, `BackingId` hides the kernel's backing id (`pub(crate)
+backing_id`). Backing ids belong to the connection, so a successor daemon has
+to close the ones its predecessor registered once their handles are released;
+it can only do that if the predecessor could record the number.
+
+### The patch (two additive functions, no behaviour change for existing users)
+
+- `Session::from_fd_initialized(fs, fd, acl, config) -> Session`: like
+  `from_fd` without the handshake and without calling `Filesystem::init`;
+  owns no mount (dropping it unmounts nothing).
+- `BackingId::raw_id(&self) -> u32`.
+
+Diff: `git diff 3e7969b -- vendor/fuser` (the vendor import commit is the
+unmodified crate).
+
+### Upstreaming
+
+A natural upstream shape is `Session::from_fd_with_state(fs, fd, acl, config,
+proto_version)` plus a `Notifier::resend()` for `FUSE_NOTIFY_RESEND` (Linux
+6.9+, which ncrs currently writes by hand on its own dup of the fd —
+`handoff::send_notify_resend`). Until then, when bumping fuser: re-vendor the
+new version, re-apply the two functions, and keep `[patch.crates-io]` pointing
+at it.

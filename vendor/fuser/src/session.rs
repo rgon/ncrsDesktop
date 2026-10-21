@@ -218,6 +218,47 @@ impl<FS: Filesystem> Session<FS> {
         Ok(session)
     }
 
+    /// Wrap a /dev/fuse file descriptor whose connection a previous session has
+    /// already initialised, e.g. one handed over by a daemon that re-executed
+    /// itself or crashed while another process kept the descriptor open.
+    ///
+    /// The kernel sends FUSE_INIT exactly once per connection, so unlike
+    /// [`Session::from_fd`] this performs no handshake and never calls
+    /// [`Filesystem::init`]: the capabilities negotiated by the first session
+    /// stay in force, and the new filesystem must be prepared to serve the
+    /// same protocol (same capability set) as the one that negotiated them.
+    /// The first request read is an ordinary operation, or a request the old
+    /// session had read but not answered once the caller sends
+    /// `FUSE_NOTIFY_RESEND`.
+    ///
+    /// Like [`Session::from_fd`], this does not own a mount: dropping the
+    /// session or its [`BackgroundSession`] does not unmount anything.
+    ///
+    /// ncrs patch (see PATCHES.md, "fuser: reattach").
+    pub fn from_fd_initialized(
+        filesystem: FS,
+        fd: OwnedFd,
+        acl: SessionACL,
+        config: Config,
+    ) -> Self {
+        let ch = Channel::new(Arc::new(DevFuse(File::from(fd))));
+        Session {
+            filesystem: FilesystemHolder {
+                fs: Some(filesystem),
+            },
+            ch,
+            mount: UmountOnDrop {
+                mount: Arc::new(Mutex::new(None)),
+            },
+            allowed: acl,
+            session_owner: geteuid(),
+            // Not known: the INIT that carried it went to the previous session.
+            // Nothing after the handshake reads it.
+            proto_version: None,
+            config,
+        }
+    }
+
     /// Run the session loop in a background thread. If the returned handle is dropped,
     /// the filesystem is unmounted and the given session ends.
     pub fn spawn(self) -> io::Result<BackgroundSession> {

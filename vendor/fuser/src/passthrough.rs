@@ -54,6 +54,17 @@ impl BackingId {
             backing_id: id as u32,
         })
     }
+
+    /// The kernel's id for this backing file, as returned by
+    /// `FUSE_DEV_IOC_BACKING_OPEN`. Backing ids belong to the connection, not
+    /// the process, so a daemon handing the connection over records them to
+    /// let its successor close them (`FUSE_DEV_IOC_BACKING_CLOSE`) once the
+    /// handles using them are released.
+    ///
+    /// ncrs patch (see PATCHES.md, "fuser: reattach").
+    pub fn raw_id(&self) -> u32 {
+        self.backing_id
+    }
 }
 
 impl Drop for BackingId {
