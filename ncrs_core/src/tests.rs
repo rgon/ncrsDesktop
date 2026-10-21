@@ -1,6 +1,6 @@
     use super::*;
 
-    fn make_test_cache() -> FsCache {
+    pub(crate) fn make_test_cache() -> FsCache {
         let mut inodes = HashMap::new();
         let mut paths = HashMap::new();
         inodes.insert(1, PathBuf::from("/"));

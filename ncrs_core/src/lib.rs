@@ -16,6 +16,7 @@ pub mod change_log;
 // Daemon-restart survival (keep the FUSE connection, restore what the kernel references).
 pub mod handoff;
 mod state_snapshot;
+mod sd_watchdog;
 pub mod ipc;
 pub mod http_clients;
 mod iomode;
@@ -6981,8 +6982,14 @@ impl NextCloudFs {
     ) {
         // The last close of the handle: the only point where no further write can arrive.
         let Some(of) = self.open_files.safe_lock().remove(&fh.0) else {
-            // A handle a reattach could not restore: drop its EIO marker.
-            state_snapshot::handle_released(fh.0);
+            // A handle a reattach could not restore: drop its EIO marker and undo
+            // what the restore still held for it.
+            if let Some(lost) = state_snapshot::handle_released(fh.0) {
+                self.io_modes.safe_lock().release(lost.ino, lost.io_kind);
+                if let Some(p) = lost.uploading {
+                    self.cache.safe_lock().uploading.remove(&p);
+                }
+            }
             reply.ok();
             return;
         };
@@ -9388,14 +9395,23 @@ fn build_fuse_options() -> Vec<MountOption> {
 /// partial one (notify_push down, WebDAV fine).
 pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_map: Option<TransferMap>, journal: Option<mutation_journal::SharedJournal>, paused: Option<Arc<AtomicBool>>, hpb_connected: Option<Arc<AtomicBool>>, offline: Option<OfflineStatus>) -> Result<(), String> {
     // Must run before any other thread is spawned (see seccomp_harden::install).
-    seccomp_harden::install();
+    // An image a planned restart exec'd into still carries the filter it
+    // installed the first time (seccomp filters survive execve): stacking a
+    // second copy on every restart only costs syscall time.
+    if !handoff::is_exec_successor() {
+        seccomp_harden::install();
+    }
+    // systemd integration: a SIGTERM (stop/restart) hands the connection to the
+    // fd store instead of dropping it, and the watchdog pings while healthy.
+    handoff::spawn_sigterm_thread();
+    sd_watchdog::spawn();
 
     // Must run before anything that touches shared resources (the IPC socket,
     // cache dirs, journal): a refused second instance must leave the running
     // daemon's state untouched.
     let cache_dir = ncrs_cache_dir(&options.url);
     // Daemon-restart survival: a previous daemon's live FUSE connection (left by
-    // our own re-exec, the fd holder or systemd's fd store) is taken over instead
+    // our own re-exec or systemd's fd store) is taken over instead
     // of mounting afresh, so programs keep their open files. Must run before
     // prepare_mount_point, which would stat — and block on — the unserved mount.
     // A connection whose node ids and handles cannot be restored is let go.
@@ -9404,11 +9420,14 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             Ok(restored) => Some((ra, restored)),
             Err(e) => {
                 log::warn!("handoff: cannot restore the previous daemon's state ({}) — mounting afresh", e);
-                handoff::abandon(ra, &options.mount_point);
+                handoff::abandon(ra);
                 None
             }
         }
     });
+    // Until the session serves it, a failure here aborts the taken-over
+    // connection rather than leaving programs blocked on it (see handoff).
+    let mut reattach_guard = handoff::ReattachGuard::new(reattach.as_ref().map(|(ra, _)| ra.dev));
     let adopted = match reattach {
         Some(_) => Vec::new(),
         None => prepare_mount_point(&options.mount_point, &cache_dir)?,
@@ -9430,12 +9449,11 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     // Daemon-restart survival: install the previous daemon's node ids and handles
     // before any thread can allocate new ones, and keep logging where it left off.
     if let Some((ra, restored)) = &reattach {
-        let report = state_snapshot::apply(&filesystem, restored);
+        let report = state_snapshot::apply(&filesystem, restored, &cache_dir, ra.dev, &options.mount_point);
         log::info!(
             "handoff: restored {} node ids and {} open handles ({} exact, {} failed, {} lost)",
             report.inodes, report.handles, report.exact, report.failed, report.lost,
         );
-        state_snapshot::start_resumed(&cache_dir, ra.dev, &options.mount_point, restored);
     }
     // One shared pause flag for the FUSE connection, background workers, and
     // the IPC PAUSE/RESUME verbs — callers without their own flag get one.
@@ -9895,20 +9913,22 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let handoff_cache = filesystem.cache_ref();
     let handoff_open_files = filesystem.open_files.clone();
     let handoff_next_fh = filesystem.next_fh.clone();
+    let handoff_journal = filesystem.journal.clone();
 
     let reattached = reattach.is_some();
     let sched_fs = fuse_dispatch::SchedFs::new(filesystem);
     // A planned restart drains the request scheduler before handing the connection over.
     handoff::set_quiesce_hook(sched_fs.quiesce_hook());
+    handoff::set_resume_hook(sched_fs.resume_hook());
     let session = match reattach {
         Some((ra, _)) => {
             log::info!("Reattaching to the live FUSE connection on {} ({:?})", options.mount_point.display(), ra.source);
-            let (fd, dev, source, lease) = ra.into_parts();
+            let handoff::Reattach { fd, dev, .. } = ra;
             let own = fd.try_clone().map_err(|e| format!("FUSE reattach: cannot dup the descriptor: {}", e))?;
             // No FUSE_INIT on a live connection: init() is not called again, and the
             // capabilities the first daemon negotiated stay in force.
             let session = fuser::Session::from_fd_initialized(sched_fs, fd, fuse_config.acl, fuse_config.clone());
-            handoff::adopt_reattached(own, dev, source, lease, &options.mount_point);
+            handoff::adopt_reattached(own, dev);
             session
         }
         None => {
@@ -9924,7 +9944,16 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     {
         let cd = cache_dir.clone();
         let open_files = handoff_open_files.clone();
-        handoff::set_snapshot_hook(move || state_snapshot::write_handles_snapshot(&cd, &open_files));
+        handoff::set_snapshot_hook(move |drained| state_snapshot::write_handles_snapshot(&cd, &open_files, drained));
+    }
+    {
+        // What the systemd watchdog checks before each ping (see sd_watchdog).
+        let c = handoff_cache.clone();
+        sd_watchdog::watch_lock("cache", move |t| sd_watchdog::lock_available(&c, t));
+        let o = handoff_open_files.clone();
+        sd_watchdog::watch_lock("open_files", move |t| sd_watchdog::lock_available(&o, t));
+        let j = handoff_journal.clone();
+        sd_watchdog::watch_lock("journal", move |t| sd_watchdog::lock_available(&j, t));
     }
     state_snapshot::spawn_ticker(handoff_cache, handoff_next_fh, shutdown_flag.clone());
 
@@ -9936,11 +9965,15 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     *notifier_slot.safe_lock() = Some(session.notifier());
     log::info!("FUSE notifier ready");
 
-    let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;
     if reattached {
-        // The session reads now: re-queue what the previous daemon left unanswered.
+        // Re-queue what the previous daemon left unanswered — before this
+        // session reads anything, so no request it takes itself is resent too
+        // (and run twice: a mkdir answering EEXIST to its own success).
         handoff::resend_in_flight();
     }
+    let bg = session.spawn().map_err(|e| format!("FUSE session spawn failed: {}", e))?;
+    reattach_guard.disarm();
+    let _ = handoff::sd_notify("READY=1", None);
 
     let result = bg.guard.join().map_err(|panic_payload| {
         let msg = panic_payload
@@ -9948,15 +9981,18 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             .or_else(|| panic_payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| format!("{:?}", panic_payload));
         format!("FUSE session thread panicked: {}", msg)
-    })
-    .and_then(|r| r.map_err(|e| format!("FUSE session failed: {}", e)));
+    });
+    // An aborted connection (fusectl abort, or the kernel giving up on it) ends
+    // the session with ECONNABORTED: as dead as an unmount for a successor.
+    let aborted = matches!(&result, Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNABORTED));
+    let result = result.and_then(|r| r.map_err(|e| format!("FUSE session failed: {}", e)));
 
     shutdown_flag.store(true, Ordering::Relaxed);
     log::info!("FUSE session ended — shutdown signal sent to background threads");
 
     // Daemon-restart survival: a clean end means unmounted, so nothing will take
-    // the connection over; an error leaves it to the keeper for a successor.
-    if result.is_ok() {
+    // the connection over; another error leaves it to the keeper for a successor.
+    if result.is_ok() || aborted {
         handoff::release_connection();
         state_snapshot::stop(&cache_dir);
     }

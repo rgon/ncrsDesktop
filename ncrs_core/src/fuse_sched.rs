@@ -224,6 +224,12 @@ impl<K: Copy + Eq + Hash + Send + 'static> Scheduler<K> {
         true
     }
 
+    /// Lifts a [`quiesce`](Self::quiesce) pause now (a planned restart that failed).
+    pub(crate) fn resume(&self) {
+        self.lock().paused_until = None;
+        self.room.notify_all();
+    }
+
     /// Keys with a task waiting or running on them right now.
     pub(crate) fn busy_keys(&self) -> Vec<K> {
         self.lock().queues.keys().copied().collect()
@@ -315,6 +321,25 @@ mod tests {
         wait_drained(&s);
         assert_eq!(*done.lock().unwrap(), vec![1, 2]);
         assert!(paused_at.elapsed() >= Duration::from_secs(4), "the pause lasted until it lifted");
+    }
+
+    #[test]
+    fn resume_lifts_the_pause_at_once() {
+        let s = sched("t-resume", 2, 64);
+        assert!(s.quiesce(Duration::from_millis(10)));
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let t = Instant::now();
+        std::thread::scope(|scope| {
+            let d = done.clone();
+            let s2 = s.clone();
+            scope.spawn(move || s2.submit(&[(1, Mode::Exclusive)], move || d.lock().unwrap().push(1)));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(done.lock().unwrap().is_empty(), "held back while paused");
+            s.resume();
+        });
+        wait_drained(&s);
+        assert_eq!(*done.lock().unwrap(), vec![1]);
+        assert!(t.elapsed() < Duration::from_secs(3), "ran right after resume, not when the pause expired");
     }
 
     /// Tiny deterministic xorshift, so a failure reproduces.
