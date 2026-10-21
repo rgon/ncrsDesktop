@@ -81,6 +81,17 @@ pub struct MountOptions {
     pub walker_rate_limit: bool,
     #[serde(default = "default_walker_listings_per_sec")]
     pub walker_listings_per_sec: u32,
+    /// Send a new file to the server in chunks while it is still being written,
+    /// once it passes `stream_upload_threshold_mb`, instead of staging all of it
+    /// on local disk first. Off means every write is staged in full: costs disk
+    /// space, but a program that goes back and rewrites early bytes of a big
+    /// file (video/audio trailers, office saves) can never hit already-sent data.
+    #[serde(default = "default_true")]
+    pub stream_uploads: bool,
+    /// How far (MiB) a new file must be written before streaming starts. Below
+    /// it the whole file stays local, so writes anywhere in it work.
+    #[serde(default = "default_stream_upload_threshold_mb")]
+    pub stream_upload_threshold_mb: u64,
 }
 
 pub fn default_walker_listings_per_sec() -> u32 {
@@ -155,6 +166,8 @@ impl MountOptions {
 }
 
 fn default_true() -> bool { true }
+
+fn default_stream_upload_threshold_mb() -> u64 { 100 }
 
 fn default_max_concurrent() -> usize { 10 }
 
@@ -237,8 +250,12 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
         .as_i64()
         .map(|n| n.clamp(*WALKER_LISTINGS_PER_SEC_RANGE.start() as i64, *WALKER_LISTINGS_PER_SEC_RANGE.end() as i64) as u32)
         .unwrap_or_else(default_walker_listings_per_sec);
+    let stream_uploads = doc["stream_uploads"].as_bool().unwrap_or(true);
+    let stream_upload_threshold_mb = doc["stream_upload_threshold_mb"].as_i64()
+        .map(|v| v.max(0) as u64)
+        .unwrap_or_else(default_stream_upload_threshold_mb);
 
-    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough, allow_insecure_http, walker_rate_limit, walker_listings_per_sec })
+    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough, allow_insecure_http, walker_rate_limit, walker_listings_per_sec, stream_uploads, stream_upload_threshold_mb })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
@@ -498,6 +515,11 @@ pub struct ConfigSettings {
     pub walker_rate_limit: bool,
     #[serde(default = "default_walker_listings_per_sec")]
     pub walker_listings_per_sec: u32,
+    // Defaulted for the same forward-compat reason as dir_cache_max_dirs above.
+    #[serde(default = "default_true")]
+    pub stream_uploads: bool,
+    #[serde(default = "default_stream_upload_threshold_mb")]
+    pub stream_upload_threshold_mb: u64,
 }
 
 impl Default for ConfigSettings {
@@ -526,6 +548,8 @@ impl Default for ConfigSettings {
             fuse_passthrough: true,
             walker_rate_limit: true,
             walker_listings_per_sec: default_walker_listings_per_sec(),
+            stream_uploads: true,
+            stream_upload_threshold_mb: default_stream_upload_threshold_mb(),
         }
     }
 }
@@ -551,6 +575,8 @@ pub fn config_settings_from_opts(opts: &MountOptions) -> ConfigSettings {
         fuse_passthrough: opts.fuse_passthrough,
         walker_rate_limit: opts.walker_rate_limit,
         walker_listings_per_sec: opts.walker_listings_per_sec,
+        stream_uploads: opts.stream_uploads,
+        stream_upload_threshold_mb: opts.stream_upload_threshold_mb,
     }
 }
 
@@ -661,6 +687,13 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# the local cache are never slowed. Applies immediately, no remount needed.\n");
     content.push_str(&format!("walker_rate_limit: {}\n", settings.walker_rate_limit));
     content.push_str(&format!("walker_listings_per_sec: {}\n", settings.walker_listings_per_sec));
+    content.push_str("# Once a new file has been written past stream_upload_threshold_mb (MiB), send\n");
+    content.push_str("# it to the server in 10 MiB pieces while it is still being written instead of\n");
+    content.push_str("# saving all of it locally first. Saves disk space on big copies; a program\n");
+    content.push_str("# that later rewrites the already-sent start of the file gets a write error.\n");
+    content.push_str("# Set false to always stage the whole file locally. Applies to newly opened files.\n");
+    content.push_str(&format!("stream_uploads: {}\n", settings.stream_uploads));
+    content.push_str(&format!("stream_upload_threshold_mb: {}\n", settings.stream_upload_threshold_mb));
 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
@@ -766,6 +799,26 @@ mod tests {
         assert_eq!(minimal_config("password: \"p\"\nwalker_listings_per_sec: 99999").walker_listings_per_sec, 1000);
         let s = config_settings_from_opts(&off);
         assert_eq!((s.walker_rate_limit, s.walker_listings_per_sec), (false, 25));
+    }
+
+    #[test]
+    fn stream_uploads_default_on_at_100_mb_and_parse() {
+        let opts = minimal_config("password: \"p\"");
+        assert!(opts.stream_uploads);
+        assert_eq!(opts.stream_upload_threshold_mb, 100);
+        let off = minimal_config("password: \"p\"\nstream_uploads: false\nstream_upload_threshold_mb: 10");
+        assert!(!off.stream_uploads);
+        assert_eq!(off.stream_upload_threshold_mb, 10);
+        let s = config_settings_from_opts(&off);
+        assert_eq!((s.stream_uploads, s.stream_upload_threshold_mb), (false, 10));
+        let d = ConfigSettings::default();
+        assert_eq!((d.stream_uploads, d.stream_upload_threshold_mb), (true, 100));
+        let mut v = serde_json::to_value(ConfigSettings::default()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("stream_uploads");
+        o.remove("stream_upload_threshold_mb");
+        let s: ConfigSettings = serde_json::from_value(v).unwrap();
+        assert_eq!((s.stream_uploads, s.stream_upload_threshold_mb), (true, 100));
     }
 
     #[test]

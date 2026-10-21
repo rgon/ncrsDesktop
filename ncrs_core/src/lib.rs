@@ -1100,7 +1100,8 @@ struct ReadAheadBuf {
 
 // State for the bounded chunked-upload streaming path (see write()'s
 // stream_eligible handling): once a sequential write on a file with no
-// pre-existing content crosses one CHUNK_SIZE, chunks are pushed to Nextcloud
+// pre-existing content crosses the stream threshold (`stream_upload_threshold_mb`,
+// 100 MiB by default), CHUNK_SIZE chunks are pushed to Nextcloud
 // as they fill instead of the whole file landing on local disk first. Writes
 // back into the unsent tail are fine; it is still on disk. There is
 // deliberately no journal entry for this: unlike the legacy staging path, a
@@ -1114,6 +1115,17 @@ struct ChunkUploadState {
     uploads_base: String,
     next_index: u64,
     bytes_confirmed: u64,
+}
+
+/// Whether write()'s streaming fast path should PUT chunks now. Before a session is
+/// open, the whole file stays in the tail until it passes `threshold` (never less than
+/// one chunk), so a program that rewrites early bytes of a file smaller than that never
+/// meets already-sent data. Once open, every full chunk of unsent tail goes out.
+fn stream_should_graduate(total_written: u64, session: Option<&ChunkUploadState>, threshold: u64) -> bool {
+    match session {
+        Some(s) => total_written - s.bytes_confirmed >= webdav_ops::CHUNK_SIZE as u64,
+        None => total_written >= threshold.max(webdav_ops::CHUNK_SIZE as u64),
+    }
 }
 
 struct OpenFile {
@@ -4072,6 +4084,10 @@ pub struct NextCloudFs {
     auto_keep_cached_files: bool,
     read_ahead_bytes: usize,
     cache_streamed_reads: bool,
+    // New files stream to the server past `stream_upload_threshold` bytes; off stages
+    // every write in full (see ChunkUploadState).
+    stream_uploads: bool,
+    stream_upload_threshold: u64,
     exclude_folders: HashSet<PathBuf>,
     thumb_inflight: Arc<Mutex<HashSet<PathBuf>>>,
     cleanup_stale_gio_temps: bool,
@@ -4323,6 +4339,8 @@ impl NextCloudFs {
             auto_keep_cached_files: options.auto_keep_cached_files,
             read_ahead_bytes: options.read_ahead_bytes,
             cache_streamed_reads: options.cache_streamed_reads,
+            stream_uploads: options.stream_uploads,
+            stream_upload_threshold: options.stream_upload_threshold_mb.saturating_mul(1024 * 1024),
             exclude_folders,
             thumb_inflight: Arc::new(Mutex::new(HashSet::new())),
             cleanup_stale_gio_temps: options.cleanup_stale_gio_temps,
@@ -4715,10 +4733,12 @@ impl DirReply {
 }
 
 impl NextCloudFs {
-    /// Called from write() once the tail staging file has accumulated at
+    /// Called from write() once stream_should_graduate() says so: the file has
+    /// passed the stream threshold, or a session is open and the tail holds at
     /// least one full CHUNK_SIZE of unsent bytes. Lazily opens the
-    /// chunked-upload session on the very first graduation, PUTs as many full
-    /// chunks as the tail currently holds (normally exactly one — FUSE writes
+    /// chunked-upload session on the very first graduation (which then sends
+    /// the whole threshold's worth of chunks), PUTs as many full
+    /// chunks as the tail currently holds (afterwards normally exactly one — FUSE writes
     /// are far smaller than CHUNK_SIZE, so the tail crosses the threshold by a
     /// small margin each time), and rewrites the tail file down to just the
     /// leftover bytes. Must be called without `open_files` locked: this
@@ -6197,7 +6217,7 @@ impl Filesystem for NextCloudFs {
                 last_read: Instant::now(),
                 total_written: 0,
                 // Only an empty staging file can stream from offset 0.
-                stream_eligible: !seeded,
+                stream_eligible: self.stream_uploads && !seeded,
                 chunk_upload: None,
                 ino: ino.0,
                 io_kind: grant.kind(),
@@ -7140,8 +7160,9 @@ impl Filesystem for NextCloudFs {
         }
 
         // Bounded chunked streaming: a freshly-written file, written purely
-        // sequentially from offset 0 while online, never keeps more than ~1
-        // chunk of unsent bytes on local disk — completed CHUNK_SIZE chunks are
+        // sequentially from offset 0 while online, never keeps more than the
+        // stream threshold (then ~1 chunk) of unsent bytes on local disk — once
+        // past the threshold, completed CHUNK_SIZE chunks are
         // pushed to Nextcloud's chunked-upload extension as they fill, instead
         // of the whole file landing on disk before any upload starts. See
         // ChunkUploadState's doc comment for why any deviation once a chunk has
@@ -7179,7 +7200,7 @@ impl Filesystem for NextCloudFs {
             of.dirty = true;
             of.total_written = of.total_written.max(offset + data.len() as u64);
 
-            if of.total_written - bytes_confirmed >= webdav_ops::CHUNK_SIZE as u64 {
+            if stream_should_graduate(of.total_written, of.chunk_upload.as_ref(), self.stream_upload_threshold) {
                 let total_written = of.total_written;
                 let existing_session = of.chunk_upload.clone();
                 let had_session = existing_session.is_some();
@@ -7445,7 +7466,7 @@ impl Filesystem for NextCloudFs {
                 lookahead_inflight: false,
                 last_read: Instant::now(),
                 total_written: 0,
-                stream_eligible: true,
+                stream_eligible: self.stream_uploads,
                 chunk_upload: None,
                 ino,
                 io_kind,

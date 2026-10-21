@@ -21,6 +21,8 @@
         fuse_passthrough: boolean;
         walker_rate_limit: boolean;
         walker_listings_per_sec: number;
+        stream_uploads: boolean;
+        stream_upload_threshold_mb: number;
     }
 
     // One desktop profile, as reported by the service (`INTEGRATIONS`):
@@ -262,6 +264,14 @@
                         <p class="sv-hint">Save data read via streaming (e.g. media playback) to the local cache. Subsequent opens are served from disk instead of re-downloading. Increases disk usage.</p>
                     </div>
                     <input id="cache-streamed" type="checkbox" class="sv-check" bind:checked={settings.cache_streamed_reads} />
+                </div>
+
+                <div class="sv-toggle">
+                    <div>
+                        <label class="sv-toggle-label" for="stream-uploads">Upload large files while they are being written</label>
+                        <p class="sv-hint">Files over {settings.stream_upload_threshold_mb} MB are sent to the server piece by piece as they are written, instead of being saved on this computer first. Saves disk space for big copies. Turn off if a program (video recorder, audio editor, office suite) shows write errors when saving large files to the Nextcloud folder.</p>
+                    </div>
+                    <input id="stream-uploads" type="checkbox" class="sv-check" bind:checked={settings.stream_uploads} />
                 </div>
 
                 <div class="sv-toggle">
