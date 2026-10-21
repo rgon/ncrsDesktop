@@ -109,6 +109,12 @@ impl SchedFs {
         move |budget| sched.quiesce(budget)
     }
 
+    /// Lifts the drain's pause when the restart did not happen.
+    pub(crate) fn resume_hook(&self) -> impl Fn() + Send + 'static {
+        let sched = Arc::clone(&self.sched);
+        move || sched.resume()
+    }
+
     /// Queues `job` on `keys` (plus any moved folder they sit under) and returns.
     fn queue(&self, mut keys: Vec<(Key, Mode)>, job: impl FnOnce(&NextCloudFs) + Send + 'static) {
         self.order_under_moves(&mut keys);

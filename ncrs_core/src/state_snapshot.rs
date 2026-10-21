@@ -9,19 +9,28 @@
 //! ENOTCONN. This module keeps them in an append-only log in the cache dir
 //! (`handoff.log`, one JSON record per line):
 //!
-//! - every node id, when it is allocated (before a reply can carry it to the
-//!   kernel), and every rename that moves or drops one;
+//! - every node id, when it is allocated, and every rename that moves or
+//!   drops one;
 //! - every open file handle with what serving it again needs (path, write
 //!   staging file and its identity, original etag, passthrough backing id),
 //!   and its release, unlink and rename retargeting;
 //! - the start of every streamed (chunked) upload;
-//! - a watermark of the handle counter, which directory handles share.
+//! - a watermark of the handle counter, which directory handles share;
+//! - a reservation of node ids, in blocks of [`RESERVE_BLOCK`].
 //!
 //! Records are plain write(2)s, no fsync: the log only has to outlive this
 //! *process* — power loss takes the kernel's connection with it, so there is
-//! nothing to reattach to after a reboot. A planned restart also writes
+//! nothing to reattach to after a reboot. Handle and rename records are written
+//! before the reply that depends on them. Node-id records, which come under the
+//! cache lock on every lookup of a new name, are queued and written once a
+//! second (and before a hand-over); what keeps a crash from handing one of
+//! them out again is the reservation, written through before the first id of
+//! each block goes out: a restore starts numbering past it, so an id whose
+//! record was lost is unknown to the successor (ENOENT), never another file.
+//! A hand-over that drained every running request also writes
 //! `handoff-handles.json`, the exact volatile per-handle state (dirty flag,
-//! streamed-upload progress) the log does not follow.
+//! streamed-upload progress) the log does not follow; the successor reads it
+//! once and deletes it.
 //!
 //! On reattach the log is replayed into the inode table and `open_files`. A
 //! handle whose state cannot be trusted is never guessed at: it comes back
@@ -47,8 +56,14 @@ use crate::{ChunkUploadState, FsCache, MutexExt, NextCloudFs, OpenFile, READ_AHE
 
 const LOG_FILE: &str = "handoff.log";
 const HANDLES_FILE: &str = "handoff-handles.json";
-/// Rewrite the log down to the live state once it grows past this.
+/// Rewrite the log down to the live state once it grows past this (and past
+/// twice its size after the last rewrite).
 const COMPACT_BYTES: u64 = 64 * 1024 * 1024;
+/// Queued node-id records are written once they reach this, or on the tick.
+const BUF_MAX: usize = 64 * 1024;
+/// Node ids are reserved in blocks of this many, so a reservation is written
+/// through once per block rather than once per id.
+const RESERVE_BLOCK: u64 = 4096;
 /// Handle numbers skipped after a restore: directory handles are not logged,
 /// only the counter once a second, so the kernel may hold a few above the
 /// last watermark.
@@ -135,6 +150,8 @@ struct OpenRecord {
 enum Record {
     Base { dev: ConnDev, mount_point: PathBuf },
     Ino { s: u64, ino: u64, path: PathBuf },
+    /// Node ids below `upto` may have been handed out, logged or not.
+    Reserve { s: u64, upto: u64 },
     Mv { s: u64, ino: u64, path: PathBuf, #[serde(default)] dropped: Option<u64> },
     Fh { s: u64, next: u64 },
     Open { s: u64, rec: OpenRecord },
@@ -182,15 +199,24 @@ struct HandlesSnapshot {
 struct Writer {
     file: File,
     path: PathBuf,
+    /// Records not written yet (node ids only; see the module doc).
+    buf: Vec<u8>,
     seq: u64,
     bytes: u64,
+    /// Size right after the last compaction: the next one waits for twice that.
+    compacted_bytes: u64,
     dev: ConnDev,
     mount_point: PathBuf,
+    /// Node ids below this may have been handed out (a durable `Reserve`).
+    reserved_upto: u64,
     /// Live handles' records with their sequence number, for compaction.
     opens: HashMap<u64, (u64, OpenRecord)>,
     /// write_path → (seq, uploads_base) of handles that started a streamed upload.
     streams: HashMap<PathBuf, (u64, String)>,
     last_fh_mark: u64,
+    /// While a compaction writes the new file off-lock: every record written to
+    /// the old file meanwhile, to append to the new one before it replaces it.
+    tail: Option<Vec<u8>>,
     failed: bool,
 }
 
@@ -202,19 +228,27 @@ impl Writer {
         self.seq
     }
 
-    fn append(&mut self, rec: &Record) {
+    /// Queues one record; `sync` writes it (and everything queued before it)
+    /// now. Only node-id records are left queued: the ticker writes them.
+    fn append(&mut self, rec: &Record, sync: bool) {
         if self.failed {
             return;
         }
-        let mut line = match serde_json::to_vec(rec) {
-            Ok(l) => l,
-            Err(e) => {
-                log::warn!("handoff log: cannot encode a record: {}", e);
-                return;
-            }
-        };
-        line.push(b'\n');
-        if let Err(e) = self.file.write_all(&line) {
+        if let Err(e) = serde_json::to_writer(&mut self.buf, rec) {
+            log::warn!("handoff log: cannot encode a record: {}", e);
+            return;
+        }
+        self.buf.push(b'\n');
+        if sync || self.buf.len() >= BUF_MAX {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.failed || self.buf.is_empty() {
+            return;
+        }
+        if let Err(e) = self.file.write_all(&self.buf) {
             // A log with a gap could map an id to the wrong file after a
             // restart; one that is missing just means "mount afresh".
             log::error!("handoff log: write failed ({}) — restart survival disabled for this mount", e);
@@ -222,45 +256,87 @@ impl Writer {
             let _ = std::fs::remove_file(&self.path);
             return;
         }
-        self.bytes += line.len() as u64;
+        self.bytes += self.buf.len() as u64;
+        if let Some(t) = self.tail.as_mut() {
+            t.extend_from_slice(&self.buf);
+        }
+        self.buf.clear();
     }
 
-    /// Rewrites the log as the current state: Base, the counter watermark,
-    /// every node id, the live handles and their streams. Sequence numbers of
-    /// handle records are kept, so a handles snapshot taken before still lines up.
-    fn compact(&mut self, c: &FsCache) -> io::Result<()> {
-        let tmp = self.path.with_extension("log.tmp");
-        let mut out = io::BufWriter::new(File::create(&tmp)?);
+    /// The current state as a compacted log (cache lock held by the caller):
+    /// cheap copies, written out later by [`LogImage::write`] without any lock.
+    /// Sequence numbers of handle records are kept, so a handles snapshot
+    /// taken before still lines up.
+    fn image(&mut self, c: &FsCache) -> LogImage {
+        self.reserved_upto = self.reserved_upto.max(c.next_inode);
+        let mut inodes: Vec<(u64, PathBuf)> = c.inodes.iter().filter(|(i, _)| **i != 1).map(|(i, p)| (*i, p.clone())).collect();
+        inodes.sort_by_key(|(i, _)| *i);
+        LogImage {
+            dev: self.dev,
+            mount_point: self.mount_point.clone(),
+            s: self.next_seq(),
+            fh_mark: self.last_fh_mark,
+            reserved_upto: self.reserved_upto,
+            inodes,
+            opens: self.opens.values().cloned().collect(),
+            streams: self.streams.iter().map(|(wp, (s, b))| (wp.clone(), *s, b.clone())).collect(),
+        }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// Grow-only threshold: a log whose live state alone is past COMPACT_BYTES
+/// would otherwise be rewritten on every tick.
+fn needs_compaction(bytes: u64, compacted_bytes: u64) -> bool {
+    bytes > COMPACT_BYTES.max(compacted_bytes.saturating_mul(2))
+}
+
+/// A compacted log: Base, the handle-counter watermark, the node-id
+/// reservation, every node id, the live handles and their streams.
+struct LogImage {
+    dev: ConnDev,
+    mount_point: PathBuf,
+    s: u64,
+    fh_mark: u64,
+    reserved_upto: u64,
+    inodes: Vec<(u64, PathBuf)>,
+    opens: Vec<(u64, OpenRecord)>,
+    streams: Vec<(PathBuf, u64, String)>,
+}
+
+impl LogImage {
+    /// Writes the image to `path` (truncating it) and returns the file, still
+    /// buffered, for the caller to append to and flush.
+    fn write(&self, path: &Path) -> io::Result<io::BufWriter<File>> {
+        let mut out = io::BufWriter::new(File::create(path)?);
         let put = |out: &mut io::BufWriter<File>, r: &Record| -> io::Result<()> {
             serde_json::to_writer(&mut *out, r).map_err(io::Error::other)?;
             out.write_all(b"\n")
         };
+        let s = self.s;
         put(&mut out, &Record::Base { dev: self.dev, mount_point: self.mount_point.clone() })?;
-        let s = self.next_seq();
-        put(&mut out, &Record::Fh { s, next: self.last_fh_mark })?;
-        let mut inos: Vec<(&u64, &PathBuf)> = c.inodes.iter().collect();
-        inos.sort_by_key(|(i, _)| **i);
-        for (ino, path) in inos {
-            if *ino == 1 {
-                continue;
-            }
-            let s = self.next_seq();
+        put(&mut out, &Record::Fh { s, next: self.fh_mark })?;
+        put(&mut out, &Record::Reserve { s, upto: self.reserved_upto })?;
+        for (ino, path) in &self.inodes {
             put(&mut out, &Record::Ino { s, ino: *ino, path: path.clone() })?;
         }
-        for (s, rec) in self.opens.values() {
+        for (s, rec) in &self.opens {
             put(&mut out, &Record::Open { s: *s, rec: rec.clone() })?;
         }
-        for (wp, (s, base)) in &self.streams {
+        for (wp, s, base) in &self.streams {
             put(&mut out, &Record::Stream { s: *s, write_path: wp.clone(), uploads_base: base.clone() })?;
         }
-        out.flush()?;
-        drop(out);
-        std::fs::rename(&tmp, &self.path)?;
-        self.file = OpenOptions::new().append(true).open(&self.path)?;
-        self.bytes = self.file.metadata().map(|m| m.len()).unwrap_or(0);
-        log::info!("handoff log: compacted to {} bytes", self.bytes);
-        Ok(())
+        Ok(out)
     }
+}
+
+fn finish_file(out: io::BufWriter<File>) -> io::Result<File> {
+    out.into_inner().map_err(|e| e.into_error())
 }
 
 fn with_log(f: impl FnOnce(&mut Writer)) {
@@ -271,19 +347,32 @@ fn with_log(f: impl FnOnce(&mut Writer)) {
 
 // ── hooks called from the filesystem ─────────────────────────────────────────
 
-/// `FsCache::allocate_inode` handed out `ino` (cache lock held).
+/// `FsCache::allocate_inode` handed out `ino` (cache lock held). Its record is
+/// only queued; what keeps a crash from reusing the number is the reservation,
+/// written through before the first id of each block goes out.
 pub(crate) fn inode_allocated(ino: u64, path: &Path) {
     with_log(|w| {
+        if ino >= w.reserved_upto {
+            w.reserved_upto = reservation_after(ino);
+            let s = w.next_seq();
+            let upto = w.reserved_upto;
+            w.append(&Record::Reserve { s, upto }, true);
+        }
         let s = w.next_seq();
-        w.append(&Record::Ino { s, ino, path: path.to_path_buf() });
+        w.append(&Record::Ino { s, ino, path: path.to_path_buf() }, false);
     });
+}
+
+/// The reservation that covers handing out `ino`: the end of its block.
+fn reservation_after(ino: u64) -> u64 {
+    (ino / RESERVE_BLOCK + 1) * RESERVE_BLOCK
 }
 
 /// rename() moved `ino` to `to`, dropping the node id that was there (cache lock held).
 pub(crate) fn inode_moved(ino: u64, to: &Path, dropped: Option<u64>) {
     with_log(|w| {
         let s = w.next_seq();
-        w.append(&Record::Mv { s, ino, path: to.to_path_buf(), dropped });
+        w.append(&Record::Mv { s, ino, path: to.to_path_buf(), dropped }, true);
     });
 }
 
@@ -307,26 +396,26 @@ pub(crate) fn handle_opened(fh: u64, of: &OpenFile, backing_id: Option<u32>) {
             mime: of.mime_detect_ct.clone().map(|ct| (ct, of.mime_detect_max_read)),
         };
         let s = w.next_seq();
-        w.append(&Record::Open { s, rec: rec.clone() });
+        w.append(&Record::Open { s, rec: rec.clone() }, true);
         w.opens.insert(fh, (s, rec));
     });
 }
 
-/// release() removed `fh` from open_files.
-pub(crate) fn handle_released(fh: u64) {
+/// release() removed `fh` from open_files — or found nothing there, in which
+/// case this returns what a restore that could not rebuild the handle still
+/// holds for it, for release() to undo.
+pub(crate) fn handle_released(fh: u64) -> Option<LostHandle> {
     with_log(|w| {
         if let Some((_, rec)) = w.opens.remove(&fh) {
             if let Some(wp) = rec.write_path {
                 w.streams.remove(&wp);
             }
             let s = w.next_seq();
-            w.append(&Record::Close { s, fh });
+            w.append(&Record::Close { s, fh }, true);
         }
     });
     release_restored_backing(fh);
-    if let Some(lost) = LOST.safe_lock().as_mut() {
-        lost.remove(&fh);
-    }
+    LOST.safe_lock().as_mut().and_then(|lost| lost.remove(&fh))
 }
 
 /// unlink() marked an open handle's file deleted.
@@ -335,7 +424,7 @@ pub(crate) fn handle_unlinked(fh: u64) {
         if let Some((_, rec)) = w.opens.get_mut(&fh) {
             rec.unlinked = true;
             let s = w.next_seq();
-            w.append(&Record::Unlinked { s, fh });
+            w.append(&Record::Unlinked { s, fh }, true);
         }
     });
 }
@@ -346,7 +435,7 @@ pub(crate) fn handle_retargeted(fh: u64, path: &Path) {
         if let Some((_, rec)) = w.opens.get_mut(&fh) {
             rec.path = path.to_path_buf();
             let s = w.next_seq();
-            w.append(&Record::Retarget { s, fh, path: path.to_path_buf() });
+            w.append(&Record::Retarget { s, fh, path: path.to_path_buf() }, true);
         }
     });
 }
@@ -356,17 +445,27 @@ pub(crate) fn handle_retargeted(fh: u64, path: &Path) {
 pub(crate) fn stream_started(write_path: &Path, uploads_base: &str) {
     with_log(|w| {
         let s = w.next_seq();
-        w.append(&Record::Stream { s, write_path: write_path.to_path_buf(), uploads_base: uploads_base.to_string() });
+        w.append(&Record::Stream { s, write_path: write_path.to_path_buf(), uploads_base: uploads_base.to_string() }, true);
         w.streams.insert(write_path.to_path_buf(), (s, uploads_base.to_string()));
     });
 }
 
+/// What a handle restored as unusable still holds: the inode's I/O mode (the
+/// kernel keeps the inode in it until the handle is released) and, for a
+/// created file, its place in `uploading`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LostHandle {
+    pub(crate) ino: u64,
+    pub(crate) io_kind: IoKind,
+    pub(crate) uploading: Option<PathBuf>,
+}
+
 /// Handles restored as unusable: flush and fsync on them report EIO, so a
 /// program does not see a successful close for data that never reaches the server.
-static LOST: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+static LOST: Mutex<Option<HashMap<u64, LostHandle>>> = Mutex::new(None);
 
 pub(crate) fn is_lost_fh(fh: u64) -> bool {
-    LOST.safe_lock().as_ref().is_some_and(|s| s.contains(&fh))
+    LOST.safe_lock().as_ref().is_some_and(|s| s.contains_key(&fh))
 }
 
 /// Staging files restored handles still need; NextCloudFs::new must not
@@ -413,39 +512,52 @@ pub(crate) fn start_fresh(cache_dir: &Path, dev: ConnDev, mount_point: &Path, ca
     let path = cache_dir.join(LOG_FILE);
     let c = cache.safe_lock();
     let mut g = LOG.safe_lock();
-    let file = match File::create(&path) {
+    *g = None;
+    let mut image = LogImage {
+        dev,
+        mount_point: mount_point.to_path_buf(),
+        s: 1,
+        fh_mark: 0,
+        reserved_upto: 0,
+        inodes: Vec::new(),
+        opens: Vec::new(),
+        streams: Vec::new(),
+    };
+    image.reserved_upto = c.next_inode;
+    image.inodes = c.inodes.iter().filter(|(i, _)| **i != 1).map(|(i, p)| (*i, p.clone())).collect();
+    image.inodes.sort_by_key(|(i, _)| *i);
+    let file = match image.write(&path).and_then(finish_file) {
         Ok(f) => f,
         Err(e) => {
-            log::warn!("handoff log: cannot create {} ({}) — restart survival disabled", path.display(), e);
-            *g = None;
+            log::warn!("handoff log: cannot write {} ({}) — restart survival disabled", path.display(), e);
+            let _ = std::fs::remove_file(&path);
             return;
         }
     };
-    let mut w = Writer {
+    let bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+    *g = Some(Writer {
         file,
         path,
-        seq: 0,
-        bytes: 0,
+        buf: Vec::new(),
+        seq: image.s,
+        bytes,
+        compacted_bytes: bytes,
         dev,
         mount_point: mount_point.to_path_buf(),
+        reserved_upto: image.reserved_upto,
         opens: HashMap::new(),
         streams: HashMap::new(),
         last_fh_mark: 0,
+        tail: None,
         failed: false,
-    };
-    if let Err(e) = w.compact(&c) {
-        log::warn!("handoff log: cannot write {} ({}) — restart survival disabled", w.path.display(), e);
-        let _ = std::fs::remove_file(&w.path);
-        *g = None;
-        return;
-    }
-    *g = Some(w);
+    });
 }
 
-/// After [`apply`]: keep appending to the log the restore came from.
-pub(crate) fn start_resumed(cache_dir: &Path, dev: ConnDev, mount_point: &Path, r: &Restored) {
+/// After a restore (cache lock held, see [`apply`]): keep appending to the log
+/// the restore came from. `next_inode` is the restored counter: nothing above
+/// it is reserved yet, so the first allocation writes a new reservation.
+fn start_resumed(cache_dir: &Path, dev: ConnDev, mount_point: &Path, r: &Restored, next_inode: u64) {
     let path = cache_dir.join(LOG_FILE);
-    let _ = std::fs::remove_file(cache_dir.join(HANDLES_FILE)); // consumed: never apply it twice
     let file = match OpenOptions::new().append(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -459,26 +571,38 @@ pub(crate) fn start_resumed(cache_dir: &Path, dev: ConnDev, mount_point: &Path, 
     *LOG.safe_lock() = Some(Writer {
         file,
         path,
+        buf: Vec::new(),
         seq: r.max_seq,
         bytes,
+        compacted_bytes: 0,
         dev,
         mount_point: mount_point.to_path_buf(),
+        reserved_upto: next_inode,
         opens,
         streams,
         last_fh_mark: r.fh_mark,
+        tail: None,
         failed: false,
     });
 }
 
 /// The mount ended cleanly: nothing will reattach, so drop the log.
 pub(crate) fn stop(cache_dir: &Path) {
+    if let Some(w) = LOG.safe_lock().as_mut() {
+        w.failed = true; // nothing left to flush into a file about to go
+    }
     *LOG.safe_lock() = None;
     let _ = std::fs::remove_file(cache_dir.join(LOG_FILE));
     let _ = std::fs::remove_file(cache_dir.join(HANDLES_FILE));
 }
 
+/// Writes every queued record: before this process hands the connection over.
+pub(crate) fn flush_log() {
+    with_log(|w| w.flush());
+}
+
 /// Once a second: log the handle counter when it moved (directory handles are
-/// not logged one by one), and compact a log that grew large.
+/// not logged one by one), write queued records, and compact a log that grew large.
 pub(crate) fn spawn_ticker(cache: Arc<Mutex<FsCache>>, next_fh: Arc<Mutex<u64>>, shutdown: Arc<AtomicBool>) {
     let _ = crate::bg::spawn_service("handoff-log", move || loop {
         std::thread::sleep(TICK);
@@ -490,33 +614,90 @@ pub(crate) fn spawn_ticker(cache: Arc<Mutex<FsCache>>, next_fh: Arc<Mutex<u64>>,
         with_log(|w| {
             if next != w.last_fh_mark {
                 let s = w.next_seq();
-                w.append(&Record::Fh { s, next });
+                w.append(&Record::Fh { s, next }, false);
                 w.last_fh_mark = next;
             }
-            big = w.bytes > COMPACT_BYTES && !w.failed;
+            w.flush();
+            big = !w.failed && w.tail.is_none() && needs_compaction(w.bytes, w.compacted_bytes);
         });
         if big {
-            let c = cache.safe_lock();
-            let mut g = LOG.safe_lock();
-            if let Some(w) = g.as_mut() {
-                if let Err(e) = w.compact(&c) {
-                    log::warn!("handoff log: compaction failed ({}) — restart survival disabled for this mount", e);
-                    w.failed = true;
-                    let _ = std::fs::remove_file(&w.path);
-                }
-            }
+            compact(&cache);
         }
     });
 }
 
-/// Planned restart: the exact volatile state of every open handle, for the
-/// successor to restore instead of the log's conservative rules.
-pub(crate) fn write_handles_snapshot(cache_dir: &Path, open_files: &Mutex<HashMap<u64, OpenFile>>) -> io::Result<()> {
+/// Rewrites the log down to the live state. Only copying the state happens
+/// under the cache lock; the old file stays complete (and in use) until the new
+/// one, plus whatever was logged while it was written, replaces it.
+fn compact(cache: &Mutex<FsCache>) {
+    let (image, path) = {
+        let c = cache.safe_lock();
+        let mut g = LOG.safe_lock();
+        let Some(w) = g.as_mut() else { return };
+        w.flush();
+        if w.failed {
+            return;
+        }
+        w.tail = Some(Vec::new());
+        (w.image(&c), w.path.clone())
+    };
+    let tmp = path.with_extension("log.tmp");
+    let written = image.write(&tmp);
+    drop(image);
+    let mut g = LOG.safe_lock();
+    let Some(w) = g.as_mut() else {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    };
+    w.flush();
+    let tail = w.tail.take().unwrap_or_default();
+    let swapped = written.and_then(|mut out| {
+        out.write_all(&tail)?;
+        let f = finish_file(out)?;
+        if w.failed {
+            return Err(io::Error::other("log failed meanwhile"));
+        }
+        std::fs::rename(&tmp, &path)?;
+        drop(f);
+        OpenOptions::new().append(true).open(&path)
+    });
+    match swapped {
+        Ok(file) => {
+            w.file = file;
+            w.bytes = w.file.metadata().map(|m| m.len()).unwrap_or(0);
+            w.compacted_bytes = w.bytes;
+            log::info!("handoff log: compacted to {} bytes", w.bytes);
+        }
+        Err(e) => {
+            // The old file is still whole: keep using it, and wait for it to
+            // double before trying again.
+            let _ = std::fs::remove_file(&tmp);
+            w.compacted_bytes = w.bytes;
+            log::warn!("handoff log: compaction failed ({}) — still logging to the uncompacted file", e);
+        }
+    }
+}
+
+/// Before a hand-over: with `drained`, the exact volatile state of every open
+/// handle, for the successor to restore instead of the log's conservative
+/// rules. Without it (requests were still running, so a snapshot could miss
+/// one's write), any earlier snapshot is removed and the successor infers.
+pub(crate) fn write_handles_snapshot(cache_dir: &Path, open_files: &Mutex<HashMap<u64, OpenFile>>, drained: bool) -> io::Result<()> {
+    let path = cache_dir.join(HANDLES_FILE);
+    if !drained {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
     let files = open_files.safe_lock();
     let (s, dev, mount_point) = {
-        let g = LOG.safe_lock();
-        match g.as_ref() {
-            Some(w) if !w.failed => (w.seq, w.dev, w.mount_point.clone()),
+        let mut g = LOG.safe_lock();
+        match g.as_mut() {
+            Some(w) if !w.failed => {
+                w.flush();
+                (w.seq, w.dev, w.mount_point.clone())
+            }
             _ => return Err(io::Error::other("handoff log unavailable")),
         }
     };
@@ -541,7 +722,6 @@ pub(crate) fn write_handles_snapshot(cache_dir: &Path, open_files: &Mutex<HashMa
         .collect();
     drop(files);
     let snap = HandlesSnapshot { dev, mount_point, s, handles };
-    let path = cache_dir.join(HANDLES_FILE);
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec(&snap).map_err(io::Error::other)?)?;
     std::fs::rename(&tmp, &path)
@@ -562,8 +742,18 @@ pub(crate) struct Restored {
     streams: HashMap<PathBuf, (u64, String)>,
     max_seq: u64,
     max_ino: u64,
+    reserved: u64,
     max_fh: u64,
     fh_mark: u64,
+}
+
+impl Restored {
+    /// The first node id a restored filesystem may hand out: past every id the
+    /// log names and every reserved one, so an id whose record was still
+    /// queued when the previous daemon died is unknown (ENOENT), never reused.
+    fn next_inode(&self) -> u64 {
+        self.max_ino.saturating_add(1).max(self.reserved).max(2)
+    }
 }
 
 impl std::fmt::Debug for Restored {
@@ -580,6 +770,7 @@ struct Replayer {
     streams: HashMap<PathBuf, (u64, String)>,
     max_seq: u64,
     max_ino: u64,
+    reserved: u64,
     max_fh: u64,
     fh_mark: u64,
     based: bool,
@@ -633,6 +824,10 @@ impl Replayer {
                         }
                     }
                 }
+            }
+            Record::Reserve { s, upto } => {
+                self.max_seq = self.max_seq.max(s);
+                self.reserved = self.reserved.max(upto);
             }
             Record::Fh { s, next } => {
                 self.max_seq = self.max_seq.max(s);
@@ -691,6 +886,7 @@ impl Replayer {
             streams: self.streams,
             max_seq: self.max_seq,
             max_ino: self.max_ino,
+            reserved: self.reserved,
             max_fh: self.max_fh,
             fh_mark: self.fh_mark,
         }
@@ -723,7 +919,11 @@ pub(crate) fn load(cache_dir: &Path, dev: ConnDev, mount_point: &Path) -> Result
     if !rp.based {
         return Err("empty log".into());
     }
-    if let Ok(data) = std::fs::read(cache_dir.join(HANDLES_FILE)) {
+    let snap_path = cache_dir.join(HANDLES_FILE);
+    if let Ok(data) = std::fs::read(&snap_path) {
+        // One-shot: it describes the moment of one hand-over. Left in place, a
+        // later crash restore would overlay it onto handles that moved on since.
+        let _ = std::fs::remove_file(&snap_path);
         match serde_json::from_slice::<HandlesSnapshot>(&data) {
             Ok(snap) => rp.overlay(snap, dev, mount_point),
             Err(e) => log::warn!("handoff: ignoring unreadable {}: {}", HANDLES_FILE, e),
@@ -866,77 +1066,81 @@ fn rebuild(h: &RestoredHandle, stream: Option<&str>, gen: u64) -> Result<(OpenFi
 }
 
 /// Installs the restored node ids and handles into a freshly built filesystem,
-/// before its session serves anything.
-pub(crate) fn apply(fs: &NextCloudFs, r: &Restored) -> ApplyReport {
+/// before its session serves anything, and resumes the log where the previous
+/// daemon left it. The cache lock is held until the log is back on, so no node
+/// id is allocated unlogged in between.
+pub(crate) fn apply(fs: &NextCloudFs, r: &Restored, cache_dir: &Path, dev: ConnDev, mount_point: &Path) -> ApplyReport {
     let mut report = ApplyReport { inodes: r.inodes.len(), ..Default::default() };
-    {
-        let mut c = fs.cache.safe_lock();
-        c.inodes.clear();
-        c.paths.clear();
-        c.inodes.insert(1, PathBuf::from("/"));
-        c.paths.insert(PathBuf::from("/"), 1);
-        for (ino, path) in &r.inodes {
-            if *ino == 1 {
-                continue;
-            }
-            c.inodes.insert(*ino, path.clone());
-            c.paths.insert(path.clone(), *ino);
-        }
-        c.next_inode = c.next_inode.max(r.max_ino.saturating_add(1)).max(2);
-        // A created file has no server copy until its handle is released: keep
-        // refreshes from dropping its listing entry, as create() does.
-        for h in r.handles.values() {
-            if h.rec.created && !h.rec.unlinked && h.rec.write_path.is_some() {
-                c.uploading.insert(h.rec.path.clone());
-            }
-        }
-    }
     let gen = fs.uploads.generation();
-    let mut files = fs.open_files.safe_lock();
-    let mut modes = fs.io_modes.safe_lock();
-    let mut lost = HashSet::new();
-    let mut backing = RestoredBacking::default();
-    for (fh, h) in &r.handles {
-        let stream = h.rec.write_path.as_ref().and_then(|wp| r.streams.get(wp)).map(|(_, b)| b.as_str());
-        // The kernel keeps the inode in this handle's I/O mode until it is
-        // released, whatever happens to the handle here.
-        let kind: IoKind = h.rec.io_kind.into();
-        modes.adopt(h.rec.ino, kind);
-        if kind == IoKind::Passthrough {
-            if let Some(id) = h.rec.backing_id {
-                backing.by_fh.insert(*fh, id);
-                *backing.users.entry(id).or_insert(0) += 1;
-            }
-        }
-        match rebuild(h, stream, gen) {
-            Ok((of, outcome)) => {
-                match outcome {
-                    Rebuilt::Ok { exact } => report.exact += exact as usize,
-                    Rebuilt::Failed => {
-                        report.failed += 1;
-                        log::warn!(
-                            "handoff: fh {} ({}) was streaming an upload when the previous daemon died — its writes and close now fail; the copy must be retried",
-                            fh, h.rec.path.display(),
-                        );
-                    }
+    let mut lost = HashMap::new();
+    let mut uploading = Vec::new();
+    {
+        let mut files = fs.open_files.safe_lock();
+        let mut modes = fs.io_modes.safe_lock();
+        let mut backing = RestoredBacking::default();
+        for (fh, h) in &r.handles {
+            let stream = h.rec.write_path.as_ref().and_then(|wp| r.streams.get(wp)).map(|(_, b)| b.as_str());
+            // The kernel keeps the inode in this handle's I/O mode until it is
+            // released, whatever happens to the handle here.
+            let kind: IoKind = h.rec.io_kind.into();
+            modes.adopt(h.rec.ino, kind);
+            if kind == IoKind::Passthrough {
+                if let Some(id) = h.rec.backing_id {
+                    backing.by_fh.insert(*fh, id);
+                    *backing.users.entry(id).or_insert(0) += 1;
                 }
-                files.insert(*fh, of);
-                report.handles += 1;
             }
-            Err(why) => {
-                log::warn!("handoff: cannot restore fh {} ({}): {} — it now fails with EIO", fh, h.rec.path.display(), why);
-                lost.insert(*fh);
-                report.lost += 1;
+            // A created file has no server copy until its handle is released: keep
+            // refreshes from dropping its listing entry, as create() does.
+            let guard = (h.rec.created && !h.rec.unlinked && h.rec.write_path.is_some()).then(|| h.rec.path.clone());
+            uploading.extend(guard.clone());
+            match rebuild(h, stream, gen) {
+                Ok((of, outcome)) => {
+                    match outcome {
+                        Rebuilt::Ok { exact } => report.exact += exact as usize,
+                        Rebuilt::Failed => {
+                            report.failed += 1;
+                            log::warn!(
+                                "handoff: fh {} ({}) was streaming an upload when the previous daemon died — its writes and close now fail; the copy must be retried",
+                                fh, h.rec.path.display(),
+                            );
+                        }
+                    }
+                    files.insert(*fh, of);
+                    report.handles += 1;
+                }
+                Err(why) => {
+                    log::warn!("handoff: cannot restore fh {} ({}): {} — it now fails with EIO", fh, h.rec.path.display(), why);
+                    // Not in open_files, so release() learns from this what to undo.
+                    lost.insert(*fh, LostHandle { ino: h.rec.ino, io_kind: kind, uploading: guard });
+                    report.lost += 1;
+                }
             }
         }
+        *RESTORED_BACKING.safe_lock() = Some(backing);
     }
-    drop(modes);
-    drop(files);
     *LOST.safe_lock() = Some(lost);
-    *RESTORED_BACKING.safe_lock() = Some(backing);
     *PROTECTED.safe_lock() = None;
-    let mut n = fs.next_fh.safe_lock();
-    *n = (*n).max(r.max_fh.saturating_add(1)).max(r.fh_mark.saturating_add(FH_GAP));
+    {
+        let mut n = fs.next_fh.safe_lock();
+        *n = (*n).max(r.max_fh.saturating_add(1)).max(r.fh_mark.saturating_add(FH_GAP));
+    }
+    let mut c = fs.cache.safe_lock();
+    c.inodes.clear();
+    c.paths.clear();
+    c.inodes.insert(1, PathBuf::from("/"));
+    c.paths.insert(PathBuf::from("/"), 1);
+    for (ino, path) in &r.inodes {
+        if *ino == 1 {
+            continue;
+        }
+        c.inodes.insert(*ino, path.clone());
+        c.paths.insert(path.clone(), *ino);
+    }
+    c.next_inode = c.next_inode.max(r.next_inode());
+    c.uploading.extend(uploading);
+    start_resumed(cache_dir, dev, mount_point, r, c.next_inode);
+    drop(c);
     report
 }
 
@@ -1145,6 +1349,141 @@ mod tests {
 
         std::fs::write(dir.path().join(LOG_FILE), format!("{}\ngarbage\n{}\n", lines[0], lines[1])).unwrap();
         assert!(load(dir.path(), DEV, &mp()).is_err());
+    }
+
+    #[test]
+    fn a_restore_numbers_past_the_reservation_not_just_the_logged_ids() {
+        // ids 2..=4 logged, 5 handed out with its record still queued at the crash:
+        // the reservation alone must keep the successor from reusing 5.
+        let rp = replay(vec![
+            base(),
+            Record::Reserve { s: 1, upto: reservation_after(2) },
+            Record::Ino { s: 2, ino: 2, path: "/a".into() },
+            Record::Ino { s: 3, ino: 4, path: "/b".into() },
+        ])
+        .unwrap();
+        let r = rp.finish();
+        assert_eq!(r.max_ino, 4);
+        assert_eq!(r.next_inode(), RESERVE_BLOCK);
+        assert!(r.next_inode() > 5);
+        assert_eq!(r.inodes.get(&5), None, "an unlogged id stays unknown (ENOENT)");
+    }
+
+    #[test]
+    fn reservations_cover_whole_blocks() {
+        assert_eq!(reservation_after(2), RESERVE_BLOCK);
+        assert_eq!(reservation_after(RESERVE_BLOCK - 1), RESERVE_BLOCK);
+        assert_eq!(reservation_after(RESERVE_BLOCK), 2 * RESERVE_BLOCK);
+        // A log without any reservation (older daemon) still numbers past its ids.
+        let r = replay(vec![base(), Record::Ino { s: 1, ino: 9, path: "/a".into() }]).unwrap().finish();
+        assert_eq!(r.next_inode(), 10);
+    }
+
+    #[test]
+    fn compaction_waits_for_the_log_to_double() {
+        assert!(!needs_compaction(COMPACT_BYTES, 0));
+        assert!(needs_compaction(COMPACT_BYTES + 1, 0));
+        // Live state alone is 100 MiB: rewriting it every tick would never end.
+        let live = 100 * 1024 * 1024;
+        assert!(!needs_compaction(live + 1, live));
+        assert!(!needs_compaction(2 * live, live));
+        assert!(needs_compaction(2 * live + 1, live));
+    }
+
+    fn writer_at(dir: &Path) -> Writer {
+        let path = dir.join(LOG_FILE);
+        Writer {
+            file: OpenOptions::new().create(true).append(true).open(&path).unwrap(),
+            path,
+            buf: Vec::new(),
+            seq: 0,
+            bytes: 0,
+            compacted_bytes: 0,
+            dev: DEV,
+            mount_point: mp(),
+            reserved_upto: 0,
+            opens: HashMap::new(),
+            streams: HashMap::new(),
+            last_fh_mark: 0,
+            tail: None,
+            failed: false,
+        }
+    }
+
+    #[test]
+    fn queued_records_reach_the_file_on_flush_and_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = writer_at(dir.path());
+        w.append(&base(), true);
+        w.append(&Record::Ino { s: 1, ino: 2, path: "/a".into() }, false);
+        let read = || std::fs::read_to_string(dir.path().join(LOG_FILE)).unwrap();
+        assert_eq!(read().lines().count(), 1, "a node-id record is only queued");
+        w.append(&Record::Mv { s: 2, ino: 2, path: "/b".into(), dropped: None }, true);
+        let text = read();
+        let kinds: Vec<&str> = text.lines().map(|l| &l[..12]).collect();
+        assert_eq!(kinds.len(), 3, "a synchronous record writes what was queued before it: {:?}", kinds);
+        assert!(text.lines().nth(1).unwrap().contains("\"ino\""));
+        w.tail = Some(Vec::new());
+        w.append(&Record::Ino { s: 3, ino: 3, path: "/c".into() }, false);
+        drop(w); // a writer that goes away flushes
+        assert_eq!(read().lines().count(), 4);
+    }
+
+    #[test]
+    fn a_compaction_keeps_what_was_logged_while_it_ran() {
+        // Uses the global log: ids far above what parallel tests allocate.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = crate::tests::make_test_cache();
+        c.inodes.insert(900_002, "/a".into());
+        c.paths.insert("/a".into(), 900_002);
+        c.next_inode = 900_003;
+        let cache = Mutex::new(c);
+        *LOG.safe_lock() = Some(writer_at(dir.path()));
+        // What compact() does under the locks, then a record arrives mid-write.
+        let (image, path) = {
+            let c = cache.safe_lock();
+            let mut g = LOG.safe_lock();
+            let w = g.as_mut().unwrap();
+            w.tail = Some(Vec::new());
+            (w.image(&c), w.path.clone())
+        };
+        inode_allocated(900_003, Path::new("/late"));
+        let tmp = path.with_extension("log.tmp");
+        let mut out = image.write(&tmp).unwrap();
+        {
+            let mut g = LOG.safe_lock();
+            let w = g.as_mut().unwrap();
+            w.flush();
+            out.write_all(&w.tail.take().unwrap()).unwrap();
+        }
+        finish_file(out).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        *LOG.safe_lock() = None;
+        let r = load(dir.path(), DEV, &mp()).unwrap();
+        assert_eq!(r.inodes.get(&900_002), Some(&PathBuf::from("/a")));
+        assert_eq!(r.inodes.get(&900_003), Some(&PathBuf::from("/late")), "logged during the compaction");
+        assert!(r.next_inode() >= reservation_after(900_003));
+    }
+
+    #[test]
+    fn the_handles_snapshot_is_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = serde_json::to_string(&base()).unwrap() + "\n";
+        std::fs::write(dir.path().join(LOG_FILE), text).unwrap();
+        let snap = HandlesSnapshot { dev: DEV, mount_point: mp(), s: 0, handles: vec![] };
+        std::fs::write(dir.path().join(HANDLES_FILE), serde_json::to_vec(&snap).unwrap()).unwrap();
+        load(dir.path(), DEV, &mp()).unwrap();
+        assert!(!dir.path().join(HANDLES_FILE).exists(), "a later crash restore must not overlay it again");
+    }
+
+    #[test]
+    fn an_undrained_hand_over_leaves_no_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(HANDLES_FILE), b"{}").unwrap();
+        let files = Mutex::new(HashMap::new());
+        write_handles_snapshot(dir.path(), &files, false).unwrap();
+        assert!(!dir.path().join(HANDLES_FILE).exists());
+        write_handles_snapshot(dir.path(), &files, false).unwrap(); // nothing to remove: still fine
     }
 
     #[test]

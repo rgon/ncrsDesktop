@@ -1,38 +1,35 @@
 //! Daemon-restart survival, part 1: keeping the kernel's FUSE connection alive
-//! while this process goes away, and handing it to the next daemon.
+//! while this process goes away, and handing it to the next daemon. The design
+//! note is docs/restart-survival.md.
 //!
 //! The kernel keeps a FUSE mount — and every file descriptor programs hold on
 //! it — alive for as long as *some* process holds the connection's /dev/fuse
 //! descriptor. When the last one closes, the connection aborts and every
-//! access fails ENOTCONN. So the descriptor is kept in one more place, chosen
-//! by how the daemon can go away:
+//! access fails ENOTCONN. So the descriptor is kept in one more place:
 //!
-//! - **planned restart** (IPC `RESTART_HANDOFF`, `ncrs-ctl restart`, e.g. after
-//!   a package upgrade): the daemon re-executes itself with a dup of the
-//!   descriptor left open across exec (`NCRS_HANDOFF_FD`). The PID stays the
-//!   same, so the GUI's child handle, the `ncrs.scope` and a service's main PID
-//!   all stay valid.
-//! - **crash, GUI-spawned daemon** (`ncrs.scope`, or a plain child when
-//!   systemd-run is unavailable): a tiny holder process (`ncrs --fd-holder`,
-//!   [`run_holder`]) keeps a dup. When the daemon's lease connection to it
-//!   drops without a release, it respawns the daemon with its original argv
-//!   and hands the descriptor over (SCM_RIGHTS). The holder lives in the
-//!   daemon's own scope/cgroup: stopping or killing the *scope* (`systemctl
-//!   --user stop ncrs.scope`, systemd-oomd, logout) takes it down with the
-//!   daemon — the deliberate "really stop" — and the mount then fails ENOTCONN
-//!   exactly as before. A crash, panic or kernel OOM kill of the daemon alone
-//!   leaves it running.
-//! - **systemd service** (`ncrs.service`, `NOTIFY_SOCKET` set): the unit's
-//!   default KillMode=control-group would kill a holder along with the daemon
-//!   on every restart, so the descriptor goes into systemd's fd store instead
-//!   (`FDSTORE=1`, the unit allows it with `FileDescriptorStoreMax=`). systemd
-//!   keeps it across `Restart=on-failure` and `systemctl restart`, and passes
-//!   it back in `LISTEN_FDS`.
+//! - **systemd service** (`ncrs.service`, `NOTIFY_SOCKET` set): the descriptor
+//!   goes into systemd's fd store (`FDSTORE=1`, allowed by the unit's
+//!   `FileDescriptorStoreMax=`). systemd keeps it across `Restart=on-failure`
+//!   (a crash, an OOM kill, a watchdog kill) and `systemctl restart`, and
+//!   passes it back in `LISTEN_FDS`. A SIGTERM from systemd (stop or restart)
+//!   drains the request scheduler and exits without unmounting ([`on_sigterm`]).
+//! - **planned restart** (IPC `RESTART_HANDOFF`, e.g. after a package upgrade):
+//!   the daemon re-executes itself with a dup of the descriptor left open
+//!   across exec (`NCRS_HANDOFF_FD`). The PID stays the same, so the service's
+//!   main PID (or a GUI's child handle) stays valid. Works with or without
+//!   systemd.
+//!
+//! Without systemd there is no keeper: a crash ends the mount with ENOTCONN, as
+//! before restart survival existed. A separate descriptor-holder process could
+//! cover that case; it is not implemented (see the design note).
 //!
 //! While no daemon serves the connection, programs touching the mount block
 //! instead of failing (the kernel queues their requests). That is bounded by
-//! the holder's [`ORPHAN_GRACE`]: if nothing takes the connection over in
-//! time it lets go, and the mount fails ENOTCONN as it does today.
+//! the unit: `StartLimitBurst=` fails a daemon that keeps dying, and once the
+//! unit is failed (or stopped) systemd drops the stored descriptor and the
+//! mount fails ENOTCONN. A successor that takes the connection over but cannot
+//! start serving it aborts it ([`ReattachGuard`]), so programs get ENOTCONN
+//! instead of waiting on a daemon that will never answer.
 //!
 //! Every reattach is checked against /proc/self/mountinfo: the descriptor must
 //! belong to the fuse mount currently on the configured mount point (same
@@ -41,20 +38,18 @@
 //!
 //! The reattached session never sees FUSE_INIT (see PATCHES.md, "fuser:
 //! reattach"); requests the previous daemon had read but not answered are
-//! re-queued with FUSE_NOTIFY_RESEND (Linux 6.9+, [`send_notify_resend`]).
-//! What the kernel still references — node ids, file handles — is restored by
-//! `state_snapshot`.
+//! re-queued with FUSE_NOTIFY_RESEND (Linux 6.9+, [`send_notify_resend`])
+//! before the new session starts reading. What the kernel still references —
+//! node ids, file handles — is restored by `state_snapshot`.
 
-use std::collections::HashMap;
-use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -63,24 +58,12 @@ use crate::MutexExt;
 /// Env vars a re-executing daemon leaves for its successor (see [`planned_restart`]).
 const ENV_FD: &str = "NCRS_HANDOFF_FD";
 const ENV_DEV: &str = "NCRS_HANDOFF_DEV";
-const ENV_LEASE_FD: &str = "NCRS_HOLDER_LEASE_FD";
 
 /// fd-store entries are named `ncrsfuse-<major>-<minor>` (systemd forbids `:` in FDNAME).
 const FDSTORE_PREFIX: &str = "ncrsfuse-";
 
-/// How long the holder keeps a connection no daemon serves before letting it
-/// go. Programs on the mount block meanwhile, so this is a trade between a
-/// slow restart (keyring unlock, network) and a hung file manager.
-pub(crate) const ORPHAN_GRACE: Duration = Duration::from_secs(60);
-/// Wait before respawning, so a daemon restarted by someone else (the GUI)
-/// gets the connection instead of racing a second one.
-const RESPAWN_DELAY: Duration = Duration::from_secs(2);
-/// A daemon that keeps dying right after taking over is not retried forever.
-const MAX_RESPAWNS: usize = 3;
-const RESPAWN_WINDOW: Duration = Duration::from_secs(600);
-/// A holder that ends up holding nothing exits after this long.
-const HOLDER_IDLE_EXIT: Duration = Duration::from_secs(10);
-const HOLDER_MAX_CONNS: usize = 16;
+/// How long a planned restart or a SIGTERM waits for running requests.
+const DRAIN_BUDGET: Duration = Duration::from_secs(3);
 
 /// The kernel's id for one FUSE connection: the device number of its mount
 /// (`st_dev` of the mount root, field 3 of /proc/self/mountinfo).
@@ -117,8 +100,6 @@ pub(crate) enum Source {
     Exec,
     /// systemd's fd store (`LISTEN_FDS`).
     FdStore,
-    /// The fd-holder process, after the previous daemon died.
-    Holder,
 }
 
 /// A live connection found by [`try_reattach`], not yet handed to a session.
@@ -126,8 +107,6 @@ pub(crate) struct Reattach {
     pub(crate) fd: OwnedFd,
     pub(crate) dev: ConnDev,
     pub(crate) source: Source,
-    /// The holder lease this process now owns (exec: inherited; holder: the take connection).
-    lease: Option<UnixStream>,
 }
 
 impl std::fmt::Debug for Reattach {
@@ -137,8 +116,8 @@ impl std::fmt::Debug for Reattach {
 }
 
 /// Who besides this process keeps the connection alive.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Keeper {
-    Holder(UnixStream),
     FdStore,
     None,
 }
@@ -148,26 +127,33 @@ struct Live {
     /// FUSE_NOTIFY_RESEND, closing inherited backing ids and the next handover.
     fd: OwnedFd,
     dev: ConnDev,
-    mount_point: PathBuf,
     keeper: Keeper,
 }
 
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
 
 type QuiesceHook = Box<dyn Fn(Duration) -> bool + Send>;
-type SnapshotHook = Box<dyn Fn() -> io::Result<()> + Send>;
+type ResumeHook = Box<dyn Fn() + Send>;
+type SnapshotHook = Box<dyn Fn(bool) -> io::Result<()> + Send>;
 
 /// Stops dispatching FUSE requests and waits (up to the budget) for the running
 /// ones to finish; true when idle. Installed by the request scheduler.
 static QUIESCE: Mutex<Option<QuiesceHook>> = Mutex::new(None);
-/// Writes the exact per-handle state for the successor (state_snapshot).
+/// Lifts that pause again (a planned restart that failed).
+static RESUME: Mutex<Option<ResumeHook>> = Mutex::new(None);
+/// With true, writes the exact per-handle state for the successor; with false,
+/// removes any such state, so the successor infers it (state_snapshot).
 static SNAPSHOT: Mutex<Option<SnapshotHook>> = Mutex::new(None);
 
 pub(crate) fn set_quiesce_hook(f: impl Fn(Duration) -> bool + Send + 'static) {
     *QUIESCE.safe_lock() = Some(Box::new(f));
 }
 
-pub(crate) fn set_snapshot_hook(f: impl Fn() -> io::Result<()> + Send + 'static) {
+pub(crate) fn set_resume_hook(f: impl Fn() + Send + 'static) {
+    *RESUME.safe_lock() = Some(Box::new(f));
+}
+
+pub(crate) fn set_snapshot_hook(f: impl Fn(bool) -> io::Result<()> + Send + 'static) {
     *SNAPSHOT.safe_lock() = Some(Box::new(f));
 }
 
@@ -178,11 +164,27 @@ pub(crate) fn set_snapshot_hook(f: impl Fn() -> io::Result<()> + Send + 'static)
 /// is safe while nobody serves it.
 pub(crate) fn fuse_mount_dev(mount_point: &Path) -> Option<ConnDev> {
     let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    parse_mountinfo_dev(&text, mount_point)
+    parse_mountinfo_dev(&text, &mount_point_spellings(mount_point))
 }
 
-fn parse_mountinfo_dev(text: &str, mount_point: &Path) -> Option<ConnDev> {
-    let want = trim_trailing_slash(mount_point.as_os_str().as_bytes());
+/// The configured path and, when it differs, its canonical form: mountinfo
+/// lists the path the kernel resolved (a symlinked home shows its target).
+/// Only the parent is canonicalized — resolving the mount point itself would
+/// send a request to the mount, which blocks while nobody serves it.
+fn mount_point_spellings(mount_point: &Path) -> Vec<Vec<u8>> {
+    let mut out = vec![trim_trailing_slash(mount_point.as_os_str().as_bytes()).to_vec()];
+    if let (Some(parent), Some(name)) = (mount_point.parent(), mount_point.file_name()) {
+        if let Ok(canon) = parent.canonicalize() {
+            let c = canon.join(name).into_os_string().into_vec();
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+fn parse_mountinfo_dev(text: &str, mount_point: &[Vec<u8>]) -> Option<ConnDev> {
     let mut found = None;
     for line in text.lines() {
         let Some((pre, post)) = line.split_once(" - ") else { continue };
@@ -192,7 +194,8 @@ fn parse_mountinfo_dev(text: &str, mount_point: &Path) -> Option<ConnDev> {
         else {
             continue;
         };
-        if unescape_mountinfo(mp) != want {
+        let mp = unescape_mountinfo(mp);
+        if !mount_point.iter().any(|want| *want == mp) {
             continue;
         }
         // Later lines are mounted on top of earlier ones: the last entry for the
@@ -257,8 +260,8 @@ fn set_cloexec(fd: RawFd, on: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Sends `data` in one sendmsg, with `fd` attached as SCM_RIGHTS.
-fn send_with_fd(sock: BorrowedFd<'_>, data: &[u8], fd: Option<BorrowedFd<'_>>, name: Option<(&libc::sockaddr_un, libc::socklen_t)>) -> io::Result<()> {
+/// Sends `data` in one sendmsg to `name`, with `fd` attached as SCM_RIGHTS.
+fn send_with_fd(sock: BorrowedFd<'_>, data: &[u8], fd: Option<BorrowedFd<'_>>, name: (&libc::sockaddr_un, libc::socklen_t)) -> io::Result<()> {
     let mut iov = libc::iovec { iov_base: data.as_ptr() as *mut libc::c_void, iov_len: data.len() };
     // u64 storage keeps the control buffer aligned for cmsghdr.
     let mut cbuf = [0u64; 4];
@@ -266,10 +269,8 @@ fn send_with_fd(sock: BorrowedFd<'_>, data: &[u8], fd: Option<BorrowedFd<'_>>, n
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    if let Some((addr, len)) = name {
-        msg.msg_name = addr as *const libc::sockaddr_un as *mut libc::c_void;
-        msg.msg_namelen = len;
-    }
+    msg.msg_name = name.0 as *const libc::sockaddr_un as *mut libc::c_void;
+    msg.msg_namelen = name.1;
     if let Some(fd) = fd {
         // SAFETY: CMSG_* only compute offsets into `cbuf`, which is larger than
         // CMSG_SPACE(sizeof(int)); the header written is inside it.
@@ -296,90 +297,6 @@ fn send_with_fd(sock: BorrowedFd<'_>, data: &[u8], fd: Option<BorrowedFd<'_>>, n
     Ok(())
 }
 
-/// One recvmsg; returns the bytes read and the first descriptor attached, if any
-/// (extra descriptors are closed). Received descriptors are FD_CLOEXEC.
-fn recv_with_fd(sock: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
-    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
-    let mut cbuf = [0u64; 8];
-    // SAFETY: an all-zero msghdr is a valid empty message.
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
-    // SAFETY: msg points at live buffers for the duration of the call.
-    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut first = None;
-    // SAFETY: walking the control messages the kernel just wrote into `cbuf`.
-    unsafe {
-        let mut c = libc::CMSG_FIRSTHDR(&msg);
-        while !c.is_null() {
-            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let data = libc::CMSG_DATA(c) as *const RawFd;
-                let payload = (*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                for i in 0..payload / std::mem::size_of::<RawFd>() {
-                    let owned = OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i)));
-                    if first.is_none() {
-                        first = Some(owned);
-                    }
-                }
-            }
-            c = libc::CMSG_NXTHDR(&msg, c);
-        }
-    }
-    Ok((n as usize, first))
-}
-
-/// Reads one `\n`-terminated message (request/response protocol: a peer never
-/// has two messages in flight, so nothing past the newline is lost).
-fn recv_line(sock: &UnixStream) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
-    let mut line = Vec::new();
-    let mut fd = None;
-    let mut buf = [0u8; 4096];
-    loop {
-        let (n, got) = recv_with_fd(sock.as_fd(), &mut buf)?;
-        if fd.is_none() {
-            fd = got;
-        }
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
-        }
-        line.extend_from_slice(&buf[..n]);
-        if line.ends_with(b"\n") {
-            line.pop();
-            return Ok((line, fd));
-        }
-        if line.len() > 1 << 20 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "message too long"));
-        }
-    }
-}
-
-fn send_json<T: Serialize>(sock: &UnixStream, msg: &T, fd: Option<BorrowedFd<'_>>) -> io::Result<()> {
-    let mut data = serde_json::to_vec(msg).map_err(io::Error::other)?;
-    data.push(b'\n');
-    send_with_fd(sock.as_fd(), &data, fd, None)
-}
-
-fn peer_is_us(sock: &UnixStream) -> bool {
-    // SAFETY: getsockopt writes at most `len` bytes into `cred`.
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut libc::ucred as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    rc == 0 && cred.uid == unsafe { libc::getuid() }
-}
-
 // ── kernel notifications ─────────────────────────────────────────────────────
 
 /// `fuse_notify_code::FUSE_NOTIFY_RESEND` (include/uapi/linux/fuse.h, 7.40).
@@ -401,8 +318,8 @@ fn notify_header(code: i32) -> [u8; 16] {
 /// calling program is interrupted.
 pub(crate) fn send_notify_resend(fd: BorrowedFd<'_>) -> io::Result<()> {
     let h = notify_header(FUSE_NOTIFY_RESEND);
-    // UNVERIFIED: header-only RESEND write; based on fs/fuse/dev.c fuse_notify()
-    // (case FUSE_NOTIFY_RESEND takes no payload), not exercised on a live kernel.
+    // Header-only write: fs/fuse/dev.c fuse_notify() takes no payload for
+    // FUSE_NOTIFY_RESEND (exercised by e2e scenario 32's watchdog step).
     // SAFETY: writes the 16 bytes of `h`.
     let n = unsafe { libc::write(fd.as_raw_fd(), h.as_ptr() as *const libc::c_void, h.len()) };
     if n < 0 {
@@ -426,7 +343,7 @@ pub(crate) fn close_backing_id(id: u32) {
     }
 }
 
-// ── systemd fd store ─────────────────────────────────────────────────────────
+// ── systemd ──────────────────────────────────────────────────────────────────
 
 fn notify_socket_addr() -> Option<(libc::sockaddr_un, libc::socklen_t)> {
     let path = std::env::var_os("NOTIFY_SOCKET")?;
@@ -451,10 +368,10 @@ fn notify_socket_addr() -> Option<(libc::sockaddr_un, libc::socklen_t)> {
 }
 
 /// sd_notify(3) with an optional descriptor. Ok(false) when not under systemd.
-fn sd_notify(state: &str, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
+pub(crate) fn sd_notify(state: &str, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
     let Some((addr, len)) = notify_socket_addr() else { return Ok(false) };
     let sock = UnixDatagram::unbound()?;
-    send_with_fd(sock.as_fd(), state.as_bytes(), fd, Some((&addr, len)))?;
+    send_with_fd(sock.as_fd(), state.as_bytes(), fd, (&addr, len))?;
     Ok(true)
 }
 
@@ -491,25 +408,22 @@ fn take_listen_fds() -> Vec<(OwnedFd, String)> {
 
 // ── finding a connection to reattach ─────────────────────────────────────────
 
-pub(crate) fn holder_socket_path() -> PathBuf {
-    crate::ipc::socket_dir().join("ncrs-fd-holder.sock")
+/// True in the image a planned restart exec'd into (before [`try_reattach`]
+/// consumes the hand-off variables). The process already carries everything
+/// the first image installed once per process, such as its seccomp filter.
+pub(crate) fn is_exec_successor() -> bool {
+    std::env::var_os(ENV_FD).is_some()
 }
 
 /// The live connection a previous daemon left for this one, if any: from this
-/// process's own re-exec, systemd's fd store, or the fd holder — in that order.
-/// Only returns a descriptor that is /dev/fuse and belongs to the fuse mount on
-/// `mount_point` right now.
+/// process's own re-exec or systemd's fd store, in that order. Only returns a
+/// descriptor that is /dev/fuse and belongs to the fuse mount on `mount_point`
+/// right now.
 pub(crate) fn try_reattach(mount_point: &Path) -> Option<Reattach> {
     if let Some(r) = from_exec_env(mount_point) {
         return Some(r);
     }
-    if let Some(r) = from_fd_store(mount_point) {
-        return Some(r);
-    }
-    if !under_systemd_service() {
-        return from_holder(mount_point);
-    }
-    None
+    from_fd_store(mount_point)
 }
 
 fn validated(fd: &OwnedFd, dev: ConnDev, mount_point: &Path) -> bool {
@@ -532,16 +446,9 @@ fn validated(fd: &OwnedFd, dev: ConnDev, mount_point: &Path) -> bool {
 fn from_exec_env(mount_point: &Path) -> Option<Reattach> {
     let fd_s = std::env::var(ENV_FD).ok();
     let dev_s = std::env::var(ENV_DEV).ok();
-    let lease_s = std::env::var(ENV_LEASE_FD).ok();
-    // Children (fusermount, the holder, a respawn) must not inherit them.
+    // Children (fusermount, a further re-exec) must not inherit them.
     std::env::remove_var(ENV_FD);
     std::env::remove_var(ENV_DEV);
-    std::env::remove_var(ENV_LEASE_FD);
-    let lease = lease_s.and_then(|s| s.parse::<RawFd>().ok()).map(|raw| {
-        let _ = set_cloexec(raw, true);
-        // SAFETY: the previous image of this process left this descriptor open for us.
-        unsafe { UnixStream::from_raw_fd(raw) }
-    });
     let raw: RawFd = fd_s?.parse().ok()?;
     let _ = set_cloexec(raw, true);
     // SAFETY: the previous image of this process left this descriptor open for us.
@@ -551,7 +458,7 @@ fn from_exec_env(mount_point: &Path) -> Option<Reattach> {
         return None;
     }
     log::info!("handoff: took over FUSE connection {} from this daemon's previous image", dev.to_colon());
-    Some(Reattach { fd, dev, source: Source::Exec, lease })
+    Some(Reattach { fd, dev, source: Source::Exec })
 }
 
 fn from_fd_store(mount_point: &Path) -> Option<Reattach> {
@@ -559,7 +466,7 @@ fn from_fd_store(mount_point: &Path) -> Option<Reattach> {
     for (fd, name) in take_listen_fds() {
         let Some(dev) = ConnDev::from_fdstore_name(&name) else { continue };
         if found.is_none() && validated(&fd, dev, mount_point) {
-            found = Some(Reattach { fd, dev, source: Source::FdStore, lease: None });
+            found = Some(Reattach { fd, dev, source: Source::FdStore });
         } else {
             // A connection whose mount is gone: drop it from the store too.
             let _ = sd_notify(&format!("FDSTOREREMOVE=1\nFDNAME={}", name), None);
@@ -571,76 +478,52 @@ fn from_fd_store(mount_point: &Path) -> Option<Reattach> {
     found
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum HolderRequest {
-    /// Keep the attached descriptor; this connection is the depositor's lease.
-    Deposit { mount_point: PathBuf, dev: ConnDev, exe: PathBuf, args: Vec<String> },
-    /// Hand the descriptor over; on success this connection becomes the taker's lease.
-    Take { mount_point: PathBuf },
-    /// Drop the descriptor: the mount ended cleanly, or the taker cannot use it.
-    Release { mount_point: PathBuf },
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
-struct HolderReply {
-    ok: bool,
-    #[serde(default)]
-    err: Option<String>,
-    #[serde(default)]
-    dev: Option<ConnDev>,
-}
-
-fn from_holder(mount_point: &Path) -> Option<Reattach> {
-    let sock = UnixStream::connect(holder_socket_path()).ok()?;
-    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    send_json(&sock, &HolderRequest::Take { mount_point: mount_point.to_path_buf() }, None).ok()?;
-    let (line, fd) = recv_line(&sock).ok()?;
-    let reply: HolderReply = serde_json::from_slice(&line).ok()?;
-    if !reply.ok {
-        // "busy": another daemon serves it (prepare_mount_point then refuses to
-        // mount over it); "none": nothing held for this mount point.
-        log::debug!("handoff: fd holder has nothing to hand over ({:?})", reply.err);
-        return None;
-    }
-    let (Some(fd), Some(dev)) = (fd, reply.dev) else { return None };
-    if !validated(&fd, dev, mount_point) {
-        let _ = send_json(&sock, &HolderRequest::Release { mount_point: mount_point.to_path_buf() }, None);
-        let _ = recv_line(&sock);
-        return None;
-    }
-    sock.set_read_timeout(None).ok();
-    log::info!("handoff: took over FUSE connection {} from the fd holder", dev.to_colon());
-    Some(Reattach { fd, dev, source: Source::Holder, lease: Some(sock) })
-}
-
 /// Gives up on a connection [`try_reattach`] found (its state could not be
-/// restored): releases every keeper and aborts the connection, so the mount
-/// point reads ENOTCONN, which `prepare_mount_point` then detaches.
-pub(crate) fn abandon(r: Reattach, mount_point: &Path) {
+/// restored): drops it from the fd store and aborts it, so the mount point
+/// reads ENOTCONN, which `prepare_mount_point` then detaches.
+pub(crate) fn abandon(r: Reattach) {
     let dev = r.dev;
-    log::warn!("handoff: abandoning FUSE connection {}; programs holding files on it get ENOTCONN", r.dev.to_colon());
-    match r.source {
-        Source::FdStore => {
-            let _ = sd_notify(&format!("FDSTOREREMOVE=1\nFDNAME={}", r.dev.fdstore_name()), None);
-        }
-        Source::Holder | Source::Exec => {
-            if let Some(lease) = &r.lease {
-                let _ = send_json(lease, &HolderRequest::Release { mount_point: mount_point.to_path_buf() }, None);
-                lease.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                let _ = recv_line(lease);
-            }
-        }
-    }
-    if under_systemd_service() {
-        let _ = sd_notify(&format!("FDSTOREREMOVE=1\nFDNAME={}", r.dev.fdstore_name()), None);
-    }
     drop(r);
-    // The kernel aborts a connection when its last descriptor closes, but a
-    // keeper may close its copy late (systemd handles FDSTOREREMOVE on its own
-    // time). Until then a stat of the mount point — prepare_mount_point's first
-    // step — would block forever, so abort it outright.
+    give_up(dev);
+}
+
+fn give_up(dev: ConnDev) {
+    log::warn!("handoff: abandoning FUSE connection {}; programs holding files on it get ENOTCONN", dev.to_colon());
+    if under_systemd_service() {
+        let _ = sd_notify(&format!("FDSTOREREMOVE=1\nFDNAME={}", dev.fdstore_name()), None);
+    }
+    // The kernel aborts a connection when its last descriptor closes, but
+    // systemd handles FDSTOREREMOVE on its own time. Until then a stat of the
+    // mount point — prepare_mount_point's first step — would block forever, so
+    // abort it outright.
     abort_connection(dev);
+}
+
+/// Armed once a reattached connection is being set up: if this daemon fails
+/// before its session serves the connection (a config, keyring or filesystem
+/// setup error), dropping the guard aborts the connection instead of leaving it
+/// in the fd store for a successor that would hit the same error — programs
+/// on the mount then get ENOTCONN rather than blocking.
+pub(crate) struct ReattachGuard(Option<ConnDev>);
+
+impl ReattachGuard {
+    pub(crate) fn new(dev: Option<ConnDev>) -> Self {
+        ReattachGuard(dev)
+    }
+
+    /// The session serves the connection now.
+    pub(crate) fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ReattachGuard {
+    fn drop(&mut self) {
+        if let Some(dev) = self.0.take() {
+            log::warn!("handoff: this daemon failed before serving the connection it took over");
+            give_up(dev);
+        }
+    }
 }
 
 /// Writes fusectl's `abort` for this connection: every pending and future
@@ -658,7 +541,7 @@ fn abort_connection(dev: ConnDev) {
 
 // ── adopting the connection this daemon serves ───────────────────────────────
 
-/// The binary to (re)start: the path this process was started from, even if a
+/// The binary to re-exec: the path this process was started from, even if a
 /// package upgrade has since replaced it (`/proc/self/exe` would still be the
 /// old, deleted image).
 fn restart_exe() -> PathBuf {
@@ -673,14 +556,11 @@ fn restart_exe() -> PathBuf {
     PathBuf::from("/proc/self/exe")
 }
 
-fn restart_args() -> Vec<String> {
-    std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect()
-}
-
-/// Called right after a fresh mount: registers the session's connection with a
-/// keeper (holder or fd store) so a crash does not end the mount. Returns the
-/// connection's id, or None when it cannot be identified (restart survival is
-/// then off for this mount, and nothing else changes).
+/// Called right after a fresh mount: keeps a dup of the session's connection
+/// (for a planned restart) and, under systemd, parks one in the fd store so a
+/// crash does not end the mount. Returns the connection's id, or None when it
+/// cannot be identified (restart survival is then off for this mount, and
+/// nothing else changes).
 pub(crate) fn adopt_fresh(session_fd: BorrowedFd<'_>, mount_point: &Path) -> Option<ConnDev> {
     let Some(dev) = fuse_mount_dev(mount_point) else {
         log::warn!("handoff: cannot identify the FUSE connection on {} — restart survival disabled", mount_point.display());
@@ -693,38 +573,32 @@ pub(crate) fn adopt_fresh(session_fd: BorrowedFd<'_>, mount_point: &Path) -> Opt
             return None;
         }
     };
-    let keeper = new_keeper(fd.as_fd(), dev, mount_point);
-    *LIVE.safe_lock() = Some(Live { fd, dev, mount_point: mount_point.to_path_buf(), keeper });
+    let keeper = new_keeper(fd.as_fd(), dev);
+    *LIVE.safe_lock() = Some(Live { fd, dev, keeper });
     Some(dev)
 }
 
-/// Called after a reattached session is created from `r.fd`'s twin.
-pub(crate) fn adopt_reattached(own: OwnedFd, dev: ConnDev, source: Source, lease: Option<UnixStream>, mount_point: &Path) {
-    let keeper = match (source, lease) {
-        (_, Some(lease)) => Keeper::Holder(lease),
-        (Source::FdStore, None) => {
-            // Re-store it: systemd handed its copy to us and dropped it from the store.
-            store_in_fd_store(own.as_fd(), dev)
-        }
-        _ => new_keeper(own.as_fd(), dev, mount_point),
-    };
-    *LIVE.safe_lock() = Some(Live { fd: own, dev, mount_point: mount_point.to_path_buf(), keeper });
+/// Called after a reattached session is created from the connection's twin.
+/// systemd handed its stored copy over (and dropped it from the store), so it
+/// goes back in; after a re-exec the store still has it, and systemd ignores a
+/// second copy of a descriptor it already holds.
+pub(crate) fn adopt_reattached(own: OwnedFd, dev: ConnDev) {
+    let keeper = new_keeper(own.as_fd(), dev);
+    *LIVE.safe_lock() = Some(Live { fd: own, dev, keeper });
 }
 
-impl Reattach {
-    /// Splits off the parts [`adopt_reattached`] needs once `fd` goes to the session.
-    pub(crate) fn into_parts(self) -> (OwnedFd, ConnDev, Source, Option<UnixStream>) {
-        (self.fd, self.dev, self.source, self.lease)
-    }
-}
-
-fn store_in_fd_store(fd: BorrowedFd<'_>, dev: ConnDev) -> Keeper {
+fn new_keeper(fd: BorrowedFd<'_>, dev: ConnDev) -> Keeper {
     match sd_notify(&format!("FDSTORE=1\nFDNAME={}", dev.fdstore_name()), Some(fd)) {
         Ok(true) => {
             log::info!("handoff: FUSE connection {} kept in the systemd fd store", dev.to_colon());
             Keeper::FdStore
         }
-        Ok(false) => Keeper::None,
+        Ok(false) => {
+            log::info!(
+                "handoff: not running as a systemd service — a crash ends the mount (planned restarts still keep it; see docs/restart-survival.md)"
+            );
+            Keeper::None
+        }
         Err(e) => {
             log::warn!("handoff: systemd fd store refused the FUSE descriptor ({}) — a crash will end the mount", e);
             Keeper::None
@@ -732,83 +606,9 @@ fn store_in_fd_store(fd: BorrowedFd<'_>, dev: ConnDev) -> Keeper {
     }
 }
 
-fn new_keeper(fd: BorrowedFd<'_>, dev: ConnDev, mount_point: &Path) -> Keeper {
-    if under_systemd_service() {
-        return store_in_fd_store(fd, dev);
-    }
-    match deposit_with_holder(fd, dev, mount_point) {
-        Ok(lease) => {
-            log::info!("handoff: FUSE connection {} kept by the fd holder", dev.to_colon());
-            Keeper::Holder(lease)
-        }
-        Err(e) => {
-            log::warn!("handoff: fd holder unavailable ({}) — a crash will end the mount", e);
-            Keeper::None
-        }
-    }
-}
-
-fn deposit_with_holder(fd: BorrowedFd<'_>, dev: ConnDev, mount_point: &Path) -> io::Result<UnixStream> {
-    let path = holder_socket_path();
-    let sock = match UnixStream::connect(&path) {
-        Ok(s) => s,
-        Err(_) => {
-            spawn_holder(&path)?;
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                match UnixStream::connect(&path) {
-                    Ok(s) => break s,
-                    Err(e) if Instant::now() >= deadline => return Err(e),
-                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
-                }
-            }
-        }
-    };
-    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let req = HolderRequest::Deposit {
-        mount_point: mount_point.to_path_buf(),
-        dev,
-        exe: restart_exe(),
-        args: restart_args(),
-    };
-    send_json(&sock, &req, Some(fd))?;
-    let (line, _) = recv_line(&sock)?;
-    let reply: HolderReply = serde_json::from_slice(&line).map_err(io::Error::other)?;
-    if !reply.ok {
-        return Err(io::Error::other(reply.err.unwrap_or_else(|| "refused".into())));
-    }
-    sock.set_read_timeout(None).ok();
-    Ok(sock)
-}
-
-fn spawn_holder(socket: &Path) -> io::Result<()> {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new("/proc/self/exe");
-    cmd.arg("--fd-holder")
-        .arg(socket)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .env_remove(ENV_FD)
-        .env_remove(ENV_DEV)
-        .env_remove(ENV_LEASE_FD);
-    // Its own session, so a hangup or a signal to the GUI's process group does
-    // not reach it. It stays in this cgroup (see the module doc).
-    // SAFETY: setsid is async-signal-safe.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let mut child = cmd.spawn()?;
-    crate::bg::spawn_service("fd-holder-reap", move || {
-        let _ = child.wait();
-    })?;
-    Ok(())
-}
-
-/// After a reattached session starts reading: re-queue what the previous
-/// daemon left unanswered.
+/// Before a reattached session starts reading: re-queue what the previous
+/// daemon left unanswered. Sent first so nothing this daemon reads itself is
+/// in what the kernel resends (that would run twice).
 pub(crate) fn resend_in_flight() {
     let g = LIVE.safe_lock();
     let Some(live) = g.as_ref() else { return };
@@ -821,20 +621,48 @@ pub(crate) fn resend_in_flight() {
     }
 }
 
-/// The session ended cleanly (unmounted): tell the keeper to let go, so the
-/// connection is not kept alive for a successor that will never come.
+/// The session ended for good (unmounted, or the connection was aborted): tell
+/// the keeper to let go, so the connection is not kept for a successor that
+/// would find nothing to serve.
 pub(crate) fn release_connection() {
     let Some(live) = LIVE.safe_lock().take() else { return };
-    match &live.keeper {
-        Keeper::Holder(lease) => {
-            let _ = send_json(lease, &HolderRequest::Release { mount_point: live.mount_point.clone() }, None);
-            lease.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let _ = recv_line(lease);
+    if live.keeper == Keeper::FdStore {
+        let _ = sd_notify(&format!("FDSTOREREMOVE=1\nFDNAME={}", live.dev.fdstore_name()), None);
+    }
+}
+
+/// Drains running requests for a hand-over and leaves the successor the best
+/// state there is: the exact handle snapshot when nothing is still running,
+/// otherwise none (a snapshot taken mid-request could miss that request's
+/// write, so the successor infers dirtiness from the staging files instead).
+fn drain_for_handover() -> io::Result<bool> {
+    let drained = match QUIESCE.safe_lock().as_ref() {
+        Some(q) => q(DRAIN_BUDGET),
+        // Only without the scheduler (never in the daemon).
+        None => false,
+    };
+    if !drained {
+        log::warn!(
+            "handoff: requests still running after {}s — handing over without the exact handle snapshot; the kernel resends them",
+            DRAIN_BUDGET.as_secs()
+        );
+    }
+    crate::state_snapshot::flush_log();
+    if let Some(snap) = SNAPSHOT.safe_lock().as_ref() {
+        snap(drained)?;
+    }
+    Ok(drained)
+}
+
+/// Undoes [`drain_for_handover`] after a hand-over that did not happen.
+fn undo_handover() {
+    if let Some(snap) = SNAPSHOT.safe_lock().as_ref() {
+        if let Err(e) = snap(false) {
+            log::warn!("handoff: cannot remove the handle snapshot: {}", e);
         }
-        Keeper::FdStore => {
-            let _ = sd_notify(&format!("FDSTOREREMOVE=1\nFDNAME={}", live.dev.fdstore_name()), None);
-        }
-        Keeper::None => {}
+    }
+    if let Some(r) = RESUME.safe_lock().as_ref() {
+        r();
     }
 }
 
@@ -857,298 +685,124 @@ pub fn request_planned_restart() -> Result<(), String> {
     Ok(())
 }
 
-/// Re-executes this daemon with the connection (and the holder lease, if any)
-/// left open across exec. Only returns on failure, with everything restored.
+/// Re-executes this daemon with the connection left open across exec. Only
+/// returns on failure, with the descriptor, the snapshot and the scheduler
+/// back as they were.
 fn planned_restart() -> io::Result<()> {
-    if let Some(q) = QUIESCE.safe_lock().as_ref() {
-        if !q(Duration::from_secs(3)) {
-            log::warn!("handoff: requests still running after 3s — restarting anyway; the kernel resends them");
+    if let Err(e) = drain_for_handover() {
+        undo_handover();
+        return Err(e);
+    }
+    let (fd, dev) = match LIVE.safe_lock().as_ref() {
+        Some(l) => (l.fd.as_raw_fd(), l.dev),
+        None => {
+            undo_handover();
+            return Err(io::Error::other("not mounted"));
         }
-    } else {
-        // Only without the scheduler (never in the daemon): a request mid-execution is
-        // cut off by exec and replayed via FUSE_NOTIFY_RESEND (non-idempotent ops
-        // like rename/unlink then see their own effect and may fail).
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    if let Some(snap) = SNAPSHOT.safe_lock().as_ref() {
-        // Without it the successor would treat every write handle as crashed.
-        snap()?;
-    }
-    let g = LIVE.safe_lock();
-    let live = g.as_ref().ok_or_else(|| io::Error::other("not mounted"))?;
-    let fd = live.fd.as_raw_fd();
-    let lease = match &live.keeper {
-        Keeper::Holder(s) => Some(s.as_raw_fd()),
-        _ => None,
     };
-    set_cloexec(fd, false)?;
-    if let Some(l) = lease {
-        set_cloexec(l, false)?;
+    if let Err(e) = set_cloexec(fd, false) {
+        undo_handover();
+        return Err(e);
     }
     let exe = restart_exe();
-    log::info!("handoff: re-executing {} with FUSE connection {} (fd {})", exe.display(), live.dev.to_colon(), fd);
+    log::info!("handoff: re-executing {} with FUSE connection {} (fd {})", exe.display(), dev.to_colon(), fd);
     let mut cmd = Command::new(&exe);
-    cmd.args(std::env::args_os().skip(1)).env(ENV_FD, fd.to_string()).env(ENV_DEV, live.dev.to_colon());
-    if let Some(l) = lease {
-        cmd.env(ENV_LEASE_FD, l.to_string());
-    }
+    cmd.args(std::env::args_os().skip(1)).env(ENV_FD, fd.to_string()).env(ENV_DEV, dev.to_colon());
     use std::os::unix::process::CommandExt;
     let err = cmd.exec();
-    // Still here: exec failed. Put the descriptors back as they were.
+    // Still here: exec failed. A later crash restore must not trust a snapshot
+    // of this moment, and the paused scheduler must serve again.
     let _ = set_cloexec(fd, true);
-    if let Some(l) = lease {
-        let _ = set_cloexec(l, true);
-    }
+    undo_handover();
     Err(err)
 }
 
-// ── the fd holder process ────────────────────────────────────────────────────
+// ── SIGTERM (systemd stop / restart) ─────────────────────────────────────────
 
-struct Held {
-    fd: OwnedFd,
-    dev: ConnDev,
-    exe: PathBuf,
-    args: Vec<String>,
-    /// Client connection id of the daemon serving it; None while orphaned.
-    lease: Option<u64>,
-    orphaned_at: Option<Instant>,
-    respawned: bool,
-    respawns: Vec<Instant>,
-}
-
-#[derive(Default)]
-struct HolderState {
-    held: HashMap<PathBuf, Held>,
-    next_conn: u64,
-}
-
-/// Body of `ncrs --fd-holder <socket>`. Exits 0 when it holds nothing.
-pub fn run_holder(socket: &Path) -> i32 {
-    drop_capabilities();
-    // A holder already listening there wins.
-    if UnixStream::connect(socket).is_ok() {
-        return 0;
-    }
-    let _ = std::fs::remove_file(socket);
-    let listener = match UnixListener::bind(socket) {
-        Ok(l) => l,
-        Err(e) => {
-            log::error!("fd holder: cannot listen on {}: {}", socket.display(), e);
-            return 1;
-        }
-    };
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
-    }
-    log::info!("fd holder: listening on {}", socket.display());
-    let state = Arc::new(Mutex::new(HolderState::default()));
-    let started = Instant::now();
-    {
-        let state = state.clone();
-        let socket = socket.to_path_buf();
-        holder_thread("fd-holder-watch", move || loop {
-            std::thread::sleep(Duration::from_secs(1));
-            let empty = holder_tick(&mut state.safe_lock(), Instant::now());
-            if empty && started.elapsed() > HOLDER_IDLE_EXIT {
-                log::info!("fd holder: nothing left to hold, exiting");
-                let _ = std::fs::remove_file(&socket);
-                std::process::exit(0);
-            }
-        });
-    }
-    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    for conn in listener.incoming() {
-        let Ok(conn) = conn else { continue };
-        if !peer_is_us(&conn) {
-            continue;
-        }
-        // One per daemon (its lease) plus short-lived takes: a pile-up means
-        // something is looping, not more daemons to serve.
-        if active.load(std::sync::atomic::Ordering::SeqCst) >= HOLDER_MAX_CONNS {
-            continue;
-        }
-        active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let state = state.clone();
-        let active = active.clone();
-        holder_thread("fd-holder-conn", move || {
-            holder_client(conn, state);
-            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        });
-    }
-    0
-}
-
-/// Threads of the holder *process*. bg::'s lifetime budgets exist to bound the
-/// daemon; the holder is a separate, tiny process whose threads are one watcher
-/// plus at most HOLDER_MAX_CONNS live connections, so it spawns directly.
-#[allow(clippy::disallowed_methods)]
-fn holder_thread(name: &str, f: impl FnOnce() + Send + 'static) {
-    if let Err(e) = std::thread::Builder::new().name(name.to_string()).spawn(f) {
-        log::error!("fd holder: cannot start {} thread: {}", name, e);
+fn term_set() -> libc::sigset_t {
+    // SAFETY: sigemptyset/sigaddset initialise the set they are given.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        set
     }
 }
 
-fn drop_capabilities() {
-    // The holder needs no privilege; ncrs's file capability (CAP_SYS_ADMIN for
-    // passthrough) would otherwise come along with the exec.
-    #[repr(C)]
-    struct CapHeader {
-        version: u32,
-        pid: i32,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CapData {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-    let mut h = CapHeader { version: 0x2008_0522, pid: 0 }; // _LINUX_CAPABILITY_VERSION_3
-    let d = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
-    // SAFETY: capset reads the header and two data structs.
-    let rc = unsafe { libc::syscall(libc::SYS_capset, &mut h as *mut CapHeader, d.as_ptr()) };
+/// Blocks SIGTERM in the calling thread, and so in every thread it starts
+/// later. Call first thing in `main`, before any thread exists; the
+/// `sigterm` service thread then takes it with sigwait. (jemalloc's
+/// background threads block every signal themselves; spawned children get
+/// an empty mask from std::process.)
+pub fn block_sigterm() {
+    let set = term_set();
+    // SAFETY: changes this thread's signal mask only.
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
     if rc != 0 {
-        log::debug!("fd holder: capset failed: {}", io::Error::last_os_error());
+        log::warn!("cannot block SIGTERM ({}) — a systemd stop kills the daemon outright", io::Error::from_raw_os_error(rc));
     }
 }
 
-/// One monitoring pass; returns true when nothing is held.
-fn holder_tick(st: &mut HolderState, now: Instant) -> bool {
-    st.held.retain(|mp, h| {
-        if fuse_mount_dev(mp) != Some(h.dev) {
-            log::info!("fd holder: {} is no longer mounted — dropping its connection", mp.display());
-            return false;
+fn sigterm_blocked() -> bool {
+    // SAFETY: reads this thread's signal mask into `cur`.
+    unsafe {
+        let mut cur: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut cur) == 0 && libc::sigismember(&cur, libc::SIGTERM) == 1
+    }
+}
+
+/// Starts the `sigterm` service thread, if `main` blocked SIGTERM (an embedder
+/// that did not keeps its own signal handling).
+pub(crate) fn spawn_sigterm_thread() {
+    if !sigterm_blocked() {
+        return;
+    }
+    let r = crate::bg::spawn_service("sigterm", || loop {
+        let set = term_set();
+        let mut sig: libc::c_int = 0;
+        // SAFETY: waits for a signal in `set`, which every thread blocks.
+        if unsafe { libc::sigwait(&set, &mut sig) } == 0 && sig == libc::SIGTERM {
+            on_sigterm();
         }
-        if h.lease.is_some() {
-            return true;
-        }
-        let since = *h.orphaned_at.get_or_insert(now);
-        if now.duration_since(since) >= ORPHAN_GRACE {
-            log::warn!(
-                "fd holder: no daemon took over {} within {}s — letting the connection go (programs on it now get ENOTCONN)",
-                mp.display(), ORPHAN_GRACE.as_secs(),
-            );
-            return false;
-        }
-        if !h.respawned && now.duration_since(since) >= RESPAWN_DELAY {
-            h.respawned = true;
-            h.respawns.retain(|t| now.duration_since(*t) < RESPAWN_WINDOW);
-            if h.respawns.len() >= MAX_RESPAWNS {
-                log::warn!("fd holder: daemon for {} died {} times in {} min — not respawning", mp.display(), MAX_RESPAWNS, RESPAWN_WINDOW.as_secs() / 60);
-            } else {
-                h.respawns.push(now);
-                respawn_daemon(&h.exe, &h.args);
-            }
-        }
-        true
     });
-    st.held.is_empty()
-}
-
-fn respawn_daemon(exe: &Path, args: &[String]) {
-    log::warn!("fd holder: daemon died without releasing its FUSE connection — restarting {}", exe.display());
-    let mut cmd = Command::new(exe);
-    cmd.args(args.iter().map(OsString::from))
-        .stdin(Stdio::null())
-        .env_remove(ENV_FD)
-        .env_remove(ENV_DEV)
-        .env_remove(ENV_LEASE_FD);
-    match cmd.spawn() {
-        Ok(mut child) => holder_thread("fd-holder-reap", move || {
-            let _ = child.wait();
-        }),
-        Err(e) => log::error!("fd holder: cannot restart {}: {}", exe.display(), e),
-    }
-}
-
-fn holder_client(conn: UnixStream, state: Arc<Mutex<HolderState>>) {
-    let id = {
-        let mut st = state.safe_lock();
-        st.next_conn += 1;
-        st.next_conn
-    };
-    // Mount points this connection is the lease for.
-    let mut leases: Vec<PathBuf> = Vec::new();
-    loop {
-        let (line, fd) = match recv_line(&conn) {
-            Ok(x) => x,
-            Err(_) => break,
-        };
-        let req: HolderRequest = match serde_json::from_slice(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = send_json(&conn, &HolderReply { ok: false, err: Some(e.to_string()), dev: None }, None);
-                continue;
-            }
-        };
-        let mut st = state.safe_lock();
-        let (reply, give) = handle_holder_request(&mut st, id, req, fd, &mut leases);
-        let give_fd = give.and_then(|mp| st.held.get(&mp).map(|h| h.fd.as_fd()));
-        let _ = send_json(&conn, &reply, give_fd);
-    }
-    // Lease connection gone: the daemon exited (or re-exec failed to keep it).
-    let mut st = state.safe_lock();
-    for mp in leases {
-        if let Some(h) = st.held.get_mut(&mp) {
-            if h.lease == Some(id) {
-                log::info!("fd holder: daemon serving {} went away", mp.display());
-                h.lease = None;
-                h.orphaned_at = None;
-                h.respawned = false;
-            }
+    if let Err(e) = r {
+        log::warn!("cannot start the SIGTERM thread ({}) — a systemd stop kills the daemon outright", e);
+        // SAFETY: changes this thread's signal mask only; with no thread to take
+        // it, SIGTERM must keep its default action.
+        unsafe {
+            let set = term_set();
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
         }
     }
 }
 
-/// The holder protocol's state transitions. Returns the reply and, for a
-/// successful take, the mount point whose descriptor to attach.
-fn handle_holder_request(
-    st: &mut HolderState,
-    conn: u64,
-    req: HolderRequest,
-    fd: Option<OwnedFd>,
-    leases: &mut Vec<PathBuf>,
-) -> (HolderReply, Option<PathBuf>) {
-    match req {
-        HolderRequest::Deposit { mount_point, dev, exe, args } => {
-            let Some(fd) = fd else {
-                return (HolderReply { ok: false, err: Some("no descriptor attached".into()), dev: None }, None);
-            };
-            if let Some(h) = st.held.get(&mount_point) {
-                if h.lease.is_some() && h.lease != Some(conn) && h.dev == dev {
-                    return (HolderReply { ok: false, err: Some("busy".into()), dev: None }, None);
-                }
-            }
-            st.held.insert(
-                mount_point.clone(),
-                Held { fd, dev, exe, args, lease: Some(conn), orphaned_at: None, respawned: false, respawns: Vec::new() },
-            );
-            leases.push(mount_point);
-            (HolderReply { ok: true, err: None, dev: Some(dev) }, None)
+/// systemd stops or restarts the service. With the connection in the fd store,
+/// this daemon hands over like a planned restart — drain, snapshot only if
+/// drained, flush the log — and exits 0 *without unmounting*: the successor
+/// (a restart) takes the connection from the store, and a plain stop lets
+/// systemd drop the store, which ends the mount. Without a keeper, SIGTERM
+/// does what it always did: the default action ends the process.
+fn on_sigterm() {
+    let keeper = LIVE.safe_lock().as_ref().map(|l| l.keeper);
+    if keeper != Some(Keeper::FdStore) {
+        log::info!("SIGTERM: exiting (no fd store keeps the mount)");
+        // SAFETY: restores the default action and re-raises in this thread,
+        // which ends the process exactly as an unhandled SIGTERM would.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            let set = term_set();
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            libc::raise(libc::SIGTERM);
         }
-        HolderRequest::Take { mount_point } => match st.held.get_mut(&mount_point) {
-            None => (HolderReply { ok: false, err: Some("none".into()), dev: None }, None),
-            Some(h) if h.lease.is_some() => (HolderReply { ok: false, err: Some("busy".into()), dev: None }, None),
-            Some(h) => {
-                h.lease = Some(conn);
-                h.orphaned_at = None;
-                h.respawned = false;
-                let dev = h.dev;
-                leases.push(mount_point.clone());
-                (HolderReply { ok: true, err: None, dev: Some(dev) }, Some(mount_point))
-            }
-        },
-        HolderRequest::Release { mount_point } => {
-            let mine = st.held.get(&mount_point).is_some_and(|h| h.lease == Some(conn) || h.lease.is_none());
-            if mine {
-                st.held.remove(&mount_point);
-                log::info!("fd holder: released the connection for {}", mount_point.display());
-            }
-            leases.retain(|m| m != &mount_point);
-            (HolderReply { ok: mine, err: (!mine).then(|| "not the lease holder".into()), dev: None }, None)
-        }
+        std::process::exit(143);
     }
+    let _ = sd_notify("STOPPING=1", None);
+    match drain_for_handover() {
+        Ok(true) => log::info!("SIGTERM: drained; exact handle snapshot written — exiting with the FUSE connection kept in the systemd fd store"),
+        Ok(false) => log::info!("SIGTERM: exiting with the FUSE connection kept in the systemd fd store (no handle snapshot)"),
+        Err(e) => log::warn!("SIGTERM: handle snapshot failed ({}) — exiting with the FUSE connection kept in the systemd fd store", e),
+    }
+    std::process::exit(0);
 }
 
 #[cfg(test)]
@@ -1163,20 +817,42 @@ mod tests {
 98 97 0:76 / /mnt/stacked rw shared:53 - tmpfs tmpfs rw
 ";
 
+    fn one(p: &str) -> Vec<Vec<u8>> {
+        mount_point_spellings(Path::new(p))
+    }
+
     #[test]
     fn mountinfo_finds_the_fuse_mount_with_escaped_path() {
-        let d = parse_mountinfo_dev(MOUNTINFO, Path::new("/home/u/Next cloud")).unwrap();
+        let d = parse_mountinfo_dev(MOUNTINFO, &one("/home/u/Next cloud")).unwrap();
         assert_eq!(d, ConnDev { major: 0, minor: 73 });
         // A trailing slash in the configured path still matches.
-        assert_eq!(parse_mountinfo_dev(MOUNTINFO, Path::new("/home/u/Next cloud/")), Some(d));
+        assert_eq!(parse_mountinfo_dev(MOUNTINFO, &one("/home/u/Next cloud/")), Some(d));
     }
 
     #[test]
     fn mountinfo_ignores_non_fuse_and_covered_mounts() {
-        assert_eq!(parse_mountinfo_dev(MOUNTINFO, Path::new("/mnt/plain")), None);
+        assert_eq!(parse_mountinfo_dev(MOUNTINFO, &one("/mnt/plain")), None);
         // fuse.sshfs mounted first, then covered by a tmpfs: a lookup reaches the tmpfs.
-        assert_eq!(parse_mountinfo_dev(MOUNTINFO, Path::new("/mnt/stacked")), None);
-        assert_eq!(parse_mountinfo_dev(MOUNTINFO, Path::new("/nowhere")), None);
+        assert_eq!(parse_mountinfo_dev(MOUNTINFO, &one("/mnt/stacked")), None);
+        assert_eq!(parse_mountinfo_dev(MOUNTINFO, &one("/nowhere")), None);
+    }
+
+    #[test]
+    fn mountinfo_matches_a_mount_point_configured_through_a_symlink() {
+        // ~/Nextcloud where ~ is a symlink: mountinfo lists the resolved path.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("home");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mp = link.join("Nextcloud");
+        let listed = real.join("Nextcloud");
+        let text = format!("95 29 0:80 / {} rw - fuse ncrs rw\n", listed.display());
+        let spellings = mount_point_spellings(&mp);
+        assert_eq!(spellings.len(), 2, "literal and canonical spelling");
+        assert_eq!(parse_mountinfo_dev(&text, &spellings), Some(ConnDev { major: 0, minor: 80 }));
+        // The mount point itself is never resolved: it does not even exist here.
+        assert!(!mp.exists());
     }
 
     #[test]
@@ -1211,103 +887,45 @@ mod tests {
     }
 
     #[test]
-    fn holder_messages_round_trip() {
-        let req = HolderRequest::Deposit {
-            mount_point: PathBuf::from("/m"),
-            dev: ConnDev { major: 0, minor: 9 },
-            exe: PathBuf::from("/usr/bin/ncrs"),
-            args: vec!["--config".into(), "/c.yaml".into()],
+    fn sd_notify_datagram_carries_the_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify");
+        let server = UnixDatagram::bind(&path).unwrap();
+        // SAFETY: an all-zero sockaddr_un is valid.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let b = path.as_os_str().as_bytes();
+        for (i, c) in b.iter().enumerate() {
+            addr.sun_path[i] = *c as libc::c_char;
+        }
+        let len = (std::mem::size_of::<libc::sa_family_t>() + b.len()) as libc::socklen_t;
+        let f: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let sock = UnixDatagram::unbound().unwrap();
+        send_with_fd(sock.as_fd(), b"FDSTORE=1\nFDNAME=ncrsfuse-0-1", Some(f.as_fd()), (&addr, len)).unwrap();
+        let mut buf = [0u8; 64];
+        let mut cbuf = [0u64; 8];
+        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+        // SAFETY: an all-zero msghdr is a valid empty message; buffers outlive the call.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
+        let n = unsafe { libc::recvmsg(server.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        assert_eq!(&buf[..n as usize], b"FDSTORE=1\nFDNAME=ncrsfuse-0-1");
+        // SAFETY: reading the control message the kernel just wrote.
+        let got = unsafe {
+            let c = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!c.is_null(), "descriptor attached");
+            assert_eq!(((*c).cmsg_level, (*c).cmsg_type), (libc::SOL_SOCKET, libc::SCM_RIGHTS));
+            OwnedFd::from_raw_fd(std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const RawFd))
         };
-        let s = serde_json::to_string(&req).unwrap();
-        assert!(s.contains("\"op\":\"deposit\""));
-        assert_eq!(serde_json::from_str::<HolderRequest>(&s).unwrap(), req);
-        let reply: HolderReply = serde_json::from_str("{\"ok\":false}").unwrap();
-        assert_eq!(reply, HolderReply::default());
-    }
-
-    fn dummy_fd() -> OwnedFd {
-        std::fs::File::open("/dev/null").unwrap().into()
-    }
-
-    fn deposit(st: &mut HolderState, conn: u64, leases: &mut Vec<PathBuf>) -> HolderReply {
-        let req = HolderRequest::Deposit {
-            mount_point: PathBuf::from("/m"),
-            dev: ConnDev { major: 0, minor: 9 },
-            exe: PathBuf::from("/bin/true"),
-            args: vec![],
-        };
-        handle_holder_request(st, conn, req, Some(dummy_fd()), leases).0
-    }
-
-    #[test]
-    fn holder_hands_over_only_an_orphaned_connection() {
-        let mut st = HolderState::default();
-        let mut l1 = Vec::new();
-        assert!(deposit(&mut st, 1, &mut l1).ok);
-        // The depositor still serves it: a second daemon must not get it.
-        let mut l2 = Vec::new();
-        let (r, give) = handle_holder_request(&mut st, 2, HolderRequest::Take { mount_point: "/m".into() }, None, &mut l2);
-        assert_eq!((r.ok, r.err.as_deref(), give), (false, Some("busy"), None));
-        // The depositor dies (what holder_client does on EOF).
-        st.held.get_mut(Path::new("/m")).unwrap().lease = None;
-        let (r, give) = handle_holder_request(&mut st, 2, HolderRequest::Take { mount_point: "/m".into() }, None, &mut l2);
-        assert!(r.ok);
-        assert_eq!(r.dev, Some(ConnDev { major: 0, minor: 9 }));
-        assert_eq!(give, Some(PathBuf::from("/m")));
-        assert_eq!(st.held[Path::new("/m")].lease, Some(2));
-        assert_eq!(l2, vec![PathBuf::from("/m")]);
-    }
-
-    #[test]
-    fn holder_release_only_from_the_lease_holder() {
-        let mut st = HolderState::default();
-        let mut l1 = Vec::new();
-        deposit(&mut st, 1, &mut l1);
-        let mut l2 = Vec::new();
-        let (r, _) = handle_holder_request(&mut st, 2, HolderRequest::Release { mount_point: "/m".into() }, None, &mut l2);
-        assert!(!r.ok, "a stranger cannot drop a served connection");
-        assert!(st.held.contains_key(Path::new("/m")));
-        let (r, _) = handle_holder_request(&mut st, 1, HolderRequest::Release { mount_point: "/m".into() }, None, &mut l1);
-        assert!(r.ok);
-        assert!(st.held.is_empty());
-        assert!(l1.is_empty());
-    }
-
-    #[test]
-    fn holder_take_of_unknown_mount_is_none() {
-        let mut st = HolderState::default();
-        let mut l = Vec::new();
-        let (r, give) = handle_holder_request(&mut st, 1, HolderRequest::Take { mount_point: "/x".into() }, None, &mut l);
-        assert_eq!((r.ok, r.err.as_deref(), give), (false, Some("none"), None));
-    }
-
-    #[test]
-    fn deposit_without_descriptor_is_refused() {
-        let mut st = HolderState::default();
-        let mut l = Vec::new();
-        let req = HolderRequest::Deposit { mount_point: "/m".into(), dev: ConnDev { major: 0, minor: 1 }, exe: "/x".into(), args: vec![] };
-        let (r, _) = handle_holder_request(&mut st, 1, req, None, &mut l);
-        assert!(!r.ok);
-        assert!(st.held.is_empty());
-    }
-
-    #[test]
-    fn fd_passing_round_trips_over_a_socketpair() {
-        let (a, b) = UnixStream::pair().unwrap();
-        let f = dummy_fd();
-        send_json(&a, &HolderReply { ok: true, err: None, dev: None }, Some(f.as_fd())).unwrap();
-        let (line, got) = recv_line(&b).unwrap();
-        let reply: HolderReply = serde_json::from_slice(&line).unwrap();
-        assert!(reply.ok);
-        let got = got.expect("descriptor attached");
         assert_ne!(got.as_raw_fd(), f.as_raw_fd(), "the receiver gets its own descriptor");
-        // SAFETY: F_GETFD on a descriptor this test owns.
-        let flags = unsafe { libc::fcntl(got.as_raw_fd(), libc::F_GETFD) };
-        assert!(flags & libc::FD_CLOEXEC != 0, "received descriptors must not leak into children");
     }
 
     #[test]
     fn dev_null_is_not_dev_fuse() {
-        assert!(!is_dev_fuse(dummy_fd().as_fd()));
+        let f: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        assert!(!is_dev_fuse(f.as_fd()));
     }
 }

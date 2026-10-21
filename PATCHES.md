@@ -234,9 +234,9 @@ read client if the field shows silent-path-death windows in practice.
 
 **Target:** `cberner/fuser`, version `0.17.0`. Needed by daemon-restart
 survival (`ncrs_core/src/handoff.rs`, `state_snapshot.rs`): a restarted ncrs
-takes over the *live* `/dev/fuse` connection (from its own re-exec, from the
-fd-holder process, or from systemd's fd store) instead of mounting afresh, so
-programs keep their open file descriptors.
+takes over the *live* `/dev/fuse` connection (from its own re-exec or from
+systemd's fd store) instead of mounting afresh, so programs keep their open
+file descriptors. Design note: `docs/restart-survival.md`.
 
 ### The gap
 
@@ -261,8 +261,9 @@ it can only do that if the predecessor could record the number.
   owns no mount (dropping it unmounts nothing).
 - `BackingId::raw_id(&self) -> u32`.
 
-Diff: `git diff 3e7969b -- vendor/fuser` (the vendor import commit is the
-unmodified crate).
+Diff: `git diff <import> -- vendor/fuser`, where `<import>` is the commit
+"chore(vendor): import fuser 0.17.0 unmodified as the base for the reattach
+patch" (`git log --format=%h -1 --grep='import fuser 0.17.0 unmodified'`).
 
 ### Upstreaming
 

@@ -66,9 +66,10 @@ graph LR
 | `ipc-accept` | `ipc::start_ipc_server` | process exit |
 | `change-log` | `ipc::start_ipc_server` (IPC v3 change-log pump, every 250 ms) | process exit |
 | `desktop-refresh` | `desktop::Desktop::spawn_refresher` (re-detects file-browser profiles every 10 min) | process exit |
-| `handoff-log` | `state_snapshot::spawn_ticker` (logs the handle counter once a second and compacts the restart-survival log) | shutdown |
+| `handoff-log` | `state_snapshot::spawn_ticker` (logs the handle counter and writes queued node-id records once a second; compacts the restart-survival log, writing the new file outside the cache lock) | shutdown |
 | `handoff-restart` | `handoff::request_planned_restart` (one-shot: drains the scheduler, then re-executes the daemon with the FUSE connection) | done (on success the process image is replaced) |
-| `fd-holder-reap` | `handoff` when it starts the fd holder (waits for that child so it is reaped) | holder exit |
+| `sigterm` | `mount_ncfs` via `handoff::spawn_sigterm_thread`, when `main` blocked SIGTERM in every thread (sigwait: under systemd with the connection in the fd store, drains the scheduler, snapshots if drained and exits 0 without unmounting; otherwise re-raises SIGTERM's default action) | process exit |
+| `sd-watchdog` | `mount_ncfs` via `sd_watchdog::spawn`, only when systemd set `WATCHDOG_USEC` (pings `WATCHDOG=1` every WATCHDOG_USEC/3 while the global locks can be taken and the `fuse` pool makes progress) | process exit |
 
 ## Scoped fan-outs (`std::thread::scope`, joined before returning)
 
