@@ -163,4 +163,4 @@ components are internal to the service.
 place (same PID, picking up an upgraded binary) and takes its live FUSE
 connection over, so programs keep their open files. The reply comes first;
 the socket then closes and reappears within a few seconds — reconnect and
-`HELLO` again. See `ncrs_core/src/handoff.rs`.
+`HELLO` again. See `docs/restart-survival.md` and `ncrs_core/src/handoff.rs`.

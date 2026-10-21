@@ -63,11 +63,13 @@ case "$1" in
             raise_sysctl net.core.rmem_max 4194304
             raise_sysctl net.core.wmem_max 4194304
         fi
-        # ncrs.service is no longer enabled by default (the GUI tray app
-        # autostarts via /etc/xdg/autostart instead). Clean up the global
-        # enable left by <= 0.1.0 installs (the last version whose postinst
-        # enabled it); leave it alone on later upgrades so an admin's
-        # deliberate global enable survives.
+        # ncrs.service must not be enabled globally: the GUI tray app
+        # autostarts via /etc/xdg/autostart and starts the user service on
+        # demand (`systemctl --user start ncrs.service`), which is what keeps
+        # the mount alive across daemon restarts. Clean up the global enable
+        # left by <= 0.1.0 installs (the last version whose postinst enabled
+        # it); leave it alone on later upgrades so an admin's deliberate
+        # global enable survives.
         if [ -n "$2" ] && dpkg --compare-versions "$2" lt "0.1.1"; then
             if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running --quiet 2>/dev/null; then
                 systemctl --global disable ncrs.service || true

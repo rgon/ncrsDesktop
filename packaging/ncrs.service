@@ -3,6 +3,11 @@ Description=ncRS Nextcloud virtual filesystem
 Documentation=https://github.com/rgon/ncrsDesktop
 After=network-online.target
 Wants=network-online.target
+# A daemon that keeps failing — even right after taking the mount over — makes
+# the unit fail after 5 starts in 2 min; systemd then drops the stored FUSE
+# descriptor and programs on the mount get ENOTCONN instead of waiting forever.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -11,12 +16,19 @@ Restart=on-failure
 # Programs on the mount block (rather than fail) while it restarts — see below —
 # so come back quickly.
 RestartSec=3
-# Daemon-restart survival: ncrs parks its live FUSE descriptor in the fd store
-# (sd_notify FDSTORE=1) and takes it back from LISTEN_FDS after a crash or a
-# `systemctl --user restart`, so the mount and open files survive. NotifyAccess
-# is what exports NOTIFY_SOCKET to a Type=simple service.
+# Daemon-restart survival (docs/restart-survival.md): ncrs parks its live FUSE
+# descriptor in the fd store (sd_notify FDSTORE=1) and takes it back from
+# LISTEN_FDS after a crash or a `systemctl --user restart`, so the mount and
+# open files survive. NotifyAccess is what exports NOTIFY_SOCKET to a
+# Type=simple service.
 NotifyAccess=main
 FileDescriptorStoreMax=4
+# Keep the store across restarts only (systemd >= 254; also its default): a
+# `systemctl --user stop` or a failed unit drops it, which ends the mount.
+FileDescriptorStorePreserve=restart
+# ncrs pings while its global locks and FUSE workers make progress; a hung
+# daemon is killed and restarted, and the mount waits for the new one.
+WatchdogSec=90
 
 [Install]
 WantedBy=default.target
