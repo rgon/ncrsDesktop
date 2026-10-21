@@ -3357,7 +3357,7 @@ mod upload_order_tests {
     }
 
     #[test]
-    fn streaming_waits_for_the_threshold_then_sends_every_full_chunk() {
+    fn streaming_keeps_a_threshold_sized_tail_sliding_behind_the_writer() {
         let chunk = webdav_ops::CHUNK_SIZE as u64;
         let threshold = 100 * 1024 * 1024;
         // No session yet: a file a few chunks long stays local in full.
@@ -3367,8 +3367,10 @@ mod upload_order_tests {
         // A threshold below one chunk still waits for a full chunk.
         assert!(!stream_should_graduate(chunk - 1, None, 0));
         assert!(stream_should_graduate(chunk, None, 0));
-        // Session open: graduation follows the unsent tail, not the threshold.
-        let s = ChunkUploadState { uploads_base: "x".into(), next_index: 10, bytes_confirmed: 10 * chunk };
-        assert!(!stream_should_graduate(11 * chunk - 1, Some(&s), threshold));
-        assert!(stream_should_graduate(11 * chunk, Some(&s), threshold));
+        // Session open: one chunk sent leaves the tail under the threshold, so the next
+        // chunk only goes once the writer has added another chunk's worth.
+        let s = ChunkUploadState { uploads_base: "x".into(), next_index: 1, bytes_confirmed: chunk };
+        assert!(!stream_should_graduate(threshold, Some(&s), threshold));
+        assert!(!stream_should_graduate(threshold + chunk - 1, Some(&s), threshold));
+        assert!(stream_should_graduate(threshold + chunk, Some(&s), threshold));
     }
