@@ -865,7 +865,7 @@ fn planned_restart() -> io::Result<()> {
             log::warn!("handoff: requests still running after 3s — restarting anyway; the kernel resends them");
         }
     } else {
-        // UNVERIFIED: without a scheduler quiesce hook, a request mid-execution is
+        // Only without the scheduler (never in the daemon): a request mid-execution is
         // cut off by exec and replayed via FUSE_NOTIFY_RESEND (non-idempotent ops
         // like rename/unlink then see their own effect and may fail).
         std::thread::sleep(Duration::from_millis(200));

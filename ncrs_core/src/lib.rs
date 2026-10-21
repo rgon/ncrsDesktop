@@ -9897,6 +9897,9 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let handoff_next_fh = filesystem.next_fh.clone();
 
     let reattached = reattach.is_some();
+    let sched_fs = fuse_dispatch::SchedFs::new(filesystem);
+    // A planned restart drains the request scheduler before handing the connection over.
+    handoff::set_quiesce_hook(sched_fs.quiesce_hook());
     let session = match reattach {
         Some((ra, _)) => {
             log::info!("Reattaching to the live FUSE connection on {} ({:?})", options.mount_point.display(), ra.source);
@@ -9904,13 +9907,13 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             let own = fd.try_clone().map_err(|e| format!("FUSE reattach: cannot dup the descriptor: {}", e))?;
             // No FUSE_INIT on a live connection: init() is not called again, and the
             // capabilities the first daemon negotiated stay in force.
-            let session = fuser::Session::from_fd_initialized(fuse_dispatch::SchedFs::new(filesystem), fd, fuse_config.acl, fuse_config.clone());
+            let session = fuser::Session::from_fd_initialized(sched_fs, fd, fuse_config.acl, fuse_config.clone());
             handoff::adopt_reattached(own, dev, source, lease, &options.mount_point);
             session
         }
         None => {
             use std::os::fd::AsFd;
-            let session = fuser::Session::new(fuse_dispatch::SchedFs::new(filesystem), &options.mount_point, &fuse_config)
+            let session = fuser::Session::new(sched_fs, &options.mount_point, &fuse_config)
                 .map_err(|e| format!("FUSE session init failed: {}", e))?;
             if let Some(dev) = handoff::adopt_fresh(session.as_fd(), &options.mount_point) {
                 state_snapshot::start_fresh(&cache_dir, dev, &options.mount_point, &handoff_cache);

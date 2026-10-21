@@ -27,6 +27,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::bg;
 
@@ -53,6 +54,8 @@ struct State<K> {
     tasks: HashMap<u64, Task<K>>,
     peak_inflight: usize,
     dispatch_waits: u64,
+    // Set by `quiesce`: no new task is taken until then, so requests wait in the kernel.
+    paused_until: Option<Instant>,
 }
 
 pub(crate) struct Scheduler<K> {
@@ -84,6 +87,7 @@ impl<K: Copy + Eq + Hash + Send + 'static> Scheduler<K> {
                 tasks: HashMap::new(),
                 peak_inflight: 0,
                 dispatch_waits: 0,
+                paused_until: None,
             }),
             room: Condvar::new(),
         })
@@ -109,6 +113,14 @@ impl<K: Copy + Eq + Hash + Send + 'static> Scheduler<K> {
             }
         }
         let mut st = self.lock();
+        while let Some(until) = st.paused_until {
+            let now = Instant::now();
+            if now >= until {
+                st.paused_until = None;
+                break;
+            }
+            st = self.room.wait_timeout(st, until - now).unwrap_or_else(|e| e.into_inner()).0;
+        }
         if st.tasks.len() >= self.max_inflight {
             st.dispatch_waits += 1;
             let waits = st.dispatch_waits;
@@ -193,6 +205,25 @@ impl<K: Copy + Eq + Hash + Send + 'static> Scheduler<K> {
         }
     }
 
+    /// For a planned daemon restart: stops taking new tasks (the dispatch thread waits, so
+    /// further requests stay queued in the kernel for the next daemon) and waits up to
+    /// `budget` for every task in flight to finish; true when none is left. The pause
+    /// lifts by itself a few seconds after the budget, so a restart that then fails
+    /// leaves the mount working again rather than stuck.
+    pub(crate) fn quiesce(&self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        let mut st = self.lock();
+        st.paused_until = Some(deadline + Duration::from_secs(5));
+        while !st.tasks.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            st = self.room.wait_timeout(st, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
+
     /// Keys with a task waiting or running on them right now.
     pub(crate) fn busy_keys(&self) -> Vec<K> {
         self.lock().queues.keys().copied().collect()
@@ -256,6 +287,34 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(20), "scheduler never drained: {:?}", s.stats());
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn quiesce_waits_for_running_tasks_and_holds_new_ones_back_until_it_lifts() {
+        let s = sched("t-quiesce", 2, 64);
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let d = done.clone();
+        s.submit(&[(1, Mode::Exclusive)], move || {
+            gate.recv().unwrap();
+            d.lock().unwrap().push(1);
+        });
+        assert!(!s.quiesce(Duration::from_millis(50)), "not idle while a task runs");
+        go.send(()).unwrap();
+        assert!(s.quiesce(Duration::from_millis(500)), "idle once it finished");
+        assert_eq!(*done.lock().unwrap(), vec![1]);
+        // While paused a submit (the dispatch thread) waits; the pause lifts on its own.
+        let paused_at = Instant::now();
+        std::thread::scope(|scope| {
+            let d = done.clone();
+            let s2 = s.clone();
+            scope.spawn(move || s2.submit(&[(2, Mode::Exclusive)], move || d.lock().unwrap().push(2)));
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(done.lock().unwrap().len(), 1, "nothing is taken while paused");
+        });
+        wait_drained(&s);
+        assert_eq!(*done.lock().unwrap(), vec![1, 2]);
+        assert!(paused_at.elapsed() >= Duration::from_secs(4), "the pause lasted until it lifted");
     }
 
     /// Tiny deterministic xorshift, so a failure reproduces.
