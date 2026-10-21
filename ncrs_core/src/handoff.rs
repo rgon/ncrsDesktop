@@ -80,6 +80,7 @@ const MAX_RESPAWNS: usize = 3;
 const RESPAWN_WINDOW: Duration = Duration::from_secs(600);
 /// A holder that ends up holding nothing exits after this long.
 const HOLDER_IDLE_EXIT: Duration = Duration::from_secs(10);
+const HOLDER_MAX_CONNS: usize = 16;
 
 /// The kernel's id for one FUSE connection: the device number of its mount
 /// (`st_dev` of the mount root, field 3 of /proc/self/mountinfo).
@@ -800,11 +801,9 @@ fn spawn_holder(socket: &Path) -> io::Result<()> {
         });
     }
     let mut child = cmd.spawn()?;
-    std::thread::Builder::new()
-        .name("fd-holder-reap".into())
-        .spawn(move || {
-            let _ = child.wait();
-        })?;
+    crate::bg::spawn_service("fd-holder-reap", move || {
+        let _ = child.wait();
+    })?;
     Ok(())
 }
 
@@ -847,16 +846,14 @@ pub fn request_planned_restart() -> Result<(), String> {
     if LIVE.safe_lock().is_none() {
         return Err("no FUSE connection to hand over (not mounted, or restart survival unavailable)".into());
     }
-    std::thread::Builder::new()
-        .name("handoff-restart".into())
-        .spawn(|| {
-            // Let the IPC reply reach the client before this image is replaced.
-            std::thread::sleep(Duration::from_millis(150));
-            if let Err(e) = planned_restart() {
-                log::error!("handoff: planned restart failed, still running: {}", e);
-            }
-        })
-        .map_err(|e| e.to_string())?;
+    crate::bg::spawn_service("handoff-restart", || {
+        // Let the IPC reply reach the client before this image is replaced.
+        std::thread::sleep(Duration::from_millis(150));
+        if let Err(e) = planned_restart() {
+            log::error!("handoff: planned restart failed, still running: {}", e);
+        }
+    })
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -950,7 +947,7 @@ pub fn run_holder(socket: &Path) -> i32 {
     {
         let state = state.clone();
         let socket = socket.to_path_buf();
-        let _ = std::thread::Builder::new().name("fd-holder-watch".into()).spawn(move || loop {
+        holder_thread("fd-holder-watch", move || loop {
             std::thread::sleep(Duration::from_secs(1));
             let empty = holder_tick(&mut state.safe_lock(), Instant::now());
             if empty && started.elapsed() > HOLDER_IDLE_EXIT {
@@ -960,15 +957,36 @@ pub fn run_holder(socket: &Path) -> i32 {
             }
         });
     }
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         if !peer_is_us(&conn) {
             continue;
         }
+        // One per daemon (its lease) plus short-lived takes: a pile-up means
+        // something is looping, not more daemons to serve.
+        if active.load(std::sync::atomic::Ordering::SeqCst) >= HOLDER_MAX_CONNS {
+            continue;
+        }
+        active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let state = state.clone();
-        let _ = std::thread::Builder::new().name("fd-holder-conn".into()).spawn(move || holder_client(conn, state));
+        let active = active.clone();
+        holder_thread("fd-holder-conn", move || {
+            holder_client(conn, state);
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
     }
     0
+}
+
+/// Threads of the holder *process*. bg::'s lifetime budgets exist to bound the
+/// daemon; the holder is a separate, tiny process whose threads are one watcher
+/// plus at most HOLDER_MAX_CONNS live connections, so it spawns directly.
+#[allow(clippy::disallowed_methods)]
+fn holder_thread(name: &str, f: impl FnOnce() + Send + 'static) {
+    if let Err(e) = std::thread::Builder::new().name(name.to_string()).spawn(f) {
+        log::error!("fd holder: cannot start {} thread: {}", name, e);
+    }
 }
 
 fn drop_capabilities() {
@@ -1037,11 +1055,9 @@ fn respawn_daemon(exe: &Path, args: &[String]) {
         .env_remove(ENV_DEV)
         .env_remove(ENV_LEASE_FD);
     match cmd.spawn() {
-        Ok(mut child) => {
-            let _ = std::thread::Builder::new().name("fd-holder-reap".into()).spawn(move || {
-                let _ = child.wait();
-            });
-        }
+        Ok(mut child) => holder_thread("fd-holder-reap", move || {
+            let _ = child.wait();
+        }),
         Err(e) => log::error!("fd holder: cannot restart {}: {}", exe.display(), e),
     }
 }
