@@ -6,6 +6,9 @@ members = [
   "plugins/nc_passwords",
   "plugins/nc_gnome_integration",
 ]
+# Patched third-party crates (see [patch.crates-io] below) are dependencies,
+# not members: keep `cargo test --workspace` from running their own suites.
+exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]
@@ -16,3 +19,9 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 clap = "4.5.40"
+
+# fuser 0.17.0 plus the reattach patch (Session::from_fd_initialized,
+# BackingId::raw_id) that lets a restarted daemon take over a live FUSE
+# connection. See PATCHES.md, "fuser: reattach".
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }
