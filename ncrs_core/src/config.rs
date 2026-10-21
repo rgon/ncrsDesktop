@@ -691,7 +691,7 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# it to the server in 10 MiB pieces while it is still being written instead of\n");
     content.push_str("# saving all of it locally first. Saves disk space on big copies; a program\n");
     content.push_str("# that later rewrites the already-sent start of the file gets a write error.\n");
-    content.push_str("# Set false to always stage the whole file locally. Applies to newly opened files.\n");
+    content.push_str("# Set false to always stage the whole file locally. Applies to files opened after the change.\n");
     content.push_str(&format!("stream_uploads: {}\n", settings.stream_uploads));
     content.push_str(&format!("stream_upload_threshold_mb: {}\n", settings.stream_upload_threshold_mb));
 

@@ -3315,6 +3315,48 @@ mod upload_order_tests {
     }
 
     #[test]
+    fn a_moved_folder_takes_its_subtree_along_in_the_inode_map() {
+        let mut c = make_test_cache();
+        let dir = c.allocate_inode(PathBuf::from("/a"));
+        let file = c.allocate_inode(PathBuf::from("/a/x.txt"));
+        let deep = c.allocate_inode(PathBuf::from("/a/sub/y.txt"));
+        let sibling = c.allocate_inode(PathBuf::from("/ab/z.txt"));
+        c.move_path(Path::new("/a"), Path::new("/b"), true);
+        assert_eq!(c.get_path(dir), Some(PathBuf::from("/b")));
+        assert_eq!(c.get_path(file), Some(PathBuf::from("/b/x.txt")));
+        assert_eq!(c.get_path(deep), Some(PathBuf::from("/b/sub/y.txt")));
+        assert_eq!(c.get_inode(Path::new("/b/x.txt")), Some(file));
+        assert_eq!(c.get_inode(Path::new("/a/x.txt")), None);
+        // A path that only shares the prefix as a string is not under the folder.
+        assert_eq!(c.get_path(sibling), Some(PathBuf::from("/ab/z.txt")));
+
+        // A file rename moves just that inode and drops the one it replaced.
+        let target = c.allocate_inode(PathBuf::from("/b/doc.odt"));
+        let tmp = c.allocate_inode(PathBuf::from("/b/lu1.tmp"));
+        c.move_path(Path::new("/b/lu1.tmp"), Path::new("/b/doc.odt"), false);
+        assert_eq!(c.get_inode(Path::new("/b/doc.odt")), Some(tmp));
+        assert_eq!(c.get_path(target), None);
+        assert_eq!(c.get_path(file), Some(PathBuf::from("/b/x.txt")));
+    }
+
+    #[test]
+    fn shrinking_the_tail_keeps_exactly_the_unsent_bytes() {
+        let dir = staging_dir("shrink-tail");
+        let wp = dir.join("write_1");
+        let chunk = webdav_ops::CHUNK_SIZE;
+        let data = pattern(chunk * 2 + 1234);
+        std::fs::write(&wp, &data).unwrap();
+        shrink_tail_file(&wp, chunk as u64).unwrap();
+        assert_eq!(std::fs::read(&wp).unwrap(), data[chunk..], "in place or by copy, the same bytes remain");
+        // The whole file being the sent chunk (collapse refuses that): falls back to the copy.
+        std::fs::write(&wp, &data[..chunk]).unwrap();
+        shrink_tail_file(&wp, chunk as u64).unwrap();
+        assert_eq!(std::fs::read(&wp).unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_rewrite_into_the_unsent_tail_lands_at_its_file_offset() {
         // LibreOffice rewrites the 4 KiB block it is in the middle of; past the first
         // chunk that block is in the tail, which starts at file offset bytes_confirmed.

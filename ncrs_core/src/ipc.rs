@@ -1431,6 +1431,21 @@ fn handle_client_loop(
                 (Some(_), Some(_)) => "error: not mounted".to_string(),
                 _ => "error: usage WALKER_LIMIT on|off <listings/s 1-1000>".to_string(),
             }
+        } else if let Some(args) = trimmed.strip_prefix("STREAM_UPLOADS ") {
+            // "STREAM_UPLOADS on 100" / "STREAM_UPLOADS off 100": applies to files opened next.
+            let mut it = args.split_whitespace();
+            let enabled = match it.next() {
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                _ => None,
+            };
+            match (enabled, it.next().and_then(|n| n.parse::<u64>().ok())) {
+                (Some(on), Some(mb)) => {
+                    crate::set_stream_uploads(on, mb);
+                    "ok".to_string()
+                }
+                _ => "error: usage STREAM_UPLOADS on|off <threshold MB>".to_string(),
+            }
         } else if trimmed == "STATE" {
             let active = !transfer_map.safe_lock().is_empty();
             state_word(&paused, &offline, active).to_string()

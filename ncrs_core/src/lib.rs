@@ -1126,7 +1126,23 @@ struct ChunkUploadState {
 /// the tail slides along behind the writer at just under the threshold. A file smaller
 /// than that never meets already-sent data, and a larger one can still be rewritten in
 /// its last threshold-minus-a-chunk bytes (a zip entry's header, LibreOffice's block).
-/// One chunk per write also bounds how long write() holds the only FUSE thread.
+/// One chunk per write also bounds how long write() holds a fuse worker and the file's queue.
+// The streamed-upload settings, read per open and per write so a change in Settings
+// applies to files opened after it without a remount (the GUI forwards it over IPC as
+// STREAM_UPLOADS). Seeded from the config at mount.
+static STREAM_UPLOADS: AtomicBool = AtomicBool::new(true);
+static STREAM_UPLOAD_THRESHOLD_MB: AtomicU64 = AtomicU64::new(100);
+
+/// Applies the streamed-upload settings to the running daemon.
+pub fn set_stream_uploads(enabled: bool, threshold_mb: u64) {
+    STREAM_UPLOADS.store(enabled, Ordering::Relaxed);
+    STREAM_UPLOAD_THRESHOLD_MB.store(threshold_mb, Ordering::Relaxed);
+}
+
+fn stream_upload_threshold() -> u64 {
+    STREAM_UPLOAD_THRESHOLD_MB.load(Ordering::Relaxed).saturating_mul(1024 * 1024)
+}
+
 fn stream_should_graduate(total_written: u64, session: Option<&ChunkUploadState>, threshold: u64) -> bool {
     let unsent = total_written - session.map_or(0, |s| s.bytes_confirmed);
     unsent >= threshold.max(webdav_ops::CHUNK_SIZE as u64)
@@ -1292,6 +1308,19 @@ fn write_into_tail_file(wp: &Path, tail_off: u64, data: &[u8]) -> std::io::Resul
 /// regardless of the total file size.
 fn shrink_tail_file(wp: &Path, skip: u64) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
+    // Cut the sent prefix out in place where the filesystem can (ext4, xfs): the tail
+    // keeps up to the stream threshold behind the writer, so copying it after every sent
+    // chunk would rewrite ~90 MiB per 10 MiB uploaded. Elsewhere, or when the tail is
+    // exactly the sent chunk (collapsing up to EOF is refused), copy what is left.
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::OpenOptions::new().write(true).open(wp)?;
+        // SAFETY: a plain syscall on an fd this scope owns; no memory is passed.
+        let r = unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_COLLAPSE_RANGE, 0, skip as libc::off_t) };
+        if r == 0 {
+            return Ok(());
+        }
+    }
     let mut leftover = Vec::new();
     {
         let mut src = std::fs::File::open(wp)?;
@@ -2269,6 +2298,34 @@ impl FsCache {
 
     fn get_inode(&self, path: &Path) -> Option<u64> {
         self.paths.get(path).copied()
+    }
+
+    /// Re-points the inode map after a rename of `from` to `to`. A moved folder takes its
+    /// subtree along: every inode below it gets its new path too, or a file the kernel
+    /// still knows by its inode would resolve to where it was before the rename.
+    fn move_path(&mut self, from: &Path, to: &Path, subtree: bool) {
+        let mut moves = Vec::new();
+        if let Some(ino) = self.paths.get(from) {
+            moves.push((from.to_path_buf(), *ino));
+        }
+        if subtree {
+            moves.extend(self.paths.iter()
+                .filter(|(p, _)| p.starts_with(from) && p.as_path() != from)
+                .map(|(p, i)| (p.clone(), *i)));
+        }
+        for (old, ino) in moves {
+            self.paths.remove(&old);
+            let new = match old.strip_prefix(from) {
+                Ok(rel) if !rel.as_os_str().is_empty() => to.join(rel),
+                _ => to.to_path_buf(),
+            };
+            self.inodes.insert(ino, new.clone());
+            if let Some(displaced) = self.paths.insert(new, ino) {
+                if displaced != ino {
+                    self.inodes.remove(&displaced);
+                }
+            }
+        }
     }
 
     fn allocate_inode(&mut self, path: PathBuf) -> u64 {
@@ -4093,10 +4150,6 @@ pub struct NextCloudFs {
     auto_keep_cached_files: bool,
     read_ahead_bytes: usize,
     cache_streamed_reads: bool,
-    // New files stream to the server past `stream_upload_threshold` bytes; off stages
-    // every write in full (see ChunkUploadState).
-    stream_uploads: bool,
-    stream_upload_threshold: u64,
     exclude_folders: HashSet<PathBuf>,
     thumb_inflight: Arc<Mutex<HashSet<PathBuf>>>,
     cleanup_stale_gio_temps: bool,
@@ -4106,6 +4159,7 @@ pub struct NextCloudFs {
 impl NextCloudFs {
     pub fn new(options: MountOptions) -> Result<Self, String> {
         let creds = options.credentials()?;
+        set_stream_uploads(options.stream_uploads, options.stream_upload_threshold_mb);
 
         let exclude_folders: HashSet<PathBuf> = options.exclude_folders.iter().map(|s| {
             let s = s.trim();
@@ -4348,8 +4402,6 @@ impl NextCloudFs {
             auto_keep_cached_files: options.auto_keep_cached_files,
             read_ahead_bytes: options.read_ahead_bytes,
             cache_streamed_reads: options.cache_streamed_reads,
-            stream_uploads: options.stream_uploads,
-            stream_upload_threshold: options.stream_upload_threshold_mb.saturating_mul(1024 * 1024),
             exclude_folders,
             thumb_inflight: Arc::new(Mutex::new(HashSet::new())),
             cleanup_stale_gio_temps: options.cleanup_stale_gio_temps,
@@ -4766,7 +4818,7 @@ impl NextCloudFs {
         total_written: u64,
     ) -> Result<ChunkUploadState, (String, Option<ChunkUploadState>)> {
         loop {
-            if !stream_should_graduate(total_written, state.as_ref(), self.stream_upload_threshold) {
+            if !stream_should_graduate(total_written, state.as_ref(), stream_upload_threshold()) {
                 return state.clone().ok_or((
                     "graduate_chunk called with nothing to graduate".to_string(),
                     state,
@@ -6230,7 +6282,7 @@ impl NextCloudFs {
                 last_read: Instant::now(),
                 total_written: 0,
                 // Only an empty staging file can stream from offset 0.
-                stream_eligible: self.stream_uploads && !seeded,
+                stream_eligible: STREAM_UPLOADS.load(Ordering::Relaxed) && !seeded,
                 chunk_upload: None,
                 ino: ino.0,
                 io_kind: grant.kind(),
@@ -7217,7 +7269,7 @@ impl NextCloudFs {
             of.dirty = true;
             of.total_written = of.total_written.max(offset + data.len() as u64);
 
-            if stream_should_graduate(of.total_written, of.chunk_upload.as_ref(), self.stream_upload_threshold) {
+            if stream_should_graduate(of.total_written, of.chunk_upload.as_ref(), stream_upload_threshold()) {
                 let total_written = of.total_written;
                 let existing_session = of.chunk_upload.clone();
                 let had_session = existing_session.is_some();
@@ -7483,7 +7535,7 @@ impl NextCloudFs {
                 lookahead_inflight: false,
                 last_read: Instant::now(),
                 total_written: 0,
-                stream_eligible: self.stream_uploads,
+                stream_eligible: STREAM_UPLOADS.load(Ordering::Relaxed),
                 chunk_upload: None,
                 ino,
                 io_kind,
@@ -8002,6 +8054,7 @@ impl NextCloudFs {
                 dir.files = Arc::new(keep);
                 moved_entry = removed.into_iter().next();
             }
+            let moved_dir = moved_entry.as_ref().is_some_and(|e| e.is_dir) || c.dir_cache.contains_key(&from);
             if let Some(mut entry) = moved_entry {
                 // rename() can arrive at the FUSE dispatcher concurrently with flush() or
                 // even before it (multi-threaded fuser dispatches ops in parallel).  When
@@ -8030,14 +8083,7 @@ impl NextCloudFs {
             // Keep the inode-to-path map consistent with the rename. Without this,
             // getattr(ino) resolves the inode to the old source path, finds nothing in
             // dir_cache, and returns ENOENT — causing the renamed file to disappear.
-            if let Some(ino) = c.paths.remove(&from) {
-                c.inodes.insert(ino, to.clone());
-                if let Some(displaced) = c.paths.insert(to.clone(), ino) {
-                    if displaced != ino {
-                        c.inodes.remove(&displaced);
-                    }
-                }
-            }
+            c.move_path(&from, &to, moved_dir);
         }
         // Keep in-memory maps consistent with the rename so DETAILDIR/STATUS reflect the new
         // path immediately, without waiting for the next readdir of either directory.
