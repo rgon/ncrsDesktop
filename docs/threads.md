@@ -66,6 +66,9 @@ graph LR
 | `ipc-accept` | `ipc::start_ipc_server` | process exit |
 | `change-log` | `ipc::start_ipc_server` (IPC v3 change-log pump, every 250 ms) | process exit |
 | `desktop-refresh` | `desktop::Desktop::spawn_refresher` (re-detects file-browser profiles every 10 min) | process exit |
+| `handoff-log` | `state_snapshot::spawn_ticker` (logs the handle counter once a second and compacts the restart-survival log) | shutdown |
+| `handoff-restart` | `handoff::request_planned_restart` (one-shot: drains the scheduler, then re-executes the daemon with the FUSE connection) | done (on success the process image is replaced) |
+| `fd-holder-reap` | `handoff` when it starts the fd holder (waits for that child so it is reaped) | holder exit |
 
 ## Scoped fan-outs (`std::thread::scope`, joined before returning)
 
