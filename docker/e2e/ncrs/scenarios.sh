@@ -1287,14 +1287,14 @@ else
     timeout -s KILL 2 ls "$SC_MOUNT/sched/other" >/dev/null 2>&1; lrc=$?
     timeout -s KILL 2 stat "$SC_MOUNT/sched/other/a.txt" >/dev/null 2>&1; src=$?
     t2=$(ms_now)
-    grep -q "SLOW GET .*slowpoke.bin" "$SC_LOG" && grep -q "SLOW PROPFIND .*slowpoke-dir" "$SC_LOG" \
-        || no "setup: the proxy never held the slow requests — the check below would prove nothing"
     if [ "$lrc" = 0 ] && [ "$src" = 0 ] && [ $((t2 - t1)) -lt 2000 ]; then
         ok "ls/stat of an unrelated folder answered in $((t2 - t1)) ms while an open and a lookup waited on the server"
     else
         no "ls/stat of an unrelated folder blocked behind a slow request (ls rc=$lrc, stat rc=$src, $((t2 - t1)) ms; 137 = still blocked when killed)"
     fi
     wait "$SO_PID" "$SL_PID"
+    grep -q "SLOW GET .*slowpoke.bin" "$SC_LOG" && grep -q "SLOW PROPFIND .*slowpoke-dir" "$SC_LOG" \
+        || no "setup: the proxy never held the slow requests — the check above proved nothing"
     read -r orc oms < /tmp/sched.open.rc
     read -r krc kms < /tmp/sched.lookup.rc
     if [ "$orc" = 0 ] && [ "$krc" = 0 ] && [ "$oms" -ge $(( (SC_SLOW - 2) * 1000 )) ]; then
