@@ -219,6 +219,15 @@ impl Pool {
 // Sizes are upper bounds on threads, not targets: workers exist only while
 // there is work. Queues absorb bursts; what overflows them is refused.
 
+/// FUSE request bodies, run in per-inode order by `fuse_sched` (the dispatch
+/// thread only orders them). Small and fixed: a request that waits on the
+/// network holds one of these and only its own inodes' queues. The queue holds
+/// every task the scheduler lets be in flight, so a runnable one is never refused.
+pub static FUSE: Pool = Pool::new("fuse", FUSE_WORKERS, FUSE_MAX_INFLIGHT);
+pub const FUSE_WORKERS: usize = 8;
+/// Requests queued or running at once; past it the dispatch thread waits.
+pub const FUSE_MAX_INFLIGHT: usize = 4096;
+
 /// FUSE readdir/readdirplus workers. A reply travels with each job, so the
 /// dispatch thread never blocks on the network. Concurrency is bounded by
 /// kernel callers anyway (each blocked `readdir(3)` is one caller).
@@ -297,7 +306,7 @@ pub const THUMB_WORKERS: usize = 2;
 pub static USER: Pool = Pool::new("user", USER_WORKERS, 4096);
 pub const USER_WORKERS: usize = 4;
 
-pub static POOLS: [&Pool; 12] = [&READDIR, &READ, &STREAM, &DNS, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER];
+pub static POOLS: [&Pool; 13] = [&FUSE, &READDIR, &READ, &STREAM, &DNS, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER];
 
 /// Named long-lived threads: the FUSE session, connectivity monitor, push
 /// watcher, IPC accept loop, savers, cleanup. Fixed in number.
@@ -370,7 +379,8 @@ pub const MAX_THREADS: usize = {
 pub const HTTP_SINGLETON_CLIENTS: usize = 7;
 pub const MAX_HTTP_CLIENT_THREADS: usize = HTTP_SINGLETON_CLIENTS + 2 * crate::http_clients::DOWNLOAD_CONNECTIONS;
 
-const POOL_SIZES: [usize; 12] = [
+const POOL_SIZES: [usize; 13] = [
+    FUSE_WORKERS,
     READDIR_WORKERS,
     READ_WORKERS,
     STREAM_WORKERS,
