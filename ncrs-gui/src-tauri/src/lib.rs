@@ -97,22 +97,93 @@ fn ncrs_binary_path() -> std::path::PathBuf {
     std::path::PathBuf::from("ncrs")
 }
 
-/// Spawn the ncrs daemon, preferring a systemd-managed transient scope over a
-/// bare child process — this gets it the same supervision the `ncrs.service`
-/// path already has (its own cgroup, `systemctl --user status ncrs.scope`,
-/// `journalctl --user` capturing its output instead of it being lost in
-/// ncrs-gui's own stdout) without needing that unit pre-enabled.
+/// The systemd user unit the .deb installs (packaging/ncrs.service, at
+/// /usr/lib/systemd/user/ncrs.service), and the binary it runs.
+const NCRS_UNIT: &str = "ncrs.service";
+const NCRS_UNIT_EXEC: &str = "/usr/bin/ncrs";
+
+/// How the daemon was started.
+enum DaemonStart {
+    /// As `ncrs.service`: systemd supervises it and keeps the mount alive across
+    /// its restarts (docs/restart-survival.md).
+    Service,
+    /// As a child of this process (transient scope or plain spawn).
+    Child(std::process::Child),
+}
+
+/// Runs `systemctl --user <args>`, giving up after `limit` (a wedged user bus
+/// must not hang the GUI). None when systemctl is missing or timed out;
+/// otherwise whether it succeeded and its trimmed stdout.
+fn systemctl_user(args: &[&str], limit: Duration) -> Option<(bool, String)> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut out = String::new();
+    if let Some(mut so) = child.stdout.take() {
+        let _ = so.read_to_string(&mut out);
+    }
+    Some((status.success(), out.trim().to_string()))
+}
+
+/// True while `ncrs.service` is running or on its way back (a restart after a
+/// crash shows as `activating` during RestartSec): the mount is being kept for
+/// the next daemon, so the GUI should wait rather than declare it gone.
+fn ncrs_service_coming_back() -> bool {
+    matches!(
+        systemctl_user(&["is-active", NCRS_UNIT], Duration::from_secs(5)),
+        Some((_, ref state)) if matches!(state.as_str(), "active" | "activating" | "reloading" | "deactivating")
+    )
+}
+
+/// Start the ncrs daemon. Prefers the `ncrs.service` user unit (started on
+/// demand, never enabled): systemd then supervises the daemon, keeps its FUSE
+/// descriptor in the fd store and restarts it after a crash or a watchdog kill
+/// with the mount and programs' open files intact.
+///
+/// The unit runs the packaged /usr/bin/ncrs, so it is only used when that is
+/// the binary this GUI would run (a dev build next to the GUI spawns its own).
+/// Without a usable `systemctl --user` (no user manager, unit not installed)
+/// it falls back to a systemd-managed transient scope, then a bare child:
+/// both work, but a crash there ends the mount (ENOTCONN), as before.
 ///
 /// `systemd-run --scope` execs directly into the target rather than forking a
-/// wrapper that lingers, so the `Child` this returns on success — whichever
-/// branch is taken — always *is* the ncrs process itself.
-///
-/// Falls back to a plain spawn if `systemd-run` is missing, or if the user
-/// session bus is unreachable: `systemd-run` itself then exits almost
-/// immediately (well before ncrs could open its IPC socket), which is
-/// detectable, unlike a spawn() failure — the D-Bus round-trip happens after
-/// the fork, so `Command::spawn()` alone cannot tell the two cases apart.
-fn spawn_ncrs_daemon(ncrs_bin: &std::path::Path) -> std::io::Result<std::process::Child> {
+/// wrapper that lingers, so the `Child` a fallback returns always *is* the
+/// ncrs process itself. `systemd-run` exits almost immediately when the user
+/// session bus is unreachable (well before ncrs could open its IPC socket),
+/// which is detectable, unlike a spawn() failure — the D-Bus round-trip
+/// happens after the fork, so `Command::spawn()` alone cannot tell the two
+/// cases apart.
+fn spawn_ncrs_daemon(ncrs_bin: &std::path::Path) -> std::io::Result<DaemonStart> {
+    if ncrs_bin == std::path::Path::new(NCRS_UNIT_EXEC) {
+        match systemctl_user(&["start", NCRS_UNIT], Duration::from_secs(20)) {
+            Some((true, _)) => {
+                log::info!("started {} — systemd supervises the daemon (restart survival on)", NCRS_UNIT);
+                return Ok(DaemonStart::Service);
+            }
+            Some((false, _)) => log::warn!("systemctl --user start {} failed — restart survival is off for this session", NCRS_UNIT),
+            None => log::warn!("systemctl --user unavailable — restart survival is off for this session"),
+        }
+    } else {
+        log::info!("{} is not the packaged daemon — spawning it directly (restart survival is off)", ncrs_bin.display());
+    }
     if let Ok(mut child) = std::process::Command::new("systemd-run")
         .args(["--user", "--scope", "--collect", "--unit=ncrs", "--"])
         .arg(ncrs_bin)
@@ -120,13 +191,30 @@ fn spawn_ncrs_daemon(ncrs_bin: &std::path::Path) -> std::io::Result<std::process
     {
         thread::sleep(Duration::from_millis(300));
         match child.try_wait() {
-            Ok(None) => return Ok(child), // still running — handed off cleanly
+            Ok(None) => return Ok(DaemonStart::Child(child)), // still running — handed off cleanly
             _ => log::warn!("systemd-run exited immediately — falling back to a plain spawn"),
         }
     } else {
         log::info!("systemd-run unavailable — falling back to a plain spawn");
     }
-    std::process::Command::new(ncrs_bin).spawn()
+    std::process::Command::new(ncrs_bin).spawn().map(DaemonStart::Child)
+}
+
+/// Grace while a supervised daemon restarts before the GUI shows Unmounted.
+const SERVICE_RESTART_GRACE: Duration = Duration::from_secs(60);
+
+/// Called after ~6 s without the daemon: whether to keep waiting. Yes while
+/// `ncrs.service` is up or restarting, for up to [`SERVICE_RESTART_GRACE`]
+/// counted from the first failed attempt.
+async fn keep_waiting_for_service(since: std::time::Instant) -> bool {
+    if since.elapsed() >= SERVICE_RESTART_GRACE {
+        return false;
+    }
+    let coming_back = tokio::task::spawn_blocking(ncrs_service_coming_back).await.unwrap_or(false);
+    if coming_back {
+        log::info!("ncrs daemon not answering, but {} is restarting — waiting", NCRS_UNIT);
+    }
+    coming_back
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
@@ -1517,7 +1605,8 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(e)))
         {
-            Ok(mut child) => {
+            Ok(DaemonStart::Service) => {}
+            Ok(DaemonStart::Child(mut child)) => {
                 // Purely bookkeeping so the child never lingers as a zombie;
                 // attached_subscribe_loop below is what detects the daemon
                 // going away and drives sync_state.
@@ -1854,6 +1943,7 @@ async fn attached_subscribe_loop(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) {
     let mut failures = 0u32;
+    let mut failing_since: Option<std::time::Instant> = None;
     loop {
         let outcome = tokio::task::spawn_blocking({
             let app = app.clone();
@@ -1874,11 +1964,14 @@ async fn attached_subscribe_loop(
                 // treat the drop as a transient restart and reset the strike count.
                 if was_connected {
                     failures = 0;
+                    failing_since = None;
                 }
                 failures += 1;
-                // ~6s of failed reconnects: the daemon is gone. Show Unmounted;
-                // the Remount menu re-probes and re-attaches or mounts embedded.
-                if failures >= 3 {
+                let since = *failing_since.get_or_insert_with(std::time::Instant::now);
+                // ~6s of failed reconnects: the daemon is gone, unless systemd is
+                // restarting it (the mount waits for it). Show Unmounted; the
+                // Remount menu re-probes and re-attaches or mounts embedded.
+                if failures >= 3 && !keep_waiting_for_service(since).await {
                     log::warn!("external ncrs daemon stopped responding — detaching");
                     state.attached.store(false, std::sync::atomic::Ordering::Relaxed);
                     *state.sync_state.lock().unwrap() = SyncState::Unmounted;
@@ -1901,6 +1994,7 @@ async fn attached_poll_loop(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) {
     let mut failures = 0u32;
+    let mut failing_since: Option<std::time::Instant> = None;
     loop {
         sleep(Duration::from_secs(2)).await;
 
@@ -1910,10 +2004,11 @@ async fn attached_poll_loop(
             .flatten();
         let Some(replies) = replies else {
             failures += 1;
-            // ~6s of silence: the daemon is gone. Show Unmounted; the Remount
-            // menu re-probes and either re-attaches (service restarted) or
-            // mounts embedded (mount point now free).
-            if failures >= 3 {
+            let since = *failing_since.get_or_insert_with(std::time::Instant::now);
+            // ~6s of silence: the daemon is gone, unless systemd is restarting
+            // it. Show Unmounted; the Remount menu re-probes and either
+            // re-attaches (service restarted) or mounts embedded (mount point now free).
+            if failures >= 3 && !keep_waiting_for_service(since).await {
                 log::warn!("external ncrs daemon stopped responding — detaching");
                 state.attached.store(false, std::sync::atomic::Ordering::Relaxed);
                 *state.sync_state.lock().unwrap() = SyncState::Unmounted;
@@ -1924,6 +2019,7 @@ async fn attached_poll_loop(
             continue;
         };
         failures = 0;
+        failing_since = None;
 
         let word = replies.first().map(String::as_str).unwrap_or("");
         if let Some(new_state) = apply_state_word(&state, word) {
