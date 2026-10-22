@@ -9923,12 +9923,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let session = match reattach {
         Some((ra, _)) => {
             log::info!("Reattaching to the live FUSE connection on {} ({:?})", options.mount_point.display(), ra.source);
-            let handoff::Reattach { fd, dev, .. } = ra;
+            let handoff::Reattach { fd, dev, stored, .. } = ra;
             let own = fd.try_clone().map_err(|e| format!("FUSE reattach: cannot dup the descriptor: {}", e))?;
             // No FUSE_INIT on a live connection: init() is not called again, and the
             // capabilities the first daemon negotiated stay in force.
             let session = fuser::Session::from_fd_initialized(sched_fs, fd, fuse_config.acl, fuse_config.clone());
-            handoff::adopt_reattached(own, dev);
+            handoff::adopt_reattached(own, dev, stored);
             session
         }
         None => {
