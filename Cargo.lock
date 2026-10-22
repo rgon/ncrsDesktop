@@ -3022,6 +3022,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ncrs_passthrough"
+version = "0.1.88"
+dependencies = [
+ "libc",
+ "seccompiler",
+ "tempfile",
+]
+
+[[package]]
 name = "ncrs_plugin"
 version = "0.1.89"
 dependencies = [
