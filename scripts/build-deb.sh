@@ -69,19 +69,19 @@ fi
 if ! $SKIP_BUILD; then
     if $SKIP_GUI; then
         echo "→ Building core binaries..."
-        cargo build --release -p ncrs_core
+        cargo build --release -p ncrs_core -p ncrs_passthrough
     else
         echo "→ Building core and GUI binaries..."
         # custom-protocol embeds the frontend; without it ncrs-gui expects
         # the vite dev server at devUrl (works on dev machines only).
-        cargo build --release -p ncrs_core -p ncrs-gui --features ncrs-gui/custom-protocol
+        cargo build --release -p ncrs_core -p ncrs_passthrough -p ncrs-gui --features ncrs-gui/custom-protocol
     fi
 fi
 
 # With --skip-build the staged binaries must already exist; fail fast instead
 # of dying mid-assembly (or silently shipping a GUI-less package).
 if $SKIP_BUILD; then
-    for bin in ncrs ncrs-open ncrs-ctl; do
+    for bin in ncrs ncrs-open ncrs-ctl ncrs-passthrough; do
         [[ -x "target/release/$bin" ]] || { echo "error: --skip-build set but target/release/$bin is missing" >&2; exit 1; }
     done
     if ! $SKIP_GUI && [[ ! -x target/release/ncrs-gui ]]; then
@@ -143,8 +143,9 @@ Description: Nextcloud FUSE virtual filesystem client
  type detection) is applied per installed browser by the service, with
  sync emblems and menus in Nautilus and Dolphin.
  .
- libcap2-bin (setcap) is used at install time to grant the ncrs binary
- CAP_SYS_ADMIN, which enables zero-copy kernel read passthrough for
+ libcap2-bin (setcap) is used at install time to grant CAP_SYS_ADMIN to
+ the small /usr/libexec/ncrs/ncrs-passthrough helper (never to the ncrs
+ service itself), which enables zero-copy kernel read passthrough for
  fully-cached files on Linux 6.9+. Without it, ncrs runs identically but
  always falls back to normal buffered reads.
 EOF
@@ -152,6 +153,10 @@ EOF
 # ── dpkg triggers ─────────────────────────────────────────────────────────────
 # Fire when python3-nautilus installs its loader later, so postinst can reload
 # Nautilus. dpkg trigger paths are literal, hence the multiarch lookup.
+# Also when libcap2-bin (a Recommends) arrives after ncrs: postinst then grants
+# the passthrough helper its capability, which it could not do without setcap.
+# Both spellings, since dpkg matches the path the package ships (/sbin on
+# Debian, /usr/sbin on merged-/usr Ubuntu).
 MULTIARCH="$(dpkg-architecture -a"$ARCH" -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
 if [[ -z "$MULTIARCH" ]]; then
     case "$ARCH" in
@@ -162,6 +167,7 @@ if [[ -z "$MULTIARCH" ]]; then
 fi
 printf 'interest-noawait /usr/lib/%s/nautilus/extensions-4\ninterest-noawait /usr/lib/%s/nautilus/extensions-3.0\n' \
     "$MULTIARCH" "$MULTIARCH" > "$PKG_DIR/DEBIAN/triggers"
+printf 'interest-noawait /usr/sbin/setcap\ninterest-noawait /sbin/setcap\n' >> "$PKG_DIR/DEBIAN/triggers"
 
 # ── Copy maintainer scripts ───────────────────────────────────────────────────
 for script in postinst prerm postrm; do
