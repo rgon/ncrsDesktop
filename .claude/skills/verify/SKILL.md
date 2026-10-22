@@ -29,11 +29,13 @@ Recipe (incremental after the first ~7 min full build; ~30 s thereafter):
 ```bash
 # 1. build a bookworm-compatible binary (separate target dir to avoid host glibc mixing)
 docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target-bookworm rust:1-bookworm \
-  bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends mold libfuse3-dev pkg-config libssl-dev && cargo build --release -p ncrs_core --bin ncrs"
+  bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends mold libfuse3-dev pkg-config libssl-dev && cargo build --release -p ncrs_core --bin ncrs -p ncrs_passthrough"
 
-# 2. pack a minimal .deb — the Dockerfile only extracts /usr/bin/ncrs from it
-d=$(mktemp -d); mkdir -p "$d/pkg/usr/bin" "$d/pkg/DEBIAN"
+# 2. pack a minimal .deb — the Dockerfile only extracts /usr/bin/ncrs and
+#    /usr/libexec/ncrs/ncrs-passthrough from it
+d=$(mktemp -d); mkdir -p "$d/pkg/usr/bin" "$d/pkg/usr/libexec/ncrs" "$d/pkg/DEBIAN"
 cp target-bookworm/release/ncrs "$d/pkg/usr/bin/ncrs"
+cp target-bookworm/release/ncrs-passthrough "$d/pkg/usr/libexec/ncrs/ncrs-passthrough"
 printf 'Package: ncrs\nVersion: 0.0.0-e2e\nArchitecture: amd64\nMaintainer: e2e <e2e@local>\nDescription: e2e\n' > "$d/pkg/DEBIAN/control"
 dpkg-deb --build "$d/pkg" docker/e2e/ncrs/ncrs.deb
 
