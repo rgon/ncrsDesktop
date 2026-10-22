@@ -310,24 +310,31 @@ impl MutationJournal {
         self.entries.iter().any(|e| e.seq == seq)
     }
 
-    /// Where a reader finds the newest not-yet-uploaded content of `path`: the newest
-    /// queued whole-file PUT or streamed finish for it. enqueue() re-points a moved file's
-    /// queued uploads at the new name, which is what lets a save-then-reopen (LibreOffice:
-    /// temp file, then rename over the document) read its own queued bytes. Deletes and
-    /// renames are not replayed here, because enqueue() has already rewritten the older
-    /// entries' paths and their order no longer says which file a path meant: a file
-    /// deleted, or renamed over, while an older upload of the same path is still queued
-    /// can read that upload's bytes until the queue drains.
+    /// Where a reader finds the newest not-yet-uploaded content of `path`, newest entry
+    /// first: a queued whole-file PUT or streamed finish for it. A delete of the path (or
+    /// of a folder above it) ends the search, since what is queued behind it belongs to a
+    /// file that is gone, unless a rename onto the path was seen first: enqueue() re-points
+    /// a moved file's queued uploads at the new name in place, so they sit behind such a
+    /// delete in the queue (a save that deletes the document, then renames its temp file
+    /// over it). The one case left: a rename over a file whose own older upload is still
+    /// queued can read that upload's bytes, as enqueue() no longer tells the two apart.
     pub fn pending_upload(&self, path: &Path) -> Option<PendingUpload> {
-        self.entries.iter().rev().find_map(|e| match &e.op {
-            MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
-                Some(PendingUpload::Staged(staging_path.clone()))
+        let mut renamed_onto = false;
+        for e in self.entries.iter().rev() {
+            match &e.op {
+                MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
+                    return Some(PendingUpload::Staged(staging_path.clone()));
+                }
+                MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, .. } if remote_path == path => {
+                    return Some(PendingUpload::StreamTail { tail: tail_path.clone(), held_from: *bytes_confirmed, sparse: *sparse });
+                }
+                MutationOp::Rename { to, .. } if path.starts_with(to) => renamed_onto = true,
+                MutationOp::Unlink { path: gone } if gone == path && !renamed_onto => return None,
+                MutationOp::RmDir { path: gone } if path.starts_with(gone) && !renamed_onto => return None,
+                _ => {}
             }
-            MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, .. } if remote_path == path => {
-                Some(PendingUpload::StreamTail { tail: tail_path.clone(), held_from: *bytes_confirmed, sparse: *sparse })
-            }
-            _ => None,
-        })
+        }
+        None
     }
 
     pub fn len(&self) -> usize {
@@ -1328,8 +1335,12 @@ mod tests {
         );
         // A newer whole-file save of the same path wins over the streamed finish...
         let staged = dir.join("write_4");
-        j.enqueue(MutationOp::Put { remote_path: PathBuf::from("/v.mkv"), staging_path: staged.clone(), if_match_etag: None });
+        j.enqueue(MutationOp::Put { remote_path: PathBuf::from("/v.mkv"), staging_path: staged.clone(), if_match_etag: Some("e".into()) });
         assert_eq!(j.pending_upload(Path::new("/v.mkv")), Some(PendingUpload::Staged(staged)));
+        // ...and once the file is deleted, nothing queued for it is its content (a file
+        // created there next is not that one), even while those uploads stay queued.
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/v.mkv") });
+        assert_eq!(j.pending_upload(Path::new("/v.mkv")), None);
 
         let _ = fs::remove_dir_all(&dir);
     }
