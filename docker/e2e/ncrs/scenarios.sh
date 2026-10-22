@@ -1783,6 +1783,162 @@ umount -l "$RS_MOUNT" 2>/dev/null
 kill "$RS_PID" 2>/dev/null; wait "$RS_PID" 2>/dev/null
 rm -f /tmp/restart.slow /tmp/restart.read* /tmp/restart.mkdir*
 
+echo "→ 33. PASSTHROUGH HELPER — only ncrs-passthrough is capped; a capability-less daemon keeps passthrough and cannot mount over a root-owned folder"
+# CAP_SYS_ADMIN used to sit on the daemon itself: fuser then mounted with a direct
+# mount(2), skipping fusermount3's checks, so any user could mount over any empty
+# directory (root-owned ones included). Now only the helper carries it, and the daemon,
+# run here as an ordinary user like a desktop session does, must (a) still get kernel
+# passthrough through the helper and (b) be refused a mount point it does not own.
+PT_USER=ptuser
+PT_HELPER=/usr/libexec/ncrs/ncrs-passthrough
+PT_HOME=/home/$PT_USER
+PT_MOUNT=$PT_HOME/mnt
+PT_NLOG=/tmp/ncrs-pt.log
+PT_DENY_NLOG=/tmp/ncrs-pt-deny.log
+PT_ROOT_MP=/srv/ncrs-root-owned
+NCRS_BIN="$(command -v ncrs)"
+PT_UID="$(id -u "$PT_USER" 2>/dev/null)"
+pt_as_user() {  # <home> <cmd...>: run as the test user with that home's XDG dirs
+    local home="$1"; shift
+    setpriv --reuid="$PT_UID" --regid="$(id -g "$PT_USER")" --init-groups \
+        env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$home" XDG_RUNTIME_DIR="$home/run" \
+        XDG_CACHE_HOME="$home/.cache" XDG_CONFIG_HOME="$home/.config" RUST_LOG="info,ncrs_core=debug" "$@"
+}
+# Root may not stat a FUSE mount another user made without allow_other (so not
+# mountpoint(1)): read the mount table instead.
+pt_mounted() { awk -v m="$1" '$2 == m { found = 1 } END { exit !found }' /proc/mounts; }
+pt_config() {  # <home> <mount point>
+    mkdir -p "$1/.config/ncrs" "$1/run" "$1/.cache"
+    cat > "$1/.config/ncrs/config.yaml" <<EOF
+url: "${URL}"
+username: "${U}"
+password: "${P}"
+user: "${U}"
+mount_point: "$2"
+allow_insecure_http: true
+http3: false
+optimistic_listing: false
+auto_keep_cached_files: false
+fuse_passthrough: true
+EOF
+    chown -R "$PT_USER:" "$1"
+    chmod 700 "$1/run"
+}
+if [ -z "$PT_UID" ] || [ ! -x "$PT_HELPER" ] || ! command -v getcap >/dev/null; then
+    no "setup: the image lacks the test user, $PT_HELPER or getcap (see docker/e2e/ncrs/Dockerfile)"
+else
+    # Docker normally keeps the file capability set at build time; set it again in
+    # case the storage driver dropped the xattr.
+    getcap "$PT_HELPER" | grep -Eq 'cap_sys_admin[=+]ep' || setcap cap_sys_admin=ep "$PT_HELPER"
+    [ -z "$(getcap "$NCRS_BIN")" ] \
+        && ok "the daemon binary ($NCRS_BIN) carries no file capability" \
+        || no "the daemon binary carries a capability: $(getcap "$NCRS_BIN")"
+    getcap "$PT_HELPER" | grep -Eq 'cap_sys_admin[=+]ep' \
+        && ok "$PT_HELPER carries cap_sys_admin=ep" \
+        || no "$PT_HELPER lacks cap_sys_admin=ep: '$(getcap "$PT_HELPER")'"
+
+    # (a) passthrough through the helper. A file put on the server directly, read once
+    # through the mount (downloaded to a complete cache copy), then opened again: that
+    # second open is the one the kernel serves from the cache copy.
+    head -c 3000000 /dev/urandom > /tmp/pt.bin
+    curl -s -u "$U:$P" -X MKCOL "${URL}pt/" -o /dev/null
+    curl -s -u "$U:$P" -T /tmp/pt.bin "${URL}pt/data.bin" -o /dev/null
+    install -d -o "$PT_USER" -g "$PT_USER" -m 0755 "$PT_MOUNT"
+    pt_config "$PT_HOME" "$PT_MOUNT"
+    : > "$PT_NLOG"; chmod 666 "$PT_NLOG"
+    pt_as_user "$PT_HOME" "$NCRS_BIN" --config "$PT_HOME/.config/ncrs/config.yaml" >>"$PT_NLOG" 2>&1 &
+    PT_DAEMON=$!
+    for _ in $(seq 1 60); do
+        pt_mounted "$PT_MOUNT" && break
+        kill -0 "$PT_DAEMON" 2>/dev/null || break
+        sleep 1
+    done
+    if ! pt_mounted "$PT_MOUNT"; then
+        no "passthrough: the daemon running as $PT_USER never mounted $PT_MOUNT"
+        tail -20 "$PT_NLOG" | sed 's/^/    /'
+    else
+        ok "a daemon without capabilities mounted its own folder (through fusermount3)"
+        eff="$(awk '/^CapEff/ {print $2}' /proc/"$PT_DAEMON"/status 2>/dev/null)"
+        [ "$eff" = "0000000000000000" ] \
+            && ok "the running daemon has an empty effective capability set" \
+            || no "the running daemon has capabilities: CapEff=$eff"
+        hpid="$(pgrep -u "$PT_UID" -f "^$PT_HELPER" | head -1)"
+        if [ -n "$hpid" ]; then
+            heff="$(awk '/^CapEff/ {print $2}' /proc/"$hpid"/status)"
+            hsec="$(awk '/^Seccomp:/ {print $2}' /proc/"$hpid"/status)"
+            hnnp="$(awk '/^NoNewPrivs/ {print $2}' /proc/"$hpid"/status)"
+            [ "$heff" = "0000000000200000" ] && [ "$hsec" = 2 ] && [ "$hnnp" = 1 ] \
+                && ok "the helper runs with CAP_SYS_ADMIN only, NO_NEW_PRIVS and its seccomp filter" \
+                || no "the helper's credentials are wrong: CapEff=$heff Seccomp=$hsec NoNewPrivs=$hnnp"
+        else
+            no "no $PT_HELPER process runs for the daemon"
+            grep -i passthrough "$PT_NLOG" | tail -5 | sed 's/^/    /'
+        fi
+        want="$(sha < /tmp/pt.bin)"
+        first="$(pt_as_user "$PT_HOME" sha256sum "$PT_MOUNT/pt/data.bin" | awk '{print $1}')"
+        [ "$first" = "$want" ] \
+            && ok "first read (download into the cache) returns the right bytes" \
+            || no "first read returned the wrong bytes"
+        major="$(uname -r | cut -d. -f1)"; minor="$(uname -r | cut -d. -f2)"
+        if [ "$major" -lt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -lt 9 ]; }; then
+            ok "kernel $(uname -r) predates FUSE passthrough (6.9) — passthrough checks skipped"
+        else
+            mark=$(($(wc -l < "$PT_NLOG") + 1))
+            again="$(pt_as_user "$PT_HOME" sha256sum "$PT_MOUNT/pt/data.bin" | awk '{print $1}')"
+            [ "$again" = "$want" ] \
+                && ok "the passthrough read returns the right bytes" \
+                || no "the second (passthrough) read returned the wrong bytes"
+            if tail -n +"$mark" "$PT_NLOG" | grep -q "FUSE passthrough granted for .*data.bin"; then
+                ok "the second open was served by kernel passthrough via the helper"
+            else
+                no "the second open was not granted passthrough"
+                grep -iE "passthrough|backing" "$PT_NLOG" | tail -8 | sed 's/^/    /'
+            fi
+            ! grep -q "FUSE passthrough unavailable" "$PT_NLOG" \
+                && ok "the daemon never fell back to buffered reads" \
+                || no "the daemon reported passthrough unavailable: $(grep -m1 'FUSE passthrough unavailable' "$PT_NLOG")"
+        fi
+    fi
+    fusermount3 -u "$PT_MOUNT" 2>/dev/null || umount -l "$PT_MOUNT" 2>/dev/null
+    kill "$PT_DAEMON" 2>/dev/null; wait "$PT_DAEMON" 2>/dev/null
+    sleep 1
+    [ -z "$(pgrep -u "$PT_UID" -f "^$PT_HELPER")" ] \
+        && ok "the helper exited with its daemon" \
+        || { no "the helper outlived its daemon"; pkill -u "$PT_UID" -f "^$PT_HELPER"; }
+
+    # (b) a root-owned empty directory: fusermount3 refuses it ("no write access"), and
+    # the daemon has no capability to mount(2) it itself.
+    rm -rf "$PT_ROOT_MP"; install -d -o root -g root -m 0755 "$PT_ROOT_MP"
+    PT_DENY_HOME=/tmp/ncrs-pt-deny
+    rm -rf "$PT_DENY_HOME"; pt_config "$PT_DENY_HOME" "$PT_ROOT_MP"
+    : > "$PT_DENY_NLOG"; chmod 666 "$PT_DENY_NLOG"
+    pt_as_user "$PT_DENY_HOME" "$NCRS_BIN" --config "$PT_DENY_HOME/.config/ncrs/config.yaml" >>"$PT_DENY_NLOG" 2>&1 &
+    PT_DENY=$!
+    mounted=""
+    for _ in $(seq 1 30); do
+        pt_mounted "$PT_ROOT_MP" && { mounted=1; break; }
+        kill -0 "$PT_DENY" 2>/dev/null || break
+        sleep 1
+    done
+    if [ -n "$mounted" ]; then
+        no "a user's daemon mounted over the root-owned $PT_ROOT_MP"
+        umount -l "$PT_ROOT_MP" 2>/dev/null
+    elif kill -0 "$PT_DENY" 2>/dev/null; then
+        no "the daemon neither mounted nor gave up on $PT_ROOT_MP within 30s"
+        tail -10 "$PT_DENY_NLOG" | sed 's/^/    /'
+    else
+        ok "mounting over the root-owned $PT_ROOT_MP as $PT_USER fails"
+        grep -qiE "fusermount|permission|access" "$PT_DENY_NLOG" \
+            && ok "the refusal comes from fusermount3's checks" \
+            || { no "the daemon failed for another reason"; tail -10 "$PT_DENY_NLOG" | sed 's/^/    /'; }
+    fi
+    [ "$(stat -c %U "$PT_ROOT_MP")" = root ] && [ -z "$(ls -A "$PT_ROOT_MP")" ] \
+        && ok "$PT_ROOT_MP is untouched (root-owned, empty)" \
+        || no "$PT_ROOT_MP was changed: $(stat -c '%U %a' "$PT_ROOT_MP") $(ls -A "$PT_ROOT_MP" | head -3)"
+    kill "$PT_DENY" 2>/dev/null; wait "$PT_DENY" 2>/dev/null
+    rm -rf "$PT_ROOT_MP" "$PT_DENY_HOME" /tmp/pt.bin
+fi
+
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
