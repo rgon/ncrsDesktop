@@ -155,6 +155,24 @@ Downloaded files are cached in `~/.cache/ncrs/`.
 RUST_LOG=info cargo run -p ncrs_core
 ```
 
+#### Kernel FUSE passthrough (zero-copy reads)
+
+On Linux 6.9+ the kernel can serve reads of fully-cached files straight from the
+cache copy. Registering those files needs CAP_SYS_ADMIN, which only the small
+`ncrs-passthrough` helper gets (the packages install it at
+`/usr/libexec/ncrs/ncrs-passthrough` with `cap_sys_admin=ep`); the `ncrs`
+service itself runs with no capabilities, so it mounts through `fusermount3`.
+The service spawns the helper per mount and falls back to buffered reads when it
+is missing or lacks the capability (the GUI settings and the IPC
+`PASSTHROUGH_STATUS` then report it as unavailable). To try it on a development build, cap the helper next to your
+binary — never `ncrs` itself:
+```sh
+cargo build -p ncrs_core -p ncrs_passthrough
+sudo setcap cap_sys_admin=ep target/debug/ncrs-passthrough
+```
+(`NCRS_PASSTHROUGH_HELPER=/path/to/ncrs-passthrough` overrides where the service
+looks for it.)
+
 #### Uninstall extension:
 ```sh
 rm ~/.local/share/nautilus-python/extensions/syncstate.py
