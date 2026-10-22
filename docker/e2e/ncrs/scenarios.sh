@@ -1053,7 +1053,14 @@ else
     head -c $((16 * 1048576)) /dev/urandom > /tmp/chunked.seq
     cp /tmp/chunked.seq "$CD_MOUNT/chunked/seq.bin"; crc=$?
     if wait_dav_sha chunked/seq.bin "$(sha < /tmp/chunked.seq)" 90 && [ "$crc" -eq 0 ]; then
-        if grep -q "ASSEMBLED .* -> .*/chunked/seq.bin (HTTP 2" "$CD_LOG"; then
+        # The proxy logs ASSEMBLED once the upstream PUT returns, a moment after the file
+        # is already visible on the server: wait for the line rather than grep once.
+        assembled=""
+        for _ in $(seq 1 15); do
+            grep -q "ASSEMBLED .* -> .*/chunked/seq.bin (HTTP 2" "$CD_LOG" && { assembled=1; break; }
+            sleep 1
+        done
+        if [ -n "$assembled" ]; then
             ok "setup: a 16 MiB sequential copy streamed through chunked upload byte-exact"
         else
             no "setup: the sequential copy never used chunked upload — the scenario below would not test the streaming path"
