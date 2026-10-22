@@ -58,6 +58,8 @@ use crate::MutexExt;
 /// Env vars a re-executing daemon leaves for its successor (see [`planned_restart`]).
 const ENV_FD: &str = "NCRS_HANDOFF_FD";
 const ENV_DEV: &str = "NCRS_HANDOFF_DEV";
+/// Set to "1" when the image that re-executed had the connection in systemd's fd store.
+const ENV_STORED: &str = "NCRS_HANDOFF_STORED";
 
 /// fd-store entries are named `ncrsfuse-<major>-<minor>` (systemd forbids `:` in FDNAME).
 const FDSTORE_PREFIX: &str = "ncrsfuse-";
@@ -107,6 +109,12 @@ pub(crate) struct Reattach {
     pub(crate) fd: OwnedFd,
     pub(crate) dev: ConnDev,
     pub(crate) source: Source,
+    /// systemd's fd store already holds this connection. Passing a stored
+    /// descriptor in LISTEN_FDS (or re-executing) does not take it out of the
+    /// store, and systemd only recognises a re-sent copy as the same one where
+    /// kcmp(2) works (not under Docker's default seccomp profile), so a re-sent
+    /// copy can become a second entry — see [`adopt_reattached`].
+    pub(crate) stored: bool,
 }
 
 impl std::fmt::Debug for Reattach {
@@ -446,9 +454,11 @@ fn validated(fd: &OwnedFd, dev: ConnDev, mount_point: &Path) -> bool {
 fn from_exec_env(mount_point: &Path) -> Option<Reattach> {
     let fd_s = std::env::var(ENV_FD).ok();
     let dev_s = std::env::var(ENV_DEV).ok();
+    let stored = std::env::var(ENV_STORED).is_ok_and(|v| v == "1");
     // Children (fusermount, a further re-exec) must not inherit them.
     std::env::remove_var(ENV_FD);
     std::env::remove_var(ENV_DEV);
+    std::env::remove_var(ENV_STORED);
     let raw: RawFd = fd_s?.parse().ok()?;
     let _ = set_cloexec(raw, true);
     // SAFETY: the previous image of this process left this descriptor open for us.
@@ -458,24 +468,35 @@ fn from_exec_env(mount_point: &Path) -> Option<Reattach> {
         return None;
     }
     log::info!("handoff: took over FUSE connection {} from this daemon's previous image", dev.to_colon());
-    Some(Reattach { fd, dev, source: Source::Exec })
+    Some(Reattach { fd, dev, source: Source::Exec, stored })
 }
 
 fn from_fd_store(mount_point: &Path) -> Option<Reattach> {
-    let mut found = None;
+    let mut found: Option<Reattach> = None;
     for (fd, name) in take_listen_fds() {
         let Some(dev) = ConnDev::from_fdstore_name(&name) else { continue };
-        if found.is_none() && validated(&fd, dev, mount_point) {
-            found = Some(Reattach { fd, dev, source: Source::FdStore });
-        } else {
+        let taken = found.as_ref().map(|r| r.dev);
+        if taken.is_none() && validated(&fd, dev, mount_point) {
+            found = Some(Reattach { fd, dev, source: Source::FdStore, stored: true });
+        } else if store_entry_is_stale(dev, taken) {
             // A connection whose mount is gone: drop it from the store too.
             let _ = sd_notify(&format!("FDSTOREREMOVE=1\nFDNAME={}", name), None);
         }
+        // A second copy of the connection just taken: only this process's copy
+        // is closed. FDSTOREREMOVE goes by name and would drop the stored copy
+        // the successor of this daemon needs as well.
     }
     if let Some(r) = &found {
         log::info!("handoff: took over FUSE connection {} from the systemd fd store", r.dev.to_colon());
     }
     found
+}
+
+/// Whether a LISTEN_FDS entry for `dev` should be removed from the store, given
+/// the connection already taken from it (if any): yes unless it is a copy of
+/// that same connection.
+fn store_entry_is_stale(dev: ConnDev, taken: Option<ConnDev>) -> bool {
+    taken != Some(dev)
 }
 
 /// Gives up on a connection [`try_reattach`] found (its state could not be
@@ -579,12 +600,27 @@ pub(crate) fn adopt_fresh(session_fd: BorrowedFd<'_>, mount_point: &Path) -> Opt
 }
 
 /// Called after a reattached session is created from the connection's twin.
-/// systemd handed its stored copy over (and dropped it from the store), so it
-/// goes back in; after a re-exec the store still has it, and systemd ignores a
-/// second copy of a descriptor it already holds.
-pub(crate) fn adopt_reattached(own: OwnedFd, dev: ConnDev) {
-    let keeper = new_keeper(own.as_fd(), dev);
+/// When the store already holds it (`stored`: taken from LISTEN_FDS, or a
+/// re-exec of an image that had stored it) nothing is sent: systemd keeps
+/// stored descriptors when it passes them on, and a re-sent copy is only
+/// deduplicated where kcmp(2) is allowed — under Docker's default seccomp
+/// profile the real systemd 255 kept it as a second entry. Otherwise (no
+/// systemd, or a re-exec from an image that predates this flag) it is stored
+/// as after a fresh mount.
+pub(crate) fn adopt_reattached(own: OwnedFd, dev: ConnDev, stored: bool) {
+    let keeper = if reattached_keeper_is_store(stored, under_systemd_service()) {
+        log::info!("handoff: FUSE connection {} stays in the systemd fd store", dev.to_colon());
+        Keeper::FdStore
+    } else {
+        new_keeper(own.as_fd(), dev)
+    };
     *LIVE.safe_lock() = Some(Live { fd: own, dev, keeper });
+}
+
+/// A reattached connection needs no new FDSTORE=1 when the store holds it and
+/// this process still talks to that store.
+fn reattached_keeper_is_store(stored: bool, under_systemd: bool) -> bool {
+    stored && under_systemd
 }
 
 fn new_keeper(fd: BorrowedFd<'_>, dev: ConnDev) -> Keeper {
@@ -693,8 +729,8 @@ fn planned_restart() -> io::Result<()> {
         undo_handover();
         return Err(e);
     }
-    let (fd, dev) = match LIVE.safe_lock().as_ref() {
-        Some(l) => (l.fd.as_raw_fd(), l.dev),
+    let (fd, dev, stored) = match LIVE.safe_lock().as_ref() {
+        Some(l) => (l.fd.as_raw_fd(), l.dev, l.keeper == Keeper::FdStore),
         None => {
             undo_handover();
             return Err(io::Error::other("not mounted"));
@@ -708,6 +744,9 @@ fn planned_restart() -> io::Result<()> {
     log::info!("handoff: re-executing {} with FUSE connection {} (fd {})", exe.display(), dev.to_colon(), fd);
     let mut cmd = Command::new(&exe);
     cmd.args(std::env::args_os().skip(1)).env(ENV_FD, fd.to_string()).env(ENV_DEV, dev.to_colon());
+    if stored {
+        cmd.env(ENV_STORED, "1");
+    }
     use std::os::unix::process::CommandExt;
     let err = cmd.exec();
     // Still here: exec failed. A later crash restore must not trust a snapshot
@@ -870,6 +909,28 @@ mod tests {
         assert!(!d.fdstore_name().contains(':'), "systemd rejects ':' in FDNAME");
         assert_eq!(ConnDev::from_fdstore_name(&d.fdstore_name()), Some(d));
         assert_eq!(ConnDev::from_fdstore_name("other-0-73"), None);
+    }
+
+    #[test]
+    fn a_second_copy_of_the_taken_connection_is_not_removed_from_the_store() {
+        let a = ConnDev { major: 0, minor: 327 };
+        let b = ConnDev { major: 0, minor: 99 };
+        // Nothing taken yet (the entry failed validation): stale.
+        assert!(store_entry_is_stale(a, None));
+        // The same connection again (systemd kept a re-sent copy as a second
+        // entry): removing it by name would drop the live copy too.
+        assert!(!store_entry_is_stale(a, Some(a)));
+        // A different connection whose mount is gone: stale.
+        assert!(store_entry_is_stale(b, Some(a)));
+    }
+
+    #[test]
+    fn a_reattached_connection_already_in_the_store_is_not_sent_again() {
+        assert!(reattached_keeper_is_store(true, true));
+        // Not stored (no systemd before the re-exec, or an older image): store it now.
+        assert!(!reattached_keeper_is_store(false, true));
+        // No notify socket: nothing to keep it in.
+        assert!(!reattached_keeper_is_store(true, false));
     }
 
     #[test]
