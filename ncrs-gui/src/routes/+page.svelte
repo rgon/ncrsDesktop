@@ -105,7 +105,6 @@
     let activeView = $state<View>("notifications");
     let needsLogin = $state(false);
     let configServerUrl = $state("");
-    let needsSetup = $state(false);
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -151,7 +150,7 @@
         if (url) await invoke("open_link", { url });
     }
 
-    interface ConfigStatus { needs_login: boolean; server_url: string | null; needs_setup: boolean; }
+    interface ConfigStatus { needs_login: boolean; server_url: string | null; }
 
     async function loadInfo() {
         const status = await invoke<ConfigStatus>("get_config_status");
@@ -162,11 +161,6 @@
             return;
         }
         needsLogin = false;
-        needsSetup = status.needs_setup;
-        if (status.needs_setup && activeView !== "settings") {
-            activeView = "settings";
-            return;
-        }
         // NB: userInfo must stay null until the backend really has it — the
         // retry below keys off `userInfo === null` to re-poll while the daemon
         // is still starting. The cached avatar is held separately (cachedAvatar)
@@ -430,7 +424,7 @@
         </header>
 
         <!-- ── Sync status strip ────────────────────────────────────────── -->
-        <SyncProgressView {syncState} {transfers} {storage} onremount={handleRemount} onlogout={handleLogout} />
+        <SyncProgressView {syncState} {transfers} {storage} onremount={handleRemount} onlogout={handleLogout} onsettings={() => { activeView = "settings"; }} />
 
         <!-- ── Content ─────────────────────────────────────────────────── -->
         <div class="nc-content">
@@ -438,7 +432,7 @@
                 <LoginView initialServerUrl={configServerUrl} />
 
             {:else if activeView === "settings"}
-                <SettingsView forced={needsSetup} />
+                <SettingsView />
 
             {:else if activeView === "search"}
                 <SearchView

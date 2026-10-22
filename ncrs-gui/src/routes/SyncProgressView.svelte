@@ -24,6 +24,7 @@
         storage?: StorageStats;
         onremount?: () => void;
         onlogout?: () => void;
+        onsettings?: () => void;
     }
 
     let {
@@ -33,6 +34,7 @@
         storage = { kept_bytes: 0, cached_bytes: 0, remote_used: 0, remote_total: 0 },
         onremount,
         onlogout,
+        onsettings,
         ...restProps
     }: Props = $props();
 
@@ -96,6 +98,8 @@
             <span class="nc-sync-alert">Credentials cleared — reconfigure to reconnect.</span>
         {:else if syncState.startsWith("error:authentication") && onlogout}
             <button class="nc-remount-btn" onclick={onlogout}>Log in</button>
+        {:else if syncState.startsWith("error:mount folder") && onsettings}
+            <button class="nc-remount-btn" onclick={onsettings}>Settings</button>
         {:else if (syncState === "unmounted" || syncState.startsWith("error:")) && onremount}
             <button class="nc-remount-btn" onclick={onremount}>Remount</button>
         {/if}

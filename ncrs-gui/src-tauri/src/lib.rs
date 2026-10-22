@@ -728,7 +728,6 @@ fn get_plugin_metas() -> Vec<ncrs_plugin::PluginMeta> {
 pub struct ConfigStatus {
     pub needs_login: bool,
     pub server_url: Option<String>,
-    pub needs_setup: bool,
 }
 
 #[tauri::command]
@@ -737,13 +736,12 @@ fn get_config_status() -> ConfigStatus {
         Ok(opts) => {
             if opts.credentials().is_err() {
                 let server = ncrs_core::notifications::base_url(&opts.url);
-                ConfigStatus { needs_login: true, server_url: Some(server), needs_setup: false }
+                ConfigStatus { needs_login: true, server_url: Some(server) }
             } else {
-                let needs_setup = opts.mount_point.as_os_str().is_empty();
-                ConfigStatus { needs_login: false, server_url: None, needs_setup }
+                ConfigStatus { needs_login: false, server_url: None }
             }
         }
-        Err(_) => ConfigStatus { needs_login: true, server_url: None, needs_setup: false },
+        Err(_) => ConfigStatus { needs_login: true, server_url: None },
     }
 }
 
@@ -905,6 +903,7 @@ pub struct LoginComplete {
 #[tauri::command]
 async fn start_login_flow(
     server_url: String,
+    mount_point: Option<String>,
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
@@ -915,6 +914,24 @@ async fn start_login_flow(
     if server.is_empty() {
         return Err("Server URL must not be empty".into());
     }
+    // A re-login (no folder field shown) keeps the configured mount point.
+    let mount_point = match mount_point {
+        Some(mp) => {
+            let mp = mp.trim().to_string();
+            if !mp.starts_with('/') {
+                return Err("Enter an absolute path for the local folder, e.g. /home/user/ncrs".into());
+            }
+            if path_exists(mp.clone()).await {
+                return Err(format!("{} already exists — choose a new folder", mp));
+            }
+            mp
+        }
+        // No folder sent but none configured either (the form sent before it
+        // learned it should show the field): refuse rather than write an
+        // empty mount_point the daemon can't use.
+        None => configured_mount_point()
+            .ok_or_else(|| "Choose a local folder for your files first".to_string())?,
+    };
 
     let init = tokio::task::spawn_blocking({
         let s = server.clone();
@@ -966,7 +983,7 @@ async fn start_login_flow(
                         return;
                     }
 
-                    if let Err(e) = write_config_from_login(&creds) {
+                    if let Err(e) = write_config_from_login(&creds, &mount_point) {
                         log::error!("failed to write config after login: {}", e);
                         app.emit("login-error", e).ok();
                         return;
@@ -1004,8 +1021,37 @@ async fn start_login_flow(
     Ok(login_url)
 }
 
+/// Off the main thread: the form calls this per keystroke on a user-typed
+/// path, which may lie under a slow or hung mount.
+#[tauri::command]
+async fn path_exists(path: String) -> bool {
+    tokio::task::spawn_blocking(move || std::path::Path::new(&path).exists())
+        .await
+        .unwrap_or(false)
+}
+
+fn configured_mount_point() -> Option<String> {
+    ncrs_core::config::load_config()
+        .ok()
+        .map(|o| o.mount_point.to_string_lossy().into_owned())
+        .filter(|mp| !mp.is_empty())
+}
+
+/// The folder field for the sign-in form: None when a mount point is already
+/// configured (a re-login keeps it), else the suggested ~/Nextcloud. The form
+/// refuses a folder that already exists — it may be another sync client's
+/// (the official Nextcloud client also defaults to ~/Nextcloud).
+#[tauri::command]
+fn setup_mount_point() -> Option<String> {
+    match configured_mount_point() {
+        Some(_) => None,
+        None => Some(ncrs_core::config::ConfigSettings::default().mount_point),
+    }
+}
+
 fn write_config_from_login(
     creds: &ncrs_core::login_flow::LoginResult,
+    mount_point: &str,
 ) -> Result<(), String> {
     let webdav_url = ncrs_core::login_flow::webdav_url(&creds.server, &creds.login_name);
 
@@ -1016,18 +1062,12 @@ fn write_config_from_login(
         &creds.app_password,
     )?;
 
-    let mount_point = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/home"))
-        .join("Nextcloud")
-        .to_string_lossy()
-        .into_owned();
-
     // No password field — credentials live in the keyring.
     let config = format!(
         "# ncRS Desktop configuration\n\
          url: \"{}\"\n\
          username: \"{}\"\n\
-         mount_point: \"{}\"\n\
+         mount_point: {:?}\n\
          user: \"{}\"\n",
         webdav_url,
         creds.login_name,
@@ -1339,6 +1379,8 @@ pub fn run() {
             close_window,
             get_config_status,
             start_login_flow,
+            path_exists,
+            setup_mount_point,
             get_sync_state,
             get_user_info,
             get_nc_theme,
@@ -1555,6 +1597,21 @@ pub fn run() {
         });
 }
 
+/// Why the daemon can't mount `opts.mount_point`, if it can't. Each message
+/// starts with "mount folder", which the status bar keys its Settings button on.
+fn mount_folder_problem(opts: &MountOptions) -> Option<String> {
+    if opts.mount_point.as_os_str().is_empty() {
+        Some("mount folder not set — choose one in Settings".into())
+    } else if ncrs_core::mount_point_occupied(&opts.mount_point, &opts.url) {
+        Some(format!(
+            "mount folder occupied: {} already has files in it — choose another folder in Settings",
+            opts.mount_point.display()
+        ))
+    } else {
+        None
+    }
+}
+
 async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), ()> {
     sleep(Duration::from_millis(500)).await;
 
@@ -1596,6 +1653,27 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
         // other daemon below.
         log::info!("existing ncrs daemon detected — attaching via IPC");
         state.attached.store(true, std::sync::atomic::Ordering::Relaxed);
+    } else if let Some(msg) = {
+        // Off the runtime and bounded: the check stats the mount point, which
+        // blocks if a hung daemon still holds a FUSE mount there. On timeout
+        // let the daemon start and report it.
+        let o = opts.clone();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || mount_folder_problem(&o)),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+    } {
+        // The daemon would refuse this folder and exit with the reason only in
+        // its own log — say it here instead.
+        log::error!("{}", msg);
+        *state.sync_state.lock().unwrap() = SyncState::Error(msg.clone());
+        app.emit("sync-state-changed", format!("error:{}", msg)).ok();
+        let _ = shutdown_tx.send(true);
+        return Ok(());
     } else {
         // No daemon owns the mount yet — spawn one and attach to it the same
         // way. The FUSE loop never runs in this process: only the small,
