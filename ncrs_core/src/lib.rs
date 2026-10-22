@@ -1016,32 +1016,46 @@ fn read_at_full(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<
 /// tail page it had just written (LibreOffice does this after every zip entry) got 0
 /// bytes back and wrote the page out again with stale buffer contents.
 fn live_write_size(open_files: &Mutex<HashMap<u64, OpenFile>>, ino: u64) -> Option<u64> {
-    enum Source {
-        Streamed(u64),
-        Staged(PathBuf),
-    }
-    // Collected under the lock, measured outside it: stat(2) must not hold up every handle.
-    // The newest usable writer, the same one staged_source serves a third handle's reads
-    // from, so the size and the bytes agree.
-    let sources: Vec<Source> = open_files.safe_lock().iter()
-        .filter(|(_, of)| of.ino == ino && of.dirty && !of.upload_failed)
+    // Picked under the lock, measured outside it: stat(2) must not hold up every handle.
+    let len = newest_usable_writer(&open_files.safe_lock(), |_, of| of.ino == ino).and_then(|(_, of)| staged_len(of));
+    len.and_then(StagedLen::resolve)
+}
+
+/// The newest handle whose staged bytes are the file's current content: dirty, not
+/// failed, and `matching`. One rule for what reads serve, what getattr reports and what
+/// rename carries over, so the three agree on the same writer.
+fn newest_usable_writer<'a>(
+    files: &'a HashMap<u64, OpenFile>,
+    matching: impl Fn(u64, &OpenFile) -> bool,
+) -> Option<(u64, &'a OpenFile)> {
+    files.iter()
+        .filter(|(fh, of)| of.dirty && !of.upload_failed && matching(**fh, of))
         .max_by_key(|(fh, _)| **fh)
-        .map(|(_, of)| of)
-        .into_iter()
-        // A failed handle's bytes are not the file (staged_source does not serve them either).
-        .filter(|of| of.ino == ino && of.dirty && !of.upload_failed)
-        .filter_map(|of| match (&of.chunk_upload, &of.write_path) {
-            (Some(_), _) => Some(Source::Streamed(of.total_written)),
-            (None, Some(wp)) => Some(Source::Staged(wp.clone())),
-            (None, None) => None,
-        })
-        .collect();
-    sources.iter()
-        .filter_map(|s| match s {
-            Source::Streamed(n) => Some(*n),
-            Source::Staged(wp) => std::fs::metadata(wp).ok().map(|m| m.len()),
-        })
-        .next()
+        .map(|(fh, of)| (*fh, of))
+}
+
+/// A writer's staged length as far as it can be known under the open-files lock: exact
+/// for a streaming handle, else its staging file, to stat once the lock is released.
+enum StagedLen {
+    Known(u64),
+    Stat(PathBuf),
+}
+
+fn staged_len(of: &OpenFile) -> Option<StagedLen> {
+    match (&of.chunk_upload, &of.write_path) {
+        (Some(_), _) => Some(StagedLen::Known(of.total_written)),
+        (None, Some(wp)) => Some(StagedLen::Stat(wp.clone())),
+        (None, None) => None,
+    }
+}
+
+impl StagedLen {
+    fn resolve(self) -> Option<u64> {
+        match self {
+            StagedLen::Known(n) => Some(n),
+            StagedLen::Stat(wp) => std::fs::metadata(wp).ok().map(|m| m.len()),
+        }
+    }
 }
 
 /// `attr` with its size replaced by the live written size when its inode has uncommitted
@@ -1065,25 +1079,17 @@ fn overlay_live_size(open_files: &Mutex<HashMap<u64, OpenFile>>, mut attr: FileA
 /// and the lowest file offset it still holds. Staged bytes are newer than the cache
 /// and the server, which hold nothing of them until release().
 fn staged_source(files: &HashMap<u64, OpenFile>, fh: u64, ino: u64) -> Option<(PathBuf, u64)> {
-    let of_source = |of: &OpenFile| {
-        // A failed handle's staging bytes are not the file any more (an aborted stream, or a
-        // stream that could not be restored after a restart): never serve them.
-        if !of.dirty || of.upload_failed {
-            return None;
-        }
-        // After chunks went out, the bytes before the unsent tail are holes (free_sent_chunk).
+    // After chunks went out, the bytes before the unsent tail are holes (free_sent_chunk).
+    let source = |of: &OpenFile| {
         let held_from = of.chunk_upload.as_ref().map_or(0, |c| c.bytes_confirmed);
         of.write_path.clone().map(|wp| (wp, held_from))
     };
-    files.get(&fh).and_then(of_source).or_else(|| {
-        // The newest sibling that holds usable bytes: a newer reader or failed handle must
-        // not hide an older writer's uncommitted data.
-        files.iter()
-            .filter(|(k, of)| **k != fh && of.ino == ino)
-            .filter_map(|(k, of)| of_source(of).map(|s| (*k, s)))
-            .max_by_key(|(k, _)| *k)
-            .map(|(_, s)| s)
-    })
+    // Its own writes first, then the newest usable sibling: a failed handle's bytes are not
+    // the file (an aborted stream, or one not restorable after a restart), and a newer
+    // reader must not hide an older writer's uncommitted data.
+    newest_usable_writer(files, |k, of| k == fh && of.write_path.is_some())
+        .or_else(|| newest_usable_writer(files, |k, of| k != fh && of.ino == ino && of.write_path.is_some()))
+        .and_then(|(_, of)| source(of))
 }
 
 /// `sz` bytes of the file at `off`, out of its staging file, which is laid out at the
@@ -1411,6 +1417,16 @@ fn punch_hole_supported() -> bool {
         return *known;
     }
     let Some(dir) = STREAM_DISK_PATH.safe_lock().clone() else { return true };
+    // A probe that could not answer (a full disk) is retried at most once a minute: it
+    // runs in write() under the open-files lock. In between, the filesystem type decides.
+    static LAST_TRY: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST_TRY.safe_lock();
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+            return fs_type_can_punch(&dir);
+        }
+        *last = Some(Instant::now());
+    }
     let probe = dir.join(format!(".punch-probe-{}", std::process::id()));
     let answer = std::fs::write(&probe, [0u8; 8192]).ok()
         .and_then(|()| std::fs::OpenOptions::new().write(true).open(&probe).ok())
@@ -1434,6 +1450,20 @@ fn punch_hole_supported() -> bool {
             *KNOWN.get_or_init(|| ok)
         }
         None => fs_type_can_punch(&dir),
+    }
+}
+
+/// Says why a read got EIO: its bytes were already streamed away. At most every 10 s,
+/// since a reader retrying would otherwise flood the log.
+fn warn_streamed_away(path: &Path, off: u64) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.safe_lock();
+    if last.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
+        *last = Some(Instant::now());
+        log::warn!(
+            "read {}: offset {} was already streamed to the server, which cannot give it back until the upload finishes — EIO",
+            path.display(), off,
+        );
     }
 }
 
@@ -6514,7 +6544,7 @@ impl NextCloudFs {
                     // Already sent and punched out locally, and an unfinished upload cannot
                     // be read back from the server either: no copy of these bytes is
                     // readable, and the server's old version would be the wrong file.
-                    log::debug!("read {}: offset {} was already streamed to the server and is not held locally", path.display(), off);
+                    warn_streamed_away(&path, off);
                     reply.error(Errno::EIO);
                     return;
                 }
@@ -6544,39 +6574,31 @@ impl NextCloudFs {
         // MutationJournal::enqueue), so a reopen of the renamed-to path resolves
         // here too. The staging file is removed the instant the PUT succeeds, so
         // this returns None again as soon as the file is safely on the server.
-        // The same after close, while a streamed upload's final chunks and assembly are
-        // still queued: the tail is the current content from where it starts; below it,
-        // nothing readable exists (the server still has the old version, if any).
-        if !sniff {
-            let finish = self.journal.safe_lock().pending_stream_finish(&path);
-            if let Some((tail, held_from, sparse)) = finish {
-                if off < held_from {
-                    reply.error(Errno::EIO);
-                    return;
-                }
-                let at = if sparse { off } else { off - held_from };
-                if let Ok(f) = std::fs::File::open(&tail) {
-                    let mut buf = vec![0u8; sz];
-                    if let Ok(n) = read_at_full(&f, &mut buf, at) {
-                        buf.truncate(n);
-                        reply.data(&buf);
-                        return;
-                    }
-                }
-            }
-        }
+        // The newest queued upload of the path (a whole-file PUT, or a streamed upload's
+        // final chunks and assembly) is the current content. A streamed one holds only its
+        // tail: below it nothing readable exists, the server still has the old version.
         {
-            let staging = self.journal.safe_lock().pending_put_staging(&path);
-            if let Some(sp) = staging {
-                if let Ok(f) = std::fs::File::open(&sp) {
-                    let mut buf = vec![0u8; sz];
-                    // The staging file *is* the current content, so its length is the
-                    // file's length and a short read here is a real EOF.
-                    if let Ok(n) = read_at_full(&f, &mut buf, off) {
-                        buf.truncate(n);
-                        reply.data(&buf);
+            let pending = self.journal.safe_lock().pending_upload(&path);
+            let (file, at) = match pending {
+                Some(mutation_journal::PendingUpload::Staged(sp)) => (Some(sp), off),
+                Some(mutation_journal::PendingUpload::StreamTail { tail, held_from, sparse }) if !sniff => {
+                    if off < held_from {
+                        warn_streamed_away(&path, off);
+                        reply.error(Errno::EIO);
                         return;
                     }
+                    (Some(tail), if sparse { off } else { off - held_from })
+                }
+                _ => (None, off),
+            };
+            if let Some(Ok(f)) = file.map(std::fs::File::open) {
+                let mut buf = vec![0u8; sz];
+                // The staging file *is* the current content, so its length is the
+                // file's length and a short read here is a real EOF.
+                if let Ok(n) = read_at_full(&f, &mut buf, at) {
+                    buf.truncate(n);
+                    reply.data(&buf);
+                    return;
                 }
             }
         }
@@ -8267,6 +8289,15 @@ impl NextCloudFs {
             }
         }
 
+        // rename() can arrive concurrently with flush() or even before it. When the source
+        // was just created via create(), its dir-cache size is 0 until flush() does its
+        // synchronous update, which may not have run yet: take the writer's staged size so
+        // the optimistic update shows the right byte count immediately. Taken before the
+        // cache lock: write() takes open_files and then cache, so the reverse would deadlock.
+        let staged_size = {
+            let len = newest_usable_writer(&self.open_files.safe_lock(), |_, of| of.remote_path == from).and_then(|(_, of)| staged_len(of));
+            len.and_then(StagedLen::resolve)
+        };
         {
             let mut c = self.cache.safe_lock();
             let mut moved_entry = None;
@@ -8277,20 +8308,6 @@ impl NextCloudFs {
             }
             let moved_dir = moved_entry.as_ref().is_some_and(|e| e.is_dir) || c.dir_cache.contains_key(&from);
             if let Some(mut entry) = moved_entry {
-                // rename() can arrive at the FUSE dispatcher concurrently with flush() or
-                // even before it (multi-threaded fuser dispatches ops in parallel).  When
-                // the source was just created via create(), its dir-cache size is 0 until
-                // flush() does its synchronous update — which may not have run yet.  Read
-                // the staging file's actual size so the optimistic update shows the right
-                // byte count immediately.
-                let staged_size = self.open_files.safe_lock()
-                    .iter()
-                    .filter(|(_, of)| of.remote_path == from && of.dirty && !of.upload_failed)
-                    .max_by_key(|(fh, _)| **fh)
-                    .and_then(|(_, of)| match &of.chunk_upload {
-                        Some(_) => Some(of.total_written),
-                        None => of.write_path.as_ref().and_then(|wp| std::fs::metadata(wp).ok()).map(|m| m.len()),
-                    });
                 if let Some(sz) = staged_size {
                     entry.size = sz;
                 }
