@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.1.87](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.86...ncrs-v0.1.87) (2026-10-22)
+
+
+### Features
+
+* **core:** add a per-inode FIFO scheduler and a fixed fuse worker pool for FUSE requests ([96807bf](https://github.com/rgon/ncrsDesktop/commit/96807bfec1e67613211a563894b6b9335d6fe8b8))
+* **core:** add a setting to turn off streamed uploads and start streaming at 100 MB instead of 10 MB ([2ae74c4](https://github.com/rgon/ncrsDesktop/commit/2ae74c4e7f84c529cd60eee5da4df2df23195061))
+* **core:** drain the per-inode scheduler before a planned restart hands the FUSE connection over ([d677f78](https://github.com/rgon/ncrsDesktop/commit/d677f78eb81683c5bbbb7ca69f39b473b4e31341))
+* **core:** keep the mount and open files alive across a daemon restart by handing the live FUSE connection to the next daemon ([90ec216](https://github.com/rgon/ncrsDesktop/commit/90ec2162d3cde85192416626959b6b090bd24617))
+* **core:** make systemd the only restart keeper: drop the fd holder, hand over on SIGTERM, ping the watchdog, and fix the handoff review findings ([ef0cd79](https://github.com/rgon/ncrsDesktop/commit/ef0cd79c7a74994327c39487372e06611738d3f4))
+* **core:** run FUSE requests on the fuse pool ordered per inode so one slow request no longer freezes the whole mount ([dbe9b2b](https://github.com/rgon/ncrsDesktop/commit/dbe9b2b105790e0f58b76be690e30fde152308cf))
+* **core:** stream a large new file only while the disk is low, and upload a long tail at close in chunk-sized pieces read one at a time ([a4f3154](https://github.com/rgon/ncrsDesktop/commit/a4f315463d753a8e92622dcd94f1fbf41cb3a5c5))
+* **fuser:** carry a reattach patch that runs a session on an already-initialised /dev/fuse connection ([15841c5](https://github.com/rgon/ncrsDesktop/commit/15841c522e77421c994eadb95a974e9115a31a52))
+* **gui:** start the daemon as the ncrs.service user unit and wait out its restarts instead of showing Unmounted ([6620382](https://github.com/rgon/ncrsDesktop/commit/662038231591e9f09536b34931180c834b64e7ed))
+* **packaging:** run ncrs as a watched systemd user service that keeps the fd store across restarts only, and document restart survival ([2dd375a](https://github.com/rgon/ncrsDesktop/commit/2dd375adc5aadd3e2d86eb259afb6857c817a6b4))
+
+
+### Bug Fixes
+
+* **core:** address the per-inode scheduler review: cut the sent chunk out in place, keep fuse workers warm, park uncached lookups, move a renamed folder's subtree, apply stream settings live ([c834513](https://github.com/rgon/ncrsDesktop/commit/c83451341ac95c48fcaea2a51dc26d9f4ce3fff2))
+* **core:** address the restart-survival and disk-reserve review: one streamed chunk per write, keep streaming once started, small copies where chunks can't be cut out, bound a stalled takeover, restore signals after a failed exec ([1461071](https://github.com/rgon/ncrsDesktop/commit/1461071a193f699591ce6b8237c97aa5ed19d540))
+* **core:** find an older writer behind newer clean or failed handles, answer EIO for already-streamed bytes, probe hole punching at mount, and drop the unshipped snapshot compatibility ([c9d48ac](https://github.com/rgon/ncrsDesktop/commit/c9d48ac60b2df1baf2d0e6ae888c694815e8a3e0))
+* **core:** keep a streamed file's first chunk local until close for muxer trailers, read a writer's whole-file staging before its first write instead of downloading again, and stage write() data outside the open-files lock ([447b9f8](https://github.com/rgon/ncrsDesktop/commit/447b9f8836272eafe3ed63a38dae1a44c9cf5947))
+* **core:** leave a reattached connection in the systemd fd store instead of storing it again, and never FDSTOREREMOVE a copy of the one taken ([cbceaed](https://github.com/rgon/ncrsDesktop/commit/cbceaedd57d8b91d2a757af5b72d9ff39cab9b4e))
+* **core:** let MIME sniffs and queued streamed finishes read correctly, fail a failed writer's own reads, agree on the newest writer for size, and remember only unsupported hole punching ([533f39f](https://github.com/rgon/ncrsDesktop/commit/533f39f3e24f3d3f5b677cdcb67c0fec36cad065))
+* **core:** punch sent chunks out of a staging file laid out at the file's own offsets instead of cutting or copying, give up a stalled takeover from the watchdog, and re-exec with execve directly ([0f550aa](https://github.com/rgon/ncrsDesktop/commit/0f550aaa14c49045c917a215b5120beb39b1274a))
+* **core:** resolve a read's queued upload as the newest one for the path again, share the staged-size lookup, and rate-limit the streamed-away warning per file ([534cf39](https://github.com/rgon/ncrsDesktop/commit/534cf39a23f0d744ff775f2a464a38986f524401))
+* **core:** resolve a read's queued upload newest-first and stop at a delete, take rename's staged size before the cache lock, share one newest-writer rule, and throttle the hole-punch probe ([3d67e65](https://github.com/rgon/ncrsDesktop/commit/3d67e65f1adffa1391080070fdf49823caa2ca2c))
+* **core:** route handoff threads through bg and point the lockfile at the vendored fuser ([3c95403](https://github.com/rgon/ncrsDesktop/commit/3c95403c79dc063be04b4416b361d7fd27bc3e92))
+* **core:** send one streamed chunk per write as a sliding window so crossing the threshold no longer freezes the mount while 100 MB uploads ([bc7c06a](https://github.com/rgon/ncrsDesktop/commit/bc7c06ab1cff8ee2b0b36b95d2c7326bc3905821))
+* **core:** stage in full where holes can't be punched, never serve or extend a failed handle, version the handle snapshot, and only exit on a takeover that is still stalled ([5c99976](https://github.com/rgon/ncrsDesktop/commit/5c999760407877494564a1210211e9f92f79b70f))
+* **core:** stop a read's queued-upload search at a delete unless a rename onto the path came after it, and take rename's staged size from the source inode ([6232460](https://github.com/rgon/ncrsDesktop/commit/6232460e2161e8de71f50673368a0ca9235a977f))
+
 ## [0.1.86](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.85...ncrs-v0.1.86) (2026-10-21)
 
 
