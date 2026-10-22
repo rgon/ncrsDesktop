@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "ncrs_passthrough"
-version = "0.1.88"
+version = "0.1.89"
 dependencies = [
  "libc",
  "seccompiler",
