@@ -41,7 +41,7 @@ jobs:
             target/release/ncrs-passthrough
             target/release/ncrs-gui
             dist/
-          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs_passthrough/**/*.rs', 'vendor/fuser/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain*', 'ncrs_core/**', 'ncrs_passthrough/**', 'vendor/**', 'plugins/**', 'ncrs-gui/**', '!ncrs-gui/node_modules/**', 'shell_integration/file-managers/dolphin/**', 'scripts/build-dolphin-plugin.sh', '.github/workflows/ci.yml') }}
 
       - name: Cache Cargo registry and git sources
         if: steps.binary-cache.outputs.cache-hit != 'true'
@@ -167,7 +167,7 @@ jobs:
             target/release/ncrs-passthrough
             target/release/ncrs-gui
             dist/
-          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs_passthrough/**/*.rs', 'vendor/fuser/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain*', 'ncrs_core/**', 'ncrs_passthrough/**', 'vendor/**', 'plugins/**', 'ncrs-gui/**', '!ncrs-gui/node_modules/**', 'shell_integration/file-managers/dolphin/**', 'scripts/build-dolphin-plugin.sh', '.github/workflows/ci.yml') }}
 
       - name: Stage .deb for Docker build context
         run: cp dist/ncrs_*.deb docker/e2e/ncrs/ncrs.deb
@@ -316,7 +316,7 @@ jobs:
             target/release/ncrs-passthrough
             target/release/ncrs-gui
             dist/
-          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs_passthrough/**/*.rs', 'vendor/fuser/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain*', 'ncrs_core/**', 'ncrs_passthrough/**', 'vendor/**', 'plugins/**', 'ncrs-gui/**', '!ncrs-gui/node_modules/**', 'shell_integration/file-managers/dolphin/**', 'scripts/build-dolphin-plugin.sh', '.github/workflows/ci.yml') }}
 
       - name: Fix binary permissions
         run: chmod +x target/release/ncrs target/release/ncrs-open target/release/ncrs-passthrough target/release/ncrs-gui
