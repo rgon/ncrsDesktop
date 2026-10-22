@@ -1021,7 +1021,13 @@ fn live_write_size(open_files: &Mutex<HashMap<u64, OpenFile>>, ino: u64) -> Opti
         Staged(PathBuf),
     }
     // Collected under the lock, measured outside it: stat(2) must not hold up every handle.
-    let sources: Vec<Source> = open_files.safe_lock().values()
+    // The newest usable writer, the same one staged_source serves a third handle's reads
+    // from, so the size and the bytes agree.
+    let sources: Vec<Source> = open_files.safe_lock().iter()
+        .filter(|(_, of)| of.ino == ino && of.dirty && !of.upload_failed)
+        .max_by_key(|(fh, _)| **fh)
+        .map(|(_, of)| of)
+        .into_iter()
         // A failed handle's bytes are not the file (staged_source does not serve them either).
         .filter(|of| of.ino == ino && of.dirty && !of.upload_failed)
         .filter_map(|of| match (&of.chunk_upload, &of.write_path) {
@@ -1035,7 +1041,7 @@ fn live_write_size(open_files: &Mutex<HashMap<u64, OpenFile>>, ino: u64) -> Opti
             Source::Streamed(n) => Some(*n),
             Source::Staged(wp) => std::fs::metadata(wp).ok().map(|m| m.len()),
         })
-        .max()
+        .next()
 }
 
 /// `attr` with its size replaced by the live written size when its inode has uncommitted
@@ -1408,10 +1414,16 @@ fn punch_hole_supported() -> bool {
     let probe = dir.join(format!(".punch-probe-{}", std::process::id()));
     let answer = std::fs::write(&probe, [0u8; 8192]).ok()
         .and_then(|()| std::fs::OpenOptions::new().write(true).open(&probe).ok())
-        .map(|f| {
+        .and_then(|f| {
             // SAFETY: a plain syscall on an fd this scope owns; no memory is passed.
             let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-            unsafe { libc::fallocate(f.as_raw_fd(), mode, 0, 4096) == 0 }
+            if unsafe { libc::fallocate(f.as_raw_fd(), mode, 0, 4096) } == 0 {
+                return Some(true);
+            }
+            // Only "not supported" is an answer; ENOSPC (btrfs needs metadata room to
+            // punch) or EIO is the moment, not the filesystem.
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            matches!(errno, Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)).then_some(false)
         });
     let _ = std::fs::remove_file(&probe);
     match answer {
@@ -4288,13 +4300,13 @@ impl NextCloudFs {
 
         let cache_dir = ncrs_cache_dir(&options.url);
         *STREAM_DISK_PATH.safe_lock() = Some(cache_dir.clone());
-        // Probed now, while the disk usually has room and before any write() holds the
-        // open-files lock (it caches its answer).
-        let _ = punch_hole_supported();
         let kept_dir = cache_dir.join("kept");
         let auto_cache_dir = cache_dir.join("cache");
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| format!("Cannot create cache dir: {}", e))?;
+        // Probed now that the directory exists, while the disk usually has room and before
+        // any write() holds the open-files lock (it caches its answer).
+        let _ = punch_hole_supported();
         std::fs::create_dir_all(&kept_dir)
             .map_err(|e| format!("Cannot create kept dir: {}", e))?;
         std::fs::create_dir_all(&auto_cache_dir)
@@ -6484,17 +6496,30 @@ impl NextCloudFs {
         // file created a moment ago. A writer must read back what it wrote (an editor
         // re-reading a page to patch it, a zip being finished in place), and so must
         // a second handle on the same inode.
+        // A GLib MIME sniff on this handle is answered below from the content type, with
+        // no file bytes, so it never needs (or fails on) bytes already streamed away.
+        let (own_failed, sniff) = self.open_files.safe_lock().get(&fh.0).map_or((false, false), |of| {
+            (of.dirty && of.upload_failed, of.mime_detect_ct.is_some() && off == 0 && sz <= of.mime_detect_max_read)
+        });
+        if own_failed {
+            // This handle's own writes were abandoned: what it reads back is not what it
+            // wrote, and another handle's bytes would be silently wrong.
+            reply.error(Errno::EIO);
+            return;
+        }
         {
             let staged = staged_source(&self.open_files.safe_lock(), fh.0, ino.0);
-            if let Some((staging, held_from)) = staged {
-                if off < held_from {
+            if let Some((_, held_from)) = &staged {
+                if off < *held_from && !sniff {
                     // Already sent and punched out locally, and an unfinished upload cannot
                     // be read back from the server either: no copy of these bytes is
                     // readable, and the server's old version would be the wrong file.
-                    log::warn!("read {}: offset {} was already streamed to the server and is not held locally", path.display(), off);
+                    log::debug!("read {}: offset {} was already streamed to the server and is not held locally", path.display(), off);
                     reply.error(Errno::EIO);
                     return;
                 }
+            }
+            if let Some((staging, _)) = staged.filter(|(_, held_from)| off >= *held_from) {
                 match read_staged(&staging, off, sz) {
                     Ok(buf) => {
                         reply.data(&buf);
@@ -6519,6 +6544,27 @@ impl NextCloudFs {
         // MutationJournal::enqueue), so a reopen of the renamed-to path resolves
         // here too. The staging file is removed the instant the PUT succeeds, so
         // this returns None again as soon as the file is safely on the server.
+        // The same after close, while a streamed upload's final chunks and assembly are
+        // still queued: the tail is the current content from where it starts; below it,
+        // nothing readable exists (the server still has the old version, if any).
+        if !sniff {
+            let finish = self.journal.safe_lock().pending_stream_finish(&path);
+            if let Some((tail, held_from, sparse)) = finish {
+                if off < held_from {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+                let at = if sparse { off } else { off - held_from };
+                if let Ok(f) = std::fs::File::open(&tail) {
+                    let mut buf = vec![0u8; sz];
+                    if let Ok(n) = read_at_full(&f, &mut buf, at) {
+                        buf.truncate(n);
+                        reply.data(&buf);
+                        return;
+                    }
+                }
+            }
+        }
         {
             let staging = self.journal.safe_lock().pending_put_staging(&path);
             if let Some(sp) = staging {
@@ -8238,11 +8284,13 @@ impl NextCloudFs {
                 // the staging file's actual size so the optimistic update shows the right
                 // byte count immediately.
                 let staged_size = self.open_files.safe_lock()
-                    .values()
-                    .find(|of| of.remote_path == from)
-                    .and_then(|of| of.write_path.as_ref())
-                    .and_then(|wp| std::fs::metadata(wp).ok())
-                    .map(|m| m.len());
+                    .iter()
+                    .filter(|(_, of)| of.remote_path == from && of.dirty && !of.upload_failed)
+                    .max_by_key(|(fh, _)| **fh)
+                    .and_then(|(_, of)| match &of.chunk_upload {
+                        Some(_) => Some(of.total_written),
+                        None => of.write_path.as_ref().and_then(|wp| std::fs::metadata(wp).ok()).map(|m| m.len()),
+                    });
                 if let Some(sz) = staged_size {
                     entry.size = sz;
                 }
