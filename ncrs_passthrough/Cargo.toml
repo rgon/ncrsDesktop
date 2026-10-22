@@ -1,0 +1,20 @@
+[package]
+name = "ncrs_passthrough"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Privilege-separated FUSE passthrough helper for ncrs (the only file that carries CAP_SYS_ADMIN)"
+
+# The privileged helper. Installed at /usr/libexec/ncrs/ncrs-passthrough with
+# `cap_sys_admin=ep`; ncrs (unprivileged) spawns it. See src/lib.rs.
+[[bin]]
+name = "ncrs-passthrough"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+seccompiler = "0.5.0"
+
+[dev-dependencies]
+tempfile = "3"
