@@ -1843,6 +1843,7 @@ else
     head -c 3000000 /dev/urandom > /tmp/pt.bin
     curl -s -u "$U:$P" -X MKCOL "${URL}pt/" -o /dev/null
     curl -s -u "$U:$P" -T /tmp/pt.bin "${URL}pt/data.bin" -o /dev/null
+    pt_ncrs=""
     install -d -o "$PT_USER" -g "$PT_USER" -m 0755 "$PT_MOUNT"
     pt_config "$PT_HOME" "$PT_MOUNT"
     : > "$PT_NLOG"; chmod 666 "$PT_NLOG"
@@ -1858,7 +1859,9 @@ else
         tail -20 "$PT_NLOG" | sed 's/^/    /'
     else
         ok "a daemon without capabilities mounted its own folder (through fusermount3)"
-        eff="$(awk '/^CapEff/ {print $2}' /proc/"$PT_DAEMON"/status 2>/dev/null)"
+        # $! is the root subshell running pt_as_user, not the daemon it started.
+        pt_ncrs="$(pgrep -u "$PT_UID" -x ncrs | head -1)"
+        eff="$(awk '/^CapEff/ {print $2}' /proc/"$pt_ncrs"/status 2>/dev/null)"
         [ "$eff" = "0000000000000000" ] \
             && ok "the running daemon has an empty effective capability set" \
             || no "the running daemon has capabilities: CapEff=$eff"
@@ -1877,8 +1880,21 @@ else
         want="$(sha < /tmp/pt.bin)"
         first="$(pt_as_user "$PT_HOME" sha256sum "$PT_MOUNT/pt/data.bin" | awk '{print $1}')"
         [ "$first" = "$want" ] \
-            && ok "first read (download into the cache) returns the right bytes" \
+            && ok "first read returns the right bytes" \
             || no "first read returned the wrong bytes"
+        # Passthrough is only offered for a complete local copy; a plain read streams
+        # without keeping one (cache_streamed_reads is off by default), so pin it.
+        pt_ipc() { printf '%s\n' "$1" | pt_as_user "$PT_HOME" timeout 10 nc -U -N "$PT_HOME/run/ncrs.sock" 2>/dev/null; }
+        [ "$(pt_ipc "KEEP $PT_MOUNT/pt/data.bin")" = "ok" ] || no "setup: IPC KEEP of pt/data.bin was not accepted"
+        pt_status=""
+        for _ in $(seq 1 60); do
+            pt_status="$(pt_ipc "STATUS $PT_MOUNT/pt/data.bin")"
+            [ "$pt_status" = "kept" ] && break
+            sleep 1
+        done
+        [ "$pt_status" = "kept" ] \
+            && ok "setup: pt/data.bin is kept locally" \
+            || no "setup: KEEP never produced a kept copy (last STATUS: ${pt_status:-none})"
         major="$(uname -r | cut -d. -f1)"; minor="$(uname -r | cut -d. -f2)"
         if [ "$major" -lt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -lt 9 ]; }; then
             ok "kernel $(uname -r) predates FUSE passthrough (6.9) — passthrough checks skipped"
@@ -1892,7 +1908,7 @@ else
                 ok "the second open was served by kernel passthrough via the helper"
             else
                 no "the second open was not granted passthrough"
-                grep -iE "passthrough|backing" "$PT_NLOG" | tail -8 | sed 's/^/    /'
+                grep -iE "passthrough|backing|data\.bin|cache" "$PT_NLOG" | tail -30 | sed 's/^/    /'
             fi
             ! grep -q "FUSE passthrough unavailable" "$PT_NLOG" \
                 && ok "the daemon never fell back to buffered reads" \
@@ -1900,6 +1916,7 @@ else
         fi
     fi
     fusermount3 -u "$PT_MOUNT" 2>/dev/null || umount -l "$PT_MOUNT" 2>/dev/null
+    [ -n "$pt_ncrs" ] && kill "$pt_ncrs" 2>/dev/null
     kill "$PT_DAEMON" 2>/dev/null; wait "$PT_DAEMON" 2>/dev/null
     sleep 1
     [ -z "$(pgrep -u "$PT_UID" -f "^$PT_HELPER")" ] \
