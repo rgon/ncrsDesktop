@@ -61,7 +61,8 @@ pub struct MountOptions {
     #[serde(default = "default_stale_gio_temp_mins")]
     pub stale_gio_temp_mins: u64,
     /// Attempt kernel FUSE_PASSTHROUGH (zero-copy read) for files served from a
-    /// complete, fresh local cache copy. Requires Linux 6.9+ and CAP_SYS_ADMIN;
+    /// complete, fresh local cache copy. Requires Linux 6.9+ and the
+    /// `ncrs-passthrough` helper (which holds CAP_SYS_ADMIN — passthrough_broker.rs);
     /// silently falls back to buffered reads when either is unavailable.
     #[serde(default = "default_true")]
     pub fuse_passthrough: bool,
@@ -686,8 +687,8 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str(&format!("stale_gio_temp_mins: {}\n", settings.stale_gio_temp_mins));
     content.push_str("# Zero-copy reads for fully-cached files: once a file is downloaded and\n");
     content.push_str("# verified fresh, the kernel serves reads directly from the backing cache\n");
-    content.push_str("# file, bypassing ncRS entirely. Requires Linux 6.9+ and CAP_SYS_ADMIN\n");
-    content.push_str("# (granted via a file capability on the ncrs binary in the .deb package);\n");
+    content.push_str("# file, bypassing ncRS entirely. Requires Linux 6.9+ and the packaged\n");
+    content.push_str("# ncrs-passthrough helper (the only file given CAP_SYS_ADMIN);\n");
     content.push_str("# silently falls back to normal reads when either is unavailable. Can be\n");
     content.push_str("# toggled live from the tray/settings without remounting.\n");
     content.push_str(&format!("fuse_passthrough: {}\n", settings.fuse_passthrough));

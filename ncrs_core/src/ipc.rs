@@ -1478,7 +1478,8 @@ fn handle_client_loop(
         } else if trimmed == "PASSTHROUGH_STATUS" {
             // "on"/"off" reflects the live toggle; the second field is whether a
             // passthrough attempt has actually succeeded this session (false
-            // stays false once CAP_SYS_ADMIN or kernel support is found missing).
+            // stays false once the passthrough helper, its CAP_SYS_ADMIN or kernel
+            // support is found missing).
             format!(
                 "{}:{}",
                 if passthrough_enabled.load(Ordering::Relaxed) { "on" } else { "off" },

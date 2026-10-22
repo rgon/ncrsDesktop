@@ -493,6 +493,12 @@ struct RestoredBacking {
 
 static RESTORED_BACKING: Mutex<Option<RestoredBacking>> = Mutex::new(None);
 
+/// The backing ids restored handles still use, which this daemon (or its
+/// passthrough helper) has to close once they are released.
+pub(crate) fn restored_backing_ids() -> Vec<u32> {
+    RESTORED_BACKING.safe_lock().as_ref().map(|rb| rb.users.keys().copied().collect()).unwrap_or_default()
+}
+
 fn release_restored_backing(fh: u64) {
     let close = {
         let mut g = RESTORED_BACKING.safe_lock();

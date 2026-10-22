@@ -29,6 +29,7 @@ pub mod preview;
 pub mod propfind;
 pub mod remote_wipe;
 pub mod search;
+mod passthrough_broker;
 mod seccomp_harden;
 pub mod webdav_ops;
 
@@ -4274,7 +4275,8 @@ struct ConnInfo {
     // (PASSTHROUGH_ON/OFF) without a remount. Seeded from MountOptions.fuse_passthrough.
     passthrough_enabled: Arc<AtomicBool>,
     // Sticky per-session verdict: flipped false the first time open_backing()
-    // fails (missing CAP_SYS_ADMIN, kernel <6.9, etc.) so every later open()
+    // fails (no passthrough helper or no CAP_SYS_ADMIN on it, kernel <6.9, etc.;
+    // passthrough_broker clears it up front when the helper is unusable) so every later open()
     // just falls back to a normal reply instead of re-probing and re-logging.
     passthrough_capable: Arc<AtomicBool>,
     /// Per-directory cooldown after the server failed a listing (see `backoff.rs`).
@@ -10163,6 +10165,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     let handoff_open_files = filesystem.open_files.clone();
     let handoff_next_fh = filesystem.next_fh.clone();
     let handoff_journal = filesystem.journal.clone();
+    let passthrough_capable = filesystem.passthrough_capable_flag();
 
     let reattached = reattach.is_some();
     let sched_fs = fuse_dispatch::SchedFs::new(filesystem);
@@ -10177,6 +10180,12 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             // No FUSE_INIT on a live connection: init() is not called again, and the
             // capabilities the first daemon negotiated stay in force.
             let session = fuser::Session::from_fd_initialized(sched_fs, fd, fuse_config.acl, fuse_config.clone());
+            {
+                use std::os::fd::AsFd;
+                // The predecessor's helper went away with it; the ids it registered
+                // stay valid on the connection and are closed through the new one.
+                passthrough_broker::start(own.as_fd(), &state_snapshot::restored_backing_ids(), &passthrough_capable);
+            }
             handoff::adopt_reattached(own, dev, stored);
             session
         }
@@ -10187,6 +10196,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
             if let Some(dev) = handoff::adopt_fresh(session.as_fd(), &options.mount_point) {
                 state_snapshot::start_fresh(&cache_dir, dev, &options.mount_point, &handoff_cache);
             }
+            passthrough_broker::start(session.as_fd(), &[], &passthrough_capable);
             session
         }
     };
@@ -10238,6 +10248,7 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
 
     shutdown_flag.store(true, Ordering::Relaxed);
     log::info!("FUSE session ended — shutdown signal sent to background threads");
+    passthrough_broker::stop();
 
     // Daemon-restart survival: a clean end means unmounted, so nothing will take
     // the connection over; another error leaves it to the keeper for a successor.
