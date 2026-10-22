@@ -1,0 +1,12 @@
+# The e2e WebDAV front (docker/e2e/ncrs/chunkdav.py) on 127.0.0.1:8090, in
+# front of the rclone container ("webdav" on the test network). GETs of
+# "slowpoke" paths are held 8 s so a read is in flight when the daemon freezes.
+[Unit]
+Description=chunkdav e2e WebDAV front
+
+[Service]
+ExecStart=/usr/bin/python3 /e2e/chunkdav.py 8090 webdav /var/log/chunkdav.log --slow slowpoke:8
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
