@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.89](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.88...ncrs-v0.1.89) (2026-10-22)
+
+
+### Features
+
+* **gui:** choose the mount folder on the sign-in form, refuse one that already exists, and report an unset or occupied folder in the status bar ([f6282fd](https://github.com/rgon/ncrsDesktop/commit/f6282fd5c6ea1d52646fdd8eb06a820434c9ec88))
+
 ## [0.1.88](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.87...ncrs-v0.1.88) (2026-10-22)
 
 
