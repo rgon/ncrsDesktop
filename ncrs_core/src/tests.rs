@@ -3140,6 +3140,7 @@ mod upload_order_tests {
             io_kind: iomode::IoKind::Cached,
             upload_failed: false,
             created: true,
+            staged_whole: false,
             unlinked: false,
             opened_gen: 0,
         }
@@ -3203,7 +3204,7 @@ mod upload_order_tests {
         let wp = dir.join("write_1");
         std::fs::write(&wp, pattern(1_000)).unwrap();
         let mut of = writer_handle(7, true, Some(wp));
-        of.chunk_upload = Some(ChunkUploadState { uploads_base: "x".into(), next_index: 3, bytes_confirmed: 30_000 });
+        of.chunk_upload = Some(ChunkUploadState { uploads_base: "x".into(), next_index: 3, bytes_confirmed: 30_000, head: 0 });
         of.total_written = 31_000;
         let files = Mutex::new(HashMap::from([(1, of)]));
 
@@ -3245,7 +3246,7 @@ mod upload_order_tests {
         let files = HashMap::from([(1, writer_handle(7, true, Some(wp.clone())))]);
 
         let (src, skip) = staged_source(&files, 1, 7).expect("a dirty writer reads from its staging file");
-        assert_eq!((src.as_path(), skip), (wp.as_path(), 0));
+        assert_eq!((src.as_path(), skip), (wp.as_path(), Held::ALL));
         // A full page, and the partial last page: short exactly at the staged end.
         assert_eq!(read_staged(&src, 4096, 4096).unwrap(), data[4096..8192]);
         assert_eq!(read_staged(&src, 8192, 4096).unwrap(), data[8192..]);
@@ -3262,7 +3263,7 @@ mod upload_order_tests {
         let reader = writer_handle(7, false, None);
         let files = HashMap::from([(1, writer_handle(7, true, Some(wp.clone()))), (2, reader)]);
 
-        assert_eq!(staged_source(&files, 2, 7), Some((wp, 0)));
+        assert_eq!(staged_source(&files, 2, 7), Some((wp, Held::ALL)));
         // …but not another file's.
         assert_eq!(staged_source(&files, 2, 8), None);
 
@@ -3292,9 +3293,36 @@ mod upload_order_tests {
         let mut failed = writer_handle(7, true, Some(dir.join("write_9")));
         failed.upload_failed = true;
         let files = HashMap::from([(5, writer), (7, reader), (9, failed)]);
-        assert_eq!(staged_source(&files, 6, 7), Some((wp, 0)), "the newest handle with usable bytes");
+        assert_eq!(staged_source(&files, 6, 7), Some((wp, Held::ALL)), "the newest handle with usable bytes");
         let files = Mutex::new(files);
         assert_eq!(live_write_size(&files, 7), Some(7), "a failed handle does not set the size");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_writer_that_staged_the_whole_file_reads_it_before_writing() {
+        // An O_RDWR open of an existing file stages its content; reading that handle
+        // before any write must come from there, not download the file a second time.
+        let dir = staging_dir("staged-whole");
+        let wp = dir.join("write_1");
+        std::fs::write(&wp, b"document").unwrap();
+        let mut of = writer_handle(7, false, Some(wp.clone()));
+        of.staged_whole = true;
+        let reader = writer_handle(7, false, None);
+        let files = HashMap::from([(1, of), (2, reader)]);
+
+        assert_eq!(staged_source(&files, 1, 7), Some((wp.clone(), Held::ALL)));
+        // Not for another handle: until it is written, the server copy is the same file.
+        assert_eq!(staged_source(&files, 2, 7), None);
+
+        // A newer writer's uncommitted bytes still win over the clean seed.
+        let other = dir.join("write_3");
+        let files = HashMap::from([
+            (1, files.into_iter().find(|(k, _)| *k == 1).unwrap().1),
+            (3, writer_handle(7, true, Some(other.clone()))),
+        ]);
+        assert_eq!(staged_source(&files, 1, 7), Some((other, Held::ALL)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3303,18 +3331,28 @@ mod upload_order_tests {
     fn a_streamed_upload_serves_only_the_bytes_it_still_holds() {
         let dir = staging_dir("streamed-read");
         let wp = dir.join("write_1");
-        // Laid out at the file's own offsets: the sent 30 000 bytes are a hole, the tail follows.
-        let tail = pattern(1_000);
+        // Laid out at the file's own offsets: the kept 10 000-byte head, the sent bytes up
+        // to 30 000 as a hole, then the tail.
+        let (head, tail) = (pattern(10_000), pattern(1_000));
         let f = std::fs::File::create(&wp).unwrap();
         f.set_len(30_000).unwrap();
+        f.write_all_at(&head, 0).unwrap();
         f.write_all_at(&tail, 30_000).unwrap();
         let mut of = writer_handle(7, true, Some(wp.clone()));
-        of.chunk_upload = Some(ChunkUploadState { uploads_base: "x".into(), next_index: 3, bytes_confirmed: 30_000 });
+        of.chunk_upload = Some(ChunkUploadState { uploads_base: "x".into(), next_index: 3, bytes_confirmed: 30_000, head: 10_000 });
         let files = HashMap::from([(1, of)]);
 
-        let (src, held_from) = staged_source(&files, 1, 7).unwrap();
-        assert_eq!(held_from, 30_000, "nothing before the first unsent byte is held any more");
+        let (src, held) = staged_source(&files, 1, 7).unwrap();
+        assert_eq!(held, Held { head: 10_000, from: 30_000 });
+        assert!(held.covers(30_500, 100));
         assert_eq!(read_staged(&src, 30_500, 100).unwrap(), tail[500..600]);
+        // A muxer reading back the header it is about to patch gets its own bytes...
+        assert!(held.covers(0, 4096) && held.covers(5_904, 4096));
+        assert_eq!(read_staged(&src, 0, 4096).unwrap(), head[..4096]);
+        // ...but nothing that reaches into the sent bytes, which are holes here.
+        assert!(!held.covers(9_000, 4096));
+        assert!(!held.covers(10_000, 1));
+        assert!(!held.covers(29_999, 1));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3431,17 +3469,18 @@ mod upload_order_tests {
     fn streaming_keeps_a_threshold_sized_tail_sliding_behind_the_writer() {
         let chunk = webdav_ops::CHUNK_SIZE as u64;
         let threshold = 100 * 1024 * 1024;
-        // No session yet: a file a few chunks long stays local in full.
+        // No session yet: a file a few chunks long stays local in full, and the head
+        // chunk, never sent early, does not count towards the threshold.
         assert!(!stream_should_graduate(chunk, None, threshold));
-        assert!(!stream_should_graduate(threshold - 1, None, threshold));
-        assert!(stream_should_graduate(threshold, None, threshold));
-        // A threshold below one chunk still waits for a full chunk.
-        assert!(!stream_should_graduate(chunk - 1, None, 0));
-        assert!(stream_should_graduate(chunk, None, 0));
+        assert!(!stream_should_graduate(threshold + chunk - 1, None, threshold));
+        assert!(stream_should_graduate(threshold + chunk, None, threshold));
+        // A threshold below one chunk still waits for a full chunk past the head.
+        assert!(!stream_should_graduate(2 * chunk - 1, None, 0));
+        assert!(stream_should_graduate(2 * chunk, None, 0));
         // Session open: one chunk sent leaves the tail under the threshold, so the next
         // chunk only goes once the writer has added another chunk's worth.
-        let s = ChunkUploadState { uploads_base: "x".into(), next_index: 1, bytes_confirmed: chunk };
-        assert!(!stream_should_graduate(threshold, Some(&s), threshold));
-        assert!(!stream_should_graduate(threshold + chunk - 1, Some(&s), threshold));
-        assert!(stream_should_graduate(threshold + chunk, Some(&s), threshold));
+        let s = ChunkUploadState { uploads_base: "x".into(), next_index: 2, bytes_confirmed: 2 * chunk, head: chunk };
+        assert!(!stream_should_graduate(threshold + chunk, Some(&s), threshold));
+        assert!(!stream_should_graduate(threshold + 2 * chunk - 1, Some(&s), threshold));
+        assert!(stream_should_graduate(threshold + 2 * chunk, Some(&s), threshold));
     }
