@@ -55,7 +55,10 @@ use crate::iomode::IoKind;
 use crate::{ChunkUploadState, FsCache, MutexExt, NextCloudFs, OpenFile, READ_AHEAD_INITIAL};
 
 const LOG_FILE: &str = "handoff.log";
-const HANDLES_FILE: &str = "handoff-handles.json";
+// Versioned name: the staging layout changed (sparse, file offsets), and a binary that
+// predates it must not find this file and restore a streaming handle in its old layout
+// (it falls back to the log, which restores a mid-stream handle as failed: safe).
+const HANDLES_FILE: &str = "handoff-handles-v2.json";
 /// Rewrite the log down to the live state once it grows past this (and past
 /// twice its size after the last rewrite).
 const COMPACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -516,6 +519,8 @@ fn release_restored_backing(fh: u64) {
 /// so no allocation slips between them.
 pub(crate) fn start_fresh(cache_dir: &Path, dev: ConnDev, mount_point: &Path, cache: &Mutex<FsCache>) {
     let _ = std::fs::remove_file(cache_dir.join(HANDLES_FILE));
+    // An unversioned snapshot from before the layout change is never read again.
+    let _ = std::fs::remove_file(cache_dir.join("handoff-handles.json"));
     let path = cache_dir.join(LOG_FILE);
     let c = cache.safe_lock();
     let mut g = LOG.safe_lock();

@@ -3357,7 +3357,7 @@ mod upload_order_tests {
         let chunk = webdav_ops::CHUNK_SIZE;
         let data = pattern(chunk * 2 + 1234);
         std::fs::write(&wp, &data).unwrap();
-        free_sent_chunk(&wp, 0, chunk as u64).unwrap();
+        free_sent_chunk(&std::fs::OpenOptions::new().write(true).open(&wp).unwrap(), 0, chunk as u64).unwrap();
         let after = std::fs::read(&wp).unwrap();
         assert_eq!(after.len(), data.len(), "the file keeps its size: offsets stay the file's own");
         assert_eq!(after[chunk..], data[chunk..], "the unsent bytes are untouched");

@@ -540,10 +540,11 @@ pub(crate) fn takeover_pending_for() -> Option<Duration> {
 /// on the mount get ENOTCONN now instead of waiting on watchdog kills that come too far
 /// apart for StartLimitBurst ever to end it, and exits non-zero so systemd starts a
 /// fresh daemon on an empty fd store.
-pub(crate) fn give_up_stalled_takeover() -> ! {
-    if let Some((_, dev)) = TAKEOVER_SINCE.safe_lock().take() {
-        give_up(dev);
-    }
+pub(crate) fn give_up_stalled_takeover() {
+    // Taken under the lock: a takeover that reached serving meanwhile disarmed its guard,
+    // and then there is nothing to give up and no reason to exit.
+    let Some((_, dev)) = TAKEOVER_SINCE.safe_lock().take() else { return };
+    give_up(dev);
     std::process::exit(1)
 }
 
@@ -792,8 +793,7 @@ fn exec_in_place(exe: &Path, set: &[(&str, String)]) -> io::Error {
     // Never inherited: the handover variables are set fresh, and systemd's belong to the
     // start that handed them over.
     let drop_var = |k: &std::ffi::OsStr| {
-        set.iter().any(|(n, _)| k == std::ffi::OsStr::new(n))
-            || [ENV_FD, ENV_DEV, ENV_STORED, "LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"].iter().any(|n| k == std::ffi::OsStr::new(n))
+        [ENV_FD, ENV_DEV, ENV_STORED, "LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"].iter().any(|n| k == std::ffi::OsStr::new(n))
     };
     let built = (|| -> io::Result<(CString, Vec<CString>, Vec<CString>)> {
         let path = cstr(exe.as_os_str().as_bytes().to_vec())?;
