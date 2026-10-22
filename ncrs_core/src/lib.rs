@@ -1367,7 +1367,7 @@ fn write_into_tail_file(wp: &Path, tail_off: u64, data: &[u8]) -> std::io::Resul
 /// completed chunk — this is what keeps the tail bounded to ~CHUNK_SIZE
 /// regardless of the total file size.
 fn shrink_tail_file(wp: &Path, skip: u64) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{Seek, SeekFrom, Write};
     // Cut the sent prefix out in place where the filesystem can (ext4, xfs): the tail
     // keeps up to the stream threshold behind the writer, so copying it after every sent
     // chunk would rewrite ~90 MiB per 10 MiB uploaded. Elsewhere, or when the tail is
@@ -1381,18 +1381,51 @@ fn shrink_tail_file(wp: &Path, skip: u64) -> std::io::Result<()> {
             return Ok(());
         }
     }
-    let mut leftover = Vec::new();
+    let tmp = wp.with_extension("tmp");
     {
         let mut src = std::fs::File::open(wp)?;
         src.seek(SeekFrom::Start(skip))?;
-        src.read_to_end(&mut leftover)?;
-    }
-    let tmp = wp.with_extension("tmp");
-    {
         let mut dst = std::fs::File::create(&tmp)?;
-        dst.write_all(&leftover)?;
+        // Streamed, never read whole: see collapse_range_supported for why it stays small.
+        std::io::copy(&mut src, &mut dst)?;
+        dst.flush()?;
     }
     std::fs::rename(&tmp, wp)
+}
+
+/// Whether the staging filesystem can cut a sent chunk out of a tail file in place
+/// (FALLOC_FL_COLLAPSE_RANGE: ext4, xfs; not btrfs or tmpfs). Probed once on a scratch
+/// file in the staging directory. Where it can't, shrink_tail_file copies the tail, so
+/// a streaming file keeps only about a chunk unsent rather than the threshold.
+fn collapse_range_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        use std::os::unix::io::AsRawFd;
+        let Some(dir) = STREAM_DISK_PATH.safe_lock().clone() else { return false };
+        let probe = dir.join(format!(".collapse-probe-{}", std::process::id()));
+        let ok = std::fs::write(&probe, vec![0u8; 3 * 65536]).is_ok()
+            && std::fs::OpenOptions::new().write(true).open(&probe).is_ok_and(|f| {
+                // SAFETY: a plain syscall on an fd this closure owns; no memory is passed.
+                unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_COLLAPSE_RANGE, 0, 65536) == 0 }
+            });
+        let _ = std::fs::remove_file(&probe);
+        log::info!("staging filesystem {} cut sent chunks out in place", if ok { "can" } else { "cannot" });
+        ok
+    })
+}
+
+/// How much unsent tail a streaming file keeps before its oldest chunk goes out: the
+/// threshold where sent chunks are cut out in place, one chunk where they are copied off
+/// (so each copy stays small).
+fn stream_window(streaming: bool, collapse: bool, threshold: u64) -> u64 {
+    if streaming && !collapse { webdav_ops::CHUNK_SIZE as u64 } else { threshold }
+}
+
+/// Whether a file not yet streaming may start now that the disk is low. Where sent chunks
+/// can only be copied off, a backlog already past twice the threshold is left staged in
+/// full: copying it would need the very space that is missing.
+fn may_start_streaming(unsent: u64, collapse: bool, threshold: u64) -> bool {
+    collapse || unsent <= threshold.saturating_mul(2)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4885,8 +4918,12 @@ impl NextCloudFs {
         mut state: Option<ChunkUploadState>,
         total_written: u64,
     ) -> Result<ChunkUploadState, (String, Option<ChunkUploadState>)> {
-        loop {
-            if !stream_should_graduate(total_written, state.as_ref(), stream_upload_threshold()) {
+        // One chunk per call: a backlog staged while the disk had room drains one chunk per
+        // write, so no single write() holds its worker and the file's queue for the whole
+        // upload (which would also starve the watchdog's progress check).
+        {
+            let window = stream_window(state.is_some(), collapse_range_supported(), stream_upload_threshold());
+            if !stream_should_graduate(total_written, state.as_ref(), window) {
                 return state.clone().ok_or((
                     "graduate_chunk called with nothing to graduate".to_string(),
                     state,
@@ -4931,6 +4968,7 @@ impl NextCloudFs {
 
             shrink_tail_file(wp, webdav_ops::CHUNK_SIZE as u64)
                 .map_err(|e| (format!("tail rewrite: {}", e), state.clone()))?;
+            Ok(state.expect("just ensured Some above"))
         }
     }
 
@@ -7358,8 +7396,23 @@ impl NextCloudFs {
             of.dirty = true;
             of.total_written = of.total_written.max(offset + data.len() as u64);
 
-            if stream_should_graduate(of.total_written, of.chunk_upload.as_ref(), stream_upload_threshold()) && stream_disk_low() {
-                if of.chunk_upload.is_none() {
+            // Once a file streams it keeps streaming until closed: cutting its sent chunks
+            // out frees the space that made the disk low, and stopping then would only
+            // stage the rest and start over.
+            let collapse = collapse_range_supported();
+            let threshold = stream_upload_threshold();
+            let streaming = of.chunk_upload.is_some();
+            let window = stream_window(streaming, collapse, threshold);
+            let go = stream_should_graduate(of.total_written, of.chunk_upload.as_ref(), window)
+                && (streaming || (stream_disk_low() && may_start_streaming(of.total_written, collapse, threshold)));
+            if !streaming && !go && !collapse && of.total_written > threshold.saturating_mul(2) && stream_disk_low() {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    log::warn!("write: disk is low, but {} is already {} MiB and this filesystem cannot free sent chunks in place — staging it in full", path.display(), of.total_written >> 20);
+                }
+            }
+            if go {
+                if !streaming {
                     log::info!("write: disk is low — streaming {} to the server as it is written", path.display());
                 }
                 let total_written = of.total_written;

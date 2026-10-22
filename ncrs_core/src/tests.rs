@@ -3315,6 +3315,18 @@ mod upload_order_tests {
     }
 
     #[test]
+    fn where_sent_chunks_are_only_copied_off_a_streaming_file_keeps_one_chunk_and_a_big_backlog_never_starts() {
+        let chunk = webdav_ops::CHUNK_SIZE as u64;
+        let threshold = 100 * 1024 * 1024;
+        assert_eq!(stream_window(false, false, threshold), threshold, "not streaming yet: the threshold");
+        assert_eq!(stream_window(true, true, threshold), threshold, "cut out in place: the sliding window");
+        assert_eq!(stream_window(true, false, threshold), chunk, "copied off: keep each copy small");
+        assert!(may_start_streaming(50 * threshold, true, threshold), "in place: any backlog drains cheaply");
+        assert!(may_start_streaming(2 * threshold, false, threshold));
+        assert!(!may_start_streaming(2 * threshold + 1, false, threshold), "copying it would need the missing space");
+    }
+
+    #[test]
     fn the_automatic_disk_reserve_is_the_larger_of_2_gib_and_5_percent() {
         let gib = 1u64 << 30;
         assert_eq!(stream_reserve_bytes(0, 10 * gib), 2 * gib, "small disk: 2 GiB floor");

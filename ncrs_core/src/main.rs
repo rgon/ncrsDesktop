@@ -76,9 +76,6 @@ struct Cli {
 }
 
 fn main() {
-    // Before any thread exists, so every thread inherits it: SIGTERM is then
-    // only taken by the daemon's own handler thread (see ncrs_core::handoff).
-    ncrs_core::handoff::block_sigterm();
     // The GUI spawns the daemon without RUST_LOG; bare env_logger::init() would then log nothing.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = Cli::parse();
@@ -104,6 +101,12 @@ fn main() {
         }
         return;
     }
+
+    // Only the daemon path from here on. Before any thread exists (the keyring lookup in
+    // config loading may start some), so every thread inherits it: SIGTERM is then only
+    // taken by the daemon's own handler thread (see ncrs_core::handoff). The one-shot
+    // modes above keep the default, so `kill` and `timeout` still stop them.
+    ncrs_core::handoff::block_sigterm();
 
     let mut opts = if let Some(ref path) = cli.config {
         let yaml = match std::fs::read_to_string(path) {

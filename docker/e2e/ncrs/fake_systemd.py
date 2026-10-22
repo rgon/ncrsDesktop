@@ -61,7 +61,10 @@ class Supervisor:
         self.ctl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.ctl.bind(self.ctl_path)
         self.ctl.listen(4)
-        self.store = {}  # FDNAME -> fd
+        # [name, fd] in storing order. Duplicates are kept: real systemd 255 only merges a
+        # re-sent descriptor when kcmp() works, and Docker's default seccomp blocks it, so
+        # a daemon that stores the same connection twice shows up here as two entries.
+        self.store = []
         self.pid = None
         self.last_ping = 0.0
         self.starts = []
@@ -72,10 +75,10 @@ class Supervisor:
 
     # ── the fd store ──────────────────────────────────────────────────────────
     def drop_store(self, why):
-        for name, fd in self.store.items():
+        for name, fd in self.store:
             os.close(fd)
             self.log("FDSTORE dropped %s (%s)" % (name, why))
-        self.store = {}
+        self.store = []
 
     # ── starting ──────────────────────────────────────────────────────────────
     def start(self):
@@ -87,8 +90,8 @@ class Supervisor:
             self.drop_store("unit failed")
             return False
         self.starts.append(now)
-        names = list(self.store.keys())
-        fds = [self.store[n] for n in names]
+        names = [n for n, _ in self.store]
+        fds = [fd for _, fd in self.store]
         env = dict(os.environ)
         env["NOTIFY_SOCKET"] = self.notify_path
         for k in ("LISTEN_FDS", "LISTEN_FDNAMES", "LISTEN_PID", "WATCHDOG_USEC", "WATCHDOG_PID"):
@@ -198,20 +201,19 @@ class Supervisor:
             self.log("STOPPING=1 from pid %d" % sender)
         name = fields.get("FDNAME", "stored")
         if fields.get("FDSTOREREMOVE") == "1":
-            fd = self.store.pop(name, None)
-            if fd is not None:
+            gone = [fd for n, fd in self.store if n == name]  # every entry of that name, as systemd does
+            self.store = [(n, fd) for n, fd in self.store if n != name]
+            for fd in gone:
                 os.close(fd)
-            self.log("FDSTOREREMOVE %s (%s)" % (name, "removed" if fd is not None else "not stored"))
+            self.log("FDSTOREREMOVE %s (%d removed)" % (name, len(gone)))
         if fields.get("FDSTORE") == "1":
             for fd in fds:
-                if name in self.store:
-                    os.close(self.store.pop(name))  # systemd keeps one copy per name
                 if len(self.store) >= FD_STORE_MAX:
                     self.log("FDSTORE %s refused: store full" % name)
                     os.close(fd)
                     continue
-                self.store[name] = fd
-                self.log("FDSTORE %s kept" % name)
+                self.store.append((name, fd))
+                self.log("FDSTORE %s kept (%d stored)" % (name, len(self.store)))
             fds = []
         for fd in fds:
             os.close(fd)
@@ -223,7 +225,7 @@ class Supervisor:
             cmd = conn.recv(256).decode().strip()
             self.log("control: %s" % cmd)
             if cmd == "status":
-                conn.sendall(("state=%s pid=%s store=%s\n" % (self.state, self.pid or "", ",".join(self.store))).encode())
+                conn.sendall(("state=%s pid=%s store=%s\n" % (self.state, self.pid or "", ",".join(n for n, _ in self.store))).encode())
             elif cmd == "restart":
                 if self.pid:
                     status = self.kill_and_reap(signal.SIGTERM, 15)

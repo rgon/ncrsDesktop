@@ -105,6 +105,20 @@ fn verdict(unavailable_locks: &[&str], pool_stuck_for: Option<Duration>, stuck_l
     }
 }
 
+/// A daemon that took over a live connection keeps programs on the mount waiting until
+/// it serves it, so starting up may not take forever: past `limit` the ping is withheld
+/// and systemd kills it (StartLimitBurst then ends the mount with ENOTCONN). A fresh
+/// start has no such bound: nobody waits on it, and it may sit at a locked keyring.
+fn takeover_verdict(pending_for: Option<Duration>, limit: Duration) -> Result<(), String> {
+    match pending_for {
+        Some(d) if d > limit => Err(format!(
+            "took over the mount {}s ago and still does not serve it",
+            d.as_secs()
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Starts the `sd-watchdog` thread when systemd enabled the watchdog for this process.
 pub(crate) fn spawn() {
     let Some(every) = interval_from_env(
@@ -126,7 +140,10 @@ pub(crate) fn spawn() {
                 .filter(|(_, ok)| !ok(LOCK_WAIT))
                 .map(|(name, _)| *name)
                 .collect();
-            match verdict(&unavailable, stuck, every / 2) {
+            let takeover_limit = (every * 2).max(Duration::from_secs(60));
+            let health = takeover_verdict(crate::handoff::takeover_pending_for(), takeover_limit)
+                .and_then(|()| verdict(&unavailable, stuck, every / 2));
+            match health {
                 Ok(()) => {
                     let _ = crate::handoff::sd_notify("WATCHDOG=1", None);
                 }
@@ -152,6 +169,14 @@ mod tests {
         assert_eq!(interval_from_env(Some("0"), None, 7), None);
         assert_eq!(interval_from_env(None, None, 7), None);
         assert_eq!(interval_from_env(Some("x"), None, 7), None);
+    }
+
+    #[test]
+    fn a_takeover_that_never_starts_serving_stops_the_pings() {
+        let limit = Duration::from_secs(60);
+        assert!(takeover_verdict(None, limit).is_ok(), "a fresh start is not bounded");
+        assert!(takeover_verdict(Some(Duration::from_secs(30)), limit).is_ok());
+        assert!(takeover_verdict(Some(Duration::from_secs(61)), limit).is_err());
     }
 
     #[test]

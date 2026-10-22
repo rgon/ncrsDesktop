@@ -351,16 +351,18 @@ fn with_log(f: impl FnOnce(&mut Writer)) {
 /// only queued; what keeps a crash from reusing the number is the reservation,
 /// written through before the first id of each block goes out.
 pub(crate) fn inode_allocated(ino: u64, path: &Path) {
-    with_log(|w| {
-        if ino >= w.reserved_upto {
-            w.reserved_upto = reservation_after(ino);
-            let s = w.next_seq();
-            let upto = w.reserved_upto;
-            w.append(&Record::Reserve { s, upto }, true);
-        }
+    with_log(|w| log_inode(w, ino, path));
+}
+
+fn log_inode(w: &mut Writer, ino: u64, path: &Path) {
+    if ino >= w.reserved_upto {
+        w.reserved_upto = reservation_after(ino);
         let s = w.next_seq();
-        w.append(&Record::Ino { s, ino, path: path.to_path_buf() }, false);
-    });
+        let upto = w.reserved_upto;
+        w.append(&Record::Reserve { s, upto }, true);
+    }
+    let s = w.next_seq();
+    w.append(&Record::Ino { s, ino, path: path.to_path_buf() }, false);
 }
 
 /// The reservation that covers handing out `ino`: the end of its block.
@@ -1431,34 +1433,24 @@ mod tests {
 
     #[test]
     fn a_compaction_keeps_what_was_logged_while_it_ran() {
-        // Uses the global log: ids far above what parallel tests allocate.
+        // A writer of its own, not the process-wide LOG that parallel tests write through.
         let dir = tempfile::tempdir().unwrap();
         let mut c = crate::tests::make_test_cache();
         c.inodes.insert(900_002, "/a".into());
         c.paths.insert("/a".into(), 900_002);
         c.next_inode = 900_003;
-        let cache = Mutex::new(c);
-        *LOG.safe_lock() = Some(writer_at(dir.path()));
+        let mut w = writer_at(dir.path());
         // What compact() does under the locks, then a record arrives mid-write.
-        let (image, path) = {
-            let c = cache.safe_lock();
-            let mut g = LOG.safe_lock();
-            let w = g.as_mut().unwrap();
-            w.tail = Some(Vec::new());
-            (w.image(&c), w.path.clone())
-        };
-        inode_allocated(900_003, Path::new("/late"));
+        w.tail = Some(Vec::new());
+        let (image, path) = (w.image(&c), w.path.clone());
+        log_inode(&mut w, 900_003, Path::new("/late"));
         let tmp = path.with_extension("log.tmp");
         let mut out = image.write(&tmp).unwrap();
-        {
-            let mut g = LOG.safe_lock();
-            let w = g.as_mut().unwrap();
-            w.flush();
-            out.write_all(&w.tail.take().unwrap()).unwrap();
-        }
+        w.flush();
+        out.write_all(&w.tail.take().unwrap()).unwrap();
         finish_file(out).unwrap();
         std::fs::rename(&tmp, &path).unwrap();
-        *LOG.safe_lock() = None;
+        drop(w);
         let r = load(dir.path(), DEV, &mp()).unwrap();
         assert_eq!(r.inodes.get(&900_002), Some(&PathBuf::from("/a")));
         assert_eq!(r.inodes.get(&900_003), Some(&PathBuf::from("/late")), "logged during the compaction");
