@@ -75,6 +75,21 @@ else
     pass "postinst does not globally enable ncrs.service"
 fi
 
+# Only the passthrough helper may get a capability; the daemon gets none, and
+# an upgrade strips one an older package (or an admin) left on it.
+POSTINST="$(dpkg-deb --ctrl-tarfile "$DEB" | tar -xO ./postinst 2>/dev/null || true)"
+check "postinst grants cap_sys_admin=ep to the passthrough helper" \
+    grep -q 'setcap cap_sys_admin=ep "\$helper"' <<<"$POSTINST"
+check "postinst strips any capability from /usr/bin/ncrs" \
+    grep -q 'setcap -r /usr/bin/ncrs' <<<"$POSTINST"
+if grep -Eq 'setcap cap_[a-z_]+[=+][a-z]+ /usr/bin/ncrs' <<<"$POSTINST"; then
+    fail "postinst must not grant a capability to /usr/bin/ncrs"
+else
+    pass "postinst grants no capability to /usr/bin/ncrs"
+fi
+check "triggers on setcap arriving later (libcap2-bin)" \
+    sh -c "dpkg-deb --ctrl-tarfile '$DEB' | tar -xO ./triggers | grep -q '^interest-noawait /usr/sbin/setcap$'"
+
 # ── Package contents ──────────────────────────────────────────────────────────
 echo "→ Package contents"
 CONTENTS="$(dpkg-deb -c "$DEB" | awk '{print $NF}')"
@@ -82,6 +97,7 @@ REQUIRED=(
     ./usr/bin/ncrs
     ./usr/bin/ncrs-open
     ./usr/bin/ncrs-ctl
+    ./usr/libexec/ncrs/ncrs-passthrough
     ./usr/bin/ncrs-search-provider
     ./usr/lib/systemd/user/ncrs.service
     ./usr/lib/sysctl.d/05-ncrs-quic.conf
@@ -190,12 +206,12 @@ if $CONTAINER; then
             test -f /usr/share/icons/hicolor/128x128/apps/ncrs.png || { echo "FAIL: icon missing"; exit 1; }
             '
         fi
-        # --privileged: postinst setcaps /usr/bin/ncrs (cap_sys_admin, for
-        # FUSE passthrough). Podman's rootless container sandboxing refuses
-        # to exec a file-capability-bearing binary, which isn't
-        # representative of a real (unsandboxed) user login session —
+        # --privileged: postinst setcaps /usr/libexec/ncrs/ncrs-passthrough
+        # (cap_sys_admin, for FUSE passthrough). Podman's rootless container
+        # sandboxing refuses to exec a file-capability-bearing binary, which
+        # isn't representative of a real (unsandboxed) user login session —
         # --privileged removes that confinement for this throwaway
-        # container so the smoke test can actually run the installed binary.
+        # container so the smoke test can actually run the installed binaries.
         "$RUNTIME" run --rm --privileged -v "$DEB_ABS:/pkg.deb:ro" "$IMAGE" bash -ec "
             # Minimized cloud images exclude /usr/share/doc — undo so we can
             # assert the provisioning example config actually installs.
@@ -213,6 +229,17 @@ if $CONTAINER; then
             test -f /usr/share/doc/ncrs/config.yaml.example || { echo 'FAIL: example config missing'; exit 1; }
             ! ls /etc/systemd/user/default.target.wants/ncrs.service >/dev/null 2>&1 || { echo 'FAIL: ncrs.service globally enabled'; exit 1; }
             /usr/bin/ncrs --print-default-config | grep -q 'ncRS Desktop configuration' || { echo 'FAIL: ncrs --print-default-config'; exit 1; }
+            # libcap2-bin is a Recommends, so apt installed it: the helper is capped,
+            # the daemon is not.
+            getcap /usr/libexec/ncrs/ncrs-passthrough | grep -Eq 'cap_sys_admin[=+]ep' || { getcap -v /usr/libexec/ncrs/ncrs-passthrough; echo 'FAIL: ncrs-passthrough lacks cap_sys_admin=ep'; exit 1; }
+            [ -z \"\$(getcap /usr/bin/ncrs)\" ] || { getcap /usr/bin/ncrs; echo 'FAIL: /usr/bin/ncrs carries a capability'; exit 1; }
+            # An upgrade from a package that capped the daemon itself: postinst strips it.
+            setcap cap_sys_admin+ep /usr/bin/ncrs
+            /var/lib/dpkg/info/ncrs.postinst configure 0.1.88 >/dev/null 2>&1 || { echo 'FAIL: postinst configure (upgrade) failed'; exit 1; }
+            [ -z \"\$(getcap /usr/bin/ncrs)\" ] || { getcap /usr/bin/ncrs; echo 'FAIL: upgrade postinst left a capability on /usr/bin/ncrs'; exit 1; }
+            getcap /usr/libexec/ncrs/ncrs-passthrough | grep -Eq 'cap_sys_admin[=+]ep' || { echo 'FAIL: upgrade postinst dropped the helper capability'; exit 1; }
+            # The helper only runs when ncrs hands it its socket on fd 3.
+            ! /usr/libexec/ncrs/ncrs-passthrough \$\$ 2>/dev/null || { echo 'FAIL: ncrs-passthrough ran without its socket'; exit 1; }
             $GUI_CHECKS
             echo 'container checks OK'
         " && pass "clean install + smoke test in $IMAGE" || fail "clean install + smoke test in $IMAGE"

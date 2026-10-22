@@ -67,6 +67,10 @@ rm -rf "$DEST"
 install -Dm755 "$BIN_DIR/ncrs"                                           "$DEST/usr/bin/ncrs"
 install -Dm755 "$BIN_DIR/ncrs-open"                                      "$DEST/usr/bin/ncrs-open"
 install -Dm755 "$BIN_DIR/ncrs-ctl"                                       "$DEST/usr/bin/ncrs-ctl"
+# FUSE passthrough helper: the only file the packages give a capability
+# (cap_sys_admin=ep — the .deb's postinst, the .rpm's %caps). Mode 0755, no
+# set-uid: the capability comes from the file, the daemon spawns it.
+install -Dm755 "$BIN_DIR/ncrs-passthrough"                               "$DEST/usr/libexec/ncrs/ncrs-passthrough"
 install -Dm644 packaging/ncrs.service                                    "$DEST/usr/lib/systemd/user/ncrs.service"
 install -Dm644 packaging/05-ncrs-quic.conf                               "$DEST/usr/lib/sysctl.d/05-ncrs-quic.conf"
 install -Dm644 packaging/es.rgon.ncrs.Open.desktop                        "$DEST/usr/share/applications/es.rgon.ncrs.Open.desktop"
