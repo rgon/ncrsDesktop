@@ -41,6 +41,11 @@ pub enum MutationOp {
         total_len: u64,
         tail_path: PathBuf,
         if_match_etag: Option<String>,
+        /// The staging file is laid out at the file's own offsets, sent chunks punched out.
+        /// Entries queued by older versions lack it: their tail file starts at
+        /// `bytes_confirmed`.
+        #[serde(default)]
+        sparse: bool,
     },
 }
 
@@ -808,11 +813,11 @@ fn execute_op(
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
-        MutationOp::FinishChunked { remote_path, uploads_base, next_index, bytes_confirmed, total_len, tail_path, if_match_etag } => {
+        MutationOp::FinishChunked { remote_path, uploads_base, next_index, bytes_confirmed, total_len, tail_path, if_match_etag, sparse } => {
             let saved_mtime = crate::staged_mtime(tail_path).unwrap_or_else(SystemTime::now);
             let result = finish_chunked(
                 &*ctx.backend, uploads_base, *next_index, *bytes_confirmed, *total_len,
-                tail_path, remote_path, if_match_etag.as_deref(),
+                tail_path, *sparse, remote_path, if_match_etag.as_deref(),
             );
             match result {
                 Ok(result) => {
@@ -863,31 +868,32 @@ fn execute_op(
     }
 }
 
-/// Reads the staging tail in `chunk`-sized pieces (the last may be shorter) and hands
-/// each to `put` with its index from 0, so a tail of any length is never in memory whole:
-/// once streaming only starts when the disk is low, a session's tail can be gigabytes.
+/// Reads `tail_len` bytes of the staging file from offset `from` in `chunk`-sized pieces
+/// (the last may be shorter) and hands each to `put` with its index from 0, so a tail of
+/// any length is never in memory whole. The file must be exactly `from + tail_len` long.
 fn each_tail_chunk<E>(
     tail_path: &Path,
+    from: u64,
     tail_len: u64,
     chunk: usize,
     local: impl Fn(String) -> E,
     mut put: impl FnMut(u64, Vec<u8>) -> Result<(), E>,
 ) -> Result<(), E> {
-    use std::io::Read;
+    use std::os::unix::fs::FileExt;
     let fault = |e: std::io::Error| local(format!("staging tail {}: {}", tail_path.display(), e));
-    let mut f = std::fs::File::open(tail_path).map_err(fault)?;
+    let f = std::fs::File::open(tail_path).map_err(fault)?;
     let len = f.metadata().map_err(fault)?.len();
-    if len != tail_len {
+    if len != from + tail_len {
         return Err(local(format!(
-            "staging tail is {} bytes, expected {} — refusing to assemble a truncated file",
-            len, tail_len,
+            "staging file is {} bytes, expected {} — refusing to assemble a truncated file",
+            len, from + tail_len,
         )));
     }
-    let (mut left, mut index) = (tail_len, 0u64);
-    while left > 0 {
-        let mut body = vec![0u8; (chunk as u64).min(left) as usize];
-        f.read_exact(&mut body).map_err(fault)?;
-        left -= body.len() as u64;
+    let (mut off, mut index) = (from, 0u64);
+    while off < from + tail_len {
+        let mut body = vec![0u8; (chunk as u64).min(from + tail_len - off) as usize];
+        f.read_exact_at(&mut body, off).map_err(fault)?;
+        off += body.len() as u64;
         put(index, body)?;
         index += 1;
     }
@@ -903,6 +909,7 @@ pub(crate) fn finish_chunked(
     bytes_confirmed: u64,
     total_len: u64,
     tail_path: &Path,
+    sparse: bool,
     remote_path: &Path,
     if_match: Option<&str>,
 ) -> Result<crate::backend::PutResult, crate::backend::BackendWriteError> {
@@ -914,7 +921,8 @@ pub(crate) fn finish_chunked(
     let tail_len = total_len.saturating_sub(bytes_confirmed);
     if tail_len > 0 {
         // Server(0, _): a local fault, never transient, so it is not retried forever.
-        each_tail_chunk(tail_path, tail_len, crate::webdav_ops::CHUNK_SIZE, |m| BackendWriteError::Server(0, m), |i, body| {
+        let from = if sparse { bytes_confirmed } else { 0 };
+        each_tail_chunk(tail_path, from, tail_len, crate::webdav_ops::CHUNK_SIZE, |m| BackendWriteError::Server(0, m), |i, body| {
             crate::retry_chunk_write("final chunk upload", || backend.put_chunk(&session, next_index + i, body.clone()))
         })?;
     }
@@ -933,13 +941,20 @@ mod tests {
         let data: Vec<u8> = (0..25u8).collect();
         fs::write(&tail, &data).unwrap();
         let mut got = Vec::new();
-        each_tail_chunk(&tail, 25, 10, |m| m, |i, body| {
+        each_tail_chunk(&tail, 0, 25, 10, |m| m, |i, body| {
             got.push((i, body));
             Ok::<(), String>(())
         }).unwrap();
         assert_eq!(got, vec![(0, data[..10].to_vec()), (1, data[10..20].to_vec()), (2, data[20..].to_vec())]);
+        // A sparse staging file: the tail starts at its own offset in the file.
+        got.clear();
+        each_tail_chunk(&tail, 12, 13, 10, |m| m, |i, body| {
+            got.push((i, body));
+            Ok::<(), String>(())
+        }).unwrap();
+        assert_eq!(got, vec![(0, data[12..22].to_vec()), (1, data[22..].to_vec())]);
         // A tail shorter than the journal says is never assembled.
-        let err = each_tail_chunk(&tail, 30, 10, |m| m, |_, _| Ok::<(), String>(())).unwrap_err();
+        let err = each_tail_chunk(&tail, 0, 30, 10, |m| m, |_, _| Ok::<(), String>(())).unwrap_err();
         assert!(err.contains("refusing to assemble"), "{}", err);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1256,6 +1271,7 @@ mod tests {
                 total_len: 24,
                 tail_path: tail.clone(),
                 if_match_etag: Some("e1".into()),
+                sparse: false,
             })
         };
         let j = MutationJournal::load_or_create(&dir);
@@ -1279,6 +1295,7 @@ mod tests {
                 total_len: 12,
                 tail_path: dir.join("gone"),
                 if_match_etag: None,
+                sparse: false,
             });
         }
         let j = MutationJournal::load_or_create(&dir);
@@ -1301,6 +1318,7 @@ mod tests {
             total_len: 10,
             tail_path: tail,
             if_match_etag: None,
+            sparse: false,
         });
         j.enqueue(MutationOp::Rename { from: PathBuf::from("/d"), to: PathBuf::from("/e") });
         assert_eq!(j.entries()[0].op.path(), Path::new("/e/tmp.bin"));

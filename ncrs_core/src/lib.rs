@@ -1055,16 +1055,16 @@ fn overlay_live_size(open_files: &Mutex<HashMap<u64, OpenFile>>, mut attr: FileA
 
 /// Where the current bytes of the file live for a reader holding `fh` on `ino`, when a
 /// handle (its own, else the newest sibling) has uncommitted writes: the staging file,
-/// and the file offset its first byte stands for. Staged bytes are newer than the cache
+/// and the lowest file offset it still holds. Staged bytes are newer than the cache
 /// and the server, which hold nothing of them until release().
 fn staged_source(files: &HashMap<u64, OpenFile>, fh: u64, ino: u64) -> Option<(PathBuf, u64)> {
     let of_source = |of: &OpenFile| {
         if !of.dirty {
             return None;
         }
-        // After chunks went out the staging file is only the unsent tail.
-        let skip = of.chunk_upload.as_ref().map_or(0, |c| c.bytes_confirmed);
-        of.write_path.clone().map(|wp| (wp, skip))
+        // After chunks went out, the bytes before the unsent tail are holes (free_sent_chunk).
+        let held_from = of.chunk_upload.as_ref().map_or(0, |c| c.bytes_confirmed);
+        of.write_path.clone().map(|wp| (wp, held_from))
     };
     files.get(&fh).and_then(of_source).or_else(|| {
         files.iter()
@@ -1074,12 +1074,12 @@ fn staged_source(files: &HashMap<u64, OpenFile>, fh: u64, ino: u64) -> Option<(P
     })
 }
 
-/// `sz` bytes of the file at `off`, out of a staging file whose first byte is file
-/// offset `skip`. Short only at the staged end, which is the file's real end.
-fn read_staged(staging: &Path, skip: u64, off: u64, sz: usize) -> std::io::Result<Vec<u8>> {
+/// `sz` bytes of the file at `off`, out of its staging file, which is laid out at the
+/// file's own offsets. Short only at the staged end, which is the file's real end.
+fn read_staged(staging: &Path, off: u64, sz: usize) -> std::io::Result<Vec<u8>> {
     let f = std::fs::File::open(staging)?;
     let mut buf = vec![0u8; sz];
-    let n = read_at_full(&f, &mut buf, off.saturating_sub(skip))?;
+    let n = read_at_full(&f, &mut buf, off)?;
     buf.truncate(n);
     Ok(buf)
 }
@@ -1202,7 +1202,9 @@ fn stream_disk_low() -> bool {
 /// than that never meets already-sent data, and a larger one can still be rewritten in
 /// its last threshold-minus-a-chunk bytes (a zip entry's header, LibreOffice's block).
 /// One chunk per write also bounds how long write() holds a fuse worker and the file's queue.
-/// Only while the disk is low (stream_disk_low); otherwise the tail just keeps growing.
+/// A file only starts streaming while the disk is low (stream_disk_low); once it does it
+/// keeps streaming until closed. Sent chunks are punched out of the staging file in place
+/// (free_sent_chunk), so the same holds on every filesystem.
 fn stream_should_graduate(total_written: u64, session: Option<&ChunkUploadState>, threshold: u64) -> bool {
     let unsent = total_written - session.map_or(0, |s| s.bytes_confirmed);
     unsent >= threshold.max(webdav_ops::CHUNK_SIZE as u64)
@@ -1356,76 +1358,33 @@ pub(crate) fn staged_mtime(staging: &Path) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_secs(t.duration_since(UNIX_EPOCH).ok()?.as_secs()))
 }
 
-/// Overwrites (and possibly extends) the tail staging file at `tail_off`, an offset
-/// relative to the tail's first byte, for a write back into bytes not yet sent.
-fn write_into_tail_file(wp: &Path, tail_off: u64, data: &[u8]) -> std::io::Result<()> {
-    std::fs::OpenOptions::new().write(true).open(wp)?.write_all_at(data, tail_off)
+/// Overwrites (and possibly extends) a streaming staging file at file offset `off`, for a
+/// write back into bytes not yet sent.
+fn write_into_tail_file(wp: &Path, off: u64, data: &[u8]) -> std::io::Result<()> {
+    std::fs::OpenOptions::new().write(true).open(wp)?.write_all_at(data, off)
 }
 
-/// Rewrites the tail staging file down to just the bytes from `skip` onward,
-/// right after the first `skip` bytes have been PUT to the server as a
-/// completed chunk — this is what keeps the tail bounded to ~CHUNK_SIZE
-/// regardless of the total file size.
-fn shrink_tail_file(wp: &Path, skip: u64) -> std::io::Result<()> {
-    use std::io::{Seek, SeekFrom, Write};
-    // Cut the sent prefix out in place where the filesystem can (ext4, xfs): the tail
-    // keeps up to the stream threshold behind the writer, so copying it after every sent
-    // chunk would rewrite ~90 MiB per 10 MiB uploaded. Elsewhere, or when the tail is
-    // exactly the sent chunk (collapsing up to EOF is refused), copy what is left.
-    {
-        use std::os::unix::io::AsRawFd;
-        let f = std::fs::OpenOptions::new().write(true).open(wp)?;
-        // SAFETY: a plain syscall on an fd this scope owns; no memory is passed.
-        let r = unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_COLLAPSE_RANGE, 0, skip as libc::off_t) };
-        if r == 0 {
-            return Ok(());
+/// Frees the disk space of the `len` bytes at `off` of a streaming staging file once they
+/// were PUT as a chunk, leaving the file's size and every other byte where it is
+/// (FALLOC_FL_PUNCH_HOLE, which ext4, xfs, btrfs and tmpfs all have). The staging file is
+/// laid out at the file's own offsets, so nothing is copied or moved and the unsent tail
+/// stays the threshold's worth on every filesystem. Where punching is unsupported the
+/// bytes just stay: still correct, only not freed.
+fn free_sent_chunk(wp: &Path, off: u64, len: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::OpenOptions::new().write(true).open(wp)?;
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    // SAFETY: a plain syscall on an fd this scope owns; no memory is passed.
+    if unsafe { libc::fallocate(f.as_raw_fd(), mode, off as libc::off_t, len as libc::off_t) } != 0 {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "staging: this filesystem cannot free sent chunks in place ({}) — streamed files keep their full size on disk",
+                std::io::Error::last_os_error(),
+            );
         }
     }
-    let tmp = wp.with_extension("tmp");
-    {
-        let mut src = std::fs::File::open(wp)?;
-        src.seek(SeekFrom::Start(skip))?;
-        let mut dst = std::fs::File::create(&tmp)?;
-        // Streamed, never read whole: see collapse_range_supported for why it stays small.
-        std::io::copy(&mut src, &mut dst)?;
-        dst.flush()?;
-    }
-    std::fs::rename(&tmp, wp)
-}
-
-/// Whether the staging filesystem can cut a sent chunk out of a tail file in place
-/// (FALLOC_FL_COLLAPSE_RANGE: ext4, xfs; not btrfs or tmpfs). Probed once on a scratch
-/// file in the staging directory. Where it can't, shrink_tail_file copies the tail, so
-/// a streaming file keeps only about a chunk unsent rather than the threshold.
-fn collapse_range_supported() -> bool {
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        use std::os::unix::io::AsRawFd;
-        let Some(dir) = STREAM_DISK_PATH.safe_lock().clone() else { return false };
-        let probe = dir.join(format!(".collapse-probe-{}", std::process::id()));
-        let ok = std::fs::write(&probe, vec![0u8; 3 * 65536]).is_ok()
-            && std::fs::OpenOptions::new().write(true).open(&probe).is_ok_and(|f| {
-                // SAFETY: a plain syscall on an fd this closure owns; no memory is passed.
-                unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_COLLAPSE_RANGE, 0, 65536) == 0 }
-            });
-        let _ = std::fs::remove_file(&probe);
-        log::info!("staging filesystem {} cut sent chunks out in place", if ok { "can" } else { "cannot" });
-        ok
-    })
-}
-
-/// How much unsent tail a streaming file keeps before its oldest chunk goes out: the
-/// threshold where sent chunks are cut out in place, one chunk where they are copied off
-/// (so each copy stays small).
-fn stream_window(streaming: bool, collapse: bool, threshold: u64) -> u64 {
-    if streaming && !collapse { webdav_ops::CHUNK_SIZE as u64 } else { threshold }
-}
-
-/// Whether a file not yet streaming may start now that the disk is low. Where sent chunks
-/// can only be copied off, a backlog already past twice the threshold is left staged in
-/// full: copying it would need the very space that is missing.
-fn may_start_streaming(unsent: u64, collapse: bool, threshold: u64) -> bool {
-    collapse || unsent <= threshold.saturating_mul(2)
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4895,12 +4854,13 @@ impl DirReply {
 }
 
 impl NextCloudFs {
-    /// Called from write() once stream_should_graduate() says the unsent tail has
-    /// reached the stream threshold. Lazily opens the chunked-upload session on the
-    /// very first graduation, PUTs the tail's oldest chunks until it is back under
-    /// the threshold (normally exactly one — FUSE writes are far smaller than
-    /// CHUNK_SIZE, so the tail crosses the threshold by a small margin each time),
-    /// and rewrites the tail file down to the bytes it keeps. Must be called without `open_files` locked: this
+    /// Called from write() once it decided a chunk should go out (stream_should_graduate,
+    /// and the disk is low or the file already streams). Lazily opens the chunked-upload
+    /// session on the very first graduation, PUTs exactly one chunk, the oldest unsent
+    /// one, and frees its space in the staging file. One per call: a backlog staged while
+    /// the disk had room drains one chunk per write, so no single write() holds its worker
+    /// and the file's queue for the whole upload (which would also starve the watchdog's
+    /// progress check). Must be called without `open_files` locked: this
     /// performs network I/O, and that mutex guards every open handle in the
     /// mount, not just this one.
     ///
@@ -4916,20 +4876,8 @@ impl NextCloudFs {
         remote_path: &Path,
         wp: &Path,
         mut state: Option<ChunkUploadState>,
-        total_written: u64,
     ) -> Result<ChunkUploadState, (String, Option<ChunkUploadState>)> {
-        // One chunk per call: a backlog staged while the disk had room drains one chunk per
-        // write, so no single write() holds its worker and the file's queue for the whole
-        // upload (which would also starve the watchdog's progress check).
         {
-            let window = stream_window(state.is_some(), collapse_range_supported(), stream_upload_threshold());
-            if !stream_should_graduate(total_written, state.as_ref(), window) {
-                return state.clone().ok_or((
-                    "graduate_chunk called with nothing to graduate".to_string(),
-                    state,
-                ));
-            }
-
             if state.is_none() {
                 let session = retry_chunk_write("chunked-upload open", || {
                     self.conn.backend.open_chunked_upload(remote_path)
@@ -4948,14 +4896,11 @@ impl NextCloudFs {
             let confirmed_state = state.clone();
             let s = state.as_mut().expect("just ensured Some above");
 
+            let sent_from = s.bytes_confirmed;
             let mut chunk = vec![0u8; webdav_ops::CHUNK_SIZE];
-            {
-                use std::io::Read;
-                let mut f = std::fs::File::open(wp)
-                    .map_err(|e| (format!("staging read: {}", e), confirmed_state.clone()))?;
-                f.read_exact(&mut chunk)
-                    .map_err(|e| (format!("staging read: {}", e), confirmed_state.clone()))?;
-            }
+            std::fs::File::open(wp)
+                .and_then(|f| f.read_exact_at(&mut chunk, sent_from))
+                .map_err(|e| (format!("staging read: {}", e), confirmed_state.clone()))?;
 
             let session = backend::ChunkedUploadSession { uploads_base: s.uploads_base.clone() };
             let index = s.next_index;
@@ -4966,8 +4911,8 @@ impl NextCloudFs {
             s.next_index += 1;
             s.bytes_confirmed += webdav_ops::CHUNK_SIZE as u64;
 
-            shrink_tail_file(wp, webdav_ops::CHUNK_SIZE as u64)
-                .map_err(|e| (format!("tail rewrite: {}", e), state.clone()))?;
+            free_sent_chunk(wp, sent_from, webdav_ops::CHUNK_SIZE as u64)
+                .map_err(|e| (format!("staging free: {}", e), state.clone()))?;
             Ok(state.expect("just ensured Some above"))
         }
     }
@@ -5013,6 +4958,7 @@ impl NextCloudFs {
             total_len,
             tail_path: tail_path.clone(),
             if_match_etag: original_etag.clone(),
+            sparse: true,
         });
         self.journal.safe_lock().supersede_uploads(&remote_path, seq);
         self.dirty.safe_lock().insert(remote_path.clone());
@@ -5045,7 +4991,7 @@ impl NextCloudFs {
             let _permit = conn.throttle.acquire();
             let result = mutation_journal::finish_chunked(
                 &*conn.backend, &cs.uploads_base, cs.next_index, cs.bytes_confirmed, total_len,
-                &tail_path, &remote_path, etag.as_deref(),
+                &tail_path, true, &remote_path, etag.as_deref(),
             );
             cache.safe_lock().uploading.remove(&remote_path);
             match result {
@@ -6481,8 +6427,8 @@ impl NextCloudFs {
         // a second handle on the same inode.
         {
             let staged = staged_source(&self.open_files.safe_lock(), fh.0, ino.0);
-            if let Some((staging, skip)) = staged.filter(|(_, skip)| off >= *skip) {
-                match read_staged(&staging, skip, off, sz) {
+            if let Some((staging, _)) = staged.filter(|(_, held_from)| off >= *held_from) {
+                match read_staged(&staging, off, sz) {
                     Ok(buf) => {
                         reply.data(&buf);
                         return;
@@ -7386,7 +7332,7 @@ impl NextCloudFs {
             let res = if offset == of.total_written {
                 append_to_tail_file(&wp, data)
             } else {
-                write_into_tail_file(&wp, offset - bytes_confirmed, data)
+                write_into_tail_file(&wp, offset, data)
             };
             if let Err(e) = res {
                 log::error!("write to staging tail file: {}", e);
@@ -7396,30 +7342,20 @@ impl NextCloudFs {
             of.dirty = true;
             of.total_written = of.total_written.max(offset + data.len() as u64);
 
-            // Once a file streams it keeps streaming until closed: cutting its sent chunks
-            // out frees the space that made the disk low, and stopping then would only
+            // Once a file streams it keeps streaming until closed: freeing its sent chunks
+            // gives back the space that made the disk low, and stopping then would only
             // stage the rest and start over.
-            let collapse = collapse_range_supported();
-            let threshold = stream_upload_threshold();
             let streaming = of.chunk_upload.is_some();
-            let window = stream_window(streaming, collapse, threshold);
-            let go = stream_should_graduate(of.total_written, of.chunk_upload.as_ref(), window)
-                && (streaming || (stream_disk_low() && may_start_streaming(of.total_written, collapse, threshold)));
-            if !streaming && !go && !collapse && of.total_written > threshold.saturating_mul(2) && stream_disk_low() {
-                static WARNED: AtomicBool = AtomicBool::new(false);
-                if !WARNED.swap(true, Ordering::Relaxed) {
-                    log::warn!("write: disk is low, but {} is already {} MiB and this filesystem cannot free sent chunks in place — staging it in full", path.display(), of.total_written >> 20);
-                }
-            }
+            let go = stream_should_graduate(of.total_written, of.chunk_upload.as_ref(), stream_upload_threshold())
+                && (streaming || stream_disk_low());
             if go {
                 if !streaming {
                     log::info!("write: disk is low — streaming {} to the server as it is written", path.display());
                 }
-                let total_written = of.total_written;
                 let existing_session = of.chunk_upload.clone();
                 let had_session = existing_session.is_some();
                 drop(files);
-                match self.graduate_chunk(&path, &wp, existing_session, total_written) {
+                match self.graduate_chunk(&path, &wp, existing_session) {
                     Ok(new_state) => {
                         if let Some(of) = self.open_files.safe_lock().get_mut(&fh.0) {
                             of.chunk_upload = Some(new_state);
