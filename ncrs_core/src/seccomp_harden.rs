@@ -1,20 +1,42 @@
-//! Best-effort seccomp hardening for the FUSE daemon process.
+//! Best-effort seccomp hardening for the FUSE daemon process — only for a
+//! daemon that (still) holds CAP_SYS_ADMIN itself.
 //!
-//! `ncrs` is granted CAP_SYS_ADMIN (a file capability — see
-//! packaging/maintainer-scripts/postinst) purely so it can request kernel
-//! FUSE_PASSTHROUGH. That capability also unlocks a long list of unrelated
-//! privileged syscalls that a memory-safety bug could otherwise pivot into.
-//! This denies the ones ncrs never legitimately calls, while deliberately
-//! leaving `mount`, `umount2` and `ioctl` untouched: `fusermount3`, spawned
-//! as a child to unmount, still needs the former two, and FUSE_PASSTHROUGH's
-//! own setup calls need the latter.
+//! Packaged installs no longer give `ncrs` any capability: the one privileged
+//! operation it needs, registering FUSE passthrough backing files, is done by
+//! the separate `ncrs-passthrough` helper (see passthrough_broker.rs), which
+//! runs under its own NO_NEW_PRIVS + seccomp allowlist. A capability-less
+//! daemon cannot install a filter at all, and that is deliberate:
+//!
+//! - seccomp(2) installs a filter only for a task that has NO_NEW_PRIVS set
+//!   or holds CAP_SYS_ADMIN. Without the capability, NO_NEW_PRIVS is the only
+//!   way in, and it is inherited and irreversible. It would make the kernel
+//!   ignore the set-uid bit of `fusermount3`, which the daemon runs to mount
+//!   (now that it cannot mount(2) itself) and to unmount and detach stale
+//!   mounts; and it would keep the helper's own file capability from taking
+//!   effect when the daemon spawns it. Mounting, unmounting and passthrough
+//!   would all break.
+//! - A filter is also inherited by every child, `fusermount3` included, so
+//!   it could never deny `mount`/`umount2` either.
+//!
+//! What the denied syscalls below guarded was mostly the capability itself
+//! (pivot_root, swapon, quotactl, setns all need privileges an unprivileged
+//! daemon does not have); without it a compromised daemon has the user's own
+//! rights and nothing more, which is the baseline for any per-user process.
+//!
+//! When the daemon does hold CAP_SYS_ADMIN — a binary somebody `setcap`ed by
+//! hand, or one left over from a package that predates the helper — the
+//! deny-list is installed as before (the capability satisfies seccomp's
+//! permission check, so no NO_NEW_PRIVS is needed), leaving `mount`, `umount2`
+//! and `ioctl` alone: with the capability fuser mounts with mount(2) itself,
+//! `fusermount3` children inherit the filter, and passthrough's backing
+//! ioctls run in-process.
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
 
-/// Syscalls with zero legitimate call site anywhere in ncrs, gated behind
-/// CAP_SYS_ADMIN, that a compromised process could otherwise pivot into.
+/// Syscalls with zero legitimate call site anywhere in ncrs that a compromised
+/// process holding CAP_SYS_ADMIN could otherwise pivot into.
 const DENY_LIST: &[i64] = &[
     libc::SYS_pivot_root,
     libc::SYS_swapon,
@@ -35,18 +57,16 @@ const DENY_LIST: &[i64] = &[
 /// before any worker threads are spawned, i.e. as the first thing
 /// `mount_ncfs` does).
 ///
-/// Best-effort: silently does nothing if the process lacks CAP_SYS_ADMIN (no
-/// setcap — a dev build, or a minimal install where libcap2-bin was absent).
-/// FUSE_PASSTHROUGH is unavailable for the same reason in that case, so there
-/// is nothing extra to protect.
-///
-/// Deliberately does not go through `seccompiler::apply_filter*`: those
-/// unconditionally call `prctl(PR_SET_NO_NEW_PRIVS, 1)` first, which would
-/// strip `fusermount3`'s own setuid bit the next time ncrs shells out to it
-/// to unmount. Installing a filter while already holding CAP_SYS_ADMIN
-/// satisfies seccomp(2)'s permission check on its own, so NO_NEW_PRIVS is
-/// never needed (or wanted) here.
+/// Only when the process holds CAP_SYS_ADMIN (see the module comment for why
+/// a capability-less daemon installs nothing). Deliberately does not go
+/// through `seccompiler::apply_filter*`: those unconditionally call
+/// `prctl(PR_SET_NO_NEW_PRIVS, 1)` first, which would strip `fusermount3`'s
+/// set-uid bit and the passthrough helper's file capability.
 pub fn install() {
+    if !ncrs_passthrough::caps::effective_has(ncrs_passthrough::caps::CAP_SYS_ADMIN) {
+        log::debug!("seccomp hardening: not installed — ncrs runs without capabilities (see seccomp_harden.rs)");
+        return;
+    }
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for &syscall in DENY_LIST {
         rules.insert(syscall, vec![]);
@@ -100,12 +120,6 @@ pub fn install() {
     if rc == 0 {
         log::info!("seccomp hardening installed ({} syscalls denied)", DENY_LIST.len());
     } else {
-        // No CAP_SYS_ADMIN (setcap absent) and NO_NEW_PRIVS unset — expected
-        // on a dev build or a minimal install; passthrough is unavailable for
-        // the same reason, so this is not a regression.
-        log::debug!(
-            "seccomp hardening: not installed ({}) — likely missing CAP_SYS_ADMIN",
-            std::io::Error::last_os_error()
-        );
+        log::warn!("seccomp hardening: not installed ({})", std::io::Error::last_os_error());
     }
 }

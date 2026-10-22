@@ -339,8 +339,16 @@ pub(crate) fn send_notify_resend(fd: BorrowedFd<'_>) -> io::Result<()> {
 const FUSE_DEV_IOC_BACKING_CLOSE: libc::c_ulong = (1 << 30) | (4 << 16) | (229 << 8) | 2;
 
 /// Closes a passthrough backing id a previous daemon registered on this
-/// connection, once the last handle it restored for it is released.
+/// connection, once the last handle it restored for it is released: through
+/// the passthrough helper when one is in use (the ioctl needs CAP_SYS_ADMIN,
+/// which the daemon normally lacks), otherwise directly.
 pub(crate) fn close_backing_id(id: u32) {
+    if let Some(r) = crate::passthrough_broker::close_backing_id(id) {
+        if let Err(e) = r {
+            log::debug!("handoff: closing inherited backing id {} via the passthrough helper failed: {}", id, e);
+        }
+        return;
+    }
     let g = LIVE.safe_lock();
     let Some(live) = g.as_ref() else { return };
     // SAFETY: the ioctl reads one u32 from `id`.

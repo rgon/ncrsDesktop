@@ -11,6 +11,10 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+# Never set NoNewPrivileges= (nor SystemCallFilter=, RestrictNamespaces= and the
+# other options that imply it in a user unit): it would make the kernel ignore
+# fusermount3's set-uid bit, which ncrs needs to mount and unmount, and the
+# file capability of /usr/libexec/ncrs/ncrs-passthrough (FUSE passthrough).
 ExecStart=/usr/bin/ncrs
 Restart=on-failure
 # Programs on the mount block (rather than fail) while it restarts — see below —

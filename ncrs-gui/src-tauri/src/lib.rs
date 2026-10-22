@@ -1676,12 +1676,11 @@ async fn start_ncfs_daemon(app: AppHandle, state: Arc<AppState>) -> Result<(), (
         return Ok(());
     } else {
         // No daemon owns the mount yet — spawn one and attach to it the same
-        // way. The FUSE loop never runs in this process: only the small,
-        // single-purpose `ncrs` binary is granted CAP_SYS_ADMIN (see
-        // packaging/maintainer-scripts/postinst), so spawning it here — rather
-        // than calling mount_ncfs() in-process — is what makes kernel
-        // FUSE_PASSTHROUGH reachable from the GUI's default autostart path at
-        // all, and keeps that capability out of this much larger process.
+        // way. The FUSE loop never runs in this process: the daemon owns the
+        // mount and spawns the `ncrs-passthrough` helper — the only file the
+        // packages grant CAP_SYS_ADMIN — for kernel FUSE_PASSTHROUGH, so
+        // spawning `ncrs` here rather than calling mount_ncfs() in-process
+        // keeps the GUI a peer IPC client of the service.
         let ncrs_bin = ncrs_binary_path();
         log::info!("no ncrs daemon found — spawning {}", ncrs_bin.display());
         match tokio::task::spawn_blocking(move || spawn_ncrs_daemon(&ncrs_bin))
