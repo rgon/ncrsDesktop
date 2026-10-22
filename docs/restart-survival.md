@@ -50,6 +50,14 @@ and programs block; nothing fails.
   write handles are judged by their staging file's identity, and a handle that
   was mid-way through a streamed upload comes back failed (EIO) rather than
   guessed.
+- **Passthrough backing ids** belong to the connection, not to a process, so
+  files the previous daemon opened in passthrough mode keep reading directly
+  from their cache copies. Their ids are part of the handle log; the
+  successor closes each one once its last restored handle is released. The
+  ioctls need CAP_SYS_ADMIN, which only the `ncrs-passthrough` helper holds:
+  the old helper exits with its daemon (its socket closes on exec, and it
+  has `PR_SET_PDEATHSIG`), and the successor spawns a new one on the
+  taken-over descriptor and lets it adopt those ids before its first open.
 - **RESEND.** Requests the previous daemon read but never answered are
   re-queued with `FUSE_NOTIFY_RESEND` (Linux 6.9+), sent before the new session
   reads anything, so no request runs twice.
