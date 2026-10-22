@@ -312,6 +312,17 @@ impl MutationJournal {
         })
     }
 
+    /// The newest queued streamed-upload finish for `path`: its tail file, the file offset
+    /// the tail starts at, and whether the file uses the file's own offsets (`sparse`).
+    pub fn pending_stream_finish(&self, path: &Path) -> Option<(PathBuf, u64, bool)> {
+        self.entries.iter().rev().find_map(|e| match &e.op {
+            MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, .. } if remote_path == path => {
+                Some((tail_path.clone(), *bytes_confirmed, *sparse))
+            }
+            _ => None,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -1279,6 +1290,29 @@ mod tests {
         assert!(j.has_pending_put(Path::new("/big.bin")));
         assert_eq!(j.entries()[0].op.staging_path(), Some(tail.as_path()));
         assert!(!j.entries()[0].in_flight, "claims are never persisted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_queued_streamed_finish_tells_reads_where_its_tail_is() {
+        let dir = temp_dir("pending_stream_finish");
+        let tail = dir.join("write_3");
+        fs::write(&tail, b"x").unwrap();
+        let mut j = MutationJournal::load_or_create(&dir);
+        assert_eq!(j.pending_stream_finish(Path::new("/v.mkv")), None);
+        for (sparse, confirmed) in [(false, 10), (true, 20)] {
+            j.enqueue(MutationOp::FinishChunked {
+                remote_path: PathBuf::from("/v.mkv"),
+                uploads_base: "u".into(),
+                next_index: 1,
+                bytes_confirmed: confirmed,
+                total_len: 30,
+                tail_path: tail.clone(),
+                if_match_etag: None,
+                sparse,
+            });
+        }
+        assert_eq!(j.pending_stream_finish(Path::new("/v.mkv")), Some((tail, 20, true)), "the newest finish");
         let _ = fs::remove_dir_all(&dir);
     }
 
