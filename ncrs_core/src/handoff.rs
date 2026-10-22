@@ -49,7 +49,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -527,19 +527,32 @@ fn give_up(dev: ConnDev) {
 /// on the mount then get ENOTCONN rather than blocking.
 pub(crate) struct ReattachGuard(Option<ConnDev>);
 
+// When the armed guard was created: programs on the mount wait while it stays armed.
+static TAKEOVER_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How long this daemon has held a taken-over connection without serving it yet.
+pub(crate) fn takeover_pending_for() -> Option<Duration> {
+    TAKEOVER_SINCE.safe_lock().map(|t| t.elapsed())
+}
+
 impl ReattachGuard {
     pub(crate) fn new(dev: Option<ConnDev>) -> Self {
+        if dev.is_some() {
+            *TAKEOVER_SINCE.safe_lock() = Some(Instant::now());
+        }
         ReattachGuard(dev)
     }
 
     /// The session serves the connection now.
     pub(crate) fn disarm(&mut self) {
         self.0 = None;
+        *TAKEOVER_SINCE.safe_lock() = None;
     }
 }
 
 impl Drop for ReattachGuard {
     fn drop(&mut self) {
+        *TAKEOVER_SINCE.safe_lock() = None;
         if let Some(dev) = self.0.take() {
             log::warn!("handoff: this daemon failed before serving the connection it took over");
             give_up(dev);
@@ -750,8 +763,14 @@ fn planned_restart() -> io::Result<()> {
     use std::os::unix::process::CommandExt;
     let err = cmd.exec();
     // Still here: exec failed. A later crash restore must not trust a snapshot
-    // of this moment, and the paused scheduler must serve again.
+    // of this moment, and the paused scheduler must serve again. std's exec also
+    // reset this process's SIGPIPE to the default action and cleared this
+    // thread's signal mask: put both back, or the next write to a vanished IPC
+    // client would kill the daemon with a "clean" SIGPIPE systemd won't restart.
     let _ = set_cloexec(fd, true);
+    // SAFETY: restores the ignore disposition the Rust runtime set at startup.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    block_sigterm();
     undo_handover();
     Err(err)
 }

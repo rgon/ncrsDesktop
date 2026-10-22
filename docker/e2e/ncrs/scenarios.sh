@@ -1580,8 +1580,13 @@ rs_wait_log() {  # <regex> <seconds>: the daemon logged it since the mark
 rs_show() { rs_since | grep -iE "handoff|SIGTERM|watchdog|reattach|restored|error" | tail -8 | sed 's/^/    /'
     rs_fs_since | tail -6 | sed 's/^/    fake systemd: /'; }
 rs_held() {  # <step> <chunk>: held descriptors write and read, the mount answers
-    printf '%s' "$2" >&7 2>/dev/null && ok "$1: the descriptor opened before it still writes" \
+    # Bounded: a mount left unserved would block the write in the kernel and stall the suite.
+    bounded 10 bash -c 'printf "%s" "$1" >&7' _ "$2" 2>/dev/null && ok "$1: the descriptor opened before it still writes" \
         || no "$1: the descriptor opened before it can no longer write"
+    # One stored copy of the connection: a re-sent one would pile up in systemd's store.
+    local stored; stored="$(fsd status | sed -n 's/.*store=\([^ ]*\).*/\1/p' | tr ',' '\n' | grep -c .)"
+    [ "$stored" = 1 ] && ok "$1: exactly one copy of the connection is in the fd store" \
+        || no "$1: the fd store holds ${stored} copies of the connection"
     [ "$(python3 -c 'import os; print(os.pread(8, 64, 0).decode(), end="")' 2>/dev/null)" = reader-content ] \
         && ok "$1: the descriptor opened before it still reads" \
         || no "$1: the descriptor opened before it can no longer read"
