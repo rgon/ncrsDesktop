@@ -3283,6 +3283,23 @@ mod upload_order_tests {
     }
 
     #[test]
+    fn an_older_writer_is_found_behind_newer_clean_or_failed_handles() {
+        let dir = staging_dir("sibling-writer");
+        let wp = dir.join("write_5");
+        std::fs::write(&wp, b"written").unwrap();
+        let writer = writer_handle(7, true, Some(wp.clone()));
+        let reader = writer_handle(7, false, None);
+        let mut failed = writer_handle(7, true, Some(dir.join("write_9")));
+        failed.upload_failed = true;
+        let files = HashMap::from([(5, writer), (7, reader), (9, failed)]);
+        assert_eq!(staged_source(&files, 6, 7), Some((wp, 0)), "the newest handle with usable bytes");
+        let files = Mutex::new(files);
+        assert_eq!(live_write_size(&files, 7), Some(7), "a failed handle does not set the size");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_streamed_upload_serves_only_the_bytes_it_still_holds() {
         let dir = staging_dir("streamed-read");
         let wp = dir.join("write_1");

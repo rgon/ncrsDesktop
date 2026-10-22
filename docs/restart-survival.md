@@ -86,13 +86,11 @@ and programs block; nothing fails.
 - Kernels older than 6.9 lack `FUSE_NOTIFY_RESEND`: a request in flight at the
   moment of a crash then stays blocked until its program is interrupted.
 - **Downgrading while a large file streams.** Streamed staging files keep the
-  file's own offsets with sent chunks punched out. A restart onto an older
-  binary does not find the versioned handle snapshot and restores such a
-  handle as failed (EIO), and an older binary refuses to finish a queued
-  streamed upload in the new layout rather than assemble a wrong file. Nothing
-  is corrupted, but that copy has to be made again. A re-exec onto a binary
-  that predates restart survival also starts it with SIGTERM blocked, so its
-  `stop` waits for systemd's SIGKILL.
+  file's own offsets with sent chunks punched out. An older binary refuses to
+  finish a queued streamed upload in that layout rather than assemble a wrong
+  file: nothing is corrupted, but that copy has to be made again. A re-exec
+  onto a binary that predates restart survival also starts it with SIGTERM
+  blocked, so its `stop` waits for systemd's SIGKILL.
 - **Staging filesystems without hole punching** (ecryptfs, vfat, some FUSE
   homes): a big file is staged in full even when the disk is low.
 
