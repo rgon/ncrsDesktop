@@ -1016,8 +1016,13 @@ fn read_at_full(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<
 /// tail page it had just written (LibreOffice does this after every zip entry) got 0
 /// bytes back and wrote the page out again with stale buffer contents.
 fn live_write_size(open_files: &Mutex<HashMap<u64, OpenFile>>, ino: u64) -> Option<u64> {
-    // Picked under the lock, measured outside it: stat(2) must not hold up every handle.
-    let len = newest_usable_writer(&open_files.safe_lock(), |_, of| of.ino == ino).and_then(|(_, of)| staged_len(of));
+    newest_staged_len(open_files, |_, of| of.ino == ino)
+}
+
+/// The staged length of the newest usable writer `matching`: picked under the lock,
+/// measured outside it, since stat(2) must not hold up every handle.
+fn newest_staged_len(open_files: &Mutex<HashMap<u64, OpenFile>>, matching: impl Fn(u64, &OpenFile) -> bool) -> Option<u64> {
+    let len = newest_usable_writer(&open_files.safe_lock(), matching).and_then(|(_, of)| staged_len(of));
     len.and_then(StagedLen::resolve)
 }
 
@@ -1453,13 +1458,15 @@ fn punch_hole_supported() -> bool {
     }
 }
 
-/// Says why a read got EIO: its bytes were already streamed away. At most every 10 s,
-/// since a reader retrying would otherwise flood the log.
+/// Says why a read got EIO: its bytes were already streamed away. At most every 10 s per
+/// file, since a reader retrying would otherwise flood the log.
 fn warn_streamed_away(path: &Path, off: u64) {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    let mut last = LAST.safe_lock();
-    if last.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
-        *last = Some(Instant::now());
+    static LAST: Mutex<Option<HashMap<PathBuf, Instant>>> = Mutex::new(None);
+    let mut guard = LAST.safe_lock();
+    let last = guard.get_or_insert_with(HashMap::new);
+    last.retain(|_, t| t.elapsed() <= Duration::from_secs(10));
+    if !last.contains_key(path) {
+        last.insert(path.to_path_buf(), Instant::now());
         log::warn!(
             "read {}: offset {} was already streamed to the server, which cannot give it back until the upload finishes — EIO",
             path.display(), off,
@@ -6564,19 +6571,15 @@ impl NextCloudFs {
             }
         }
 
-        // A locally-written-but-not-yet-uploaded edit is the newest version of the
-        // file and MUST win over any cached/kept copy or the server copy. Serve it
-        // straight from the pending PUT's staging file. This is what lets edits
-        // survive a server outage (read your own writes while offline) and fixes
-        // the save-then-reopen EIO — including when a stale cache entry for the
-        // path exists, which is why this runs before every other source below. A
-        // rename rewrites the queued Put's remote_path to the destination (see
-        // MutationJournal::enqueue), so a reopen of the renamed-to path resolves
-        // here too. The staging file is removed the instant the PUT succeeds, so
-        // this returns None again as soon as the file is safely on the server.
-        // The newest queued upload of the path (a whole-file PUT, or a streamed upload's
-        // final chunks and assembly) is the current content. A streamed one holds only its
-        // tail: below it nothing readable exists, the server still has the old version.
+        // A locally-written-but-not-yet-uploaded edit is the newest version of the file and
+        // MUST win over any cached/kept copy or the server copy: the newest queued upload
+        // of the path (a whole-file PUT, or a streamed upload's final chunks and assembly),
+        // served from its staging file. This lets edits survive a server outage and a
+        // save-then-reopen read its own bytes (a rename re-points the queued upload at the
+        // destination), including over a stale cache entry, which is why this runs before
+        // every other source below. The staging file goes the instant the upload succeeds.
+        // A streamed one holds only its tail: below it nothing readable exists, the server
+        // still has the old version.
         {
             let pending = self.journal.safe_lock().pending_upload(&path);
             let (file, at) = match pending {
@@ -8294,10 +8297,9 @@ impl NextCloudFs {
         // synchronous update, which may not have run yet: take the writer's staged size so
         // the optimistic update shows the right byte count immediately. Taken before the
         // cache lock: write() takes open_files and then cache, so the reverse would deadlock.
-        let staged_size = {
-            let len = newest_usable_writer(&self.open_files.safe_lock(), |_, of| of.remote_path == from).and_then(|(_, of)| staged_len(of));
-            len.and_then(StagedLen::resolve)
-        };
+        // Nothing can grow it in between: write() and flush() on this file wait behind
+        // rename's exclusive key on the inode in the request scheduler (fuse_dispatch).
+        let staged_size = newest_staged_len(&self.open_files, |_, of| of.remote_path == from);
         {
             let mut c = self.cache.safe_lock();
             let mut moved_entry = None;

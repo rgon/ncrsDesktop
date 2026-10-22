@@ -310,38 +310,24 @@ impl MutationJournal {
         self.entries.iter().any(|e| e.seq == seq)
     }
 
-    /// Staging file backing a still-queued Put for `path`, if any. Reads of a
-    /// locally-written-but-not-yet-uploaded file can be served from here instead
-    /// of streaming from a server that does not have the content yet.
-    pub fn pending_put_staging(&self, path: &Path) -> Option<PathBuf> {
+    /// Where a reader finds the newest not-yet-uploaded content of `path`: the newest
+    /// queued whole-file PUT or streamed finish for it. enqueue() re-points a moved file's
+    /// queued uploads at the new name, which is what lets a save-then-reopen (LibreOffice:
+    /// temp file, then rename over the document) read its own queued bytes. Deletes and
+    /// renames are not replayed here, because enqueue() has already rewritten the older
+    /// entries' paths and their order no longer says which file a path meant: a file
+    /// deleted, or renamed over, while an older upload of the same path is still queued
+    /// can read that upload's bytes until the queue drains.
+    pub fn pending_upload(&self, path: &Path) -> Option<PendingUpload> {
         self.entries.iter().rev().find_map(|e| match &e.op {
             MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
-                Some(staging_path.clone())
+                Some(PendingUpload::Staged(staging_path.clone()))
+            }
+            MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, .. } if remote_path == path => {
+                Some(PendingUpload::StreamTail { tail: tail_path.clone(), held_from: *bytes_confirmed, sparse: *sparse })
             }
             _ => None,
         })
-    }
-
-    /// Where a reader finds the newest not-yet-uploaded content of `path`, newest entry
-    /// first: a queued whole-file PUT or streamed finish for it wins, and a later Unlink of
-    /// it (or RmDir above it) means what is queued belongs to a file that is gone. A Rename
-    /// does not stop the search: enqueue() already re-pointed the moved file's uploads at
-    /// the new name, which is what lets a save-then-reopen read its own queued bytes.
-    pub fn pending_upload(&self, path: &Path) -> Option<PendingUpload> {
-        for e in self.entries.iter().rev() {
-            match &e.op {
-                MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
-                    return Some(PendingUpload::Staged(staging_path.clone()));
-                }
-                MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, .. } if remote_path == path => {
-                    return Some(PendingUpload::StreamTail { tail: tail_path.clone(), held_from: *bytes_confirmed, sparse: *sparse });
-                }
-                MutationOp::Unlink { path: gone } if gone == path => return None,
-                MutationOp::RmDir { path: gone } if path.starts_with(gone) => return None,
-                _ => {}
-            }
-        }
-        None
     }
 
     pub fn len(&self) -> usize {
@@ -1148,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_put_staging_follows_rename() {
+    fn pending_upload_follows_rename() {
         // Mirrors the LibreOffice save: write temp file (Put), then rename temp onto
         // the final name. enqueue() rewrites the queued Put's remote_path to the
         // destination, so a read of the destination resolves to the temp's staging.
@@ -1162,15 +1148,17 @@ mod tests {
             staging_path: staging.clone(),
             if_match_etag: None,
         });
-        assert_eq!(j.pending_put_staging(&PathBuf::from("/docs/lu123.tmp")), Some(staging.clone()));
+        assert_eq!(j.pending_upload(Path::new("/docs/lu123.tmp")), Some(PendingUpload::Staged(staging.clone())));
 
+        // Some saves delete the document before renaming the temp file over it.
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/docs/report.odt") });
         j.enqueue(MutationOp::Rename {
             from: PathBuf::from("/docs/lu123.tmp"),
             to: PathBuf::from("/docs/report.odt"),
         });
         // Old path no longer resolves; destination now serves the staging bytes.
-        assert!(j.pending_put_staging(&PathBuf::from("/docs/lu123.tmp")).is_none());
-        assert_eq!(j.pending_put_staging(&PathBuf::from("/docs/report.odt")), Some(staging));
+        assert!(j.pending_upload(Path::new("/docs/lu123.tmp")).is_none());
+        assert_eq!(j.pending_upload(Path::new("/docs/report.odt")), Some(PendingUpload::Staged(staging)));
         assert!(j.has_pending_put(&PathBuf::from("/docs/report.odt")));
 
         let _ = fs::remove_dir_all(&dir);
@@ -1342,9 +1330,7 @@ mod tests {
         let staged = dir.join("write_4");
         j.enqueue(MutationOp::Put { remote_path: PathBuf::from("/v.mkv"), staging_path: staged.clone(), if_match_etag: None });
         assert_eq!(j.pending_upload(Path::new("/v.mkv")), Some(PendingUpload::Staged(staged)));
-        // ...and once the file is deleted, nothing queued for it is its content.
-        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/v.mkv") });
-        assert_eq!(j.pending_upload(Path::new("/v.mkv")), None);
+
         let _ = fs::remove_dir_all(&dir);
     }
 
