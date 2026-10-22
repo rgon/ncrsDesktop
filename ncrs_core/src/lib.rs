@@ -1059,7 +1059,9 @@ fn overlay_live_size(open_files: &Mutex<HashMap<u64, OpenFile>>, mut attr: FileA
 /// and the server, which hold nothing of them until release().
 fn staged_source(files: &HashMap<u64, OpenFile>, fh: u64, ino: u64) -> Option<(PathBuf, u64)> {
     let of_source = |of: &OpenFile| {
-        if !of.dirty {
+        // A failed handle's staging bytes are not the file any more (an aborted stream, or one
+        // restored in an older layout): never serve them.
+        if !of.dirty || of.upload_failed {
             return None;
         }
         // After chunks went out, the bytes before the unsent tail are holes (free_sent_chunk).
@@ -1110,11 +1112,12 @@ struct ReadAheadBuf {
 // pre-existing content crosses the stream threshold (`stream_upload_threshold_mb`,
 // 100 MiB by default), the oldest CHUNK_SIZE chunk is pushed to Nextcloud each
 // time the unsent tail reaches the threshold again, instead of the whole file
-// landing on local disk first. Writes back into the unsent tail are fine; it is
-// still on disk. There is
+// landing on local disk first. The staging file keeps the file's own offsets: sent
+// chunks become holes (free_sent_chunk) and the unsent tail stays where it was, so
+// writes back into the tail are fine. There is
 // deliberately no journal entry for this: unlike the legacy staging path, a
 // crash or a write into already-sent bytes while a session is open cannot be resumed
-// or safely unwound (the already-uploaded prefix is no longer held locally),
+// or safely unwound (the already-uploaded prefix is punched out locally),
 // so those cases fail the handle outright rather than risk silent corruption
 // or data loss. A plain sequential copy — the case this exists for — never
 // hits either path.
@@ -1370,11 +1373,10 @@ fn write_into_tail_file(wp: &Path, off: u64, data: &[u8]) -> std::io::Result<()>
 /// laid out at the file's own offsets, so nothing is copied or moved and the unsent tail
 /// stays the threshold's worth on every filesystem. Where punching is unsupported the
 /// bytes just stay: still correct, only not freed.
-fn free_sent_chunk(wp: &Path, off: u64, len: u64) -> std::io::Result<()> {
+fn free_sent_chunk(f: &std::fs::File, off: u64, len: u64) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    let f = std::fs::OpenOptions::new().write(true).open(wp)?;
     let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-    // SAFETY: a plain syscall on an fd this scope owns; no memory is passed.
+    // SAFETY: a plain syscall on an fd the caller owns; no memory is passed.
     if unsafe { libc::fallocate(f.as_raw_fd(), mode, off as libc::off_t, len as libc::off_t) } != 0 {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
@@ -1385,6 +1387,38 @@ fn free_sent_chunk(wp: &Path, off: u64, len: u64) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether the staging filesystem can punch holes, probed once on a scratch file. Where
+/// it cannot (ecryptfs, vfat, some FUSE homes), streaming would free nothing and only add
+/// ways to fail, so a big file is staged in full there instead. A probe that cannot even
+/// write its scratch file (a full disk, a missing directory) is not an answer: it is
+/// retried on the next call rather than remembered.
+fn punch_hole_supported() -> bool {
+    use std::os::unix::io::AsRawFd;
+    static KNOWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(known) = KNOWN.get() {
+        return *known;
+    }
+    let Some(dir) = STREAM_DISK_PATH.safe_lock().clone() else { return true };
+    let probe = dir.join(format!(".punch-probe-{}", std::process::id()));
+    let answer = std::fs::write(&probe, [0u8; 8192]).ok()
+        .and_then(|()| std::fs::OpenOptions::new().write(true).open(&probe).ok())
+        .map(|f| {
+            // SAFETY: a plain syscall on an fd this scope owns; no memory is passed.
+            let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+            unsafe { libc::fallocate(f.as_raw_fd(), mode, 0, 4096) == 0 }
+        });
+    let _ = std::fs::remove_file(&probe);
+    match answer {
+        Some(ok) => {
+            if !ok {
+                log::warn!("staging: {} cannot free sent chunks in place — large files are staged in full even when the disk is low", dir.display());
+            }
+            *KNOWN.get_or_init(|| ok)
+        }
+        None => true,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4898,8 +4932,8 @@ impl NextCloudFs {
 
             let sent_from = s.bytes_confirmed;
             let mut chunk = vec![0u8; webdav_ops::CHUNK_SIZE];
-            std::fs::File::open(wp)
-                .and_then(|f| f.read_exact_at(&mut chunk, sent_from))
+            let staging = std::fs::OpenOptions::new().read(true).write(true).open(wp)
+                .and_then(|f| f.read_exact_at(&mut chunk, sent_from).map(|()| f))
                 .map_err(|e| (format!("staging read: {}", e), confirmed_state.clone()))?;
 
             let session = backend::ChunkedUploadSession { uploads_base: s.uploads_base.clone() };
@@ -4911,7 +4945,7 @@ impl NextCloudFs {
             s.next_index += 1;
             s.bytes_confirmed += webdav_ops::CHUNK_SIZE as u64;
 
-            free_sent_chunk(wp, sent_from, webdav_ops::CHUNK_SIZE as u64)
+            free_sent_chunk(&staging, sent_from, webdav_ops::CHUNK_SIZE as u64)
                 .map_err(|e| (format!("staging free: {}", e), state.clone()))?;
             Ok(state.expect("just ensured Some above"))
         }
@@ -7170,7 +7204,7 @@ impl NextCloudFs {
                 if let Some(of) = files.get_mut(&fh_raw) {
                     if let Some(cs) = &of.chunk_upload {
                         // A streamed upload is in progress: already-sent chunks are
-                        // gone from local disk, so only a no-op truncate (to the
+                        // holes in the staging file now, so only a no-op truncate (to the
                         // length already accounted for) can be honored — anything
                         // else would need to shrink/extend bytes we no longer have.
                         if new_size != of.total_written {
@@ -7283,6 +7317,12 @@ impl NextCloudFs {
                 return;
             }
         };
+        if of.upload_failed {
+            // Its upload was abandoned (or it was restored unusable): nothing written now
+            // could reach the server, so say so instead of staging it.
+            reply.error(Errno::EIO);
+            return;
+        }
 
         let wp = of.write_path.get_or_insert_with(|| {
             let cache_dir = self.cache.safe_lock().cache_dir.clone();
@@ -7347,7 +7387,7 @@ impl NextCloudFs {
             // stage the rest and start over.
             let streaming = of.chunk_upload.is_some();
             let go = stream_should_graduate(of.total_written, of.chunk_upload.as_ref(), stream_upload_threshold())
-                && (streaming || stream_disk_low());
+                && (streaming || (stream_disk_low() && punch_hole_supported()));
             if go {
                 if !streaming {
                     log::info!("write: disk is low — streaming {} to the server as it is written", path.display());
@@ -7393,7 +7433,7 @@ impl NextCloudFs {
             // At least one chunk is already sitting on the server with nothing
             // local to reconstruct it from — a write into those sent bytes or
             // past the end, a resize, or going offline mid-copy cannot be reconciled here. Fail the
-            // write rather than misplace bytes in the small tail file or lose
+            // write rather than write into a punched-out range or lose
             // the already-uploaded prefix silently. A plain sequential copy
             // never reaches this.
             log::error!(
