@@ -66,6 +66,15 @@ Requires Docker (with `compose`) and `/dev/fuse`. The `ncrs` container needs
   and the backend to a timeout — the guarantee is durability, not first-read
   consistency.
 
+## Real systemd (restart survival)
+
+`scripts/e2e-systemd.sh` runs the daemon as the packaged user unit under the
+real systemd 255 (PID 1 of an Ubuntu 24.04 container, `docker/e2e/systemd/`)
+and checks restart survival step by step against `systemctl --user show` and
+the journal: re-exec, restart, crash, watchdog kill, start limit, stop. It
+uses the same prebuilt `docker/e2e/ncrs/ncrs.deb` and an rclone WebDAV behind
+`chunkdav.py`. See docs/restart-survival.md, "Testing with the real systemd".
+
 ## Walker harness (thread / CPU regression under a failing server)
 
 `docker/e2e/walker/` reproduces "a `find` walks the tree while the server
