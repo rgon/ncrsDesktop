@@ -32,7 +32,8 @@ pub enum MutationOp {
         to: PathBuf,
     },
     /// The end of a streamed upload whose earlier chunks are already on the server:
-    /// PUT `tail_path` as chunk `next_index`, then assemble the session into `remote_path`.
+    /// PUT the kept head as chunk 0 and the tail from chunk `next_index` on, then
+    /// assemble the session into `remote_path`.
     FinishChunked {
         remote_path: PathBuf,
         uploads_base: String,
@@ -46,6 +47,10 @@ pub enum MutationOp {
         /// `bytes_confirmed`.
         #[serde(default)]
         sparse: bool,
+        /// Length of the file's start kept in the staging file and not sent yet (chunk 0).
+        /// Entries queued by older versions sent the head with the rest: 0.
+        #[serde(default)]
+        head: u64,
     },
 }
 
@@ -54,9 +59,10 @@ pub enum MutationOp {
 pub enum PendingUpload {
     /// A whole-file PUT: the staging file is the file.
     Staged(PathBuf),
-    /// A streamed upload's finish: only the tail from `held_from` is local; `sparse` says
-    /// it sits at the file's own offsets rather than starting the file at `held_from`.
-    StreamTail { tail: PathBuf, held_from: u64, sparse: bool },
+    /// A streamed upload's finish: only the first `head` bytes and the tail from
+    /// `held_from` are local; `sparse` says they sit at the file's own offsets rather
+    /// than the tail starting the file at `held_from`.
+    StreamTail { tail: PathBuf, held_from: u64, head: u64, sparse: bool },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -325,8 +331,8 @@ impl MutationJournal {
                 MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
                     return Some(PendingUpload::Staged(staging_path.clone()));
                 }
-                MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, .. } if remote_path == path => {
-                    return Some(PendingUpload::StreamTail { tail: tail_path.clone(), held_from: *bytes_confirmed, sparse: *sparse });
+                MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, head, .. } if remote_path == path => {
+                    return Some(PendingUpload::StreamTail { tail: tail_path.clone(), held_from: *bytes_confirmed, head: *head, sparse: *sparse });
                 }
                 MutationOp::Rename { to, .. } if path.starts_with(to) => renamed_onto = true,
                 MutationOp::Unlink { path: gone } if gone == path && !renamed_onto => return None,
@@ -838,11 +844,11 @@ fn execute_op(
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
-        MutationOp::FinishChunked { remote_path, uploads_base, next_index, bytes_confirmed, total_len, tail_path, if_match_etag, sparse } => {
+        MutationOp::FinishChunked { remote_path, uploads_base, next_index, bytes_confirmed, total_len, tail_path, if_match_etag, sparse, head } => {
             let saved_mtime = crate::staged_mtime(tail_path).unwrap_or_else(SystemTime::now);
             let result = finish_chunked(
                 &*ctx.backend, uploads_base, *next_index, *bytes_confirmed, *total_len,
-                tail_path, *sparse, remote_path, if_match_etag.as_deref(),
+                tail_path, *sparse, *head, remote_path, if_match_etag.as_deref(),
             );
             match result {
                 Ok(result) => {
@@ -935,6 +941,7 @@ pub(crate) fn finish_chunked(
     total_len: u64,
     tail_path: &Path,
     sparse: bool,
+    head: u64,
     remote_path: &Path,
     if_match: Option<&str>,
 ) -> Result<crate::backend::PutResult, crate::backend::BackendWriteError> {
@@ -950,6 +957,17 @@ pub(crate) fn finish_chunked(
         each_tail_chunk(tail_path, from, tail_len, crate::webdav_ops::CHUNK_SIZE, |m| BackendWriteError::Server(0, m), |i, body| {
             crate::retry_chunk_write("final chunk upload", || backend.put_chunk(&session, next_index + i, body.clone()))
         })?;
+    }
+    // The head was kept for header rewrites until the file was closed: it goes now, as
+    // chunk 0, which the server assembles first. After the tail, whose length check
+    // catches a truncated staging file before anything is sent.
+    if head > 0 {
+        use std::os::unix::fs::FileExt;
+        let mut body = vec![0u8; head.min(total_len) as usize];
+        std::fs::File::open(tail_path)
+            .and_then(|f| f.read_exact_at(&mut body, 0))
+            .map_err(|e| BackendWriteError::Server(0, format!("staging head {}: {}", tail_path.display(), e)))?;
+        crate::retry_chunk_write("head chunk upload", || backend.put_chunk(&session, 0, body.clone()))?;
     }
     crate::retry_chunk_write("chunked-upload finish", || backend.finish_chunked_upload(&session, remote_path, if_match, mtime))
 }
@@ -1299,6 +1317,7 @@ mod tests {
                 tail_path: tail.clone(),
                 if_match_etag: Some("e1".into()),
                 sparse: false,
+                head: 0,
             })
         };
         let j = MutationJournal::load_or_create(&dir);
@@ -1326,11 +1345,12 @@ mod tests {
                 tail_path: tail.clone(),
                 if_match_etag: None,
                 sparse,
+                head: if sparse { 10 } else { 0 },
             });
         }
         assert_eq!(
             j.pending_upload(Path::new("/v.mkv")),
-            Some(PendingUpload::StreamTail { tail: tail.clone(), held_from: 20, sparse: true }),
+            Some(PendingUpload::StreamTail { tail: tail.clone(), held_from: 20, head: 10, sparse: true }),
             "the newest finish",
         );
         // A newer whole-file save of the same path wins over the streamed finish...
@@ -1359,6 +1379,7 @@ mod tests {
                 tail_path: dir.join("gone"),
                 if_match_etag: None,
                 sparse: false,
+                head: 0,
             });
         }
         let j = MutationJournal::load_or_create(&dir);
@@ -1382,6 +1403,7 @@ mod tests {
             tail_path: tail,
             if_match_etag: None,
             sparse: false,
+            head: 0,
         });
         j.enqueue(MutationOp::Rename { from: PathBuf::from("/d"), to: PathBuf::from("/e") });
         assert_eq!(j.entries()[0].op.path(), Path::new("/e/tmp.bin"));

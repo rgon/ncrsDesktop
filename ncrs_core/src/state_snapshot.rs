@@ -132,6 +132,9 @@ struct OpenRecord {
     dirty: bool,
     #[serde(default)]
     created: bool,
+    /// The staging file held the whole file when opened (see OpenFile::staged_whole).
+    #[serde(default)]
+    staged_whole: bool,
     #[serde(default)]
     unlinked: bool,
     #[serde(default)]
@@ -183,6 +186,8 @@ struct ChunkRec {
     uploads_base: String,
     next_index: u64,
     bytes_confirmed: u64,
+    #[serde(default)]
+    head: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -390,6 +395,7 @@ pub(crate) fn handle_opened(fh: u64, of: &OpenFile, backing_id: Option<u32>) {
             write_path: of.write_path.clone(),
             dirty: of.dirty,
             created: of.created,
+            staged_whole: of.staged_whole,
             unlinked: of.unlinked,
             original_etag: of.original_etag.clone(),
             stream_eligible: of.stream_eligible,
@@ -715,6 +721,7 @@ pub(crate) fn write_handles_snapshot(cache_dir: &Path, open_files: &Mutex<HashMa
                 uploads_base: c.uploads_base.clone(),
                 next_index: c.next_index,
                 bytes_confirmed: c.bytes_confirmed,
+                head: c.head,
             }),
             upload_failed: of.upload_failed,
             unlinked: of.unlinked,
@@ -1006,7 +1013,7 @@ fn write_state(h: &RestoredHandle, staging_now: Option<StagingId>, stream: Optio
         Some(uploads_base) => Ok(WriteState {
             dirty: true,
             total_written: 0,
-            chunk: Some(ChunkRec { uploads_base: uploads_base.to_string(), next_index: 0, bytes_confirmed: 0 }),
+            chunk: Some(ChunkRec { uploads_base: uploads_base.to_string(), next_index: 0, bytes_confirmed: 0, head: 0 }),
             upload_failed: true,
             ..base
         }),
@@ -1043,6 +1050,7 @@ fn rebuild(h: &RestoredHandle, stream: Option<&str>, gen: u64) -> Result<(OpenFi
         io_kind: rec.io_kind.into(),
         upload_failed: false,
         created: rec.created,
+        staged_whole: rec.staged_whole,
         unlinked: rec.unlinked,
         opened_gen: gen,
     };
@@ -1058,6 +1066,7 @@ fn rebuild(h: &RestoredHandle, stream: Option<&str>, gen: u64) -> Result<(OpenFi
         uploads_base: c.uploads_base,
         next_index: c.next_index,
         bytes_confirmed: c.bytes_confirmed,
+        head: c.head,
     });
     of.upload_failed = ws.upload_failed;
     of.unlinked = ws.unlinked;
@@ -1165,6 +1174,7 @@ mod tests {
             staging: None,
             dirty: false,
             created: false,
+            staged_whole: false,
             unlinked: false,
             original_etag: Some("e1".into()),
             stream_eligible: false,
@@ -1327,7 +1337,7 @@ mod tests {
             dirty: true,
             total_written: 300,
             stream_eligible: true,
-            chunk: Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200 }),
+            chunk: Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, head: 100 }),
             upload_failed: false,
             unlinked: false,
             created: true,
@@ -1336,7 +1346,7 @@ mod tests {
         let ws = write_state(&h, Some(staging(100, 30)), Some("u")).unwrap();
         assert!(!ws.upload_failed);
         assert!(ws.stream_eligible);
-        assert_eq!(ws.chunk, Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200 }));
+        assert_eq!(ws.chunk, Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, head: 100 }));
         assert_eq!(ws.total_written, 300);
     }
 

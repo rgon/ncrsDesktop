@@ -87,6 +87,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if SLOW_MARK and SLOW_MARK in path and self.command in ("GET", "PROPFIND"):
             log("SLOW %s %s" % (self.command, path))
             time.sleep(SLOW_SECS)
+        if self.command == "GET":
+            # Counted by the checks that a file is downloaded once, not twice.
+            log("GET %s %s" % (path, self.headers.get("Range", "whole")))
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         headers["Host"] = UPSTREAM
         # reqwest sends header names in lower case; a MOVE whose Destination still

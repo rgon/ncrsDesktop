@@ -996,7 +996,8 @@ echo "→ 29. LARGE LIBREOFFICE SAVE over chunked upload — a rewrite of the un
 # in the local tail, yet any out-of-order write after the first chunk failed the handle
 # with EIO. rclone has no chunked uploads, so this runs a second daemon against
 # chunkdav.py, which adds Nextcloud's uploads collection in front of the same server.
-# Streaming normally starts at 100 MiB; the threshold is lowered to one chunk here.
+# Streaming normally starts at 100 MiB; the threshold is lowered to one chunk here. The
+# first chunk stays local until close, so the first one sent is at 20 MiB.
 CD_PORT=8090
 CD_LOG=/tmp/chunkdav.log
 CD_HOME=/tmp/ncrs-chunked
@@ -1050,7 +1051,7 @@ else
     mkdir -p "$CD_MOUNT/chunked"
     # Setup guard: a plain sequential copy must really go through chunks, or the
     # LibreOffice case below would pass without ever reaching the streaming path.
-    head -c $((16 * 1048576)) /dev/urandom > /tmp/chunked.seq
+    head -c $((26 * 1048576)) /dev/urandom > /tmp/chunked.seq
     cp /tmp/chunked.seq "$CD_MOUNT/chunked/seq.bin"; crc=$?
     if wait_dav_sha chunked/seq.bin "$(sha < /tmp/chunked.seq)" 90 && [ "$crc" -eq 0 ]; then
         # The proxy logs ASSEMBLED once the upstream PUT returns, a moment after the file
@@ -1060,14 +1061,14 @@ else
             grep -q "ASSEMBLED .* -> .*/chunked/seq.bin (HTTP 2" "$CD_LOG" && { assembled=1; break; }
             sleep 1
         done
-        if [ -n "$assembled" ]; then
-            ok "setup: a 16 MiB sequential copy streamed through chunked upload byte-exact"
+        if [ -n "$assembled" ] && grep -q "streaming /chunked/seq.bin to the server as it is written" "$CD_NLOG"; then
+            ok "setup: a 26 MiB sequential copy streamed through chunked upload byte-exact"
         else
             no "setup: the sequential copy never used chunked upload — the scenario below would not test the streaming path"
             tail -10 "$CD_LOG" | sed 's/^/    /'
         fi
     else
-        no "setup: a 16 MiB sequential copy over chunked upload did not reach the backend intact (cp rc=$crc)"
+        no "setup: a 26 MiB sequential copy over chunked upload did not reach the backend intact (cp rc=$crc)"
         grep -E "seq.bin" "$CD_NLOG" | tail -10 | sed 's/^/    /'
         tail -15 /tmp/chunkdav.err 2>/dev/null | sed 's/^/    chunkdav: /'
     fi
@@ -1075,7 +1076,7 @@ else
     python3 - "$CD_MOUNT/chunked/lo-save.tmp" /tmp/chunked.lo.expect <<'PY'
 import os, sys
 path, expect_path = sys.argv[1], sys.argv[2]
-total = 16 * 1048576 + 777
+total = 26 * 1048576 + 777
 data = bytearray(os.urandom(total))
 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
 bad = []
@@ -1086,8 +1087,9 @@ def put(buf, off, what):
             bad.append("%s: short write %d of %d at %d" % (what, n, len(buf), off))
     except OSError as e:
         bad.append("%s at offset %d: %s" % (what, off, e))
-# Sequential, as LibreOffice streams the zip, stopping mid-block exactly as seen live.
-stop, off = 15531976, 0
+# Sequential, as LibreOffice streams the zip, stopping mid-block exactly as seen live
+# (moved on by the kept first chunk, so a chunk has gone out by then here too).
+stop, off = 15531976 + 10 * 1048576, 0
 while off < stop:
     n = min(65536, stop - off)
     put(bytes(data[off:off + n]), off, "sequential write")
@@ -1129,6 +1131,80 @@ PY
     [ -n "$t_lo" ] && [ "$(date -u -d "$srv" +%s 2>/dev/null)" = "$t_lo" ] \
         && ok "the chunked upload kept the save's mtime on the server" \
         || no "the chunked upload's server mtime (${srv:-none}) is not the save's ($(date -u -d "@${t_lo:-0}" +%T))"
+
+    # A muxer finishing a file it streamed: ffmpeg's mp4 (no faststart) and OBS's mkv go
+    # back to the start when they close, to patch the mdat size or the segment size and
+    # seek head. The first chunk stays local until close, so that patch must land even
+    # though later chunks are already on the server, and chunk 0 must go up last.
+    python3 - "$CD_MOUNT/chunked/trailer.mp4" /tmp/chunked.trailer.expect "$CD_LOG" "$(wc -l < "$CD_LOG")" <<'PY'
+import os, sys
+path, expect_path, log, mark = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+data = bytearray(os.urandom(36 * 1048576 + 123))
+fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+bad = []
+try:
+    for off in range(0, len(data), 65536):
+        os.pwrite(fd, bytes(data[off:off + 65536]), off)
+    sent = [l.split()[1] for l in open(log).read().splitlines()[mark:] if l.startswith("PUT ")]
+    if not sent:
+        bad.append("no chunk was sent while the file was open: the check would not test streaming")
+    if any(c.endswith("/0000000000") for c in sent):
+        bad.append("chunk 0 was sent while the file was open: %s" % sent)
+    if os.pread(fd, 4096, 0) != bytes(data[0:4096]):
+        bad.append("reading back the header before patching it returned other bytes")
+    data[32:40] = os.urandom(8)
+    os.pwrite(fd, bytes(data[32:40]), 32)
+    data[0:4096] = os.urandom(4096)
+    os.pwrite(fd, bytes(data[0:4096]), 0)
+    os.close(fd)
+except OSError as e:
+    bad.append("write: %s" % e)
+open(expect_path, "wb").write(bytes(data))
+for b in bad:
+    print("    " + b)
+sys.exit(1 if bad else 0)
+PY
+    trc=$?
+    [ "$trc" = 0 ] && ok "a streamed file's header patched at close (ffmpeg/OBS trailer) got no write error" \
+        || {
+            no "patching the header of a streamed file at close failed (rc=$trc)"
+            grep -E "trailer.mp4" "$CD_NLOG" | grep -E "non-sequential|abort" | tail -4 | sed 's/^/    /'
+        }
+    wait_dav_sha chunked/trailer.mp4 "$(sha < /tmp/chunked.trailer.expect)" 90 \
+        && ok "the header-patched streamed file reached the backend byte-exact" \
+        || no "the header-patched streamed file never reached the backend intact"
+
+    # Opening an existing file for writing stages its content; reading it through that
+    # handle before writing anything must not download it a second time (LibreOffice
+    # reads a document through the O_RDWR fd it keeps open).
+    head -c $((3 * 1048576 + 99)) /dev/urandom > /tmp/chunked.rw
+    curl -s -o /dev/null -u "$U:$P" -T /tmp/chunked.rw "${URL}chunked/opened-rw.bin"
+    for _ in $(seq 1 30); do
+        [ -f "$CD_MOUNT/chunked/opened-rw.bin" ] && break
+        ls "$CD_MOUNT/chunked" >/dev/null 2>&1; sleep 1
+    done
+    mark=$(wc -l < "$CD_LOG")
+    got="$(python3 - "$CD_MOUNT/chunked/opened-rw.bin" <<'PY'
+import hashlib, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+h, off = hashlib.sha256(), 0
+while True:
+    b = os.pread(fd, 65536, off)
+    if not b:
+        break
+    h.update(b)
+    off += len(b)
+os.close(fd)
+print(h.hexdigest())
+PY
+)"
+    gets=$(tail -n +"$((mark + 1))" "$CD_LOG" | grep -c "^GET .*/chunked/opened-rw.bin ")
+    if [ "$got" = "$(sha < /tmp/chunked.rw)" ] && [ "$gets" = 1 ]; then
+        ok "a file opened for writing and read before any write was downloaded once"
+    else
+        no "a file opened for writing and read before any write: $gets download(s), content $([ "$got" = "$(sha < /tmp/chunked.rw)" ] && echo intact || echo WRONG)"
+        tail -n +"$((mark + 1))" "$CD_LOG" | grep "opened-rw.bin" | head -5 | sed 's/^/    /'
+    fi
 
     cd_restart() {  # <sed expression for the config>: remount with a changed setting
         fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
@@ -1212,7 +1288,8 @@ PY
         hrc=$?
         [ "$hrc" = 0 ] && ok "streaming off: rewriting offset 0 of a 24 MiB new file got no write error" \
             || no "streaming off: rewriting offset 0 of a 24 MiB new file failed (rc=$hrc)"
-        # With streaming on, this rewrite would hit an already-sent chunk and fail.
+        # Streaming on keeps the first chunk local as well (the trailer check above);
+        # this is the staged-in-full path, which any write pattern survives.
         wait_dav_sha chunked/header.bin "$(sha < /tmp/chunked.hdr.expect 2>/dev/null)" 90 \
             && ok "streaming off: the header-patched file reached the backend byte-exact" \
             || no "streaming off: the header-patched file never reached the backend intact"
@@ -1221,7 +1298,8 @@ fi
 fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
 kill "$CD_DAEMON" "$CD_PID" 2>/dev/null
 wait "$CD_DAEMON" "$CD_PID" 2>/dev/null
-rm -f /tmp/chunked.seq /tmp/chunked.lo.expect /tmp/chunked.hdr.expect /tmp/chunked.big /tmp/chunked.roomy.expect
+rm -f /tmp/chunked.seq /tmp/chunked.lo.expect /tmp/chunked.hdr.expect /tmp/chunked.big /tmp/chunked.roomy.expect \
+    /tmp/chunked.trailer.expect /tmp/chunked.rw
 
 echo "→ 30. MODIFICATION TIME is the same after the upload as right after the save"
 # LibreOffice remembers a document's mtime right after saving it and, before the next save,
