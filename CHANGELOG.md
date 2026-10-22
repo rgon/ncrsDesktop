@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.88](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.87...ncrs-v0.1.88) (2026-10-22)
+
+
+### Features
+
+* **rpm:** add openSUSE RPM packaging for Leap 16, Slowroll and Tumbleweed ([ef8b013](https://github.com/rgon/ncrsDesktop/commit/ef8b013d4273409e80a5b8a78196df42d1097bff))
+
 ## [0.1.87](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.86...ncrs-v0.1.87) (2026-10-22)
 
 
