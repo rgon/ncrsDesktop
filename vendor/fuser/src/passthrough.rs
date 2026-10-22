@@ -1,6 +1,8 @@
 use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::Weak;
 
 use log::error;
@@ -9,6 +11,33 @@ use crate::dev_fuse::DevFuse;
 use crate::ll::ioctl::fuse_backing_map;
 use crate::ll::ioctl::fuse_dev_ioc_backing_close;
 use crate::ll::ioctl::fuse_dev_ioc_backing_open;
+
+/// Performs `FUSE_DEV_IOC_BACKING_OPEN` / `FUSE_DEV_IOC_BACKING_CLOSE` on the
+/// session's behalf. The kernel requires CAP_SYS_ADMIN for both ioctls; a
+/// filesystem that runs without it can hand them to a privileged helper
+/// process that holds the same /dev/fuse connection.
+///
+/// ncrs patch (see PATCHES.md, "fuser: backing broker").
+pub trait BackingBroker: Send + Sync {
+    /// Registers `fd` as a backing file; returns the kernel's backing id.
+    fn open(&self, fd: BorrowedFd<'_>) -> std::io::Result<u32>;
+    /// Releases a backing id `open` returned.
+    fn close(&self, backing_id: u32) -> std::io::Result<()>;
+}
+
+static BROKER: RwLock<Option<Arc<dyn BackingBroker>>> = RwLock::new(None);
+
+/// Routes every later [`BackingId`] creation and drop through `broker`
+/// (process-wide); `None` restores the direct ioctls.
+///
+/// ncrs patch (see PATCHES.md, "fuser: backing broker").
+pub fn set_backing_broker(broker: Option<Arc<dyn BackingBroker>>) {
+    *BROKER.write().unwrap_or_else(|p| p.into_inner()) = broker;
+}
+
+fn backing_broker() -> Option<Arc<dyn BackingBroker>> {
+    BROKER.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
 
 /// A reference to a previously opened fd intended to be used for passthrough
 ///
@@ -43,15 +72,20 @@ impl BackingId {
             ));
         }
 
-        let map = fuse_backing_map {
-            fd: fd.as_fd().as_raw_fd() as u32,
-            flags: 0,
-            padding: 0,
+        // ncrs patch ("fuser: backing broker"): a broker, when set, does the ioctl.
+        let id = if let Some(broker) = backing_broker() {
+            broker.open(fd.as_fd())?
+        } else {
+            let map = fuse_backing_map {
+                fd: fd.as_fd().as_raw_fd() as u32,
+                flags: 0,
+                padding: 0,
+            };
+            unsafe { fuse_dev_ioc_backing_open(channel.as_raw_fd(), &map) }? as u32
         };
-        let id = unsafe { fuse_dev_ioc_backing_open(channel.as_raw_fd(), &map) }?;
         Ok(Self {
             channel: Arc::downgrade(channel),
-            backing_id: id as u32,
+            backing_id: id,
         })
     }
 
@@ -70,8 +104,14 @@ impl BackingId {
 impl Drop for BackingId {
     fn drop(&mut self) {
         if let Some(ch) = self.channel.upgrade() {
-            if let Err(e) = unsafe { fuse_dev_ioc_backing_close(ch.as_raw_fd(), &self.backing_id) }
-            {
+            // ncrs patch ("fuser: backing broker"): a broker, when set, does the ioctl.
+            let r = match backing_broker() {
+                Some(broker) => broker.close(self.backing_id),
+                None => unsafe { fuse_dev_ioc_backing_close(ch.as_raw_fd(), &self.backing_id) }
+                    .map(|_| ())
+                    .map_err(std::io::Error::from),
+            };
+            if let Err(e) = r {
                 error!("Failed to close backing fd: {e}");
             }
         }

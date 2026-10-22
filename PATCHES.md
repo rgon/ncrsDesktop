@@ -1,9 +1,9 @@
 # PATCHES.md — upstream fixes worth submitting (reqwest, fuser)
 
-The reqwest items below are worked around in-tree. The fuser item at the end
-("fuser: reattach") is the one patch ncrs actually carries: `vendor/fuser` is
-fuser 0.17.0 plus that change, wired in with `[patch.crates-io]` in the root
-`Cargo.toml`.
+The reqwest items below are worked around in-tree. The fuser items at the end
+("fuser: reattach", "fuser: backing broker") are the patches ncrs actually
+carries: `vendor/fuser` is fuser 0.17.0 plus those changes, wired in with
+`[patch.crates-io]` in the root `Cargo.toml`.
 
 Findings from the 2026-09-01 HTTP/3 investigation (see `GOTCHAS.md` §3). ncrs
 works around all of them in-tree (`http_clients::DavClient` stamps request
@@ -273,3 +273,37 @@ proto_version)` plus a `Notifier::resend()` for `FUSE_NOTIFY_RESEND` (Linux
 `handoff::send_notify_resend`). Until then, when bumping fuser: re-vendor the
 new version, re-apply the two functions, and keep `[patch.crates-io]` pointing
 at it.
+
+---
+
+# fuser: backing broker (carried as `vendor/fuser`)
+
+**Target:** `cberner/fuser`, version `0.17.0`. Needed by the privilege-separated
+passthrough helper (`ncrs_passthrough/`, `ncrs_core/src/passthrough_broker.rs`).
+
+### The gap
+
+`ReplyOpen::open_backing` and `BackingId`'s `Drop` issue
+`FUSE_DEV_IOC_BACKING_OPEN` / `FUSE_DEV_IOC_BACKING_CLOSE` on the session's own
+/dev/fuse descriptor, and the kernel requires CAP_SYS_ADMIN of the calling task
+for both. So the only way to use passthrough was to give the whole filesystem
+daemon CAP_SYS_ADMIN — which also lets fuser mount with a direct mount(2),
+bypassing fusermount3's checks (mount-point ownership, `mount_max`), and turns
+any code execution in the daemon into root.
+
+### The patch (additive; no behaviour change unless a broker is set)
+
+- `pub trait BackingBroker: Send + Sync { fn open(&self, fd) -> io::Result<u32>;
+  fn close(&self, id: u32) -> io::Result<()>; }`
+- `pub fn set_backing_broker(Option<Arc<dyn BackingBroker>>)`: process-wide.
+  When set, `BackingId::create` asks the broker for the id instead of doing the
+  ioctl, and `Drop` hands the id back to it (still only while the channel is
+  alive, as before). ncrs's broker forwards both to `ncrs-passthrough`, a
+  small capability-holding process that holds a dup of the same connection.
+
+### Upstreaming
+
+Upstream could take this as is, or as a per-session option on `Config`
+instead of a global (ncrs runs one session per process, so the global is
+enough here).
+
