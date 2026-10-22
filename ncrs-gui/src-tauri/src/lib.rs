@@ -203,9 +203,9 @@ fn spawn_ncrs_daemon(ncrs_bin: &std::path::Path) -> std::io::Result<DaemonStart>
 /// Grace while a supervised daemon restarts before the GUI shows Unmounted. A hung
 /// daemon still answers `is-active` as active until the watchdog kills it, and the mount
 /// survives that: up to ~45 s before its pings stop, WatchdogSec=90 after the last one,
-/// RestartSec=3 and a start. Only while the unit is active or starting; a stopped or
-/// failed unit shows Unmounted at once.
-const SERVICE_RESTART_GRACE: Duration = Duration::from_secs(240);
+/// RestartSec=3, then a takeover that may take up to sd_watchdog's 180 s. Only while
+/// the unit is active or starting; a stopped or failed unit shows Unmounted at once.
+const SERVICE_RESTART_GRACE: Duration = Duration::from_secs(360);
 
 /// Called after ~6 s without the daemon: whether to keep waiting. Yes while
 /// `ncrs.service` is up or restarting, for up to [`SERVICE_RESTART_GRACE`]

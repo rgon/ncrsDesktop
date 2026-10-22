@@ -55,10 +55,7 @@ use crate::iomode::IoKind;
 use crate::{ChunkUploadState, FsCache, MutexExt, NextCloudFs, OpenFile, READ_AHEAD_INITIAL};
 
 const LOG_FILE: &str = "handoff.log";
-// Versioned name: the staging layout changed (sparse, file offsets), and a binary that
-// predates it must not find this file and restore a streaming handle in its old layout
-// (it falls back to the log, which restores a mid-stream handle as failed: safe).
-const HANDLES_FILE: &str = "handoff-handles-v2.json";
+const HANDLES_FILE: &str = "handoff-handles.json";
 /// Rewrite the log down to the live state once it grows past this (and past
 /// twice its size after the last rewrite).
 const COMPACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -186,11 +183,6 @@ struct ChunkRec {
     uploads_base: String,
     next_index: u64,
     bytes_confirmed: u64,
-    /// The staging file is laid out at the file's own offsets (sent chunks punched out).
-    /// Missing in records of older versions, whose tail file starts at `bytes_confirmed`:
-    /// such a handle is restored failed rather than read with the wrong layout.
-    #[serde(default)]
-    sparse: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -519,8 +511,6 @@ fn release_restored_backing(fh: u64) {
 /// so no allocation slips between them.
 pub(crate) fn start_fresh(cache_dir: &Path, dev: ConnDev, mount_point: &Path, cache: &Mutex<FsCache>) {
     let _ = std::fs::remove_file(cache_dir.join(HANDLES_FILE));
-    // An unversioned snapshot from before the layout change is never read again.
-    let _ = std::fs::remove_file(cache_dir.join("handoff-handles.json"));
     let path = cache_dir.join(LOG_FILE);
     let c = cache.safe_lock();
     let mut g = LOG.safe_lock();
@@ -725,7 +715,6 @@ pub(crate) fn write_handles_snapshot(cache_dir: &Path, open_files: &Mutex<HashMa
                 uploads_base: c.uploads_base.clone(),
                 next_index: c.next_index,
                 bytes_confirmed: c.bytes_confirmed,
-                sparse: true,
             }),
             upload_failed: of.upload_failed,
             unlinked: of.unlinked,
@@ -1017,7 +1006,7 @@ fn write_state(h: &RestoredHandle, staging_now: Option<StagingId>, stream: Optio
         Some(uploads_base) => Ok(WriteState {
             dirty: true,
             total_written: 0,
-            chunk: Some(ChunkRec { uploads_base: uploads_base.to_string(), next_index: 0, bytes_confirmed: 0, sparse: true }),
+            chunk: Some(ChunkRec { uploads_base: uploads_base.to_string(), next_index: 0, bytes_confirmed: 0 }),
             upload_failed: true,
             ..base
         }),
@@ -1065,13 +1054,12 @@ fn rebuild(h: &RestoredHandle, stream: Option<&str>, gen: u64) -> Result<(OpenFi
     of.dirty = ws.dirty;
     of.total_written = ws.total_written;
     of.stream_eligible = ws.stream_eligible;
-    let old_layout = ws.chunk.as_ref().is_some_and(|c| !c.sparse);
     of.chunk_upload = ws.chunk.map(|c| ChunkUploadState {
         uploads_base: c.uploads_base,
         next_index: c.next_index,
         bytes_confirmed: c.bytes_confirmed,
     });
-    of.upload_failed = ws.upload_failed || old_layout;
+    of.upload_failed = ws.upload_failed;
     of.unlinked = ws.unlinked;
     of.created = ws.created;
     of.original_etag = ws.original_etag;
@@ -1339,7 +1327,7 @@ mod tests {
             dirty: true,
             total_written: 300,
             stream_eligible: true,
-            chunk: Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, sparse: true }),
+            chunk: Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200 }),
             upload_failed: false,
             unlinked: false,
             created: true,
@@ -1348,7 +1336,7 @@ mod tests {
         let ws = write_state(&h, Some(staging(100, 30)), Some("u")).unwrap();
         assert!(!ws.upload_failed);
         assert!(ws.stream_eligible);
-        assert_eq!(ws.chunk, Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, sparse: true }));
+        assert_eq!(ws.chunk, Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200 }));
         assert_eq!(ws.total_written, 300);
     }
 

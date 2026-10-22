@@ -1022,7 +1022,8 @@ fn live_write_size(open_files: &Mutex<HashMap<u64, OpenFile>>, ino: u64) -> Opti
     }
     // Collected under the lock, measured outside it: stat(2) must not hold up every handle.
     let sources: Vec<Source> = open_files.safe_lock().values()
-        .filter(|of| of.ino == ino && of.dirty)
+        // A failed handle's bytes are not the file (staged_source does not serve them either).
+        .filter(|of| of.ino == ino && of.dirty && !of.upload_failed)
         .filter_map(|of| match (&of.chunk_upload, &of.write_path) {
             (Some(_), _) => Some(Source::Streamed(of.total_written)),
             (None, Some(wp)) => Some(Source::Staged(wp.clone())),
@@ -1059,8 +1060,8 @@ fn overlay_live_size(open_files: &Mutex<HashMap<u64, OpenFile>>, mut attr: FileA
 /// and the server, which hold nothing of them until release().
 fn staged_source(files: &HashMap<u64, OpenFile>, fh: u64, ino: u64) -> Option<(PathBuf, u64)> {
     let of_source = |of: &OpenFile| {
-        // A failed handle's staging bytes are not the file any more (an aborted stream, or one
-        // restored in an older layout): never serve them.
+        // A failed handle's staging bytes are not the file any more (an aborted stream, or a
+        // stream that could not be restored after a restart): never serve them.
         if !of.dirty || of.upload_failed {
             return None;
         }
@@ -1069,10 +1070,13 @@ fn staged_source(files: &HashMap<u64, OpenFile>, fh: u64, ino: u64) -> Option<(P
         of.write_path.clone().map(|wp| (wp, held_from))
     };
     files.get(&fh).and_then(of_source).or_else(|| {
+        // The newest sibling that holds usable bytes: a newer reader or failed handle must
+        // not hide an older writer's uncommitted data.
         files.iter()
             .filter(|(k, of)| **k != fh && of.ino == ino)
-            .max_by_key(|(k, _)| **k)
-            .and_then(|(_, of)| of_source(of))
+            .filter_map(|(k, of)| of_source(of).map(|s| (*k, s)))
+            .max_by_key(|(k, _)| *k)
+            .map(|(_, s)| s)
     })
 }
 
@@ -1389,11 +1393,11 @@ fn free_sent_chunk(f: &std::fs::File, off: u64, len: u64) -> std::io::Result<()>
     Ok(())
 }
 
-/// Whether the staging filesystem can punch holes, probed once on a scratch file. Where
-/// it cannot (ecryptfs, vfat, some FUSE homes), streaming would free nothing and only add
-/// ways to fail, so a big file is staged in full there instead. A probe that cannot even
-/// write its scratch file (a full disk, a missing directory) is not an answer: it is
-/// retried on the next call rather than remembered.
+/// Whether the staging filesystem can punch holes, probed once on a scratch file (first
+/// at mount, while the disk usually still has room). Where it cannot (ecryptfs, vfat,
+/// some FUSE homes), streaming would free nothing and only add ways to fail, so a big
+/// file is staged in full there instead. A probe that cannot even write its scratch file
+/// (a full disk) is not remembered: until one succeeds, the filesystem type decides.
 fn punch_hole_supported() -> bool {
     use std::os::unix::io::AsRawFd;
     static KNOWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1417,8 +1421,23 @@ fn punch_hole_supported() -> bool {
             }
             *KNOWN.get_or_init(|| ok)
         }
-        None => true,
+        None => fs_type_can_punch(&dir),
     }
+}
+
+/// Fallback when the probe cannot run: whether the filesystem type is one known to punch
+/// holes, judged by what it is not (ecryptfs, FAT, exFAT and FUSE filesystems do not, or
+/// not reliably). Unknown types are assumed to, like every common local filesystem.
+fn fs_type_can_punch(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const NO_PUNCH: [i64; 4] = [0xf15f, 0x4d44, 0x2011_bab0, 0x6573_5546]; // ecryptfs, msdos, exfat, fuse
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return true };
+    // SAFETY: statfs only writes the struct; `c` is NUL-terminated and outlives the call.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return true;
+    }
+    !NO_PUNCH.contains(&(st.f_type as i64))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4269,6 +4288,9 @@ impl NextCloudFs {
 
         let cache_dir = ncrs_cache_dir(&options.url);
         *STREAM_DISK_PATH.safe_lock() = Some(cache_dir.clone());
+        // Probed now, while the disk usually has room and before any write() holds the
+        // open-files lock (it caches its answer).
+        let _ = punch_hole_supported();
         let kept_dir = cache_dir.join("kept");
         let auto_cache_dir = cache_dir.join("cache");
         std::fs::create_dir_all(&cache_dir)
@@ -4945,6 +4967,9 @@ impl NextCloudFs {
             s.next_index += 1;
             s.bytes_confirmed += webdav_ops::CHUNK_SIZE as u64;
 
+            // Punched before write() publishes the new bytes_confirmed, which is safe: write()
+            // holds this file's inode exclusively in the request scheduler (fuse_dispatch),
+            // so no read of it runs until then.
             free_sent_chunk(&staging, sent_from, webdav_ops::CHUNK_SIZE as u64)
                 .map_err(|e| (format!("staging free: {}", e), state.clone()))?;
             Ok(state.expect("just ensured Some above"))
@@ -6461,7 +6486,15 @@ impl NextCloudFs {
         // a second handle on the same inode.
         {
             let staged = staged_source(&self.open_files.safe_lock(), fh.0, ino.0);
-            if let Some((staging, _)) = staged.filter(|(_, held_from)| off >= *held_from) {
+            if let Some((staging, held_from)) = staged {
+                if off < held_from {
+                    // Already sent and punched out locally, and an unfinished upload cannot
+                    // be read back from the server either: no copy of these bytes is
+                    // readable, and the server's old version would be the wrong file.
+                    log::warn!("read {}: offset {} was already streamed to the server and is not held locally", path.display(), off);
+                    reply.error(Errno::EIO);
+                    return;
+                }
                 match read_staged(&staging, off, sz) {
                     Ok(buf) => {
                         reply.data(&buf);
