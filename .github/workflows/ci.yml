@@ -38,9 +38,10 @@ jobs:
             target/release/ncrs
             target/release/ncrs-open
             target/release/ncrs-ctl
+            target/release/ncrs-passthrough
             target/release/ncrs-gui
             dist/
-          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs_passthrough/**/*.rs', 'vendor/fuser/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
 
       - name: Cache Cargo registry and git sources
         if: steps.binary-cache.outputs.cache-hit != 'true'
@@ -106,13 +107,13 @@ jobs:
         if: steps.binary-cache.outputs.cache-hit != 'true'
         env:
           RUSTC_WRAPPER: sccache
-        run: cargo build --release -p ncrs_core -p ncrs-gui --features ncrs-gui/custom-protocol
+        run: cargo build --release -p ncrs_core -p ncrs_passthrough -p ncrs-gui --features ncrs-gui/custom-protocol
 
       - name: Run unit tests
         if: steps.binary-cache.outputs.cache-hit != 'true'
         env:
           RUSTC_WRAPPER: sccache
-        run: cargo test --release -p ncrs_core
+        run: cargo test --release -p ncrs_core -p ncrs_passthrough
 
       # The one .deb carries the Dolphin plugin for Plasma 5 and Plasma 6. KF5
       # builds on this runner; jammy has no KF6, so that build runs in trixie.
@@ -163,9 +164,10 @@ jobs:
             target/release/ncrs
             target/release/ncrs-open
             target/release/ncrs-ctl
+            target/release/ncrs-passthrough
             target/release/ncrs-gui
             dist/
-          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs_passthrough/**/*.rs', 'vendor/fuser/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
 
       - name: Stage .deb for Docker build context
         run: cp dist/ncrs_*.deb docker/e2e/ncrs/ncrs.deb
@@ -311,12 +313,13 @@ jobs:
             target/release/ncrs
             target/release/ncrs-open
             target/release/ncrs-ctl
+            target/release/ncrs-passthrough
             target/release/ncrs-gui
             dist/
-          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
+          key: ncrs-release-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'ncrs_core/**/*.rs', 'ncrs_passthrough/**/*.rs', 'vendor/fuser/**/*.rs', 'ncrs-gui/src-tauri/**/*.rs', 'ncrs-gui/src/**', 'ncrs-gui/pnpm-lock.yaml', 'shell_integration/file-managers/dolphin/**') }}
 
       - name: Fix binary permissions
-        run: chmod +x target/release/ncrs target/release/ncrs-open target/release/ncrs-gui
+        run: chmod +x target/release/ncrs target/release/ncrs-open target/release/ncrs-passthrough target/release/ncrs-gui
 
       - name: Test .deb
         run: bash scripts/test-deb.sh --container
