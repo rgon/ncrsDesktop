@@ -49,6 +49,16 @@ pub enum MutationOp {
     },
 }
 
+/// A queued upload's local bytes, for reads before it reaches the server.
+#[derive(Debug, PartialEq)]
+pub enum PendingUpload {
+    /// A whole-file PUT: the staging file is the file.
+    Staged(PathBuf),
+    /// A streamed upload's finish: only the tail from `held_from` is local; `sparse` says
+    /// it sits at the file's own offsets rather than starting the file at `held_from`.
+    StreamTail { tail: PathBuf, held_from: u64, sparse: bool },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub seq: SeqId,
@@ -312,15 +322,26 @@ impl MutationJournal {
         })
     }
 
-    /// The newest queued streamed-upload finish for `path`: its tail file, the file offset
-    /// the tail starts at, and whether the file uses the file's own offsets (`sparse`).
-    pub fn pending_stream_finish(&self, path: &Path) -> Option<(PathBuf, u64, bool)> {
-        self.entries.iter().rev().find_map(|e| match &e.op {
-            MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, .. } if remote_path == path => {
-                Some((tail_path.clone(), *bytes_confirmed, *sparse))
+    /// Where a reader finds the newest not-yet-uploaded content of `path`, newest entry
+    /// first: a queued whole-file PUT or streamed finish for it wins, and a later Unlink of
+    /// it (or RmDir above it) means what is queued belongs to a file that is gone. A Rename
+    /// does not stop the search: enqueue() already re-pointed the moved file's uploads at
+    /// the new name, which is what lets a save-then-reopen read its own queued bytes.
+    pub fn pending_upload(&self, path: &Path) -> Option<PendingUpload> {
+        for e in self.entries.iter().rev() {
+            match &e.op {
+                MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
+                    return Some(PendingUpload::Staged(staging_path.clone()));
+                }
+                MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, .. } if remote_path == path => {
+                    return Some(PendingUpload::StreamTail { tail: tail_path.clone(), held_from: *bytes_confirmed, sparse: *sparse });
+                }
+                MutationOp::Unlink { path: gone } if gone == path => return None,
+                MutationOp::RmDir { path: gone } if path.starts_with(gone) => return None,
+                _ => {}
             }
-            _ => None,
-        })
+        }
+        None
     }
 
     pub fn len(&self) -> usize {
@@ -1299,7 +1320,7 @@ mod tests {
         let tail = dir.join("write_3");
         fs::write(&tail, b"x").unwrap();
         let mut j = MutationJournal::load_or_create(&dir);
-        assert_eq!(j.pending_stream_finish(Path::new("/v.mkv")), None);
+        assert_eq!(j.pending_upload(Path::new("/v.mkv")), None);
         for (sparse, confirmed) in [(false, 10), (true, 20)] {
             j.enqueue(MutationOp::FinishChunked {
                 remote_path: PathBuf::from("/v.mkv"),
@@ -1312,7 +1333,18 @@ mod tests {
                 sparse,
             });
         }
-        assert_eq!(j.pending_stream_finish(Path::new("/v.mkv")), Some((tail, 20, true)), "the newest finish");
+        assert_eq!(
+            j.pending_upload(Path::new("/v.mkv")),
+            Some(PendingUpload::StreamTail { tail: tail.clone(), held_from: 20, sparse: true }),
+            "the newest finish",
+        );
+        // A newer whole-file save of the same path wins over the streamed finish...
+        let staged = dir.join("write_4");
+        j.enqueue(MutationOp::Put { remote_path: PathBuf::from("/v.mkv"), staging_path: staged.clone(), if_match_etag: None });
+        assert_eq!(j.pending_upload(Path::new("/v.mkv")), Some(PendingUpload::Staged(staged)));
+        // ...and once the file is deleted, nothing queued for it is its content.
+        j.enqueue(MutationOp::Unlink { path: PathBuf::from("/v.mkv") });
+        assert_eq!(j.pending_upload(Path::new("/v.mkv")), None);
         let _ = fs::remove_dir_all(&dir);
     }
 
