@@ -107,7 +107,7 @@ echo "Building ncrs ${VERSION} (.rpm) → ${OUT_DIR}"
 # must exist before rpmbuild starts. (--source-tar is used verbatim and is the
 # caller's responsibility.)
 if $SKIP_BUILD && [[ -z "$SOURCE_TAR" ]]; then
-    for bin in ncrs ncrs-open ncrs-ctl; do
+    for bin in ncrs ncrs-open ncrs-ctl ncrs-passthrough; do
         [[ -x "target/release/$bin" ]] || { echo "error: --skip-build set but target/release/$bin is missing" >&2; exit 1; }
     done
     if ! $SKIP_GUI && [[ ! -x target/release/ncrs-gui ]]; then
@@ -153,7 +153,7 @@ make_source_tar() {
         tar -xf "$git_tar" -C "$unpack"
         mkdir -p "$unpack/$root/target/release"
         local bin
-        for bin in ncrs ncrs-open ncrs-ctl; do
+        for bin in ncrs ncrs-open ncrs-ctl ncrs-passthrough; do
             install -m755 "target/release/$bin" "$unpack/$root/target/release/$bin"
         done
         if ! $SKIP_GUI; then

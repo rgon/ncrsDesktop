@@ -88,7 +88,6 @@ Recommends:     libayatana-appindicator3-1
 Requires:       libayatana-appindicator3-1
 %endif
 %endif
-Recommends:     libcap-progs
 Recommends:     python3-gobject
 Recommends:     typelib-1_0-GdkPixbuf-2_0
 Recommends:     perl-Image-ExifTool
@@ -102,10 +101,11 @@ provider. File-browser integration (indexer exclusion, thumbnails,
 type detection) is applied per installed browser by the service, with
 sync emblems and menus in Nautilus and Dolphin.
 .
-libcap-progs (setcap) is used at install time to grant the ncrs binary
-CAP_SYS_ADMIN, which enables zero-copy kernel read passthrough for
-fully-cached files on Linux 6.9+. Without it, ncrs runs identically
-but always falls back to normal buffered reads.
+The small /usr/libexec/ncrs/ncrs-passthrough helper is installed with
+CAP_SYS_ADMIN (never the ncrs service itself), which enables zero-copy
+kernel read passthrough for fully-cached files on Linux 6.9+. Where the
+capability cannot be used, ncrs runs identically but falls back to
+normal buffered reads.
 
 %prep
 %setup -q -n %{name}-%{version}
@@ -127,9 +127,9 @@ HOME="$PWD" pnpm install --frozen-lockfile
 HOME="$PWD" pnpm build
 popd
 
-cargo build --release -p ncrs_core -p ncrs-gui --features ncrs-gui/custom-protocol
+cargo build --release -p ncrs_core -p ncrs_passthrough -p ncrs-gui --features ncrs-gui/custom-protocol
 %else
-cargo build --release -p ncrs_core
+cargo build --release -p ncrs_core -p ncrs_passthrough
 %endif
 
 %if %{with dolphin}
@@ -161,6 +161,14 @@ packaging/install-tree.sh $install_args
 %{_bindir}/ncrs
 %{_bindir}/ncrs-open
 %{_bindir}/ncrs-ctl
+# FUSE passthrough needs CAP_SYS_ADMIN for two ioctls; only this helper gets it,
+# and rpm sets it from the payload itself as the file is installed (no setcap,
+# no libcap-progs, nothing to forget on upgrade, and `rpm -V` verifies it).
+# /usr/bin/ncrs carries no capability: it mounts through fusermount3.
+# Spelled with the prefix rather than the libexecdir macro because
+# packaging/install-tree.sh (shared with the .deb) stages it at /usr/libexec.
+%dir %{_prefix}/libexec/ncrs
+%caps(cap_sys_admin=ep) %{_prefix}/libexec/ncrs/ncrs-passthrough
 %{_bindir}/ncrs-search-provider
 %{_bindir}/cr3-thumbnailer
 %{_userunitdir}/ncrs.service
@@ -247,15 +255,13 @@ if command -v sysctl >/dev/null 2>&1; then
     raise_sysctl net.core.rmem_max 4194304
     raise_sysctl net.core.wmem_max 4194304
 fi
-# Grant CAP_SYS_ADMIN via a file capability so ncrs -- an ordinary per-user
-# process, not root or setuid -- can use kernel FUSE_PASSTHROUGH (zero-copy
-# reads for fully-cached files, Linux 6.9+). Best-effort: setcap comes from
-# libcap-progs, a Recommends (not a hard Requires), so its absence is expected
-# on minimal installs. ncrs detects the missing capability itself at runtime
-# and falls back to normal reads, so this is never fatal to the install.
-if command -v setcap >/dev/null 2>&1; then
-    setcap cap_sys_admin+ep /usr/bin/ncrs || \
-        echo "ncrs: setcap failed -- FUSE passthrough will stay disabled (buffered reads still work normally)" >&2
+# The FUSE passthrough capability is set by rpm itself (%%caps on the helper in
+# the files list). Older packages instead ran `setcap cap_sys_admin+ep
+# /usr/bin/ncrs` here; rpm replaces that file on upgrade, which drops it, but
+# strip a hand-applied one too: a capable daemon bypasses fusermount3's checks.
+if command -v getcap >/dev/null 2>&1 && getcap /usr/bin/ncrs 2>/dev/null | grep -q 'cap_'; then
+    setcap -r /usr/bin/ncrs || \
+        echo "ncrs: could not remove the capability from /usr/bin/ncrs -- remove it with: setcap -r /usr/bin/ncrs" >&2
 fi
 # Register the nc:// URI handler and other desktop entries
 if command -v update-desktop-database >/dev/null 2>&1; then

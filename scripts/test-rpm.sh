@@ -112,6 +112,23 @@ else
     pass "post scriptlet does not globally enable ncrs.service"
 fi
 
+# ── File capabilities ───────────────────────────────────────────────────────
+# Only the passthrough helper carries one (%caps in the spec); the daemon none.
+echo "→ File capabilities"
+FILECAPS="$(rpm -qp --filecaps "$RPM" 2>/dev/null)"
+check "ncrs-passthrough carries cap_sys_admin=ep" \
+    grep -Eq '^/usr/libexec/ncrs/ncrs-passthrough[[:space:]]+cap_sys_admin[=+]ep$' <<<"$FILECAPS"
+if grep -E '^/usr/bin/ncrs[[:space:]]' <<<"$FILECAPS" | grep -q 'cap_'; then
+    fail "/usr/bin/ncrs must carry no file capability"
+else
+    pass "/usr/bin/ncrs carries no file capability"
+fi
+if grep -q 'setcap cap_' <<<"$SCRIPTS"; then
+    fail "scriptlets must not grant capabilities (the spec uses %caps)"
+else
+    pass "scriptlets grant no capabilities"
+fi
+
 # ── Package contents ────────────────────────────────────────────────────────
 echo "→ Package contents"
 CONTENTS="$(rpm -qlp "$RPM" 2>/dev/null)"
@@ -119,6 +136,7 @@ REQUIRED=(
     /usr/bin/ncrs
     /usr/bin/ncrs-open
     /usr/bin/ncrs-ctl
+    /usr/libexec/ncrs/ncrs-passthrough
     /usr/bin/ncrs-search-provider
     /usr/bin/cr3-thumbnailer
     /usr/lib/systemd/user/ncrs.service
@@ -248,6 +266,8 @@ if $CONTAINER; then
             fi
             test ! -e /etc/systemd/user/default.target.wants/ncrs.service || { echo 'FAIL: ncrs.service globally enabled'; exit 1; }
             /usr/bin/ncrs --print-default-config | grep -q 'ncRS Desktop configuration' || { echo 'FAIL: ncrs --print-default-config'; exit 1; }
+            # rpm applied the %caps itself; rpm -V would flag a missing one.
+            rpm -V ncrs 2>/dev/null | grep -E ' /usr/(libexec/ncrs/ncrs-passthrough|bin/ncrs)$' | grep -q '^........P' && { echo 'FAIL: file capabilities do not match the package'; exit 1; }
             $GUI_CHECKS
             echo 'container checks OK'
         "
