@@ -29,7 +29,7 @@ Recipe (incremental after the first ~7 min full build; ~30 s thereafter):
 ```bash
 # 1. build a bookworm-compatible binary (separate target dir to avoid host glibc mixing)
 docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target-bookworm rust:1-bookworm \
-  bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends mold libfuse3-dev pkg-config libssl-dev && cargo build --release -p ncrs_core --bin ncrs -p ncrs_passthrough"
+  bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends mold libfuse3-dev pkg-config libssl-dev && cargo build --release -p ncrs_core -p ncrs_passthrough --bin ncrs --bin ncrs-passthrough"
 
 # 2. pack a minimal .deb — the Dockerfile only extracts /usr/bin/ncrs and
 #    /usr/libexec/ncrs/ncrs-passthrough from it

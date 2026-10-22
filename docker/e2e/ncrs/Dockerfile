@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p ncrs_core --bin ncrs -p ncrs_passthrough \
+RUN cargo build --release -p ncrs_core -p ncrs_passthrough --bin ncrs --bin ncrs-passthrough \
     && cp target/release/ncrs /ncrs \
     && cp target/release/ncrs-passthrough /ncrs-passthrough
 
