@@ -25,6 +25,10 @@ from gi.repository import GdkPixbuf
 
 
 def ipc(cmd, timeout=10):
+    # One command per line: a newline in a file name would end this request
+    # and run the rest as a second command, so never send control characters.
+    if any(ord(c) < 0x20 or c == '\x7f' for c in cmd):
+        return None
     sock = os.path.join(
         os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}',
         'ncrs.sock',

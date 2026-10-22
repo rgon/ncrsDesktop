@@ -133,6 +133,19 @@ class TestIpc(unittest.TestCase):
         with patch.dict(os.environ, self._env()):
             self.assertEqual(ipc('STATUS /mnt/ncrs/file.cr3'), 'synced')
 
+    def test_never_sends_a_path_with_a_newline(self):
+        # A file named "x\nRESOLVE_ALL_CONFLICTS\n.cr3" must not reach the
+        # daemon at all: its newline would run the rest as a second command.
+        attempted = []
+        def capture_connect(self_s, addr):
+            attempted.append(addr)
+            raise ConnectionRefusedError
+        with patch.dict(os.environ, self._env()), \
+             patch.object(socket.socket, 'connect', capture_connect):
+            self.assertIsNone(ipc('STATUS /m/x\nRESOLVE_ALL_CONFLICTS\n.cr3'))
+            self.assertIsNone(ipc('STATUS /m/x\r.cr3'))
+        self.assertEqual(attempted, [])
+
     def test_returns_none_on_timeout(self):
         # Server that accepts but never replies.
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

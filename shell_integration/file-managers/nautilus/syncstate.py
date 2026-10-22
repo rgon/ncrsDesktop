@@ -68,6 +68,20 @@ _DAEMON_MOUNT: str | None = None
 
 _POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="ncrs-nautilus")
 
+
+def _has_control_char(s: str) -> bool:
+    """One command per line: a newline (or other control character) in a path
+    would end the request and run the rest as a second command."""
+    return any(ord(c) < 0x20 or c == "\x7f" for c in s)
+
+
+def _inside_mount(path: str, mount_prefix: str | None) -> bool:
+    """Whether a path the daemon told us to touch is a plain path under the
+    mount: FILE_CHANGES drives unlink/rename/rmdir, so never act outside it."""
+    if not mount_prefix or not path.startswith(mount_prefix):
+        return False
+    return all(part not in ("", ".", "..") for part in path[len(mount_prefix):].split("/"))
+
 # Bind the InfoProvider result enums once so the per-file hot path does not
 # re-resolve the Nautilus.OperationResult attribute chain on every call.
 _COMPLETE = Nautilus.OperationResult.COMPLETE
@@ -142,6 +156,8 @@ class _PersistentConn:
         self._rfile = s.makefile("rb")
 
     def send(self, cmd: str) -> str:
+        if _has_control_char(cmd):
+            return "error: control character in request"
         for attempt in range(2):
             try:
                 self._ensure()
@@ -176,6 +192,8 @@ def query_status(path: str, sock_path: str | None = None) -> str:
     Accepts an optional *sock_path* override for use in tests.  Returns
     ``'unknown'`` on any connection or timeout error.
     """
+    if _has_control_char(path):
+        return "unknown"
     effective_path = sock_path if sock_path is not None else _sock_path()
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -560,8 +578,13 @@ class NcrsInfoProvider(GObject.GObject, Nautilus.InfoProvider):
                 entries = [e for e in fc_resp.split("\t") if ":" in e]
                 if entries:
                     had_changes = True
+                mount_prefix = self._mount_prefix
                 for entry in entries:
                     kind, path = entry.split(":", 1)
+                    targets = path.split("\x1e", 1) if kind == "R" else [path]
+                    if not all(_inside_mount(t, mount_prefix) for t in targets):
+                        _log_error(f"FILE_CHANGES entry outside the mount ignored: {entry!r}")
+                        continue
                     try:
                         if kind == "A":
                             fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)

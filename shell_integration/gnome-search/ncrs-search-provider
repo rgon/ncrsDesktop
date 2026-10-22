@@ -66,6 +66,9 @@ def _sock_path():
 
 
 def _ipc_search(term):
+    # One command per line: a newline in the term would start a second command.
+    if any(ord(c) < 0x20 or c == "\x7f" for c in term):
+        return []
     sp = _sock_path()
     if not os.path.exists(sp):
         return []
