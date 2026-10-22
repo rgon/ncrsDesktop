@@ -70,6 +70,11 @@ impl Conn {
     }
 
     fn request(&mut self, line: &str) -> Result<String, String> {
+        // One command per line: a newline in a file name would end this request
+        // and run the rest of the name as a second command.
+        if line.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(format!("refusing a path with a control character: {:?}", line));
+        }
         writeln!(self.stream, "{}", line).map_err(|e| e.to_string())?;
         self.read_line()
     }

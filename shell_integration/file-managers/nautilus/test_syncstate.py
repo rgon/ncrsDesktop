@@ -10,6 +10,7 @@ import socket
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 # Import only the pure-Python parts; skip the gi/Nautilus import.
 # We do this by loading the module source directly after monkey-patching
@@ -832,6 +833,46 @@ class TestTargetedChangeRefresh(unittest.TestCase):
         self.assertEqual(syncstate._dir_cache_ts[parent], ts, "dir not marked stale")
         self.assertIn(f"DETAIL {parent}/f", calls)
         self.assertNotIn(f"DETAILDIR {parent}", calls)
+
+    def test_file_changes_never_touch_paths_outside_the_mount(self):
+        # A desynced reply (e.g. a server display name carrying a newline) must
+        # not turn FILE_CHANGES into unlink/rename of the user's own files.
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = os.path.join(tmp, "mnt")
+            os.mkdir(mount)
+            victim = os.path.join(tmp, "thesis.odt")
+            open(victim, "w").close()
+            inside = os.path.join(mount, "gone.txt")
+            open(inside, "w").close()
+            entries = "\t".join([
+                f"D:{victim}",
+                f"D:{mount}/../thesis.odt",
+                f"R:{victim}\x1e{mount}/stolen.odt",
+                f"D:{inside}",
+            ])
+            syncstate._send_command = lambda cmd: entries if cmd == "FILE_CHANGES" else ""
+            prov = syncstate.NcrsInfoProvider.__new__(syncstate.NcrsInfoProvider)
+            prov._mount = mount
+            prov._mount_prefix = mount + "/"
+            prov._poll_running = True
+            prov._poll_skip = 0
+            prov._do_poll_changes()
+
+            self.assertTrue(os.path.exists(victim), "file outside the mount was touched")
+            self.assertFalse(os.path.exists(os.path.join(mount, "stolen.odt")))
+            self.assertFalse(os.path.exists(inside), "in-mount delete must still apply")
+
+
+class TestControlCharacterRefusal(unittest.TestCase):
+    def test_persistent_conn_never_sends_a_newline(self):
+        conn = syncstate._PersistentConn()
+        with patch.object(syncstate._PersistentConn, "_ensure", lambda _s: self.fail("must not connect")):
+            self.assertTrue(conn.send("DETAIL /m/x\nPURGE_CACHE").startswith("error"))
+
+    def test_query_status_never_sends_a_newline(self):
+        self.assertEqual(
+            syncstate.query_status("/m/x\nPURGE_CACHE", sock_path="/nonexistent"), "unknown"
+        )
 
 
 if __name__ == "__main__":

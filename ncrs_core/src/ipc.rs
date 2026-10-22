@@ -886,6 +886,15 @@ fn read_line_bounded<R: BufRead>(reader: &mut R, max_len: usize) -> std::io::Res
     }
 }
 
+/// Whether a request line carries an ASCII control character other than tab.
+/// `\n` already ended the line in `read_line_bounded`, so this cannot catch a
+/// path whose newline split it into a second command — clients must refuse
+/// those before sending — but a CR, NUL or escape that survived in a path is
+/// refused here rather than looked up or echoed back into a reply.
+fn has_control_char(line: &str) -> bool {
+    line.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+}
+
 /// Put back the status a path had before a KEEP marked it Downloading.
 fn restore_status(status_map: &StatusMap, path: &Path, before: Option<FileStatus>) {
     let mut sm = status_map.safe_write();
@@ -903,16 +912,16 @@ fn is_idle_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
+/// The remote path for a client-supplied path under the mount, or `None` if it is
+/// outside it. `Path::starts_with` compares components, so `<mount>/../..` would
+/// pass it: anything past the prefix must be plain names, or EVICT's
+/// empty-directory cleanup could walk out of the cache dir.
 fn strip_mount<'a>(path: &'a Path, mount_point: &Path) -> Option<PathBuf> {
-    if path.starts_with(mount_point) {
-        Some(
-            path.strip_prefix(mount_point)
-                .map(|p| Path::new("/").join(p))
-                .unwrap_or_else(|_| PathBuf::from("/")),
-        )
-    } else {
-        None
+    let rel = path.strip_prefix(mount_point).ok()?;
+    if !rel.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        return None;
     }
+    Some(Path::new("/").join(rel))
 }
 
 fn handle_client(
@@ -1057,7 +1066,17 @@ fn handle_client_loop(
                 break;
             }
         };
-        let trimmed = line.trim();
+        // Only leading whitespace: a trailing space belongs to the path argument
+        // (`a.txt ` is a different file from `a.txt`), and read_line_bounded
+        // already dropped the line's own `\r`.
+        let trimmed = line.trim_start();
+        if has_control_char(trimmed) {
+            log::warn!("IPC client sent a request with a control character; refused");
+            if writeln!(write_half, "error: control character in request").is_err() {
+                break;
+            }
+            continue;
+        }
 
         // SUBSCRIBE hands this connection to the push loop: acknowledge, send the
         // current snapshot, then a SNAP line whenever state changes (with a PING
@@ -1568,6 +1587,27 @@ mod tests {
         sm.safe_write().insert(p.clone(), FileStatus::Kept);
         restore_status(&sm, &p, Some(FileStatus::Synced));
         assert!(sm.safe_read().get(&p).copied() == Some(FileStatus::Kept));
+    }
+
+    #[test]
+    fn strip_mount_refuses_paths_that_leave_the_mount() {
+        let mp = Path::new("/home/u/Nextcloud");
+        assert_eq!(strip_mount(Path::new("/home/u/Nextcloud"), mp), Some(PathBuf::from("/")));
+        assert_eq!(strip_mount(Path::new("/home/u/Nextcloud/a/b.txt"), mp), Some(PathBuf::from("/a/b.txt")));
+        assert_eq!(strip_mount(Path::new("/home/u/Nextcloud/../../.."), mp), None);
+        assert_eq!(strip_mount(Path::new("/home/u/Nextcloud/a/../../x"), mp), None);
+        assert_eq!(strip_mount(Path::new("/home/u/Nextcloudx/a"), mp), None);
+        assert_eq!(strip_mount(Path::new("/etc/passwd"), mp), None);
+    }
+
+    #[test]
+    fn control_characters_are_refused_but_tabs_are_not() {
+        assert!(has_control_char("STATUS /a/b\rRESOLVE_ALL_CONFLICTS"));
+        assert!(has_control_char("STATUS /a/\0b"));
+        assert!(has_control_char("STATUS /a/\x1b[2Jb"));
+        assert!(has_control_char("STATUS /a/\x7fb"));
+        assert!(!has_control_char("STATUS /a/b\tc"));
+        assert!(!has_control_char("STATUS /a/ñandú.cr3"));
     }
 
     #[test]

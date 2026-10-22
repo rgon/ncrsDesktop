@@ -78,7 +78,12 @@ pub fn http3_effective(options: &MountOptions) -> bool {
 /// `None` for anything that does not name a file inside `mount_point`.
 pub fn mount_local_path(mount_point: &Path, remote_path: &str) -> Option<PathBuf> {
     let rel = remote_path.trim_start_matches('/');
-    if rel.is_empty() || rel.split(['/', '\\']).any(|seg| seg == ".." || seg == ".") {
+    // Control characters too: the result is sent to the daemon as a `KEEP <path>`
+    // line, where a newline would start a second command.
+    if rel.is_empty()
+        || rel.chars().any(char::is_control)
+        || rel.split(['/', '\\']).any(|seg| seg == ".." || seg == ".")
+    {
         return None;
     }
     let joined = mount_point.join(rel);

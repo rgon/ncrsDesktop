@@ -629,7 +629,7 @@ impl<R: std::io::BufRead> ResponseReader<R> {
                             resp.has_preview = self.read_text()? == "true";
                         }
                         "permissions" => {
-                            resp.permissions = Some(self.read_text()?);
+                            resp.permissions = Some(self.read_label()?);
                         }
                         "fileid" => {
                             // Only overwrite with a value that parsed. A server
@@ -643,10 +643,10 @@ impl<R: std::io::BufRead> ResponseReader<R> {
                             }
                         }
                         "owner-id" => {
-                            resp.owner_id = Some(self.read_text()?);
+                            resp.owner_id = Some(self.read_label()?);
                         }
                         "owner-display-name" => {
-                            resp.owner_display_name = Some(self.read_text()?);
+                            resp.owner_display_name = Some(self.read_label()?);
                         }
                         "share-types" => {
                             resp.is_shared = self.read_has_children("share-types")?;
@@ -706,6 +706,14 @@ impl<R: std::io::BufRead> ResponseReader<R> {
                 _ => {}
             }
         }
+    }
+
+    /// `read_text` minus control characters, for server text that is echoed into
+    /// line- and tab-framed IPC replies (DETAIL, DETAILDIR): an owner display name
+    /// like `x\nD:/home/u/file` would otherwise end the reply early and be read
+    /// back by the client as the answer to its next request.
+    fn read_label(&mut self) -> Result<String, String> {
+        Ok(self.read_text()?.chars().filter(|c| !c.is_control()).collect())
     }
 
     fn read_text(&mut self) -> Result<String, String> {
@@ -910,6 +918,23 @@ mod tests {
         assert_eq!(dir.size, 2000000);
         assert!(!dir.has_preview);
         assert!(!dir.is_shared);
+    }
+
+    #[test]
+    fn owner_and_permissions_lose_control_characters() {
+        // Echoed into newline/tab-framed IPC replies: an encoded newline in a
+        // display name must not survive to split a DETAIL reply in two.
+        let xml = SAMPLE
+            .replace("Alice Smith", "x&#10;D:/home/u/thesis.odt&#9;y")
+            .replace(">alice<", ">al&#13;ice<")
+            .replace("RGDNVW", "RG&#30;DNVW");
+        let prefix = "/remote.php/dav/files/user";
+        let (_, _, entries) =
+            parse_multistatus_str(&xml, &format!("https://cloud.example.com{}", prefix)).unwrap();
+        let file = &entries[0];
+        assert_eq!(file.owner_display_name.as_deref(), Some("xD:/home/u/thesis.odty"));
+        assert_eq!(file.owner_id.as_deref(), Some("alice"));
+        assert_eq!(file.permissions.as_deref(), Some("RGDNVW"));
     }
 
     #[test]

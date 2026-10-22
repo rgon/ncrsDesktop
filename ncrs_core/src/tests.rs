@@ -2876,7 +2876,7 @@ mod mount_local_path_tests {
     #[test]
     fn refuses_traversal_and_empty_paths() {
         let mount = Path::new("/home/u/Nextcloud");
-        for bad in ["/../.bashrc", "/a/../../b", "..\\..\\x", "/./x", "/", "", "///"] {
+        for bad in ["/../.bashrc", "/a/../../b", "..\\..\\x", "/./x", "/", "", "///", "/a\nPURGE_CACHE", "/a\r.txt"] {
             assert_eq!(mount_local_path(mount, bad), None, "{:?} must be refused", bad);
         }
     }
