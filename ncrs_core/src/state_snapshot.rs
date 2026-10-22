@@ -183,6 +183,11 @@ struct ChunkRec {
     uploads_base: String,
     next_index: u64,
     bytes_confirmed: u64,
+    /// The staging file is laid out at the file's own offsets (sent chunks punched out).
+    /// Missing in records of older versions, whose tail file starts at `bytes_confirmed`:
+    /// such a handle is restored failed rather than read with the wrong layout.
+    #[serde(default)]
+    sparse: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -715,6 +720,7 @@ pub(crate) fn write_handles_snapshot(cache_dir: &Path, open_files: &Mutex<HashMa
                 uploads_base: c.uploads_base.clone(),
                 next_index: c.next_index,
                 bytes_confirmed: c.bytes_confirmed,
+                sparse: true,
             }),
             upload_failed: of.upload_failed,
             unlinked: of.unlinked,
@@ -1006,7 +1012,7 @@ fn write_state(h: &RestoredHandle, staging_now: Option<StagingId>, stream: Optio
         Some(uploads_base) => Ok(WriteState {
             dirty: true,
             total_written: 0,
-            chunk: Some(ChunkRec { uploads_base: uploads_base.to_string(), next_index: 0, bytes_confirmed: 0 }),
+            chunk: Some(ChunkRec { uploads_base: uploads_base.to_string(), next_index: 0, bytes_confirmed: 0, sparse: true }),
             upload_failed: true,
             ..base
         }),
@@ -1054,12 +1060,13 @@ fn rebuild(h: &RestoredHandle, stream: Option<&str>, gen: u64) -> Result<(OpenFi
     of.dirty = ws.dirty;
     of.total_written = ws.total_written;
     of.stream_eligible = ws.stream_eligible;
+    let old_layout = ws.chunk.as_ref().is_some_and(|c| !c.sparse);
     of.chunk_upload = ws.chunk.map(|c| ChunkUploadState {
         uploads_base: c.uploads_base,
         next_index: c.next_index,
         bytes_confirmed: c.bytes_confirmed,
     });
-    of.upload_failed = ws.upload_failed;
+    of.upload_failed = ws.upload_failed || old_layout;
     of.unlinked = ws.unlinked;
     of.created = ws.created;
     of.original_etag = ws.original_etag;
@@ -1327,7 +1334,7 @@ mod tests {
             dirty: true,
             total_written: 300,
             stream_eligible: true,
-            chunk: Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200 }),
+            chunk: Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, sparse: true }),
             upload_failed: false,
             unlinked: false,
             created: true,
@@ -1336,7 +1343,7 @@ mod tests {
         let ws = write_state(&h, Some(staging(100, 30)), Some("u")).unwrap();
         assert!(!ws.upload_failed);
         assert!(ws.stream_eligible);
-        assert_eq!(ws.chunk, Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200 }));
+        assert_eq!(ws.chunk, Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, sparse: true }));
         assert_eq!(ws.total_written, 300);
     }
 

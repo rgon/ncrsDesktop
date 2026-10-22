@@ -47,7 +47,6 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -527,18 +526,31 @@ fn give_up(dev: ConnDev) {
 /// on the mount then get ENOTCONN rather than blocking.
 pub(crate) struct ReattachGuard(Option<ConnDev>);
 
-// When the armed guard was created: programs on the mount wait while it stays armed.
-static TAKEOVER_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+// When the armed guard was created, and for which connection: programs on the mount
+// wait while it stays armed.
+static TAKEOVER_SINCE: Mutex<Option<(Instant, ConnDev)>> = Mutex::new(None);
 
 /// How long this daemon has held a taken-over connection without serving it yet.
 pub(crate) fn takeover_pending_for() -> Option<Duration> {
-    TAKEOVER_SINCE.safe_lock().map(|t| t.elapsed())
+    TAKEOVER_SINCE.safe_lock().map(|(t, _)| t.elapsed())
+}
+
+/// The watchdog's way out of a takeover that never gets to serving (a hung keyring,
+/// auth command or network call during startup): gives the connection up, so programs
+/// on the mount get ENOTCONN now instead of waiting on watchdog kills that come too far
+/// apart for StartLimitBurst ever to end it, and exits non-zero so systemd starts a
+/// fresh daemon on an empty fd store.
+pub(crate) fn give_up_stalled_takeover() -> ! {
+    if let Some((_, dev)) = TAKEOVER_SINCE.safe_lock().take() {
+        give_up(dev);
+    }
+    std::process::exit(1)
 }
 
 impl ReattachGuard {
     pub(crate) fn new(dev: Option<ConnDev>) -> Self {
-        if dev.is_some() {
-            *TAKEOVER_SINCE.safe_lock() = Some(Instant::now());
+        if let Some(d) = dev {
+            *TAKEOVER_SINCE.safe_lock() = Some((Instant::now(), d));
         }
         ReattachGuard(dev)
     }
@@ -755,24 +767,64 @@ fn planned_restart() -> io::Result<()> {
     }
     let exe = restart_exe();
     log::info!("handoff: re-executing {} with FUSE connection {} (fd {})", exe.display(), dev.to_colon(), fd);
-    let mut cmd = Command::new(&exe);
-    cmd.args(std::env::args_os().skip(1)).env(ENV_FD, fd.to_string()).env(ENV_DEV, dev.to_colon());
+    let mut set = vec![(ENV_FD, fd.to_string()), (ENV_DEV, dev.to_colon())];
     if stored {
-        cmd.env(ENV_STORED, "1");
+        set.push((ENV_STORED, "1".to_string()));
     }
-    use std::os::unix::process::CommandExt;
-    let err = cmd.exec();
+    let err = exec_in_place(&exe, &set);
     // Still here: exec failed. A later crash restore must not trust a snapshot
-    // of this moment, and the paused scheduler must serve again. std's exec also
-    // reset this process's SIGPIPE to the default action and cleared this
-    // thread's signal mask: put both back, or the next write to a vanished IPC
-    // client would kill the daemon with a "clean" SIGPIPE systemd won't restart.
+    // of this moment, and the paused scheduler must serve again.
     let _ = set_cloexec(fd, true);
-    // SAFETY: restores the ignore disposition the Rust runtime set at startup.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    block_sigterm();
     undo_handover();
     Err(err)
+}
+
+/// execve(2) of `exe` with this process's arguments and environment plus `set`, done
+/// directly rather than through std's Command::exec: that resets SIGPIPE to its default
+/// and clears the calling thread's signal mask before exec, so a SIGPIPE or SIGTERM in
+/// that window (or for good, if the exec then fails) would end the daemon "cleanly",
+/// which systemd does not restart. Kept as is, the new image also starts with SIGTERM
+/// already blocked. Only returns on failure.
+fn exec_in_place(exe: &Path, set: &[(&str, String)]) -> io::Error {
+    use std::ffi::CString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let cstr = |b: Vec<u8>| CString::new(b).map_err(|_| io::Error::other("NUL byte in an exec argument"));
+    // Never inherited: the handover variables are set fresh, and systemd's belong to the
+    // start that handed them over.
+    let drop_var = |k: &std::ffi::OsStr| {
+        set.iter().any(|(n, _)| k == std::ffi::OsStr::new(n))
+            || [ENV_FD, ENV_DEV, ENV_STORED, "LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"].iter().any(|n| k == std::ffi::OsStr::new(n))
+    };
+    let built = (|| -> io::Result<(CString, Vec<CString>, Vec<CString>)> {
+        let path = cstr(exe.as_os_str().as_bytes().to_vec())?;
+        let mut argv = vec![path.clone()];
+        for a in std::env::args_os().skip(1) {
+            argv.push(cstr(a.into_vec())?);
+        }
+        let mut envp = Vec::new();
+        for (k, v) in std::env::vars_os().filter(|(k, _)| !drop_var(k)) {
+            let mut kv = k.into_vec();
+            kv.push(b'=');
+            kv.extend(v.into_vec());
+            envp.push(cstr(kv)?);
+        }
+        for (k, v) in set {
+            envp.push(cstr(format!("{}={}", k, v).into_bytes())?);
+        }
+        Ok((path, argv, envp))
+    })();
+    let (path, argv, envp) = match built {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let mut argp: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    argp.push(std::ptr::null());
+    let mut envpp: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
+    envpp.push(std::ptr::null());
+    // SAFETY: every pointer is to a NUL-terminated CString alive across the call, and
+    // both arrays end in a null pointer as execve requires.
+    unsafe { libc::execve(path.as_ptr(), argp.as_ptr(), envpp.as_ptr()) };
+    io::Error::last_os_error()
 }
 
 // ── SIGTERM (systemd stop / restart) ─────────────────────────────────────────

@@ -105,10 +105,15 @@ fn verdict(unavailable_locks: &[&str], pool_stuck_for: Option<Duration>, stuck_l
     }
 }
 
+/// How long a daemon that took over a live connection may take to serve it.
+const TAKEOVER_LIMIT: Duration = Duration::from_secs(60);
+
 /// A daemon that took over a live connection keeps programs on the mount waiting until
-/// it serves it, so starting up may not take forever: past `limit` the ping is withheld
-/// and systemd kills it (StartLimitBurst then ends the mount with ENOTCONN). A fresh
-/// start has no such bound: nobody waits on it, and it may sit at a locked keyring.
+/// it serves it, so starting up may not take forever: past `limit` the watchdog gives the
+/// connection up itself (handoff::give_up_stalled_takeover). Withholding pings would not
+/// do: systemd's kills would come WatchdogSec apart, too slow for StartLimitBurst to ever
+/// end the mount. A fresh start has no such bound: nobody waits on it, and it may sit at
+/// a locked keyring.
 fn takeover_verdict(pending_for: Option<Duration>, limit: Duration) -> Result<(), String> {
     match pending_for {
         Some(d) if d > limit => Err(format!(
@@ -140,10 +145,11 @@ pub(crate) fn spawn() {
                 .filter(|(_, ok)| !ok(LOCK_WAIT))
                 .map(|(name, _)| *name)
                 .collect();
-            let takeover_limit = (every * 2).max(Duration::from_secs(60));
-            let health = takeover_verdict(crate::handoff::takeover_pending_for(), takeover_limit)
-                .and_then(|()| verdict(&unavailable, stuck, every / 2));
-            match health {
+            if let Err(why) = takeover_verdict(crate::handoff::takeover_pending_for(), TAKEOVER_LIMIT) {
+                log::error!("watchdog: {} — giving the mount up", why);
+                crate::handoff::give_up_stalled_takeover();
+            }
+            match verdict(&unavailable, stuck, every / 2) {
                 Ok(()) => {
                     let _ = crate::handoff::sd_notify("WATCHDOG=1", None);
                 }

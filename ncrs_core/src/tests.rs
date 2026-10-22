@@ -3247,9 +3247,9 @@ mod upload_order_tests {
         let (src, skip) = staged_source(&files, 1, 7).expect("a dirty writer reads from its staging file");
         assert_eq!((src.as_path(), skip), (wp.as_path(), 0));
         // A full page, and the partial last page: short exactly at the staged end.
-        assert_eq!(read_staged(&src, skip, 4096, 4096).unwrap(), data[4096..8192]);
-        assert_eq!(read_staged(&src, skip, 8192, 4096).unwrap(), data[8192..]);
-        assert!(read_staged(&src, skip, 10_000, 4096).unwrap().is_empty());
+        assert_eq!(read_staged(&src, 4096, 4096).unwrap(), data[4096..8192]);
+        assert_eq!(read_staged(&src, 8192, 4096).unwrap(), data[8192..]);
+        assert!(read_staged(&src, 10_000, 4096).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3286,15 +3286,18 @@ mod upload_order_tests {
     fn a_streamed_upload_serves_only_the_bytes_it_still_holds() {
         let dir = staging_dir("streamed-read");
         let wp = dir.join("write_1");
+        // Laid out at the file's own offsets: the sent 30 000 bytes are a hole, the tail follows.
         let tail = pattern(1_000);
-        std::fs::write(&wp, &tail).unwrap();
+        let f = std::fs::File::create(&wp).unwrap();
+        f.set_len(30_000).unwrap();
+        f.write_all_at(&tail, 30_000).unwrap();
         let mut of = writer_handle(7, true, Some(wp.clone()));
         of.chunk_upload = Some(ChunkUploadState { uploads_base: "x".into(), next_index: 3, bytes_confirmed: 30_000 });
         let files = HashMap::from([(1, of)]);
 
-        let (src, skip) = staged_source(&files, 1, 7).unwrap();
-        assert_eq!(skip, 30_000, "the staging file starts at the first unsent byte");
-        assert_eq!(read_staged(&src, skip, 30_500, 100).unwrap(), tail[500..600]);
+        let (src, held_from) = staged_source(&files, 1, 7).unwrap();
+        assert_eq!(held_from, 30_000, "nothing before the first unsent byte is held any more");
+        assert_eq!(read_staged(&src, 30_500, 100).unwrap(), tail[500..600]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3312,18 +3315,6 @@ mod upload_order_tests {
         assert_eq!(staged_mtime(&dir.join("missing")), None);
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn where_sent_chunks_are_only_copied_off_a_streaming_file_keeps_one_chunk_and_a_big_backlog_never_starts() {
-        let chunk = webdav_ops::CHUNK_SIZE as u64;
-        let threshold = 100 * 1024 * 1024;
-        assert_eq!(stream_window(false, false, threshold), threshold, "not streaming yet: the threshold");
-        assert_eq!(stream_window(true, true, threshold), threshold, "cut out in place: the sliding window");
-        assert_eq!(stream_window(true, false, threshold), chunk, "copied off: keep each copy small");
-        assert!(may_start_streaming(50 * threshold, true, threshold), "in place: any backlog drains cheaply");
-        assert!(may_start_streaming(2 * threshold, false, threshold));
-        assert!(!may_start_streaming(2 * threshold + 1, false, threshold), "copying it would need the missing space");
     }
 
     #[test]
@@ -3360,18 +3351,18 @@ mod upload_order_tests {
     }
 
     #[test]
-    fn shrinking_the_tail_keeps_exactly_the_unsent_bytes() {
-        let dir = staging_dir("shrink-tail");
+    fn freeing_a_sent_chunk_keeps_the_size_and_every_unsent_byte_in_place() {
+        let dir = staging_dir("free-chunk");
         let wp = dir.join("write_1");
         let chunk = webdav_ops::CHUNK_SIZE;
         let data = pattern(chunk * 2 + 1234);
         std::fs::write(&wp, &data).unwrap();
-        shrink_tail_file(&wp, chunk as u64).unwrap();
-        assert_eq!(std::fs::read(&wp).unwrap(), data[chunk..], "in place or by copy, the same bytes remain");
-        // The whole file being the sent chunk (collapse refuses that): falls back to the copy.
-        std::fs::write(&wp, &data[..chunk]).unwrap();
-        shrink_tail_file(&wp, chunk as u64).unwrap();
-        assert_eq!(std::fs::read(&wp).unwrap().len(), 0);
+        free_sent_chunk(&wp, 0, chunk as u64).unwrap();
+        let after = std::fs::read(&wp).unwrap();
+        assert_eq!(after.len(), data.len(), "the file keeps its size: offsets stay the file's own");
+        assert_eq!(after[chunk..], data[chunk..], "the unsent bytes are untouched");
+        // Where punching works the sent range reads back as zeros; elsewhere it stays as written.
+        assert!(after[..chunk] == data[..chunk] || after[..chunk].iter().all(|b| *b == 0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3379,18 +3370,19 @@ mod upload_order_tests {
     #[test]
     fn a_rewrite_into_the_unsent_tail_lands_at_its_file_offset() {
         // LibreOffice rewrites the 4 KiB block it is in the middle of; past the first
-        // chunk that block is in the tail, which starts at file offset bytes_confirmed.
+        // chunk that block is in the unsent tail, at its own offset in the staging file.
         let dir = staging_dir("tail-rewrite");
         let wp = dir.join("write_1");
-        std::fs::write(&wp, pattern(1_000)).unwrap();
-        let confirmed = 30_000;
+        let f = std::fs::File::create(&wp).unwrap();
+        f.set_len(30_000).unwrap();
+        f.write_all_at(&pattern(1_000), 30_000).unwrap();
         let block = vec![0xAB; 600];
-        write_into_tail_file(&wp, 30_800 - confirmed, &block).unwrap();
+        write_into_tail_file(&wp, 30_800, &block).unwrap();
 
-        let mut want = pattern(1_000)[..800].to_vec();
-        want.extend_from_slice(&block);
-        assert_eq!(std::fs::read(&wp).unwrap(), want, "overwrote 200 bytes and extended by 400");
-        assert_eq!(read_staged(&wp, confirmed, 30_800, 600).unwrap(), block);
+        let staged = std::fs::read(&wp).unwrap();
+        assert_eq!(staged.len(), 31_400, "overwrote 200 bytes and extended by 400");
+        assert_eq!(staged[30_000..30_800], pattern(1_000)[..800]);
+        assert_eq!(read_staged(&wp, 30_800, 600).unwrap(), block);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3410,8 +3402,8 @@ mod upload_order_tests {
         let size = live_write_size(&files, 7).expect("a file being written has a live size");
         assert_eq!(size, zip.len() as u64, "the kernel must not be told the file is empty");
 
-        let (src, skip) = staged_source(&files.lock().unwrap(), 1, 7).unwrap();
-        let reread = read_staged(&src, skip, page, 4096).unwrap();
+        let (src, _) = staged_source(&files.lock().unwrap(), 1, 7).unwrap();
+        let reread = read_staged(&src, page, 4096).unwrap();
         assert_eq!(reread.len(), 1_653, "the partial last page comes back, not nothing");
         assert_eq!(reread, zip[page as usize..], "and it holds the bytes that were written");
 
