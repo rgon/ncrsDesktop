@@ -8297,9 +8297,11 @@ impl NextCloudFs {
         // synchronous update, which may not have run yet: take the writer's staged size so
         // the optimistic update shows the right byte count immediately. Taken before the
         // cache lock: write() takes open_files and then cache, so the reverse would deadlock.
-        // Nothing can grow it in between: write() and flush() on this file wait behind
-        // rename's exclusive key on the inode in the request scheduler (fuse_dispatch).
-        let staged_size = newest_staged_len(&self.open_files, |_, of| of.remote_path == from);
+        // Looked up by the source's inode, the one rename holds exclusively in the request
+        // scheduler (fuse_dispatch): write() and flush() on it wait behind the rename, so
+        // nothing grows it in between. (By path it could pick another inode's handle.)
+        let from_ino = self.cache.safe_lock().get_inode(&from);
+        let staged_size = from_ino.and_then(|ino| newest_staged_len(&self.open_files, |_, of| of.ino == ino));
         {
             let mut c = self.cache.safe_lock();
             let mut moved_entry = None;
