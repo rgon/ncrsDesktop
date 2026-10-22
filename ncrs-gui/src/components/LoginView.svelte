@@ -8,10 +8,29 @@
     let status = $state<"idle" | "waiting" | "error">("idle");
     let errorMsg = $state("");
     let loginUrl = $state("");
+    // null = a mount point is already configured (re-login keeps it), so the
+    // folder field is hidden.
+    let mountPoint = $state<string | null>(null);
+    let mountExists = $state(false);
+    // Until setup_mount_point answers, null would read as "keep the configured
+    // folder" and a fresh install would sign in with none.
+    let mountLoaded = $state(false);
+    const canConnect = $derived(mountLoaded && (mountPoint === null || (!mountExists && mountPoint.trim().startsWith("/"))));
+
+    // An existing folder may belong to another sync client (the official
+    // client also defaults to ~/Nextcloud), so sign-in needs a new one.
+    $effect(() => {
+        if (mountPoint === null) return;
+        const path = mountPoint.trim();
+        invoke<boolean>("path_exists", { path }).then(exists => {
+            if (path === mountPoint?.trim()) mountExists = exists;
+        });
+    });
 
     let unlisten: (() => void) | null = null;
 
     async function connect() {
+        if (!canConnect) return;
         const trimmed = serverUrl.trim().replace(/\/+$/, "");
         if (!trimmed) { errorMsg = "Enter a server URL first."; status = "error"; return; }
 
@@ -20,7 +39,7 @@
         loginUrl = "";
 
         try {
-            loginUrl = await invoke<string>("start_login_flow", { serverUrl: trimmed });
+            loginUrl = await invoke<string>("start_login_flow", { serverUrl: trimmed, mountPoint: mountPoint?.trim() ?? null });
         } catch (e: unknown) {
             errorMsg = String(e);
             status = "error";
@@ -28,6 +47,9 @@
     }
 
     onMount(() => {
+        invoke<string | null>("setup_mount_point")
+            .then(mp => { mountPoint = mp; }, () => { mountPoint = ""; })
+            .finally(() => { mountLoaded = true; });
         const errP = listen<string>("login-error", (e) => {
             errorMsg = e.payload;
             status = "error";
@@ -62,11 +84,26 @@
                 spellcheck="false"
             />
 
+            {#if mountPoint !== null}
+                <label class="lv-label" for="mount-point">Local folder</label>
+                <input
+                    id="mount-point"
+                    class="nc-input"
+                    type="text"
+                    bind:value={mountPoint}
+                    onkeydown={(e) => { if (e.key === "Enter") connect(); }}
+                    spellcheck="false"
+                />
+                {#if mountExists}
+                    <p class="lv-error">This folder already exists — another sync client may be using it. Choose a new folder.</p>
+                {/if}
+            {/if}
+
             {#if status === "error" && errorMsg}
                 <p class="lv-error">{errorMsg}</p>
             {/if}
 
-            <button class="nc-btn-primary lv-connect-btn" onclick={connect}>
+            <button class="nc-btn-primary lv-connect-btn" onclick={connect} disabled={!canConnect}>
                 Sign in with Nextcloud
             </button>
         </div>

@@ -10300,9 +10300,7 @@ fn prepare_mount_point(mount_point: &Path, cache_dir: &Path) -> Result<Vec<Adopt
         return Ok(Vec::new());
     }
 
-    let canon_mp = mount_point.canonicalize().unwrap_or_else(|_| mount_point.to_path_buf());
-    let previously_owned = read_mount_marker(cache_dir).map_or(false, |m| m == canon_mp);
-    if !previously_owned {
+    if !previously_owned(mount_point, cache_dir) {
         return Err(format!(
             "mount point {} is not empty — mounting would hide its contents; move them away first",
             mp_str
@@ -10320,6 +10318,22 @@ fn prepare_mount_point(mount_point: &Path, cache_dir: &Path) -> Result<Vec<Adopt
         )
     })?;
     relocate_leftovers(mount_point, cache_dir, &leftovers)
+}
+
+fn previously_owned(mount_point: &Path, cache_dir: &Path) -> bool {
+    let canon_mp = mount_point.canonicalize().unwrap_or_else(|_| mount_point.to_path_buf());
+    read_mount_marker(cache_dir).map_or(false, |m| m == canon_mp)
+}
+
+/// True when `mount_point` holds files ncrs did not leave there (e.g. another
+/// sync client's folder), so prepare_mount_point would refuse to mount over it.
+/// Lets the GUI say why instead of the daemon just exiting. A live mount is
+/// ncrs' own and never counts.
+pub fn mount_point_occupied(mount_point: &Path, url: &str) -> bool {
+    // Checked first so a live mount (whose daemon may be hung) is never listed.
+    !is_live_fuse_mount(mount_point)
+        && std::fs::read_dir(mount_point).is_ok_and(|mut entries| entries.next().is_some())
+        && !previously_owned(mount_point, &ncrs_cache_dir(url))
 }
 
 // True if the path appears as a mounted fuse filesystem in /proc/self/mounts.

@@ -2396,6 +2396,20 @@ password: "pass"
     }
 
     #[test]
+    fn mount_point_occupied_only_for_nonempty_unowned_dirs() {
+        // What the GUI checks before spawning the daemon: the same folders
+        // prepare_mount_point refuses, and nothing it would mount over.
+        let base = test_tmp("occupied");
+        let mount_point = base.join("mount");
+        let url = "https://occupied.invalid/remote.php/dav/files/u/";
+        assert!(!crate::mount_point_occupied(&mount_point, url), "missing folder is free");
+        std::fs::create_dir_all(&mount_point).unwrap();
+        assert!(!crate::mount_point_occupied(&mount_point, url), "empty folder is free");
+        std::fs::write(mount_point.join("other_client.txt"), b"data").unwrap();
+        assert!(crate::mount_point_occupied(&mount_point, url));
+    }
+
+    #[test]
     fn prepare_mount_point_rejects_nonempty_with_mismatched_marker() {
         // ncrs owns a *different* path per the marker — this one is still new
         // to it, so it must refuse just like the no-marker case, not adopt.

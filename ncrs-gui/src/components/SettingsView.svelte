@@ -44,8 +44,6 @@
         adapter_connected: boolean;
     }
 
-    let { forced = false }: { forced?: boolean } = $props();
-
     let settings = $state<ConfigSettings | null>(null);
     let version = $state("");
     let status = $state<"idle" | "saving" | "saved" | "error">("idle");
@@ -203,12 +201,6 @@
 </script>
 
 <div class="sv-root">
-    {#if forced}
-        <div class="sv-banner">
-            <strong>Mount point required.</strong> Set a local directory for your Nextcloud files.
-        </div>
-    {/if}
-
     {#if !settings}
         <div class="sv-loading">Loading…</div>
     {:else}
@@ -227,6 +219,9 @@
                         bind:value={settings.mount_point}
                         spellcheck="false"
                     />
+                    {#if !settings.mount_point.trim()}
+                        <p class="sv-hint sv-warn">No folder set — your files won't be mounted until you choose one.</p>
+                    {/if}
                     <p class="sv-hint">Local path where your Nextcloud files appear. The directory is created automatically.</p>
                 </div>
             </section>
@@ -547,14 +542,8 @@
     overflow: hidden;
 }
 
-.sv-banner {
-    flex-shrink: 0;
-    background: color-mix(in srgb, var(--nc-warning) 12%, transparent);
-    border-bottom: 1px solid color-mix(in srgb, var(--nc-warning) 30%, transparent);
+.sv-hint.sv-warn {
     color: var(--nc-warning);
-    font-size: 12px;
-    padding: 8px 14px;
-    line-height: 1.4;
 }
 
 .sv-loading {
