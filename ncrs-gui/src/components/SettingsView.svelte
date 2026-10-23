@@ -25,6 +25,7 @@
         stream_upload_threshold_mb: number;
         stream_disk_reserve_mb: number;
         honor_server_locks: boolean;
+        app_lock_files: boolean;
     }
 
     // One desktop profile, as reported by the service (`INTEGRATIONS`):
@@ -238,6 +239,20 @@
                         </p>
                     </div>
                     <input id="server-locks" type="checkbox" class="sv-check" bind:checked={settings.honor_server_locks} />
+                </div>
+
+                <div class="sv-toggle">
+                    <div>
+                        <label class="sv-toggle-label" for="app-locks">Lock documents on the server while you edit them</label>
+                        <p class="sv-hint">
+                            While LibreOffice, Microsoft Office, Vim or Kate has a document open
+                            from this folder, it is locked on the server, so others see that you
+                            are editing it and cannot save over it. The lock is released when you
+                            close the document, and expires within a minute if the program or ncrs
+                            stops. Requires "Respect Nextcloud file locks".
+                        </p>
+                    </div>
+                    <input id="app-locks" type="checkbox" class="sv-check" disabled={!settings.honor_server_locks} bind:checked={settings.app_lock_files} />
                 </div>
             </section>
 

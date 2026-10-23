@@ -770,7 +770,8 @@ fn save_config_values(values: ncrs_core::config::ConfigSettings) -> Result<(), S
         values.stream_disk_reserve_mb,
     );
     let locks = format!("SERVER_LOCKS {}", if values.honor_server_locks { "on" } else { "off" });
-    for verb in [limit, stream, locks] {
+    let app_locks = format!("APP_LOCKS {}", if values.app_lock_files { "on" } else { "off" });
+    for verb in [limit, stream, locks, app_locks] {
         if ipc_request(&[verb.as_str()]).is_none() {
             log::debug!("{} saved; no daemon to forward it to right now", verb);
         }
