@@ -23,6 +23,8 @@ pub enum WriteError {
     Locked,
     Network(String),
     Server(u16, String),
+    /// put_file_from_path_settled's `settle` called the upload off.
+    Withdrawn,
 }
 
 impl std::fmt::Display for WriteError {
@@ -32,6 +34,7 @@ impl std::fmt::Display for WriteError {
             WriteError::Locked => write!(f, "423 Locked"),
             WriteError::Network(e) => write!(f, "network error: {}", e),
             WriteError::Server(code, msg) => write!(f, "server error {}: {}", code, msg),
+            WriteError::Withdrawn => write!(f, "upload withdrawn before it was sent"),
         }
     }
 }
@@ -117,16 +120,20 @@ fn put_file_streamed(
     put_result(req.send().map_err(|e| WriteError::Network(e.to_string()))?)
 }
 
+/// A response's ETag without its quotes (or a weak validator's `W/`).
+pub(crate) fn response_etag(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers.get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_start_matches("W/").trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn put_result(resp: reqwest::blocking::Response) -> Result<PutResult, WriteError> {
     let status = resp.status().as_u16();
 
     match status {
         200 | 201 | 204 => {
-            let new_etag = resp
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim_matches('"').to_string());
+            let new_etag = response_etag(resp.headers());
             Ok(PutResult { new_etag })
         }
         412 => Err(WriteError::Conflict),
@@ -187,21 +194,28 @@ pub fn delete(
     }
 }
 
+/// MOVE `from` to `to`, overwriting it. With `dest_etag`, only while `to` is still that
+/// version (412 otherwise): the tagged If header names the destination, which a plain
+/// If-Match on a MOVE would not (see move_precondition).
 pub fn move_resource(
     client: &crate::http_clients::DavClient,
     base_url: &str,
     creds: &crate::auth::Credentials,
     from: &Path,
     to: &Path,
+    dest_etag: Option<&str>,
 ) -> Result<(), WriteError> {
     let src_url = dav_url(base_url, creds.username(), from);
     let dst_url = dav_url(base_url, creds.username(), to);
-    let resp = creds.apply(client
+    let mut req = creds.apply(client
         .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &src_url)
         .timeout(WRITE_TIMEOUT))
         .header("Destination", &dst_url)
-        .header("Overwrite", "T")
-        .send()
+        .header("Overwrite", "T");
+    if let Some(etag) = dest_etag {
+        req = req.header("If", move_precondition(&dst_url, etag));
+    }
+    let resp = req.send()
         .map_err(|e| WriteError::Network(e.to_string()))?;
 
     let status = resp.status().as_u16();
@@ -371,6 +385,20 @@ pub fn put_file_from_path(
     staging_path: &Path,
     if_match_etag: Option<&str>,
 ) -> Result<PutResult, WriteError> {
+    put_file_from_path_settled(client, base_url, creds, staging_path, &mut || {
+        Some((path.to_path_buf(), if_match_etag.map(str::to_string)))
+    })
+}
+
+/// put_file_from_path with the destination asked of `settle` right before the request
+/// that names it: the single PUT, or a chunked upload's assembly once every chunk is up.
+pub fn put_file_from_path_settled(
+    client: &crate::http_clients::DavClient,
+    base_url: &str,
+    creds: &crate::auth::Credentials,
+    staging_path: &Path,
+    settle: &mut dyn FnMut() -> Option<(std::path::PathBuf, Option<String>)>,
+) -> Result<PutResult, WriteError> {
     let file_size = std::fs::metadata(staging_path)
         .map_err(|e| WriteError::Network(format!("staging stat: {}", e)))?
         .len() as usize;
@@ -379,15 +407,17 @@ pub fn put_file_from_path(
     if file_size <= CHUNK_SIZE {
         let body = std::fs::read(staging_path)
             .map_err(|e| WriteError::Network(format!("staging read: {}", e)))?;
-        return put_file(client, base_url, creds, path, body, if_match_etag, mtime);
+        let (path, if_match_etag) = settle().ok_or(WriteError::Withdrawn)?;
+        return put_file(client, base_url, creds, &path, body, if_match_etag.as_deref(), mtime);
     }
 
     let uploads_base = match open_chunked_session(client, base_url, creds) {
         Ok(u) => u,
         // A plain WebDAV server without Nextcloud's chunked uploads rejects the session.
         Err(WriteError::Server(404 | 501, _)) => {
+            let (path, if_match_etag) = settle().ok_or(WriteError::Withdrawn)?;
             log::info!("chunked upload unavailable — sending {} as a single PUT", path.display());
-            return put_file_streamed(client, base_url, creds, path, staging_path, file_size, if_match_etag, mtime);
+            return put_file_streamed(client, base_url, creds, &path, staging_path, file_size, if_match_etag.as_deref(), mtime);
         }
         Err(e) => return Err(e),
     };
@@ -410,7 +440,11 @@ pub fn put_file_from_path(
         }
     }
 
-    finish_chunked_upload(client, base_url, creds, &uploads_base, path, if_match_etag, mtime)
+    let Some((path, if_match_etag)) = settle() else {
+        let _ = cleanup_chunked_upload(client, &uploads_base, creds);
+        return Err(WriteError::Withdrawn);
+    };
+    finish_chunked_upload(client, base_url, creds, &uploads_base, &path, if_match_etag.as_deref(), mtime)
 }
 
 fn cleanup_chunked_upload(

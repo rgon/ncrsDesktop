@@ -22,6 +22,7 @@
             deleting: HashSet::new(),
             not_dirs: HashSet::new(),
             trackerignore_hidden: false,
+            displaced: HashMap::new(),
         }
     }
 
@@ -3043,6 +3044,41 @@ mod upload_order_tests {
     }
 
     #[test]
+    fn a_handle_reads_one_version_but_follows_our_own_uploads() {
+        use crate::{ServedVersions, VersionPin};
+        let served = ServedVersions::default();
+        let p = Path::new("/v.mkv");
+        let tagged = |e: &str| {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert("etag", format!("\"{}\"", e).parse().unwrap());
+            h
+        };
+        let pin = VersionPin::default();
+        assert!(pin.admit(&served, p, &tagged("e1")).is_ok(), "the first response pins its version");
+        assert_eq!(served.served(p).as_deref(), Some("e1"));
+        assert!(pin.admit(&served, p, &tagged("e1")).is_ok());
+        assert!(pin.admit(&served, p, &tagged("e2")).is_err(), "someone else's change ends the handle's reads");
+        served.wrote(p, "e3");
+        assert!(pin.admit(&served, p, &tagged("e3")).is_ok(), "our own save changes the file under its readers, as on a disk");
+        assert!(pin.admit(&served, p, &reqwest::header::HeaderMap::new()).is_ok(), "a server that sends no etag is not checked");
+        pin.freeze();
+        served.wrote(p, "e4");
+        assert!(pin.admit(&served, p, &tagged("e4")).is_err(), "a replaced file's handle reads nothing newer");
+    }
+
+    #[test]
+    fn served_versions_follow_renames() {
+        use crate::ServedVersions;
+        let s = ServedVersions::default();
+        s.serve(Path::new("/d/a"), "e1");
+        s.serve(Path::new("/x"), "e9");
+        s.moved(Path::new("/d"), Path::new("/x"));
+        assert_eq!(s.served(Path::new("/x/a")).as_deref(), Some("e1"));
+        assert_eq!(s.served(Path::new("/x")), None, "what was at the destination is gone");
+        assert_eq!(s.served(Path::new("/d/a")), None);
+    }
+
+    #[test]
     fn recorded_etags_follow_renames_and_deletes() {
         let u = UploadOrder::default();
         let g = u.generation();
@@ -3157,6 +3193,7 @@ mod upload_order_tests {
             staged_whole: false,
             unlinked: false,
             opened_gen: 0,
+            pin: VersionPin::default(),
         }
     }
 

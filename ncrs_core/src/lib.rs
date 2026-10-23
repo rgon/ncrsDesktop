@@ -1202,6 +1202,18 @@ static STREAM_DISK_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 // The last verdict and when it was taken, so writes past the threshold don't each statvfs.
 static STREAM_DISK_LOW: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 
+// Whether a file locked on the server by someone else is shown and opened read-only
+// (config `honor_server_locks`, live over IPC SERVER_LOCKS). Seeded from the config at mount.
+static HONOR_SERVER_LOCKS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_honor_server_locks(enabled: bool) {
+    HONOR_SERVER_LOCKS.store(enabled, Ordering::Relaxed);
+}
+
+fn honor_server_locks() -> bool {
+    HONOR_SERVER_LOCKS.load(Ordering::Relaxed)
+}
+
 /// Applies the streamed-upload settings to the running daemon.
 pub fn set_stream_uploads(enabled: bool, threshold_mb: u64, disk_reserve_mb: u64) {
     STREAM_UPLOADS.store(enabled, Ordering::Relaxed);
@@ -1353,6 +1365,123 @@ struct OpenFile {
     unlinked: bool,
     // UploadOrder generation when opened, for etag chaining (see UploadOrder::etag_for).
     opened_gen: u64,
+    // The version this handle's network reads must be (see VersionPin).
+    pin: VersionPin,
+}
+
+/// How long opening a file for writing waits for its streamed upload to be assembled on
+/// the server before refusing (EBUSY): until then the server cannot hand its bytes back.
+const STREAMED_REOPEN_WAIT: Duration = Duration::from_secs(60);
+
+/// Error a range read returns when the server's copy is no longer the version the
+/// handle was reading: answered ESTALE, never served.
+const VERSION_CHANGED_ERR: &str = "range read: the file changed on the server since this handle read it";
+
+/// The version (ETag) a handle's network reads are served from, set at open from the
+/// cached copy it was opened on, or by its first response. A read whose response is
+/// another version fails instead of splicing two versions into one read, except for
+/// a version this daemon's own upload made: that is the file changing under its
+/// readers, as it would on a local disk. A frozen pin (the handle's file was replaced
+/// by a rename, see FsCache::displaced) admits nothing new.
+#[derive(Clone, Default)]
+struct VersionPin(Arc<Mutex<PinState>>);
+
+#[derive(Default)]
+struct PinState {
+    etag: Option<String>,
+    frozen: bool,
+}
+
+impl VersionPin {
+    fn at(etag: Option<String>) -> Self {
+        VersionPin(Arc::new(Mutex::new(PinState { etag, frozen: false })))
+    }
+
+    fn freeze(&self) {
+        self.0.safe_lock().frozen = true;
+    }
+
+    /// Checks the version a response for `path` is, pinning it if nothing was yet.
+    fn admit(&self, served: &ServedVersions, path: &Path, headers: &reqwest::header::HeaderMap) -> Result<(), String> {
+        let Some(got) = webdav_ops::response_etag(headers) else { return Ok(()) };
+        let mut p = self.0.safe_lock();
+        match p.etag.as_deref() {
+            Some(pinned) if pinned == got => Ok(()),
+            None if !p.frozen => {
+                served.serve(path, &got);
+                p.etag = Some(got);
+                Ok(())
+            }
+            Some(_) if !p.frozen && served.is_ours(path, &got) => {
+                p.etag = Some(got);
+                Ok(())
+            }
+            pinned => {
+                log::warn!("read {}: server has version {} — this handle reads {:?}", path.display(), got, pinned);
+                Err(VERSION_CHANGED_ERR.into())
+            }
+        }
+    }
+}
+
+/// Per file, the version this mount last handed to a program (a download's ETag, a
+/// fresh cached copy's, our own upload's), and the versions this daemon's own uploads
+/// made. A rename-save is made conditional on the served version, so a change the
+/// server got in between turns into a conflicted copy instead of being overwritten.
+#[derive(Clone, Default)]
+struct ServedVersions(Arc<Mutex<HashMap<PathBuf, ServedVersion>>>);
+
+#[derive(Default)]
+struct ServedVersion {
+    served: Option<String>,
+    ours: std::collections::VecDeque<String>,
+}
+
+impl ServedVersions {
+    fn serve(&self, path: &Path, etag: &str) {
+        self.0.safe_lock().entry(path.to_path_buf()).or_default().served = Some(etag.to_string());
+    }
+
+    fn served(&self, path: &Path) -> Option<String> {
+        self.0.safe_lock().get(path).and_then(|v| v.served.clone())
+    }
+
+    fn wrote(&self, path: &Path, etag: &str) {
+        let mut m = self.0.safe_lock();
+        let v = m.entry(path.to_path_buf()).or_default();
+        v.served = Some(etag.to_string());
+        v.ours.push_back(etag.to_string());
+        while v.ours.len() > 4 {
+            v.ours.pop_front();
+        }
+    }
+
+    fn is_ours(&self, path: &Path, etag: &str) -> bool {
+        self.0.safe_lock().get(path).is_some_and(|v| v.ours.iter().any(|e| e == etag))
+    }
+
+    /// A rename: what was known of `from` (and below it) is now known of `to`.
+    fn moved(&self, from: &Path, to: &Path) {
+        let mut m = self.0.safe_lock();
+        m.remove(to);
+        let under: Vec<PathBuf> = m.keys().filter(|p| p.starts_with(from)).cloned().collect();
+        for p in under {
+            if let (Some(v), Ok(rel)) = (m.remove(&p), p.strip_prefix(from)) {
+                m.insert(if rel.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rel) }, v);
+            }
+        }
+    }
+
+    fn forget(&self, path: &Path) {
+        self.0.safe_lock().remove(path);
+    }
+
+    /// The version at `path` is not known any more (what our own uploads made still is).
+    fn unknown(&self, path: &Path) {
+        if let Some(v) = self.0.safe_lock().get_mut(path) {
+            v.served = None;
+        }
+    }
 }
 
 /// Ordering and etag bookkeeping shared by the workers that change files on the server.
@@ -1363,6 +1492,7 @@ struct UploadOrder {
     // recorded at: a handle opened before that upload must send it, not its stale etag.
     committed: Arc<Mutex<HashMap<PathBuf, (u64, Option<String>)>>>,
     gen: Arc<AtomicU64>,
+    served: ServedVersions,
 }
 
 impl UploadOrder {
@@ -1378,11 +1508,15 @@ impl UploadOrder {
     }
 
     fn record(&self, path: &Path, etag: Option<String>) {
+        if let Some(e) = &etag {
+            self.served.wrote(path, e);
+        }
         let g = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
         self.committed.safe_lock().insert(path.to_path_buf(), (g, etag));
     }
 
     fn moved(&self, from: &Path, to: &Path) {
+        self.served.moved(from, to);
         let mut c = self.committed.safe_lock();
         if let Some(v) = c.remove(from) {
             c.insert(to.to_path_buf(), v);
@@ -1390,6 +1524,7 @@ impl UploadOrder {
     }
 
     fn forget(&self, path: &Path) {
+        self.served.forget(path);
         self.committed.safe_lock().remove(path);
     }
 
@@ -2235,6 +2370,52 @@ fn submit_mutation(job: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// How long a re-pointed upload waits for earlier changes to its new name (a delete the
+/// saving program sent first) before it is left to a replay instead. It waits outside its
+/// PathSeq ticket, on jobs queued after its own, so it must not hold a worker forever.
+const SETTLE_WAIT: Duration = Duration::from_secs(600);
+
+/// A live upload's destination and If-Match, asked of the journal right before the request
+/// that names them (MutationJournal::settle_upload). None withdraws the upload.
+fn settle_live_upload(
+    journal: &mutation_journal::SharedJournal,
+    seq: mutation_journal::SeqId,
+    started_as: &Path,
+    if_match: Option<String>,
+) -> Option<(PathBuf, Option<String>)> {
+    use mutation_journal::Settled;
+    let deadline = Instant::now() + SETTLE_WAIT;
+    loop {
+        let settled = journal.safe_lock().settle_upload(seq, started_as, if_match.clone());
+        match settled {
+            Settled::Go(path, etag) => return Some((path, etag)),
+            Settled::Wait if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Settled::Wait => {
+                log::warn!("PUT {}: an earlier change to its destination is still pending — leaving it to a replay", started_as.display());
+                journal.safe_lock().mark_deferred(seq, "an earlier change to the same file did not finish".into());
+                return None;
+            }
+            Settled::Deferred | Settled::Withdrawn => return None,
+        }
+    }
+}
+
+/// After a save became a conflicted copy: the server's version of `path` is what the
+/// program sees once the listing refreshes (LibreOffice then warns "changed since it was
+/// opened"), so the next save is based on it, and "save anyway" overwrites it instead of
+/// making one more copy.
+fn adopt_server_version(conn: &ConnInfo, uploads: &UploadOrder, cache: &Arc<Mutex<FsCache>>, path: &Path) {
+    match conn.backend.list_dir(path, Duration::from_secs(10)) {
+        Ok((_, Some(now), _)) if now.change_token.is_some() => {
+            uploads.served.serve(path, now.change_token.as_deref().unwrap_or_default());
+        }
+        _ => uploads.served.unknown(path),
+    }
+    if let Some(d) = cache.safe_lock().dir_cache.get_mut(path.parent().unwrap_or(Path::new("/"))) {
+        d.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
+    }
+}
+
 /// Sends a kernel cache notification from the single notify worker, never the
 /// FUSE dispatch thread (a notify the kernel blocks on would deadlock it).
 pub(crate) fn notify_later(job: impl FnOnce() + Send + 'static) {
@@ -2407,12 +2588,20 @@ impl std::io::Write for ProgressWriter {
     }
 }
 
+/// Returns the ETag of the version downloaded, when the server sent one.
+/// A temporary name beside `path` to build its replacement under, then rename() over it.
+fn replacement_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!(".{}.ncrs-part-{}-{}", name, std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
 fn open_file_timeout(
     conn: &Arc<ConnInfo>,
     path: PathBuf,
     dest: std::fs::File,
     transfers: Option<TransferMap>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     open_file_within(conn, path, dest, transfers, None)
 }
 
@@ -2424,7 +2613,7 @@ fn open_file_within(
     dest: std::fs::File,
     transfers: Option<TransferMap>,
     deadline: Option<Instant>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     log::info!("DOWNLOAD {}", path.display());
     let left = |cap: Duration| deadline.map_or(cap, |d| cap.min(d.saturating_duration_since(Instant::now())));
     // Runs on the caller's thread: the request carries its own DOWNLOAD_TIMEOUT,
@@ -2441,8 +2630,8 @@ fn open_file_within(
     } else {
         Box::new(dest)
     };
-    conn.backend.download_file(&path, &mut *writer, timeout, _permit.slot())
-        .map(|_| ())
+    conn.backend.download_file_tagged(&path, &mut *writer, timeout, _permit.slot())
+        .map(|(_, etag)| etag)
         .map_err(|e| e.to_string())
 }
 
@@ -2479,6 +2668,10 @@ pub(crate) struct FsCache {
     // to the root listing — mirrors the old real-file semantics ("stays opted
     // out only until the next mount") without ever touching the backend.
     trackerignore_hidden: bool,
+    // Last attrs of a file a rename replaced while handles were still open on it, keyed by
+    // its inode (now pathless): fstat on those handles answers with them, nlink 0, the way
+    // a local filesystem keeps an unlinked inode until its last close.
+    displaced: HashMap<u64, FileAttr>,
 }
 
 impl FsCache {
@@ -2614,13 +2807,18 @@ impl FsCache {
         }
         self.not_dirs.remove(&path);
         // Re-merge any in-flight uploads missing from the server listing so
-        // that concurrent PROPFIND refreshes don't produce ENOENT on stat().
+        // that concurrent PROPFIND refreshes don't produce ENOENT on stat(). One the
+        // server already lists is listed at its version before the upload: keep our
+        // size, mtime and etag, or the file reads back as the old one until it lands.
         if let Some(old) = self.dir_cache.get(&path) {
-            for old_entry in old.files.iter() {
-                if self.uploading.contains(&old_entry.path)
-                    && !files.iter().any(|f| f.path == old_entry.path)
-                {
-                    files.push(old_entry.clone());
+            for old_entry in old.files.iter().filter(|e| self.uploading.contains(&e.path)) {
+                match files.iter_mut().find(|f| f.path == old_entry.path) {
+                    Some(f) => {
+                        f.size = old_entry.size;
+                        f.modified = old_entry.modified;
+                        f.change_token = old_entry.change_token.clone();
+                    }
+                    None => files.push(old_entry.clone()),
                 }
             }
         }
@@ -2910,8 +3108,13 @@ impl FsCache {
     /// sides (offline, or a server without etags) assume fresh, so this never
     /// breaks offline reads. Serving a stale copy at the dir-cache's newer size is
     /// what makes a just-edited odt/xlsx look corrupt, so the read fast-paths gate
-    /// on this before returning local bytes.
+    /// on this before returning local bytes. A path with an upload of ours still on its
+    /// way is never fresh: the cached copy is the version before it (a document a save
+    /// renamed its temp file over), whatever the not-yet-updated listing says.
     fn file_cache_matches_remote(&self, path: &Path) -> bool {
+        if self.uploading.contains(path) {
+            return false;
+        }
         match self.file_cache.get(path) {
             None => false,
             Some(fc) => match (fc.etag.as_deref(), self.remote_etag_for(path).as_deref()) {
@@ -3884,18 +4087,22 @@ pub(crate) fn ensure_file_cached_within(
     const DOWNLOAD_RETRIES: u32 = 2;
     let mut dl_delay = Duration::from_millis(500);
     let mut dl_attempt = 0u32;
-    loop {
+    // Downloaded beside the copy and renamed over it: a handle still reading the previous
+    // copy (a passthrough backing file) keeps that version instead of seeing it truncated.
+    let part = replacement_path(&local_path);
+    let got_etag = loop {
         let file =
-            std::fs::File::create(&local_path).map_err(|e| format!("create cache file: {}", e))?;
-        match open_file_within(conn, remote_path.clone(), file, transfers.cloned(), deadline) {
-            Ok(()) => break,
+            std::fs::File::create(&part).map_err(|e| format!("create cache file: {}", e))?;
+        match open_file_within(conn, remote_path.clone(), file, transfers.cloned(), deadline)
+            .and_then(|etag| std::fs::rename(&part, &local_path).map(|()| etag).map_err(|e| format!("install cache file: {}", e)))
+        {
+            Ok(etag) => break etag,
             Err(e) => {
                 if let Some(tm) = transfers { tm.safe_lock().remove(&whole_file_transfer(&remote_path)); }
-                if let Err(rm_err) = std::fs::remove_file(&local_path) {
-                    log::error!("CRITICAL: cannot remove partial download {}: {} — zeroing to prevent serving corrupt data", local_path.display(), rm_err);
-                    if let Ok(f) = std::fs::File::create(&local_path) {
-                        let _ = f.set_len(0);
-                    }
+                let _ = std::fs::remove_file(&part);
+                // The previous copy is stale (that is why this ran) and its entry goes below.
+                if let Err(rm_err) = std::fs::remove_file(&local_path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }) {
+                    log::error!("CRITICAL: cannot remove stale cache copy {}: {}", local_path.display(), rm_err);
                 }
                 let time_left = deadline.is_none_or(|d| d.saturating_duration_since(Instant::now()) > dl_delay);
                 if dl_attempt < DOWNLOAD_RETRIES && time_left && is_transient_network_err(&e) {
@@ -3920,7 +4127,7 @@ pub(crate) fn ensure_file_cached_within(
                 return Err(e);
             }
         }
-    }
+    };
 
     if let Some(tm) = transfers { tm.safe_lock().remove(&whole_file_transfer(&remote_path)); }
 
@@ -3928,7 +4135,9 @@ pub(crate) fn ensure_file_cached_within(
     {
         let mut c = cache.safe_lock();
         let mod_time = c.remote_modified_for(&remote_path);
-        let etag = c.remote_etag_for(&remote_path);
+        // Labelled with the listing's etag, which freshness checks compare against; the
+        // GET's own tag only stands in when the listing has none.
+        let etag = c.remote_etag_for(&remote_path).or(got_etag);
         c.file_cache.insert(
             remote_path.clone(),
             FileCacheEntry { local_path: local_path.clone(), remote_modified: mod_time, etag, kept, size: std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0) },
@@ -4175,7 +4384,9 @@ pub(crate) fn make_file_attr(inode: u64, entry: &RemoteEntry) -> FileAttr {
         ctime: modified,
         crtime: modified,
         kind: if entry.is_dir { FileType::Directory } else { FileType::RegularFile },
-        perm: perms_to_mode(entry.ext.str("permissions"), entry.is_dir),
+        // Locked on the server by someone else: writable again once they unlock it.
+        perm: perms_to_mode(entry.ext.str("permissions"), entry.is_dir)
+            & if !entry.is_dir && entry.ext.locked_by.is_some() && honor_server_locks() { !0o222 } else { !0 },
         nlink: if entry.is_dir { 2 } else { 1 },
         uid: proc_uid(),
         gid: proc_gid(),
@@ -4252,6 +4463,8 @@ fn root_attr() -> FileAttr {
 
 struct ConnInfo {
     backend: Arc<dyn crate::backend::CloudBackend>,
+    /// The same map as the filesystem's UploadOrder::served, for the read paths.
+    served: ServedVersions,
     base_url: String,
     webdav_url: String,
     creds: auth::Credentials,
@@ -4366,6 +4579,7 @@ impl NextCloudFs {
     pub fn new(options: MountOptions) -> Result<Self, String> {
         let creds = options.credentials()?;
         set_stream_uploads(options.stream_uploads, options.stream_upload_threshold_mb, options.stream_disk_reserve_mb);
+        set_honor_server_locks(options.honor_server_locks);
 
         let exclude_folders: HashSet<PathBuf> = options.exclude_folders.iter().map(|s| {
             let s = s.trim();
@@ -4525,8 +4739,10 @@ impl NextCloudFs {
             )?)
         };
 
+        let uploads = UploadOrder::default();
         let conn = Arc::new(ConnInfo {
             backend,
+            served: uploads.served.clone(),
             base_url,
             webdav_url: options.url.clone(),
             creds,
@@ -4584,6 +4800,7 @@ impl NextCloudFs {
                     deleting: HashSet::new(),
                     not_dirs: HashSet::new(),
                     trackerignore_hidden: false,
+                    displaced: HashMap::new(),
                 }));
                 load_dir_cache(&c);
                 c
@@ -4596,7 +4813,7 @@ impl NextCloudFs {
             children_map,
             conn,
             open_files: Arc::new(Mutex::new(HashMap::new())),
-            uploads: UploadOrder::default(),
+            uploads,
             io_modes: Mutex::new(iomode::InodeIoModes::default()),
             open_dirs: Arc::new(Mutex::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
@@ -5155,6 +5372,7 @@ impl NextCloudFs {
                 Ok(result) => {
                     log::info!("PUT (streamed) {} → new etag {:?}", remote_path.display(), result.new_change_token);
                     uploads.record(&remote_path, result.new_change_token.clone());
+                    journal.safe_lock().rebase(&remote_path, etag.as_deref(), result.new_change_token.as_deref());
                     {
                         let mut c = cache.safe_lock();
                         if let Some(dir) = c.dir_cache.get_mut(&parent) {
@@ -5178,13 +5396,27 @@ impl NextCloudFs {
                     let conflict_name = make_conflict_name(&remote_path);
                     let session = backend::ChunkedUploadSession { uploads_base: cs.uploads_base.clone() };
                     match conn.backend.finish_chunked_upload(&session, &conflict_name, None, None) {
-                        Ok(_) => log::info!("conflicted copy assembled as {}", conflict_name.display()),
-                        Err(e) => log::error!("failed to assemble conflicted copy {}: {}", conflict_name.display(), e),
+                        Ok(_) => {
+                            log::info!("conflicted copy assembled as {}", conflict_name.display());
+                            push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
+                            adopt_server_version(&conn, &uploads, &cache, &remote_path);
+                            smap.safe_write().remove(&remote_path);
+                            let _ = std::fs::remove_file(&tail_path);
+                            journal.safe_lock().remove(seq);
+                        }
+                        Err(e) => {
+                            // The chunks stay on the server and the entry queued: a retry
+                            // 412s again and assembles the copy then.
+                            log::error!("failed to assemble conflicted copy {}: {} — the edit stays queued", conflict_name.display(), e);
+                            push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — your version is kept until its conflicted copy uploads".into());
+                            smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+                            if e.is_transient() {
+                                journal.safe_lock().mark_deferred(seq, e.to_string());
+                            } else {
+                                journal.safe_lock().mark_failed(seq, e.to_string());
+                            }
+                        }
                     }
-                    push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
-                    smap.safe_write().remove(&remote_path);
-                    let _ = std::fs::remove_file(&tail_path);
-                    journal.safe_lock().remove(seq);
                 }
                 Err(ref e) if e.is_transient() => {
                     if e.is_network_down() {
@@ -5351,13 +5583,45 @@ impl NextCloudFs {
                     bytes_done: 0,
                     total_bytes: upload_size,
                 });
-                let etag_ref = original_etag.as_deref();
-                match conn.backend.put_file_from_path(&remote_path, &write_path, etag_ref) {
+                // Where it goes is settled only as the request naming it is sent: a rename
+                // while it waits or while its chunks go up re-points it (retarget_upload).
+                let started_as = remote_path;
+                let mut named = None;
+                let put = {
+                    let mut settle = || settle_live_upload(&journal, seq, &started_as, original_etag.clone()).inspect(|settled| named = Some(settled.clone()));
+                    conn.backend.put_file_settled(&write_path, &mut settle)
+                };
+                tmap.safe_lock().remove(&whole_file_transfer(&started_as));
+                let (remote_path, sent_etag) = named.unwrap_or_else(|| (started_as.clone(), None));
+                match put {
+                    Err(backend::BackendWriteError::Withdrawn) => {
+                        // Superseded, deleted or replaced before it was sent, or put back
+                        // for a replay: the journal owns what happens to it now.
+                        // Put back for a replay, it may have been re-pointed since it started.
+                        let current = journal.safe_lock().entries().iter().find(|e| e.seq == seq).map(|e| e.op.path().to_path_buf());
+                        let deferred = current.is_some();
+                        let remote_path = current.unwrap_or(remote_path);
+                        let still_pending: Vec<bool> = [&started_as, &remote_path].iter()
+                            .map(|p| journal.safe_lock().has_pending_put(p))
+                            .collect();
+                        let mut c = cache.safe_lock();
+                        for (p, pending) in [&started_as, &remote_path].into_iter().zip(still_pending) {
+                            if deferred || !pending {
+                                c.uploading.remove(p);
+                            }
+                        }
+                        drop(c);
+                        if deferred {
+                            smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+                        }
+                        log::info!("PUT {} withdrawn before it was sent{}", remote_path.display(), if deferred { " — queued for replay" } else { "" });
+                    }
                     Ok(result) => {
                         tmap.safe_lock().remove(&whole_file_transfer(&remote_path));
                         cache.safe_lock().uploading.remove(&remote_path);
                         log::info!("PUT {} → new etag {:?}", remote_path.display(), result.new_change_token);
                         uploads.record(&remote_path, result.new_change_token.clone());
+                        let new_etag = result.new_change_token.clone();
                         let new_size = upload_size;
                         {
                             let mut c = cache.safe_lock();
@@ -5379,14 +5643,37 @@ impl NextCloudFs {
                             of.dirty = false;
                             of.original_etag = result.new_change_token.clone();
                         }
+                        // A rename queued its MOVE while this was on the wire: until that lands
+                        // the bytes are the destination's only readable copy.
+                        let handed = {
+                            let mut j = journal.safe_lock();
+                            let handed = j.hand_staging_to_rename(&remote_path, &write_path);
+                            j.remove(seq);
+                            j.rebase(&remote_path, sent_etag.as_deref(), new_etag.as_deref());
+                            handed
+                        };
+                        // Nothing reads the staging file once its entry is gone, so it becomes
+                        // the kept copy by a rename: no second copy of the file on disk. One a
+                        // MOVE still holds is copied instead. Either way it lands under a new
+                        // inode, so a passthrough reader of the previous kept copy keeps it.
+                        let mut staging_gone = false;
                         if auto_keep {
                             let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
                             let keep_path = cache.safe_lock().kept_dir.join(rel);
-                            let mut kept = false;
                             if let Some(parent) = keep_path.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
-                            if std::fs::copy(&write_path, &keep_path).is_ok() {
+                            let moved = !handed && std::fs::rename(&write_path, &keep_path).is_ok();
+                            staging_gone = moved;
+                            let kept = moved || {
+                                let part = replacement_path(&keep_path);
+                                let copied = std::fs::copy(&write_path, &part).and_then(|_| std::fs::rename(&part, &keep_path));
+                                if copied.is_err() {
+                                    let _ = std::fs::remove_file(&part);
+                                }
+                                copied.is_ok()
+                            };
+                            if kept {
                                 cache.safe_lock().file_cache.insert(remote_path.clone(), FileCacheEntry {
                                     local_path: keep_path,
                                     remote_modified: Some(saved_mtime),
@@ -5395,37 +5682,50 @@ impl NextCloudFs {
                                     size: upload_size,
                                 });
                                 smap.safe_write().insert(remote_path.clone(), FileStatus::Kept);
-                                kept = true;
-                            }
-                            if !kept {
+                            } else {
                                 smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
                             }
                         } else {
                             smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
                         }
-                        let _ = std::fs::remove_file(&write_path);
+                        if !handed && !staging_gone {
+                            let _ = std::fs::remove_file(&write_path);
+                        }
                         dirty.safe_lock().insert(remote_path.clone());
                         dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
-                        journal.safe_lock().remove(seq);
                     }
                     Err(backend::BackendWriteError::Conflict) => {
                         tmap.safe_lock().remove(&whole_file_transfer(&remote_path));
                         cache.safe_lock().uploading.remove(&remote_path);
-                        smap.safe_write().remove(&remote_path);
                         log::warn!("CONFLICT on PUT {} — creating conflicted copy", remote_path.display());
-                        push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                         let conflict_name = make_conflict_name(&remote_path);
                         match conn.backend.put_file_from_path(&conflict_name, &write_path, None) {
-                            Ok(_) => log::info!("conflicted copy uploaded as {}", conflict_name.display()),
-                            Err(e) => log::error!("failed to upload conflict copy: {}", e),
-                        }
-                        if let Some(of) = open_files.safe_lock().get_mut(&fh.0) {
-                            of.dirty = false;
+                            Ok(_) => {
+                                log::info!("conflicted copy uploaded as {}", conflict_name.display());
+                                push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
+                                adopt_server_version(&conn, &uploads, &cache, &remote_path);
+                                smap.safe_write().remove(&remote_path);
+                                if let Some(of) = open_files.safe_lock().get_mut(&fh.0) {
+                                    of.dirty = false;
+                                }
+                                journal.safe_lock().remove(seq);
+                                let _ = std::fs::remove_file(&write_path);
+                            }
+                            Err(e) => {
+                                // The server has these bytes under neither name: they stay
+                                // queued, and the retry's PUT 412s again and makes the copy then.
+                                log::error!("failed to upload conflicted copy {}: {} — the edit stays queued", conflict_name.display(), e);
+                                push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — your version is kept locally until its conflicted copy uploads".into());
+                                smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
+                                if e.is_transient() {
+                                    journal.safe_lock().mark_deferred(seq, e.to_string());
+                                } else {
+                                    journal.safe_lock().mark_failed(seq, e.to_string());
+                                }
+                            }
                         }
                         dirty.safe_lock().insert(remote_path.clone());
                         dirty.safe_lock().insert(remote_path.parent().unwrap_or(Path::new("/")).to_path_buf());
-                        journal.safe_lock().remove(seq);
-                        let _ = std::fs::remove_file(&write_path);
                     }
                     Err(ref e) => {
                         tmap.safe_lock().remove(&whole_file_transfer(&remote_path));
@@ -5454,6 +5754,12 @@ impl NextCloudFs {
                                 mark_offline(&conn.is_offline, &conn.offline_since);
                             }
                             log::warn!("PUT {} deferred — {} (queued for retry)", remote_path.display(), e);
+                            if matches!(e, backend::BackendWriteError::Locked) {
+                                // Not a blip: someone holds a lock on it (another app, or the
+                                // file open in Nextcloud Office). Say so, the save waits for them.
+                                push_error(&elog, remote_path.clone(), SyncErrorKind::Locked,
+                                    "Locked on the server — your save is kept and goes up once it is unlocked".into());
+                            }
                             journal.safe_lock().mark_deferred(seq, e.to_string());
                         } else {
                             // Permanent — the server refuses this write (permission, quota,
@@ -6138,10 +6444,16 @@ impl NextCloudFs {
             return;
         }
 
-        let path = match self.cache.safe_lock().get_path(ino.0) {
+        // Bound first: a guard in the match scrutinee would still be held in the arms.
+        let found = self.cache.safe_lock().get_path(ino.0);
+        let path = match found {
             Some(p) => p,
             None => {
-                reply.error(Errno::ENOENT);
+                let displaced = self.cache.safe_lock().displaced.get(&ino.0).cloned();
+                match displaced {
+                    Some(attr) => reply.attr(&Duration::ZERO, &overlay_live_size(&self.open_files, attr).0),
+                    None => reply.error(Errno::ENOENT),
+                }
                 return;
             }
         };
@@ -6278,7 +6590,7 @@ impl NextCloudFs {
     }
 
     fn open(&self, req: &Req, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let (path, local, etag, nc_permissions, remote_size) = {
+        let (path, local, local_etag, mut etag, nc_permissions, remote_size, locked_by) = {
             let c = self.cache.safe_lock();
             let path = match c.get_path(ino.0) {
                 Some(p) => p,
@@ -6287,18 +6599,20 @@ impl NextCloudFs {
                     return;
                 }
             };
-            let local = c
+            let (local, local_etag) = c
                 .file_cache
                 .get(&path)
                 .filter(|e| e.local_path.metadata().map_or(false, |m| m.len() > 0))
-                .map(|e| e.local_path.clone());
+                .map(|e| (e.local_path.clone(), e.etag.clone()))
+                .unzip();
+            let local_etag = local_etag.flatten();
             let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
-            let (etag, nc_permissions, remote_size) = c.get_cached_dir_readonly(&parent)
+            let (etag, nc_permissions, remote_size, locked_by) = c.get_cached_dir_readonly(&parent)
                 .and_then(|files| files.iter().find(|e| e.path == path).map(|e| {
-                    (e.change_token.clone(), e.ext.str("permissions").map(str::to_string), e.size)
+                    (e.change_token.clone(), e.ext.str("permissions").map(str::to_string), e.size, e.ext.locked_by.clone())
                 }))
-                .unwrap_or((None, None, 0));
-            (path, local, etag, nc_permissions, remote_size)
+                .unwrap_or((None, None, 0, None));
+            (path, local, local_etag, etag, nc_permissions, remote_size, locked_by.filter(|_| honor_server_locks()))
         };
 
         let writable = flags.0 & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND) != 0;
@@ -6316,6 +6630,38 @@ impl NextCloudFs {
         if writable && perms_to_mode(nc_permissions.as_deref(), false) & 0o200 == 0
             && nc_permissions.is_some()
         {
+            reply.error(Errno::EACCES);
+            return;
+        }
+
+        // Locked on the server by someone else (open in Nextcloud Office, or locked by
+        // another user): their lock would refuse our upload, so refuse the write now and
+        // let the program open it read-only. A lock coming and going does not change the
+        // folder's etag, so the listing may hold an old one: ask about the file itself.
+        if writable && locked_by.is_some() && !self.conn.is_offline.load(Ordering::Relaxed) {
+            match self.conn.backend.list_dir(&path, Duration::from_secs(10)) {
+                Ok((_, Some(now), _)) if now.ext.locked_by.is_none() => {
+                    let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+                    let mut c = self.cache.safe_lock();
+                    if let Some(dir) = c.dir_cache.get_mut(&parent) {
+                        let mut files = (*dir.files).clone();
+                        if let Some(e) = files.iter_mut().find(|e| e.path == path) {
+                            e.ext.locked_by = None;
+                        }
+                        dir.files = Arc::new(files);
+                    }
+                }
+                Ok((_, Some(now), _)) => {
+                    log::info!("open {} for writing refused: locked on the server by {}", path.display(), now.ext.locked_by.as_deref().unwrap_or("?"));
+                    reply.error(Errno::EACCES);
+                    return;
+                }
+                _ => {
+                    reply.error(Errno::EACCES);
+                    return;
+                }
+            }
+        } else if writable && locked_by.is_some() {
             reply.error(Errno::EACCES);
             return;
         }
@@ -6361,16 +6707,59 @@ impl NextCloudFs {
             let wp = cache_dir.join(format!("write_{}", fh));
             // Stage the current content before any write: a write that does not start at
             // 0 (O_APPEND, an in-place edit) would otherwise upload a zero-filled prefix.
+            // Our own upload still on its way is the file (a save that renamed its temp
+            // file over this one): the server and the cache both hold the version before.
+            let mut pending = self.journal.safe_lock().pending_upload(&path);
+            // A streamed upload still finishing holds only its unsent tail here; the rest is
+            // in the server's upload session, where nothing can read it until it is
+            // assembled. Wait for that rather than start from the server's old version (an
+            // edit right after a recording stops, an append), or refuse the open.
+            let mut streamed_landed = false;
+            if !truncating && matches!(pending, Some(mutation_journal::PendingUpload::StreamTail { .. })) {
+                let deadline = Instant::now() + STREAMED_REOPEN_WAIT;
+                log::info!("open {} for writing: waiting for its streamed upload to finish", path.display());
+                while matches!(pending, Some(mutation_journal::PendingUpload::StreamTail { .. }))
+                    && Instant::now() < deadline
+                    && !self.conn.is_offline.load(Ordering::Relaxed)
+                {
+                    thread::sleep(Duration::from_millis(100));
+                    pending = self.journal.safe_lock().pending_upload(&path);
+                }
+                if matches!(pending, Some(mutation_journal::PendingUpload::StreamTail { .. })) {
+                    log::warn!("open {} for writing refused: its streamed upload has not reached the server yet", path.display());
+                    let _ = std::fs::remove_file(&wp);
+                    reply.error(Errno::EBUSY);
+                    return;
+                }
+                streamed_landed = true;
+            }
+            let pending = match pending {
+                Some(mutation_journal::PendingUpload::Staged(sp)) => Some(sp),
+                _ => None,
+            };
             let staged = if truncating {
                 std::fs::File::create(&wp).map(|_| ()).map_err(|e| e.to_string())
+            } else if let Some(sp) = pending {
+                seeded = true;
+                std::fs::copy(sp, &wp).map(|_| ()).map_err(|e| e.to_string())
             } else if let Some(local) = local.as_ref().filter(|_| cache_fresh) {
                 seeded = true;
+                if let Some(e) = &local_etag {
+                    self.uploads.served.serve(&path, e);
+                }
                 std::fs::copy(local, &wp).map(|_| ()).map_err(|e| e.to_string())
-            } else if remote_size > 0 {
+            } else if remote_size > 0 || streamed_landed {
                 seeded = true;
                 std::fs::File::create(&wp)
                     .map_err(|e| e.to_string())
                     .and_then(|dest| open_file_timeout(&self.conn, path.clone(), dest, Some(self.transfer_map.clone())))
+                    .map(|got| {
+                        // The version the handle starts from, which a stale listing may be behind.
+                        if let Some(got) = got {
+                            self.uploads.served.serve(&path, &got);
+                            etag = Some(got);
+                        }
+                    })
             } else {
                 Ok(())
             };
@@ -6472,6 +6861,14 @@ impl NextCloudFs {
             _ => {}
         }
 
+        // A handle on a fresh cached copy reads that version, wherever its bytes come from.
+        let pin = match local_etag.filter(|_| cache_fresh && local.is_some()) {
+            Some(e) => {
+                self.uploads.served.serve(&path, &e);
+                VersionPin::at(Some(e))
+            }
+            None => VersionPin::default(),
+        };
         self.open_files.safe_lock().insert(
             fh,
             OpenFile {
@@ -6502,6 +6899,7 @@ impl NextCloudFs {
                 staged_whole: seeded || truncating,
                 unlinked: false,
                 opened_gen: self.uploads.generation(),
+                pin,
             },
         );
         // Daemon-restart survival: logged before the reply hands fh to the kernel.
@@ -6881,6 +7279,7 @@ impl NextCloudFs {
         // `read_ahead_bytes`, so streaming ends up with the same large window as
         // before; a seek drops back to READ_AHEAD_INITIAL, so probing a file's
         // header or seektable costs ~1 MB instead of 64 MB apiece.
+        let pin = self.open_files.safe_lock().get(&fh.0).map(|of| of.pin.clone()).unwrap_or_default();
         let fetch = {
             let ceiling = read_ahead.max(READ_AHEAD_INITIAL);
             let mut ofs = self.open_files.safe_lock();
@@ -6924,6 +7323,7 @@ impl NextCloudFs {
                 deadline: Instant::now() + RANGE_OPEN_BUDGET,
                 primary: None,
                 reserved: None,
+                pin: pin.clone(),
             };
             match open_window(&conn, &path, req) {
                 Ok(OpenedWindow { mut resp, permit, extras, plan, target, total, budget }) => {
@@ -7052,10 +7452,14 @@ impl NextCloudFs {
                                 }
                                 // Stream lock held only for the write: read() takes open_files then
                                 // this lock, so it must never be held while taking cache/open_files.
+                                let part = replacement_path(&local_path);
                                 let written = {
                                     let ss = mtx.lock().unwrap();
-                                    std::fs::write(&local_path, &ss.data[..file_total_size as usize]).is_ok()
-                                };
+                                    std::fs::write(&part, &ss.data[..file_total_size as usize]).is_ok()
+                                } && std::fs::rename(&part, &local_path).is_ok();
+                                if !written {
+                                    let _ = std::fs::remove_file(&part);
+                                }
                                 if written {
                                     let mut c = cache.safe_lock();
                                     let mod_time = c.remote_modified_for(&path);
@@ -7094,6 +7498,7 @@ impl NextCloudFs {
                                 permit: permit.into_owned(&conn.read_throttle),
                                 extras: extras.into_iter().map(|(p, t)| (p.into_owned(&conn.read_throttle), t)).collect(),
                                 plan,
+                                pin: pin.clone(),
                                 finish,
                             }
                             .spawn();
@@ -7115,6 +7520,12 @@ impl NextCloudFs {
                             reply.error(Errno::EIO);
                         }
                     }
+                }
+                Err(e) if e == VERSION_CHANGED_ERR => {
+                    // Not a reason to fetch the whole file: that is the new version too.
+                    push_error(&elog, path.clone(), SyncErrorKind::Conflict,
+                        "Changed on the server while open — reopen the file to read the new version".into());
+                    reply.error(Errno::ESTALE);
                 }
                 Err(e) if e == DNS_BUSY_ERR => {
                     log::warn!("read {} at {}: {} — EAGAIN", path.display(), off, e);
@@ -7225,6 +7636,9 @@ impl NextCloudFs {
         state_snapshot::handle_released(fh.0);
         self.io_modes.safe_lock().release(of.ino, of.io_kind);
         reply.ok();
+        if of.unlinked && !self.open_files.safe_lock().values().any(|o| o.ino == of.ino) {
+            self.cache.safe_lock().displaced.remove(&of.ino);
+        }
 
         if of.upload_failed || of.unlinked {
             // A write already returned EIO after chunks reached the server (assembling them
@@ -7235,7 +7649,10 @@ impl NextCloudFs {
                     let _ = std::fs::remove_file(wp);
                 }
             }
-            self.cache.safe_lock().uploading.remove(&of.remote_path);
+            // Only create()'s guard is this handle's; any other belongs to an upload.
+            if of.created {
+                self.cache.safe_lock().uploading.remove(&of.remote_path);
+            }
             if let Some(cs) = of.chunk_upload {
                 log::warn!(
                     "release: fh {} streamed upload of {} failed mid-copy ({}) — abandoning it, the copy must be retried",
@@ -7251,9 +7668,12 @@ impl NextCloudFs {
         if !of.dirty {
             if let Some(ref wp) = of.write_path {
                 // Opened writable but never written — discard the staging copy and the
-                // create() guard; no PUT will follow.
+                // create() guard; no PUT will follow. A document's other handles (the one
+                // LibreOffice keeps open over a save) leave the guard to the upload it is for.
                 let _ = std::fs::remove_file(wp);
-                self.cache.safe_lock().uploading.remove(&of.remote_path);
+                if of.created {
+                    self.cache.safe_lock().uploading.remove(&of.remote_path);
+                }
             }
             return;
         }
@@ -7454,7 +7874,12 @@ impl NextCloudFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let path = match self.cache.safe_lock().get_path(ino.0) {
+        // A handle on a file a rename replaced still takes writes, as on a local disk; they
+        // only stay in its own copy (release() discards it).
+        let found = self.cache.safe_lock().get_path(ino.0);
+        let path = match found.or_else(|| {
+            self.open_files.safe_lock().get(&fh.0).filter(|of| of.unlinked).map(|of| of.remote_path.clone())
+        }) {
             Some(p) => p,
             None => {
                 reply.error(Errno::ENOENT);
@@ -7756,6 +8181,7 @@ impl NextCloudFs {
                                     staged_whole: false,
                                     unlinked: false,
                                     opened_gen: self.uploads.generation(),
+                                    pin: VersionPin::default(),
                                 });
                                 if let Some(of) = self.open_files.safe_lock().get(&fh) {
                                     state_snapshot::handle_opened(fh, of, None);
@@ -7850,6 +8276,7 @@ impl NextCloudFs {
                 staged_whole: true,
                 unlinked: false,
                 opened_gen: self.uploads.generation(),
+                pin: VersionPin::default(),
             },
         );
         if let Some(of) = self.open_files.safe_lock().get(&fh) {
@@ -8050,6 +8477,8 @@ impl NextCloudFs {
             c.deleting.insert(remote_path.clone());
             // Evict cached bytes immediately so a re-inserted dir entry can't serve stale content.
             c.file_cache.remove(&remote_path);
+            // Nor may an upload's guard bring the entry back once the DELETE lands.
+            c.uploading.remove(&remote_path);
         }
 
         // Keep in-memory maps consistent with the delete so DETAILDIR/STATUS no longer
@@ -8367,15 +8796,29 @@ impl NextCloudFs {
         // nothing grows it in between. (By path it could pick another inode's handle.)
         let from_ino = self.cache.safe_lock().get_inode(&from);
         let staged_size = from_ino.and_then(|ino| newest_staged_len(&self.open_files, |_, of| of.ino == ino));
+        // A listed file without an etag was made here and never came back from the server.
+        let source_on_server;
+        let moved_dir;
+        // The file the rename replaces, if handles may still hold it: its inode loses its
+        // path below, and those handles must neither stat as missing nor commit over `to`.
+        let displaced;
+        // The file at `to` as listed, Some(its etag) when there is one.
+        let dest_listed;
         {
             let mut c = self.cache.safe_lock();
+            let dest_entry = c.get_cached_dir_readonly(&new_parent_path)
+                .and_then(|files| files.iter().find(|f| f.path == to && !f.is_dir).cloned());
+            displaced = c.get_inode(&to).filter(|d| Some(*d) != from_ino)
+                .map(|ino| (ino, dest_entry.as_ref().map(|e| make_file_attr(ino, e))));
+            dest_listed = dest_entry.map(|e| e.change_token);
             let mut moved_entry = None;
             if let Some(dir) = c.dir_cache.get_mut(&old_parent_path) {
                 let (keep, removed): (Vec<_>, Vec<_>) = dir.files.iter().cloned().partition(|e| e.path != from);
                 dir.files = Arc::new(keep);
                 moved_entry = removed.into_iter().next();
             }
-            let moved_dir = moved_entry.as_ref().is_some_and(|e| e.is_dir) || c.dir_cache.contains_key(&from);
+            source_on_server = moved_entry.as_ref().is_none_or(|e| e.is_dir || e.change_token.is_some());
+            moved_dir = moved_entry.as_ref().is_some_and(|e| e.is_dir) || c.dir_cache.contains_key(&from);
             if let Some(mut entry) = moved_entry {
                 if let Some(sz) = staged_size {
                     entry.size = sz;
@@ -8432,6 +8875,7 @@ impl NextCloudFs {
         // Handles still open under the source now commit to the destination. One made by
         // create() means the server has no copy of the source yet, so there is nothing to MOVE.
         let mut uncommitted_source = false;
+        let mut displaced_held = false;
         {
             let mut files = self.open_files.safe_lock();
             for (fh, of) in files.iter_mut() {
@@ -8443,8 +8887,21 @@ impl NextCloudFs {
                         of.remote_path = to.join(suffix);
                     }
                     state_snapshot::handle_retargeted(*fh, &of.remote_path);
+                } else if displaced.is_some_and(|(ino, _)| of.ino == ino) {
+                    // Writes through it went to the replaced file, which no longer exists.
+                    // Whatever guard it made with create() now covers the new file.
+                    of.unlinked = true;
+                    of.created = false;
+                    of.stream_eligible = false;
+                    of.pin.freeze();
+                    displaced_held = true;
+                    state_snapshot::handle_unlinked(*fh);
                 }
             }
+        }
+        if let Some((ino, Some(mut attr))) = displaced.filter(|_| displaced_held) {
+            attr.nlink = 0;
+            self.cache.safe_lock().displaced.insert(ino, attr);
         }
         if uncommitted_source && !self.journal.safe_lock().has_pending_put(&from) {
             log::info!("rename {} → {}: source not uploaded yet — retargeted, no MOVE needed", from.display(), to.display());
@@ -8456,17 +8913,53 @@ impl NextCloudFs {
             reply.ok();
             return;
         }
+        // Closed already, but its upload has not named the source yet (it is queued, or its
+        // chunks are still going up): it lands under the destination instead. A MOVE would
+        // leave the destination at its old version on the server until both requests finish,
+        // and every reader and listing in between would see that version.
+        // The version of `to` the save replaces: the one a change still queued for it was
+        // based on, else the one this mount last served there, else the listed one. Its
+        // upload or MOVE overwrites only that version; a newer one on the server means
+        // someone else changed the file meanwhile, and the save becomes a conflicted copy.
+        let dest_base = if moved_dir {
+            None
+        } else {
+            let queued = self.journal.safe_lock().pending_base(&to);
+            queued.unwrap_or_else(|| dest_listed.and_then(|listed| self.uploads.served.served(&to).or(listed)))
+        };
+        if let Some(base) = &dest_base {
+            log::info!("rename {} → {}: replaces version {} of the destination", from.display(), to.display(), base);
+        }
+        if !source_on_server && self.journal.safe_lock().retarget_upload(&from, &to, dest_base.clone()) {
+            log::info!("rename {} → {}: its upload now goes to the destination — no MOVE needed", from.display(), to.display());
+            let mut c = self.cache.safe_lock();
+            if c.uploading.remove(&from) {
+                c.uploading.insert(to.clone());
+            }
+            drop(c);
+            reply.ok();
+            return;
+        }
 
         let seq = self.journal.safe_lock().enqueue(
-            mutation_journal::MutationOp::Rename { from: from.clone(), to: to.clone() },
+            mutation_journal::MutationOp::Rename { from: from.clone(), to: to.clone(), staging: None, if_match: dest_base.clone() },
         );
 
         if !self.conn.is_offline.load(Ordering::Relaxed) {
+            // Until the MOVE lands the server still lists the destination's old version (or
+            // none): a refresh meanwhile must keep the moved entry, which this MOVE's
+            // completion releases. An upload of the source already under way still names
+            // the source and the MOVE follows it, its bytes read back as the destination's.
+            if !moved_dir {
+                self.cache.safe_lock().uploading.insert(to.clone());
+            }
             let conn = self.conn.clone();
             let journal = self.journal.clone();
             let elog = self.error_log.clone();
             let cache = self.cache.clone();
             let uploads = self.uploads.clone();
+            let smap = self.status.clone();
+            let dirty = self.dirty.clone();
             let root = Path::new("/");
             let order = MUTATION_ORDER.safe_lock();
             let ticket = uploads.seq.ticket(&[
@@ -8507,13 +9000,88 @@ impl NextCloudFs {
                 }
                 let _permit = conn.throttle.acquire();
                 log::info!("MOVE {} → {}: sending WebDAV MOVE", from.display(), to.display());
-                match conn.backend.rename(&from, &to) {
-                    Ok(()) => {
+                let staging = journal.safe_lock().rename_staging(seq);
+                let outcome = mutation_journal::send_move(&*conn.backend, &from, &to, staging.as_deref(), dest_base.as_deref());
+                // Both outcomes that end the entry leave the destination's listing to the server.
+                let settle_listing = |cache: &Arc<Mutex<FsCache>>, pending: bool| {
+                    let mut c = cache.safe_lock();
+                    if !pending {
+                        c.uploading.remove(&to);
+                    }
+                    for dir in [to.parent(), from.parent()].into_iter().flatten() {
+                        if let Some(d) = c.dir_cache.get_mut(dir) {
+                            d.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
+                        }
+                    }
+                };
+                match outcome {
+                    mutation_journal::MoveOutcome::Moved => {
                         log::info!("MOVE {} → {}", from.display(), to.display());
                         uploads.moved(&from, &to);
-                        journal.safe_lock().remove(seq);
+                        // A MOVE answers with no etag, and the source's need not carry over:
+                        // ask, since the next save over the file is conditional on it.
+                        if !moved_dir {
+                            match conn.backend.list_dir(&to, Duration::from_secs(10)) {
+                                Ok((_, Some(now), _)) if now.change_token.is_some() => {
+                                    let tag = now.change_token.clone().unwrap_or_default();
+                                    uploads.served.wrote(&to, &tag);
+                                    let mut c = cache.safe_lock();
+                                    if let Some(dir) = c.dir_cache.get_mut(to.parent().unwrap_or(root)) {
+                                        let mut files = (*dir.files).clone();
+                                        if let Some(e) = files.iter_mut().find(|e| e.path == to) {
+                                            e.change_token = Some(tag);
+                                        }
+                                        dir.files = Arc::new(files);
+                                    }
+                                }
+                                _ => uploads.served.unknown(&to),
+                            }
+                        }
+                        {
+                            let mut j = journal.safe_lock();
+                            j.remove(seq);
+                            // Changes queued on the version this replaced are on the moved file now.
+                            j.rebase(&to, dest_base.as_deref(), None);
+                        }
+                        if let Some(s) = &staging {
+                            let _ = std::fs::remove_file(s);
+                        }
+                        // The destination's listing still shows its version from before the
+                        // MOVE and the source's status its upload: both are the new file now.
+                        let pending = journal.safe_lock().pending_upload(&to).is_some();
+                        settle_listing(&cache, pending);
+                        {
+                            let mut st = smap.safe_write();
+                            st.remove(&from);
+                            if !pending && st.get(&to) == Some(&FileStatus::Uploading) {
+                                st.insert(to.clone(), FileStatus::Synced);
+                            }
+                        }
+                        let mut d = dirty.safe_lock();
+                        d.insert(to.clone());
+                        d.insert(to.parent().unwrap_or(root).to_path_buf());
                     }
-                    Err(backend::BackendWriteError::Server(404, _)) => {
+                    mutation_journal::MoveOutcome::ConflictCopy(copy) => {
+                        // Someone changed the destination after this mount last served it:
+                        // it keeps their version, and this save is the conflicted copy.
+                        log::warn!("MOVE {} → {}: the destination changed on the server — saved as {}", from.display(), to.display(), copy.display());
+                        push_error(&elog, to.clone(), SyncErrorKind::Conflict, format!(
+                            "Changed on the server since it was opened — your save is in {}",
+                            copy.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                        ));
+                        journal.safe_lock().remove(seq);
+                        if let Some(s) = &staging {
+                            let _ = std::fs::remove_file(s);
+                        }
+                        let pending = journal.safe_lock().pending_upload(&to).is_some();
+                        settle_listing(&cache, pending);
+                        adopt_server_version(&conn, &uploads, &cache, &to);
+                        smap.safe_write().remove(&from);
+                        let mut d = dirty.safe_lock();
+                        d.insert(to.clone());
+                        d.insert(to.parent().unwrap_or(root).to_path_buf());
+                    }
+                    mutation_journal::MoveOutcome::SourceGone => {
                         // Source is gone on the server. Reconcile the same way the journal
                         // replay does (MoveSourceGone) instead of surfacing a misleading
                         // "rename failed" error and leaving the entry to retry forever.
@@ -8524,11 +9092,18 @@ impl NextCloudFs {
                             to: to.clone(),
                         });
                         j.remove(seq);
+                        drop(j);
+                        cache.safe_lock().uploading.remove(&to);
                     }
-                    Err(e) => {
+                    mutation_journal::MoveOutcome::Failed(e) => {
                         log::error!("MOVE {} → {} failed (journaled): {}", from.display(), to.display(), e);
-                        push_error(&elog, from, SyncErrorKind::ServerError(0), format!("rename failed: {}", e));
-                        journal.safe_lock().mark_failed(seq, e.to_string());
+                        cache.safe_lock().uploading.remove(&to);
+                        if e.is_transient() {
+                            journal.safe_lock().mark_deferred(seq, e.to_string());
+                        } else {
+                            push_error(&elog, from, SyncErrorKind::ServerError(0), format!("rename failed: {}", e));
+                            journal.safe_lock().mark_failed(seq, e.to_string());
+                        }
                     }
                 }
             });
@@ -8638,6 +9213,7 @@ enum Slot<'a> {
 fn do_range_read_stream<'a>(
     conn: &'a ConnInfo,
     path: &Path,
+    pin: &VersionPin,
     offset: u64,
     size: usize,
     slot: Slot<'a>,
@@ -8680,6 +9256,11 @@ fn do_range_read_stream<'a>(
         match conn.creds.apply(req).send() {
             Ok(resp) => {
                 let status = resp.status();
+                // Every request of a handle must be the version it has been reading, or a
+                // window (or a read spanning two) would hold bytes of two versions.
+                if status.is_success() {
+                    pin.admit(&conn.served, path, resp.headers())?;
+                }
                 // A 206 is the range asked for. A 200 is the whole file from byte 0:
                 // fine for a range that starts there (every consumer stops reading at
                 // its own length), wrong bytes for any other offset.
@@ -8782,6 +9363,8 @@ struct WindowRequest<'a> {
     /// The window's memory, if the caller reserved it already (a look-ahead does,
     /// all or nothing); otherwise `open_window` reserves what the budget allows.
     reserved: Option<BufferReservation>,
+    /// The reading handle's version (see VersionPin).
+    pin: VersionPin,
 }
 
 /// A window whose first request is open, with the slots for the rest of it.
@@ -8812,7 +9395,7 @@ struct OpenedWindow<'a> {
 /// fan-out, so a stale size can neither send a segment past the end nor stop the
 /// window short.
 fn open_window<'a>(conn: &'a ConnInfo, path: &Path, req: WindowRequest<'a>) -> Result<OpenedWindow<'a>, String> {
-    let WindowRequest { start, target, need, file_size, spare, deadline, primary, reserved } = req;
+    let WindowRequest { start, target, need, file_size, spare, deadline, primary, reserved, pin } = req;
     if !wait_out_offline_blip(conn) {
         return Err(OFFLINE_READ_ERR.into());
     }
@@ -8854,7 +9437,7 @@ fn open_window<'a>(conn: &'a ConnInfo, path: &Path, req: WindowRequest<'a>) -> R
     // Rounding can make fewer segments than slots; hand the surplus straight back.
     extras.truncate(plan.len() - 1);
     let (resp, permit) = do_range_read_stream(
-        conn, path, start, plan[0].len as usize, Slot::Held { permit: primary, spare }, deadline,
+        conn, path, &pin, start, plan[0].len as usize, Slot::Held { permit: primary, spare }, deadline,
     )?;
     let total = resp.headers()
         .get(reqwest::header::CONTENT_RANGE)
@@ -8923,6 +9506,7 @@ struct WindowPump<'a> {
     spare: usize,
     /// The file's length as the server stated it (`OpenedWindow::total`).
     total: Option<u64>,
+    pin: &'a VersionPin,
 }
 
 /// Marks a window finished — `done`, waiters woken, TRANSFERS entry gone — when
@@ -9094,7 +9678,7 @@ impl<'a> WindowPump<'a> {
             None => {
                 let held = _permit.take().expect("set just above");
                 let deadline = Instant::now() + RANGE_OPEN_BUDGET;
-                match do_range_read_stream(self.conn, self.path, self.start + seg.at, seg.len as usize,
+                match do_range_read_stream(self.conn, self.path, self.pin, self.start + seg.at, seg.len as usize,
                     Slot::Held { permit: held, spare: self.spare }, deadline)
                 {
                     // Only a 206 is the part asked for; a 200 would be the file from byte 0.
@@ -9244,7 +9828,7 @@ impl<'a> WindowPump<'a> {
                         thread::sleep(Duration::from_millis(300 * retries as u64));
                     }
                     let deadline = Instant::now() + RANGE_OPEN_BUDGET;
-                    match do_range_read_stream(self.conn, self.path, self.start + seg.at + got, remaining as usize,
+                    match do_range_read_stream(self.conn, self.path, self.pin, self.start + seg.at + got, remaining as usize,
                         Slot::Take { spare: self.spare }, deadline)
                     {
                         // Only a 206 is the tail we asked for. A 200 is the whole file
@@ -9297,13 +9881,14 @@ struct PumpJob {
     permit: OwnedSlot,
     extras: Vec<(OwnedSlot, bg::SegmentThread)>,
     plan: Vec<Segment>,
+    pin: VersionPin,
     /// Runs after the body, with the bytes the window ended up holding.
     finish: Box<dyn FnOnce(usize) + Send>,
 }
 
 impl PumpJob {
     fn run(self) {
-        let PumpJob { conn, path, fh, open_files, tmap, tkey, shared, start, spare, total, resp, permit, extras, plan, finish } = self;
+        let PumpJob { conn, path, fh, open_files, tmap, tkey, shared, start, spare, total, resp, permit, extras, plan, pin, finish } = self;
         let permit = permit.bind(&conn.read_throttle);
         let extras = extras.into_iter().map(|(s, t)| (s.bind(&conn.read_throttle), t)).collect();
         let n = WindowPump {
@@ -9317,6 +9902,7 @@ impl PumpJob {
             start,
             spare,
             total,
+            pin: &pin,
         }
         .run((resp, permit), extras, &plan);
         finish(n);
@@ -9372,6 +9958,7 @@ fn run_lookahead(
 ) {
     let LookaheadPlan { after, start, len, budget } = plan;
     let primary = slot.bind(&conn.read_throttle);
+    let Some(pin) = open_files.safe_lock().get(&fh).map(|of| of.pin.clone()) else { return };
     if conn.is_offline.load(Ordering::Relaxed) {
         return;
     }
@@ -9384,6 +9971,7 @@ fn run_lookahead(
         deadline: Instant::now() + LOOKAHEAD_OPEN_BUDGET,
         primary: Some(primary),
         reserved: Some(budget),
+        pin: pin.clone(),
     };
     let opened = match open_window(conn, path, req) {
         // Only a 206 is the window asked for; a 200 would be the file from byte 0.
@@ -9441,6 +10029,7 @@ fn run_lookahead(
         start,
         spare: LOOKAHEAD_SPARE_SLOTS,
         total,
+        pin: &pin,
     }
     .run((resp, permit), extras, &segments);
     log::debug!("look-ahead {} at {}: {} of {} bytes", path.display(), start, got, target);

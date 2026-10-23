@@ -16,6 +16,10 @@ const PROPFIND_BODY: &str = r#"<?xml version="1.0"?>
     <oc:owner-display-name />
     <nc:has-preview />
     <oc:share-types />
+    <nc:lock />
+    <nc:lock-owner />
+    <nc:lock-owner-displayname />
+    <nc:lock-owner-type />
   </d:prop>
 </d:propfind>"#;
 
@@ -87,6 +91,8 @@ pub struct DavEntry {
     pub fileid: Option<u64>,
     pub owner_id: Option<String>,
     pub owner_display_name: Option<String>,
+    /// Who holds a server lock (files_lock) that keeps this user from writing it.
+    pub locked_by: Option<String>,
 }
 
 pub fn propfind_list(
@@ -117,7 +123,7 @@ pub fn propfind_list(
     }
 
     let reader = std::io::BufReader::new(resp);
-    let result = parse_multistatus_stream(reader, webdav_url);
+    let result = parse_multistatus_stream(reader, webdav_url, creds.username());
     log::info!("PROPFIND {} parsed in {:?}", path.display(), t0.elapsed());
     Ok(result?)
 }
@@ -172,7 +178,7 @@ pub fn propfind_etag(
     }
 
     let reader = std::io::BufReader::new(resp);
-    let (dir_etag, _, _) = parse_multistatus_stream(reader, webdav_url)?;
+    let (dir_etag, _, _) = parse_multistatus_stream(reader, webdav_url, creds.username())?;
     Ok(dir_etag)
 }
 
@@ -277,7 +283,7 @@ fn search_fileids(
     }
 
     let reader = std::io::BufReader::new(resp);
-    let (_, self_entry, mut hits) = parse_multistatus_stream(reader, webdav_url)?;
+    let (_, self_entry, mut hits) = parse_multistatus_stream(reader, webdav_url, creds.username())?;
 
     // The parser reserves the first response for the collection a PROPFIND was
     // issued against; in a SEARCH result it is an ordinary hit.
@@ -312,9 +318,11 @@ fn build_url(webdav_url: &str, path: &std::path::Path) -> String {
 
 // ── XML parser ──────────────────────────────────────────────────────────────
 
+/// `me` is the user the listing is for: a lock they hold themselves does not stop them.
 fn parse_multistatus_stream<R: std::io::BufRead>(
     reader: R,
     webdav_url: &str,
+    me: &str,
 ) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), String> {
     let mut entries = Vec::new();
     let mut dir_etag: Option<String> = None;
@@ -340,6 +348,7 @@ fn parse_multistatus_stream<R: std::io::BufRead>(
             }
         };
 
+        let locked_by = resp.locked_against(me);
         let entry = DavEntry {
             path: remote_path,
             is_dir: resp.is_collection,
@@ -352,6 +361,7 @@ fn parse_multistatus_stream<R: std::io::BufRead>(
             permissions: resp.permissions,
             fileid: resp.fileid,
             owner_id: resp.owner_id,
+            locked_by,
             owner_display_name: resp.owner_display_name,
         };
 
@@ -418,6 +428,7 @@ pub fn propfind_list_streaming<E: From<DavEntry> + Send>(
                 continue;
             }
         };
+        let locked_by = resp.locked_against(creds.username());
         let entry = DavEntry {
             path: remote_path,
             is_dir: resp.is_collection,
@@ -430,6 +441,7 @@ pub fn propfind_list_streaming<E: From<DavEntry> + Send>(
             permissions: resp.permissions,
             fileid: resp.fileid,
             owner_id: resp.owner_id,
+            locked_by,
             owner_display_name: resp.owner_display_name,
         };
         if is_first {
@@ -452,7 +464,7 @@ fn parse_multistatus_str(
     xml: &str,
     webdav_url: &str,
 ) -> Result<(Option<String>, Option<DavEntry>, Vec<DavEntry>), String> {
-    parse_multistatus_stream(xml.as_bytes(), webdav_url)
+    parse_multistatus_stream(xml.as_bytes(), webdav_url, "user")
 }
 
 fn webdav_prefix(webdav_url: &str) -> String {
@@ -523,6 +535,22 @@ struct RawResponse {
     fileid: Option<u64>,
     owner_id: Option<String>,
     owner_display_name: Option<String>,
+    lock: bool,
+    lock_owner: Option<String>,
+    lock_owner_display: Option<String>,
+    lock_owner_type: Option<u8>,
+}
+
+impl RawResponse {
+    /// Who holds the lock on it, unless it is `me`'s own user lock (lock-owner-type 0),
+    /// which lets them write from any client. App locks (1, e.g. Nextcloud Office while
+    /// the file is open there) and token locks (2, WebDAV LOCK) stop every other writer.
+    fn locked_against(&self, me: &str) -> Option<String> {
+        if !self.lock || (self.lock_owner_type == Some(0) && self.lock_owner.as_deref() == Some(me)) {
+            return None;
+        }
+        Some(self.lock_owner_display.clone().or_else(|| self.lock_owner.clone()).unwrap_or_else(|| "another client".into()))
+    }
 }
 
 struct ResponseReader<R: std::io::BufRead> {
@@ -650,6 +678,30 @@ impl<R: std::io::BufRead> ResponseReader<R> {
                         }
                         "share-types" => {
                             resp.is_shared = self.read_has_children("share-types")?;
+                        }
+                        // Only ever set, never cleared: a server that has no such property
+                        // echoes it back empty under a later 404 propstat (see `fileid`).
+                        "lock" => {
+                            if self.read_text()?.trim() == "1" {
+                                resp.lock = true;
+                            }
+                        }
+                        "lock-owner" => {
+                            let v = self.read_label()?;
+                            if !v.is_empty() {
+                                resp.lock_owner = Some(v);
+                            }
+                        }
+                        "lock-owner-displayname" => {
+                            let v = self.read_label()?;
+                            if !v.is_empty() {
+                                resp.lock_owner_display = Some(v);
+                            }
+                        }
+                        "lock-owner-type" => {
+                            if let Ok(t) = self.read_text()?.trim().parse() {
+                                resp.lock_owner_type = Some(t);
+                            }
                         }
                         _ => {}
                     }
@@ -921,6 +973,25 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_only_stops_writers_other_than_its_owner() {
+        let xml = |owner: &str, kind: u8| format!(r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns" xmlns:oc="http://owncloud.org/ns">
+  <d:response><d:href>/remote.php/dav/files/user/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:response><d:href>/remote.php/dav/files/user/a.odt</d:href><d:propstat><d:prop>
+    <d:getcontentlength>3</d:getcontentlength><d:resourcetype/>
+    <nc:lock>1</nc:lock><nc:lock-owner>{owner}</nc:lock-owner><nc:lock-owner-displayname>Ana</nc:lock-owner-displayname><nc:lock-owner-type>{kind}</nc:lock-owner-type>
+  </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+</d:multistatus>"#);
+        let url = "https://h/remote.php/dav/files/user";
+        let lock = |owner: &str, kind: u8| parse_multistatus_str(&xml(owner, kind), url).unwrap().2[0].locked_by.clone();
+        assert_eq!(lock("ana", 0), Some("Ana".to_string()), "another user's lock");
+        assert_eq!(lock("user", 0), None, "our own user lock lets us write from here too");
+        assert_eq!(lock("user", 1), Some("Ana".to_string()), "an app lock (Nextcloud Office) stops even its own user's other clients");
+        let unlocked = SAMPLE.replace("<nc:lock>1</nc:lock>", "");
+        assert!(parse_multistatus_str(&unlocked, url).unwrap().2.iter().all(|e| e.locked_by.is_none()));
+    }
+
+    #[test]
     fn owner_and_permissions_lose_control_characters() {
         // Echoed into newline/tab-framed IPC replies: an encoded newline in a
         // display name must not survive to split a DETAIL reply in two.
@@ -1005,6 +1076,7 @@ mod tests {
             let mut is_first = true;
             while let Some(resp) = buf_reader.next_response().unwrap() {
                 let remote_path = href_to_remote_path(&resp.href, &prefix).unwrap();
+                let locked_by = resp.locked_against("user");
                 let entry = DavEntry {
                     path: remote_path,
                     is_dir: resp.is_collection,
@@ -1017,6 +1089,7 @@ mod tests {
                     permissions: resp.permissions,
                     fileid: resp.fileid,
                     owner_id: resp.owner_id,
+                    locked_by,
                     owner_display_name: resp.owner_display_name,
                 };
                 if is_first {

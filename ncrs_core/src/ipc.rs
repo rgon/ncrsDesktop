@@ -1450,6 +1450,14 @@ fn handle_client_loop(
                 (Some(_), Some(_)) => "error: not mounted".to_string(),
                 _ => "error: usage WALKER_LIMIT on|off <listings/s 1-1000>".to_string(),
             }
+        } else if let Some(arg) = trimmed.strip_prefix("SERVER_LOCKS ") {
+            // "SERVER_LOCKS on|off": whether files locked on the server by someone else
+            // show and open read-only. Applies to the next stat and open.
+            match arg.trim() {
+                "on" => { crate::set_honor_server_locks(true); "ok".to_string() }
+                "off" => { crate::set_honor_server_locks(false); "ok".to_string() }
+                _ => "error: usage SERVER_LOCKS on|off".to_string(),
+            }
         } else if let Some(args) = trimmed.strip_prefix("STREAM_UPLOADS ") {
             // "STREAM_UPLOADS on 100 [reserve MB]" / "STREAM_UPLOADS off 100 …": applies to
             // files opened next; a missing reserve keeps the current one (0 = automatic).

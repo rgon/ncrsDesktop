@@ -30,6 +30,17 @@ pub enum MutationOp {
     Rename {
         from: PathBuf,
         to: PathBuf,
+        /// The moved file's bytes once the source's upload has landed (under the source's
+        /// name) and until this MOVE does: the destination is read from here meanwhile, and
+        /// a source gone from the server is uploaded from here instead of lost.
+        #[serde(default)]
+        staging: Option<PathBuf>,
+        /// The version of the file this replaces at `to` that the rename was based on (the
+        /// one this mount last served there): the MOVE only overwrites that version, and
+        /// a newer one makes the moved file a conflicted copy instead. None when `to` is
+        /// new, or nothing is known of its version.
+        #[serde(default)]
+        if_match: Option<String>,
     },
     /// The end of a streamed upload whose earlier chunks are already on the server:
     /// PUT the kept head as chunk 0 and the tail from chunk `next_index` on, then
@@ -76,6 +87,27 @@ pub struct JournalEntry {
     /// makes every entry replayable again.
     #[serde(skip)]
     pub in_flight: bool,
+    /// Re-pointed by retarget_upload: the live worker uploads to the op's current path,
+    /// not the one it was started with.
+    #[serde(skip)]
+    pub retargeted: bool,
+    /// The live worker has sent the request that names this upload's destination (see
+    /// settle_upload): from here on a rename can only follow it with a MOVE.
+    #[serde(skip)]
+    pub dest_fixed: bool,
+}
+
+/// What a live upload does when it is about to name its destination (settle_upload).
+#[derive(Debug, PartialEq)]
+pub enum Settled {
+    /// Send it to this path with this If-Match.
+    Go(PathBuf, Option<String>),
+    /// An earlier change to the destination has not reached the server yet.
+    Wait,
+    /// That earlier change is waiting for a replay; the upload has been put back for one too.
+    Deferred,
+    /// Superseded, or its file deleted or replaced since: nothing to send.
+    Withdrawn,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -170,7 +202,31 @@ impl MutationOp {
         match self {
             MutationOp::Put { staging_path, .. } => Some(staging_path),
             MutationOp::FinishChunked { tail_path, .. } => Some(tail_path),
+            MutationOp::Rename { staging, .. } => staging.as_deref(),
             _ => None,
+        }
+    }
+
+    /// Whether this op changes `path` or a folder above it, so an upload of `path`
+    /// queued after it has to wait for it.
+    fn touches(&self, path: &Path) -> bool {
+        match self {
+            MutationOp::Put { remote_path: p, .. } | MutationOp::FinishChunked { remote_path: p, .. }
+            | MutationOp::Unlink { path: p } => p == path,
+            MutationOp::MkDir { path: p } | MutationOp::RmDir { path: p } => path.starts_with(p),
+            MutationOp::Rename { from, to, .. } => path.starts_with(from) || path.starts_with(to),
+        }
+    }
+
+    /// Whether this op, queued after an upload of `path`, makes that upload pointless:
+    /// a newer upload of it, its delete, or another file moved over it.
+    fn replaces(&self, path: &Path) -> bool {
+        match self {
+            MutationOp::Put { remote_path: p, .. } | MutationOp::FinishChunked { remote_path: p, .. }
+            | MutationOp::Unlink { path: p } => p == path,
+            MutationOp::RmDir { path: p } => path.starts_with(p),
+            MutationOp::Rename { to, .. } => path.starts_with(to),
+            MutationOp::MkDir { .. } => false,
         }
     }
 
@@ -190,7 +246,7 @@ impl MutationOp {
             MutationOp::MkDir { path } => rewrite(path, old_prefix, new_prefix),
             MutationOp::Unlink { path } => rewrite(path, old_prefix, new_prefix),
             MutationOp::RmDir { path } => rewrite(path, old_prefix, new_prefix),
-            MutationOp::Rename { from, to } => {
+            MutationOp::Rename { from, to, .. } => {
                 rewrite(from, old_prefix, new_prefix);
                 rewrite(to, old_prefix, new_prefix);
             }
@@ -220,9 +276,15 @@ impl MutationJournal {
             (VecDeque::new(), 1)
         };
 
-        // Validate Put staging files exist
+        // Validate Put staging files exist. A MOVE still has to run without its copy.
         let mut orphaned = Vec::new();
-        for entry in &entries {
+        for entry in &mut entries {
+            if let MutationOp::Rename { staging, .. } = &mut entry.op {
+                if staging.as_ref().is_some_and(|s| !s.exists()) {
+                    *staging = None;
+                }
+                continue;
+            }
             if let Some(staging_path) = entry.op.staging_path() {
                 if !staging_path.exists() {
                     log::warn!("JOURNAL: staging file missing for {}, will discard", entry.op.path().display());
@@ -274,9 +336,20 @@ impl MutationJournal {
     pub fn enqueue(&mut self, op: MutationOp) -> SeqId {
         self.coalesce_before_enqueue(&op);
 
-        if let MutationOp::Rename { ref from, ref to } = op {
-            for entry in &mut self.entries {
+        // A live worker uploads under the name it was given, so its entry keeps that name
+        // and this MOVE follows it; pending_upload() follows the MOVE to its bytes.
+        // An upload moved onto the destination itself replaces the version the rename was
+        // based on, so it is conditional on it like the MOVE would have been.
+        if let MutationOp::Rename { ref from, ref to, ref if_match, .. } = op {
+            for entry in self.entries.iter_mut().filter(|e| !e.in_flight && !e.retargeted) {
                 entry.op.update_path_prefix(from, to);
+                if let MutationOp::Put { remote_path, if_match_etag: cond @ None, .. }
+                    | MutationOp::FinishChunked { remote_path, if_match_etag: cond @ None, .. } = &mut entry.op
+                {
+                    if remote_path == to {
+                        cond.clone_from(if_match);
+                    }
+                }
             }
         }
 
@@ -289,6 +362,8 @@ impl MutationJournal {
             attempts: 0,
             last_error: None,
             in_flight: false,
+            retargeted: false,
+            dest_fixed: false,
         });
         self.save_journal();
         seq
@@ -322,25 +397,160 @@ impl MutationJournal {
     /// file that is gone, unless a rename onto the path was seen first: enqueue() re-points
     /// a moved file's queued uploads at the new name in place, so they sit behind such a
     /// delete in the queue (a save that deletes the document, then renames its temp file
-    /// over it). The one case left: a rename over a file whose own older upload is still
-    /// queued can read that upload's bytes, as enqueue() no longer tells the two apart.
+    /// over it). An upload a live worker holds keeps its own name instead, so a rename onto
+    /// the path also looks for the source's upload, and for the copy the source's finished
+    /// upload left the MOVE. The one case left: a rename over a file whose own older upload
+    /// is still queued can read that upload's bytes, as enqueue() no longer tells the two apart.
     pub fn pending_upload(&self, path: &Path) -> Option<PendingUpload> {
+        let mut names = vec![path.to_path_buf()];
         let mut renamed_onto = false;
         for e in self.entries.iter().rev() {
             match &e.op {
-                MutationOp::Put { remote_path, staging_path, .. } if remote_path == path => {
+                MutationOp::Put { remote_path, staging_path, .. } if names.contains(remote_path) => {
                     return Some(PendingUpload::Staged(staging_path.clone()));
                 }
-                MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, head, .. } if remote_path == path => {
+                MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, head, .. } if names.contains(remote_path) => {
                     return Some(PendingUpload::StreamTail { tail: tail_path.clone(), held_from: *bytes_confirmed, head: *head, sparse: *sparse });
                 }
-                MutationOp::Rename { to, .. } if path.starts_with(to) => renamed_onto = true,
+                MutationOp::Rename { from, to, staging, .. } if path.starts_with(to) => {
+                    if let Some(s) = staging.as_ref().filter(|_| path == to) {
+                        return Some(PendingUpload::Staged(s.clone()));
+                    }
+                    names.push(from.join(path.strip_prefix(to).unwrap_or(Path::new(""))));
+                    renamed_onto = true;
+                }
                 MutationOp::Unlink { path: gone } if gone == path && !renamed_onto => return None,
                 MutationOp::RmDir { path: gone } if path.starts_with(gone) && !renamed_onto => return None,
                 _ => {}
             }
         }
         None
+    }
+
+    /// Re-points the queued upload of a file the server has never seen (`from`, just renamed
+    /// to `to`) at `to`, and moves it behind everything queued so far. Its upload then lands
+    /// straight under the new name: no MOVE, so no moment where the server has the file only
+    /// under the old one, or where a refresh shows `to`'s previous version. Only while no
+    /// request has named `from` yet (settle_upload), i.e. while nothing can create it on the
+    /// server. Returns whether it did; otherwise the rename needs its MOVE.
+    ///
+    /// `base` is the version of `to` the save replaces: the upload overwrites only that one.
+    pub fn retarget_upload(&mut self, from: &Path, to: &Path, base: Option<String>) -> bool {
+        let ups: Vec<usize> = self.entries.iter().enumerate()
+            .filter(|(_, e)| e.op.is_upload_of(from))
+            .map(|(i, _)| i)
+            .collect();
+        let [i] = ups[..] else { return false };
+        let e = &self.entries[i];
+        if e.dest_fixed || !matches!(e.op, MutationOp::Put { if_match_etag: None, .. }) {
+            return false;
+        }
+        // Anything else queued for the old name (a delete, a move) would need it on the server.
+        if self.entries.iter().enumerate().any(|(k, e)| k != i && e.op.touches(from)) {
+            return false;
+        }
+        let Some(mut e) = self.entries.remove(i) else { return false };
+        if let MutationOp::Put { remote_path, if_match_etag, .. } = &mut e.op {
+            *remote_path = to.to_path_buf();
+            *if_match_etag = base;
+        }
+        e.retargeted = true;
+        self.entries.push_back(e);
+        self.save_journal();
+        true
+    }
+
+    /// Called by a live upload right before the request that names its destination. A
+    /// retargeted upload goes to its current path, after every earlier change to that path
+    /// and only while nothing later replaces it; any other upload keeps the path it started
+    /// with (`started_as`), whatever a rename of a folder above it rewrote in the entry.
+    pub fn settle_upload(&mut self, seq: SeqId, started_as: &Path, if_match: Option<String>) -> Settled {
+        let Some(i) = self.entries.iter().position(|e| e.seq == seq) else { return Settled::Withdrawn };
+        if !self.entries[i].retargeted {
+            self.entries[i].dest_fixed = true;
+            return Settled::Go(started_as.to_path_buf(), if_match);
+        }
+        let dest = self.entries[i].op.path().to_path_buf();
+        if self.entries.iter().skip(i + 1).any(|e| e.op.replaces(&dest)) {
+            let gone = self.entries.remove(i);
+            if let Some(sp) = gone.as_ref().and_then(|e| e.op.staging_path()) {
+                let _ = std::fs::remove_file(sp);
+            }
+            self.save_journal();
+            return Settled::Withdrawn;
+        }
+        if let Some(before) = self.entries.iter().take(i).find(|e| e.op.touches(&dest)) {
+            if before.in_flight || before.last_error.is_none() {
+                return Settled::Wait;
+            }
+            self.mark_deferred(seq, format!("waiting for an earlier change to {} to reach the server", dest.display()));
+            return Settled::Deferred;
+        }
+        let e = &mut self.entries[i];
+        e.dest_fixed = true;
+        let etag = match &e.op {
+            MutationOp::Put { if_match_etag, .. } => if_match_etag.clone(),
+            _ => None,
+        };
+        Settled::Go(dest, etag)
+    }
+
+    /// Gives a finished upload of `uploaded_as` to the MOVE queued after it, if any, as the
+    /// destination's copy until that MOVE lands (see MutationOp::Rename). Returns whether it
+    /// did, in which case the caller must keep `staging`.
+    pub fn hand_staging_to_rename(&mut self, uploaded_as: &Path, staging: &Path) -> bool {
+        let Some(slot) = self.entries.iter_mut().find_map(|e| match &mut e.op {
+            MutationOp::Rename { from, staging: slot @ None, .. } if from == uploaded_as => Some(slot),
+            _ => None,
+        }) else {
+            return false;
+        };
+        *slot = Some(staging.to_path_buf());
+        self.save_journal();
+        true
+    }
+
+    /// The version of `path` the newest queued change to it was based on, when one is
+    /// queued: a save replacing `path` before that change lands is based on the same
+    /// version (rebase() moves it on once the change lands). Some(None) when that version
+    /// is unknown, or the change replaces `path` with another file.
+    pub fn pending_base(&self, path: &Path) -> Option<Option<String>> {
+        self.entries.iter().rev().find_map(|e| match &e.op {
+            MutationOp::Put { remote_path, if_match_etag, .. } | MutationOp::FinishChunked { remote_path, if_match_etag, .. }
+                if remote_path == path => Some(if_match_etag.clone()),
+            op if op.replaces(path) => Some(None),
+            _ => None,
+        })
+    }
+
+    /// `path` went from version `sent` to `new` on the server through one of our changes:
+    /// the changes queued after it that were based on `sent` are based on `new` now.
+    pub fn rebase(&mut self, path: &Path, sent: Option<&str>, new: Option<&str>) {
+        let Some(sent) = sent else { return };
+        let mut changed = false;
+        for e in self.entries.iter_mut() {
+            let cond = match &mut e.op {
+                MutationOp::Put { remote_path, if_match_etag, .. } | MutationOp::FinishChunked { remote_path, if_match_etag, .. }
+                    if remote_path == path => if_match_etag,
+                MutationOp::Rename { to, if_match, .. } if to == path => if_match,
+                _ => continue,
+            };
+            if cond.as_deref() == Some(sent) {
+                *cond = new.map(str::to_string);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_journal();
+        }
+    }
+
+    /// The copy a queued MOVE holds of its file (see hand_staging_to_rename).
+    pub fn rename_staging(&self, seq: SeqId) -> Option<PathBuf> {
+        self.entries.iter().find(|e| e.seq == seq).and_then(|e| match &e.op {
+            MutationOp::Rename { staging, .. } => staging.clone(),
+            _ => None,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -391,6 +601,7 @@ impl MutationJournal {
             entry.attempts += 1;
             entry.last_error = Some(error);
             entry.in_flight = false;
+            entry.dest_fixed = false;
         }
         self.save_journal();
     }
@@ -403,6 +614,7 @@ impl MutationJournal {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.seq == seq) {
             entry.last_error = Some(error);
             entry.in_flight = false;
+            entry.dest_fixed = false;
         }
         self.save_journal();
     }
@@ -650,10 +862,23 @@ pub(crate) fn replay_journal(
             continue;
         }
 
-        match execute_op(&entry, ctx, cache, dirty, error_log) {
-            ReplayResult::Ok => {
+        let result = execute_op(&entry, ctx, cache, dirty, error_log);
+        // What was queued behind it on the version it replaced is on its version now.
+        let landed = match (&result, &entry.op) {
+            (ReplayResult::Uploaded(new), MutationOp::Put { remote_path, if_match_etag, .. } | MutationOp::FinishChunked { remote_path, if_match_etag, .. }) => {
+                Some((remote_path, if_match_etag, new.clone()))
+            }
+            (ReplayResult::Ok, MutationOp::Rename { to, if_match, .. }) => Some((to, if_match, None)),
+            _ => None,
+        };
+        if let Some((path, sent, new)) = landed {
+            journal.safe_lock().rebase(path, sent.as_deref(), new.as_deref());
+        }
+        match result {
+            ReplayResult::Ok | ReplayResult::Uploaded(_) => {
                 let mut j = journal.safe_lock();
                 j.dequeue_front();
+                release_upload_guard(&j, cache, &entry.op);
                 if let Some(staging_path) = entry.op.staging_path() {
                     let _ = std::fs::remove_file(staging_path);
                 }
@@ -674,12 +899,14 @@ pub(crate) fn replay_journal(
                         journal.safe_lock().recover_staging(staging_path, remote_path);
                     }
                 }
-                if let MutationOp::FinishChunked { tail_path, .. } = &entry.op {
-                    let _ = std::fs::remove_file(tail_path);
+                // A MOVE's copy only stood in for bytes the server already has under the source.
+                if let MutationOp::FinishChunked { tail_path: sp, .. } | MutationOp::Rename { staging: Some(sp), .. } = &entry.op {
+                    let _ = std::fs::remove_file(sp);
                 }
                 let mut j = journal.safe_lock();
                 j.add_conflict(kind);
                 j.dequeue_front();
+                release_upload_guard(&j, cache, &entry.op);
             }
             ReplayResult::Idempotent => {
                 let mut j = journal.safe_lock();
@@ -709,8 +936,77 @@ pub(crate) fn replay_journal(
     }
 }
 
+/// Drops the listing guard (FsCache::uploading) a replayed upload or MOVE leaves behind,
+/// unless another queued upload of the same file still needs it: replay is the only thing
+/// that finishes an upload queued offline, and a stale guard pins the file's listing.
+fn release_upload_guard(j: &MutationJournal, cache: &Arc<Mutex<crate::FsCache>>, op: &MutationOp) {
+    use crate::MutexExt;
+    let path = match op {
+        MutationOp::Put { remote_path, .. } | MutationOp::FinishChunked { remote_path, .. } => remote_path,
+        MutationOp::Rename { to, .. } => to,
+        _ => return,
+    };
+    if j.pending_upload(path).is_none() {
+        cache.safe_lock().uploading.remove(path);
+    }
+}
+
+/// How a queued MOVE ended (see send_move).
+pub(crate) enum MoveOutcome {
+    Moved,
+    /// The destination was newer than the version the rename replaced: the moved file
+    /// went up under this conflicted-copy name, and the destination kept the server's.
+    ConflictCopy(PathBuf),
+    /// Neither the source nor a local copy of it is left.
+    SourceGone,
+    Failed(crate::backend::BackendWriteError),
+}
+
+/// Sends a queued MOVE of `from` onto `to`, overwriting only the version `if_match`
+/// names. When the source's upload landed but the source is gone again, its local copy
+/// (`staging`) goes to the destination instead, under the same condition.
+pub(crate) fn send_move(
+    backend: &dyn crate::backend::CloudBackend,
+    from: &Path,
+    to: &Path,
+    staging: Option<&Path>,
+    if_match: Option<&str>,
+) -> MoveOutcome {
+    use crate::backend::BackendWriteError;
+    let staging = staging.filter(|s| s.exists());
+    let (sent, from_copy) = match (backend.rename(from, to, if_match), staging) {
+        (Err(BackendWriteError::Server(404, _)), Some(s)) => {
+            log::warn!("MOVE {} → {}: source gone on the server — uploading the destination from the local copy", from.display(), to.display());
+            (backend.put_file_from_path(to, s, if_match).map(|_| ()), true)
+        }
+        (r, _) => (r, false),
+    };
+    match sent {
+        Ok(()) => MoveOutcome::Moved,
+        Err(BackendWriteError::Conflict) => {
+            let copy = crate::make_conflict_name(to);
+            let saved = match (from_copy, staging) {
+                (true, Some(s)) => backend.put_file_from_path(&copy, s, None).map(|_| ()),
+                _ => match (backend.rename(from, &copy, None), staging) {
+                    (Err(BackendWriteError::Server(404, _)), Some(s)) => backend.put_file_from_path(&copy, s, None).map(|_| ()),
+                    (r, _) => r,
+                },
+            };
+            match saved {
+                Ok(()) => MoveOutcome::ConflictCopy(copy),
+                Err(BackendWriteError::Server(404, _)) => MoveOutcome::SourceGone,
+                Err(e) => MoveOutcome::Failed(e),
+            }
+        }
+        Err(BackendWriteError::Server(404, _)) => MoveOutcome::SourceGone,
+        Err(e) => MoveOutcome::Failed(e),
+    }
+}
+
 enum ReplayResult {
     Ok,
+    /// An upload landed, making the file this version.
+    Uploaded(Option<String>),
     Conflict(ConflictKind),
     Idempotent,
     /// Transient failure — retry later without counting against the attempt budget.
@@ -744,6 +1040,7 @@ fn execute_op(
             match ctx.backend.put_file_from_path(remote_path, staging_path, etag_ref) {
                 Ok(result) => {
                     log::info!("JOURNAL replay: PUT {} → token {:?}", remote_path.display(), result.new_change_token);
+                    let new_etag = result.new_change_token.clone();
                     let mut c = cache.safe_lock();
                     let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
                     if let Some(dir) = c.dir_cache.get_mut(&parent) {
@@ -763,17 +1060,23 @@ fn execute_op(
                     }
                     dirty.safe_lock().insert(parent);
                     dirty.safe_lock().insert(remote_path.clone());
-                    ReplayResult::Ok
+                    ReplayResult::Uploaded(new_etag)
                 }
                 Err(BackendWriteError::Conflict) => {
                     log::warn!("JOURNAL replay: PUT {} conflict — creating conflicted copy", remote_path.display());
                     let conflict_name = crate::make_conflict_name(remote_path);
-                    let _ = ctx.backend.put_file_from_path(&conflict_name, staging_path, None);
-                    crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
-                    ReplayResult::Conflict(ConflictKind::EditConflict {
-                        local_path: remote_path.clone(),
-                        conflicted_copy_path: conflict_name,
-                    })
+                    // The staging file is deleted only once the copy is on the server.
+                    match ctx.backend.put_file_from_path(&conflict_name, staging_path, None) {
+                        Ok(_) => {
+                            crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
+                            ReplayResult::Conflict(ConflictKind::EditConflict {
+                                local_path: remote_path.clone(),
+                                conflicted_copy_path: conflict_name,
+                            })
+                        }
+                        Err(e) if e.is_transient() => ReplayResult::Retryable(format!("conflicted copy {} not uploaded: {}", conflict_name.display(), e)),
+                        Err(e) => ReplayResult::ServerError(format!("conflicted copy {} not uploaded: {}", conflict_name.display(), e)),
+                    }
                 }
                 Err(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
                 Err(BackendWriteError::Server(404, _)) => {
@@ -822,26 +1125,30 @@ fn execute_op(
                 Err(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
-        MutationOp::Rename { from, to } => {
-            match ctx.backend.rename(from, to) {
-                Ok(()) => {
+        MutationOp::Rename { from, to, staging, if_match } => {
+            match send_move(&*ctx.backend, from, to, staging.as_deref(), if_match.as_deref()) {
+                MoveOutcome::Moved => {
                     log::info!("JOURNAL replay: MOVE {} → {}", from.display(), to.display());
+                    dirty.safe_lock().insert(to.parent().unwrap_or(Path::new("/")).to_path_buf());
                     ReplayResult::Ok
                 }
-                Err(BackendWriteError::Server(404, _)) => {
+                MoveOutcome::ConflictCopy(copy) => {
+                    log::warn!("JOURNAL replay: MOVE {} → {}: {} changed on the server — moved to {}", from.display(), to.display(), to.display(), copy.display());
+                    crate::push_error(error_log, to.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
+                    dirty.safe_lock().insert(to.parent().unwrap_or(Path::new("/")).to_path_buf());
+                    ReplayResult::Conflict(ConflictKind::EditConflict {
+                        local_path: to.clone(),
+                        conflicted_copy_path: copy,
+                    })
+                }
+                MoveOutcome::SourceGone => {
                     ReplayResult::Conflict(ConflictKind::MoveSourceGone {
                         from: from.clone(),
                         to: to.clone(),
                     })
                 }
-                Err(BackendWriteError::Conflict) => {
-                    ReplayResult::Conflict(ConflictKind::MoveDestExists {
-                        from: from.clone(),
-                        to: to.clone(),
-                    })
-                }
-                Err(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
-                Err(e) => ReplayResult::ServerError(e.to_string()),
+                MoveOutcome::Failed(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
+                MoveOutcome::Failed(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
         MutationOp::FinishChunked { remote_path, uploads_base, next_index, bytes_confirmed, total_len, tail_path, if_match_etag, sparse, head } => {
@@ -853,6 +1160,7 @@ fn execute_op(
             match result {
                 Ok(result) => {
                     log::info!("JOURNAL replay: finished streamed upload {} → token {:?}", remote_path.display(), result.new_change_token);
+                    let new_etag = result.new_change_token.clone();
                     let parent = remote_path.parent().unwrap_or(Path::new("/")).to_path_buf();
                     {
                         let mut c = cache.safe_lock();
@@ -872,7 +1180,7 @@ fn execute_op(
                     }
                     dirty.safe_lock().insert(parent);
                     dirty.safe_lock().insert(remote_path.clone());
-                    ReplayResult::Ok
+                    ReplayResult::Uploaded(new_etag)
                 }
                 Err(BackendWriteError::Conflict) => {
                     // Changed on the server meanwhile: every chunk is already there, so
@@ -880,12 +1188,17 @@ fn execute_op(
                     log::warn!("JOURNAL replay: streamed upload {} conflict — assembling a conflicted copy", remote_path.display());
                     let conflict_name = crate::make_conflict_name(remote_path);
                     let session = crate::backend::ChunkedUploadSession { uploads_base: uploads_base.clone() };
-                    let _ = ctx.backend.finish_chunked_upload(&session, &conflict_name, None, None);
-                    crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
-                    ReplayResult::Conflict(ConflictKind::EditConflict {
-                        local_path: remote_path.clone(),
-                        conflicted_copy_path: conflict_name,
-                    })
+                    match ctx.backend.finish_chunked_upload(&session, &conflict_name, None, None) {
+                        Ok(_) => {
+                            crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
+                            ReplayResult::Conflict(ConflictKind::EditConflict {
+                                local_path: remote_path.clone(),
+                                conflicted_copy_path: conflict_name,
+                            })
+                        }
+                        Err(e) if e.is_transient() => ReplayResult::Retryable(format!("conflicted copy {} not assembled: {}", conflict_name.display(), e)),
+                        Err(e) => ReplayResult::ServerError(format!("conflicted copy {} not assembled: {}", conflict_name.display(), e)),
+                    }
                 }
                 Err(e) if e.is_transient() => ReplayResult::Retryable(e.to_string()),
                 Err(BackendWriteError::Server(404, _)) => {
@@ -1146,6 +1459,8 @@ mod tests {
         j.enqueue(MutationOp::Rename {
             from: PathBuf::from("/old_dir"),
             to: PathBuf::from("/new_dir"),
+            staging: None,
+            if_match: None,
         });
 
         let first = &j.entries()[0];
@@ -1180,11 +1495,122 @@ mod tests {
         j.enqueue(MutationOp::Rename {
             from: PathBuf::from("/docs/lu123.tmp"),
             to: PathBuf::from("/docs/report.odt"),
+            staging: None,
+            if_match: None,
         });
         // Old path no longer resolves; destination now serves the staging bytes.
         assert!(j.pending_upload(Path::new("/docs/lu123.tmp")).is_none());
         assert_eq!(j.pending_upload(Path::new("/docs/report.odt")), Some(PendingUpload::Staged(staging)));
         assert!(j.has_pending_put(&PathBuf::from("/docs/report.odt")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retarget_sends_a_new_files_upload_to_its_new_name() {
+        // The LibreOffice save once the temp file is closed: its upload is queued (or its
+        // chunks are going up) when the temp file is renamed over the document.
+        let dir = temp_dir("retarget_new_file");
+        let staging = dir.join("staging_lo");
+        fs::write(&staging, b"odf-bytes").unwrap();
+        let (tmp, doc) = (PathBuf::from("/docs/lu123.tmp"), PathBuf::from("/docs/report.odt"));
+
+        let mut j = MutationJournal::load_or_create(&dir);
+        let seq = j.enqueue(MutationOp::Put { remote_path: tmp.clone(), staging_path: staging.clone(), if_match_etag: None });
+        // Some saves delete the document before renaming the temp file over it.
+        j.enqueue(MutationOp::Unlink { path: doc.clone() });
+        assert!(j.claim(seq), "the live worker has it, but has not named a destination yet");
+        assert!(j.retarget_upload(&tmp, &doc, None));
+
+        assert!(matches!(&j.entries()[0].op, MutationOp::Unlink { .. }), "the upload goes behind the delete");
+        assert!(matches!(&j.entries()[1].op, MutationOp::Put { remote_path, .. } if *remote_path == doc));
+        assert_eq!(j.pending_upload(&doc), Some(PendingUpload::Staged(staging.clone())));
+        assert!(j.pending_upload(&tmp).is_none());
+
+        // The worker waits for the delete, then sends it to the document.
+        assert_eq!(j.settle_upload(seq, &tmp, None), Settled::Wait);
+        let del = j.entries()[0].seq;
+        j.remove(del);
+        assert_eq!(j.settle_upload(seq, &tmp, None), Settled::Go(doc.clone(), None));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retarget_refused_once_the_upload_names_its_source() {
+        let dir = temp_dir("retarget_refused");
+        let staging = dir.join("staging_a");
+        fs::write(&staging, b"a").unwrap();
+        let (tmp, doc) = (PathBuf::from("/a.tmp"), PathBuf::from("/a.odt"));
+
+        let mut j = MutationJournal::load_or_create(&dir);
+        let seq = j.enqueue(MutationOp::Put { remote_path: tmp.clone(), staging_path: staging.clone(), if_match_etag: None });
+        assert!(j.claim(seq));
+        assert_eq!(j.settle_upload(seq, &tmp, None), Settled::Go(tmp.clone(), None));
+        assert!(!j.retarget_upload(&tmp, &doc, None), "the PUT naming the temp file is on the wire: only a MOVE can follow it");
+
+        // An edit of a file the server has is not a new file: its rename stays a MOVE.
+        j.remove(seq);
+        j.enqueue(MutationOp::Put { remote_path: tmp.clone(), staging_path: staging, if_match_etag: Some("e1".into()) });
+        assert!(!j.retarget_upload(&tmp, &doc, None));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retargeted_upload_withdrawn_when_something_later_replaces_it() {
+        let dir = temp_dir("retarget_withdrawn");
+        let staging = dir.join("staging_old");
+        let newer = dir.join("staging_new");
+        fs::write(&staging, b"old").unwrap();
+        fs::write(&newer, b"new").unwrap();
+        let (tmp, doc) = (PathBuf::from("/b.tmp"), PathBuf::from("/b.odt"));
+
+        let mut j = MutationJournal::load_or_create(&dir);
+        let seq = j.enqueue(MutationOp::Put { remote_path: tmp.clone(), staging_path: staging.clone(), if_match_etag: None });
+        assert!(j.claim(seq), "its chunks are going up, so supersede_uploads cannot drop it");
+        assert!(j.retarget_upload(&tmp, &doc, None));
+        // The next save lands before the first one's chunks are all up.
+        let next = j.enqueue(MutationOp::Put { remote_path: doc.clone(), staging_path: newer.clone(), if_match_etag: None });
+        j.supersede_uploads(&doc, next);
+
+        assert_eq!(j.settle_upload(seq, &tmp, None), Settled::Withdrawn);
+        assert!(!j.contains(seq));
+        assert!(!staging.exists(), "the withdrawn upload's bytes go");
+        assert_eq!(j.pending_upload(&doc), Some(PendingUpload::Staged(newer)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_after_an_upload_on_the_wire_keeps_the_source_readable_as_its_destination() {
+        // The temp file's PUT already named it when the rename came: a MOVE follows it,
+        // and until that lands the document is read from the PUT's bytes.
+        let dir = temp_dir("move_follows_upload");
+        let staging = dir.join("staging_c");
+        fs::write(&staging, b"c").unwrap();
+        let (tmp, doc) = (PathBuf::from("/c.tmp"), PathBuf::from("/c.odt"));
+
+        let mut j = MutationJournal::load_or_create(&dir);
+        let put = j.enqueue(MutationOp::Put { remote_path: tmp.clone(), staging_path: staging.clone(), if_match_etag: None });
+        assert!(j.claim(put));
+        assert_eq!(j.settle_upload(put, &tmp, None), Settled::Go(tmp.clone(), None));
+        let mv = j.enqueue(MutationOp::Rename { from: tmp.clone(), to: doc.clone(), staging: None, if_match: None });
+
+        assert!(j.has_pending_put(&tmp), "the upload keeps its name, so the MOVE waits for it");
+        assert_eq!(j.pending_upload(&doc), Some(PendingUpload::Staged(staging.clone())));
+
+        // The PUT lands: its bytes stay the document's until the MOVE does.
+        assert!(j.hand_staging_to_rename(&tmp, &staging));
+        j.remove(put);
+        assert_eq!(j.pending_upload(&doc), Some(PendingUpload::Staged(staging.clone())));
+        assert_eq!(j.rename_staging(mv), Some(staging.clone()));
+
+        // A restart keeps the MOVE, even if its copy is gone by then.
+        fs::remove_file(&staging).unwrap();
+        let j = MutationJournal::load_or_create(&dir);
+        assert!(j.contains(mv), "the MOVE still has to run");
+        assert_eq!(j.rename_staging(mv), None);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1254,6 +1680,8 @@ mod tests {
             attempts: 0,
             last_error: None,
             in_flight: false,
+            retargeted: false,
+            dest_fixed: false,
         }];
         let journal_path = dir.join(JOURNAL_FILE);
         fs::write(&journal_path, serde_json::to_vec(&entries).unwrap()).unwrap();
@@ -1405,8 +1833,69 @@ mod tests {
             sparse: false,
             head: 0,
         });
-        j.enqueue(MutationOp::Rename { from: PathBuf::from("/d"), to: PathBuf::from("/e") });
+        j.enqueue(MutationOp::Rename { from: PathBuf::from("/d"), to: PathBuf::from("/e"), staging: None, if_match: None });
         assert_eq!(j.entries()[0].op.path(), Path::new("/e/tmp.bin"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_over_a_document_is_conditional_on_the_version_it_replaces() {
+        // LibreOffice's save: the temp file is renamed over the document it opened at e1.
+        let dir = temp_dir("retarget_base");
+        let staging = dir.join("staging_lo");
+        fs::write(&staging, b"odf").unwrap();
+        let (tmp, doc) = (PathBuf::from("/docs/lu1.tmp"), PathBuf::from("/docs/report.odt"));
+        let mut j = MutationJournal::load_or_create(&dir);
+        let seq = j.enqueue(MutationOp::Put { remote_path: tmp.clone(), staging_path: staging, if_match_etag: None });
+        assert!(j.retarget_upload(&tmp, &doc, Some("e1".into())));
+        assert!(j.claim(seq));
+        assert_eq!(j.settle_upload(seq, &tmp, None), Settled::Go(doc.clone(), Some("e1".into())),
+            "it overwrites the document only while the server still has the version it was based on");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_to_back_saves_chain_onto_the_version_the_first_one_made() {
+        let dir = temp_dir("rebase_chain");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        fs::write(&a, b"1").unwrap();
+        fs::write(&b, b"2").unwrap();
+        let doc = PathBuf::from("/report.odt");
+        let mut j = MutationJournal::load_or_create(&dir);
+        assert_eq!(j.pending_base(&doc), None, "nothing queued");
+        let first = j.enqueue(MutationOp::Put { remote_path: doc.clone(), staging_path: a, if_match_etag: Some("e1".into()) });
+        assert!(j.claim(first));
+        // A second save while the first is on the wire is based on the same version...
+        assert_eq!(j.pending_base(&doc), Some(Some("e1".into())));
+        let second = j.enqueue(MutationOp::Put { remote_path: doc.clone(), staging_path: b, if_match_etag: Some("e1".into()) });
+        // ...until the first lands and makes the document e2.
+        j.remove(first);
+        j.rebase(&doc, Some("e1"), Some("e2"));
+        let cond = j.entries().iter().find(|e| e.seq == second).map(|e| match &e.op {
+            MutationOp::Put { if_match_etag, .. } => if_match_etag.clone(),
+            _ => None,
+        });
+        assert_eq!(cond, Some(Some("e2".into())), "a 412 here would turn our own second save into a conflicted copy");
+        // A save based on another version is left alone.
+        j.rebase(&doc, Some("e9"), Some("e10"));
+        assert_eq!(j.pending_base(&doc), Some(Some("e2".into())));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_upload_moved_onto_the_destination_carries_the_renames_condition() {
+        // Offline: the temp file's upload is queued and an older version of it blocks
+        // the retarget, so enqueue() re-points the queued upload in place.
+        let dir = temp_dir("rename_cond");
+        let staging = dir.join("s");
+        fs::write(&staging, b"x").unwrap();
+        let mut j = MutationJournal::load_or_create(&dir);
+        j.enqueue(MutationOp::Put { remote_path: PathBuf::from("/t.tmp"), staging_path: staging, if_match_etag: None });
+        j.enqueue(MutationOp::Rename { from: PathBuf::from("/t.tmp"), to: PathBuf::from("/doc"), staging: None, if_match: Some("e1".into()) });
+        assert!(matches!(&j.entries()[0].op, MutationOp::Put { remote_path, if_match_etag: Some(e), .. }
+            if remote_path == Path::new("/doc") && e == "e1"));
+        assert_eq!(j.pending_base(Path::new("/doc")), Some(None),
+            "after the MOVE the document is the moved file, whose version is not known yet");
         let _ = fs::remove_dir_all(&dir);
     }
 }

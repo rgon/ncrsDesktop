@@ -1059,6 +1059,15 @@ fn rebuild(h: &RestoredHandle, stream: Option<&str>, gen: u64) -> Result<(OpenFi
         staged_whole: rec.staged_whole,
         unlinked: rec.unlinked,
         opened_gen: gen,
+        // Not persisted: a restored reader pins whatever it reads first, unless its file
+        // was replaced, which nothing it reads can be any more.
+        pin: {
+            let pin = crate::VersionPin::default();
+            if rec.unlinked {
+                pin.freeze();
+            }
+            pin
+        },
     };
     let Some(wp) = rec.write_path.as_deref() else {
         return Ok((of, Rebuilt::Ok { exact: false }));

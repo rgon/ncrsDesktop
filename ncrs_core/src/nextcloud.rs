@@ -212,6 +212,16 @@ impl CloudBackend for NextcloudBackend {
         timeout: Duration,
         slot: usize,
     ) -> Result<u64, BackendReadError> {
+        self.download_file_tagged(path, dest, timeout, slot).map(|(n, _)| n)
+    }
+
+    fn download_file_tagged(
+        &self,
+        path: &Path,
+        dest: &mut dyn std::io::Write,
+        timeout: Duration,
+        slot: usize,
+    ) -> Result<(u64, Option<String>), BackendReadError> {
         // One path for both auth types. The basic-auth branch used to go through
         // remotefs-webdav, which buffered the entire file in memory before
         // writing it out; this streams straight into `dest`.
@@ -227,7 +237,9 @@ impl CloudBackend for NextcloudBackend {
             let body = resp.text().unwrap_or_default();
             return Err(BackendReadError::Server(status.as_u16(), body));
         }
+        let etag = crate::webdav_ops::response_etag(resp.headers());
         resp.copy_to(dest)
+            .map(|n| (n, etag))
             .map_err(|e| BackendReadError::Network(e.to_string()))
     }
 
@@ -304,6 +316,16 @@ impl CloudBackend for NextcloudBackend {
         .map_err(BackendWriteError::from)
     }
 
+    fn put_file_settled(
+        &self,
+        staging_path: &Path,
+        settle: &mut dyn FnMut() -> Option<(std::path::PathBuf, Option<String>)>,
+    ) -> Result<PutResult, BackendWriteError> {
+        webdav_ops::put_file_from_path_settled(&self.clients.get(), &self.base_url, &self.creds, staging_path, settle)
+            .map(PutResult::from)
+            .map_err(BackendWriteError::from)
+    }
+
     fn open_chunked_upload(&self, _path: &Path) -> Result<crate::backend::ChunkedUploadSession, BackendWriteError> {
         webdav_ops::open_chunked_session(&self.clients.get(), &self.base_url, &self.creds)
             .map(|uploads_base| crate::backend::ChunkedUploadSession { uploads_base })
@@ -364,13 +386,14 @@ impl CloudBackend for NextcloudBackend {
         .map_err(BackendWriteError::from)
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<(), BackendWriteError> {
+    fn rename(&self, from: &Path, to: &Path, dest_etag: Option<&str>) -> Result<(), BackendWriteError> {
         webdav_ops::move_resource(
             &self.clients.get(),
             &self.base_url,
             &self.creds,
             from,
             to,
+            dest_etag,
         )
         .map_err(BackendWriteError::from)
     }

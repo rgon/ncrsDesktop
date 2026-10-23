@@ -88,6 +88,8 @@ pub struct EntryExtensions {
     pub fileid: Option<u64>,
     pub has_preview: bool,
     pub is_shared: bool,
+    /// Who holds a server lock that keeps this user from writing the file.
+    pub locked_by: Option<Arc<str>>,
 }
 
 impl EntryExtensions {
@@ -96,6 +98,7 @@ impl EntryExtensions {
             "permissions" => self.permissions.as_deref(),
             "owner_id" => self.owner_id.as_deref(),
             "owner_display_name" => self.owner_display_name.as_deref(),
+            "locked_by" => self.locked_by.as_deref(),
             _ => None,
         }
     }
@@ -122,6 +125,7 @@ impl EntryExtensions {
             "permissions" => &mut self.permissions,
             "owner_id" => &mut self.owner_id,
             "owner_display_name" => &mut self.owner_display_name,
+            "locked_by" => &mut self.locked_by,
             _ => return,
         };
         *slot = Some(intern(value));
@@ -160,6 +164,8 @@ struct ExtWire {
     has_preview: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     is_shared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locked_by: Option<String>,
 
     // Legacy shape, read-only. Never written (hence always empty on the way
     // out), and only ever populated one entry at a time while loading an old
@@ -185,6 +191,7 @@ impl serde::Serialize for EntryExtensions {
             fileid: self.fileid,
             has_preview: self.has_preview,
             is_shared: self.is_shared,
+            locked_by: self.locked_by.as_deref().map(str::to_owned),
             ..Default::default()
         }
         .serialize(s)
@@ -204,6 +211,7 @@ impl<'de> serde::Deserialize<'de> for EntryExtensions {
             fileid: w.fileid.or_else(|| w.integers.remove("fileid")),
             has_preview: w.has_preview || w.booleans.remove("has_preview").unwrap_or(false),
             is_shared: w.is_shared || w.booleans.remove("is_shared").unwrap_or(false),
+            locked_by: intern_opt(w.locked_by),
         })
     }
 }
@@ -221,6 +229,9 @@ pub enum BackendWriteError {
     /// The backend does not implement this operation (e.g. chunked-upload
     /// streaming on a non-Nextcloud backend). Never queued for retry.
     Unsupported,
+    /// put_file_settled's `settle` called the upload off before anything named its
+    /// destination; the journal already says what becomes of it.
+    Withdrawn,
 }
 
 impl BackendWriteError {
@@ -239,7 +250,7 @@ impl BackendWriteError {
             // 5xx = server-side outage/error; 408 request timeout; 429 too many
             // requests. All resolve on their own once the server recovers.
             Self::Server(code, _) => *code >= 500 || *code == 408 || *code == 429,
-            Self::Conflict | Self::Forbidden | Self::QuotaExceeded | Self::Unsupported => false,
+            Self::Conflict | Self::Forbidden | Self::QuotaExceeded | Self::Unsupported | Self::Withdrawn => false,
         }
     }
 
@@ -266,6 +277,7 @@ impl std::fmt::Display for BackendWriteError {
             Self::QuotaExceeded => write!(f, "quota exceeded"),
             Self::Server(code, msg) => write!(f, "server error {}: {}", code, msg),
             Self::Unsupported => write!(f, "operation not supported by this backend"),
+            Self::Withdrawn => write!(f, "upload withdrawn before it was sent"),
         }
     }
 }
@@ -392,6 +404,18 @@ pub trait CloudBackend: Send + Sync + 'static {
         slot: usize,
     ) -> Result<u64, BackendReadError>;
 
+    /// [`download_file`](Self::download_file), also returning the ETag of the version
+    /// the bytes are (None when the server sent none).
+    fn download_file_tagged(
+        &self,
+        path: &Path,
+        dest: &mut dyn std::io::Write,
+        timeout: Duration,
+        slot: usize,
+    ) -> Result<(u64, Option<String>), BackendReadError> {
+        self.download_file(path, dest, timeout, slot).map(|n| (n, None))
+    }
+
     /// `slot` as for [`download_file`](Self::download_file).
     fn read_file_range(
         &self,
@@ -422,11 +446,26 @@ pub trait CloudBackend: Send + Sync + 'static {
         self.put_file(path, body, if_match)
     }
 
+    /// put_file_from_path, with the destination and If-Match asked of `settle` only right
+    /// before the request that names them: for a chunked upload that is the final assembly,
+    /// so a rename while the chunks go up still decides where the file lands. `settle`
+    /// returning None withdraws the upload (BackendWriteError::Withdrawn).
+    fn put_file_settled(
+        &self,
+        staging_path: &Path,
+        settle: &mut dyn FnMut() -> Option<(PathBuf, Option<String>)>,
+    ) -> Result<PutResult, BackendWriteError> {
+        let (path, if_match) = settle().ok_or(BackendWriteError::Withdrawn)?;
+        self.put_file_from_path(&path, staging_path, if_match.as_deref())
+    }
+
     fn mkdir(&self, path: &Path) -> Result<(), BackendWriteError>;
 
     fn delete(&self, path: &Path) -> Result<(), BackendWriteError>;
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<(), BackendWriteError>;
+    /// With `dest_etag`, overwrites `to` only while it is that version
+    /// (BackendWriteError::Conflict otherwise).
+    fn rename(&self, from: &Path, to: &Path, dest_etag: Option<&str>) -> Result<(), BackendWriteError>;
 
     // -- Bounded chunked-upload streaming --------------------------------------
     //
@@ -562,6 +601,7 @@ impl From<crate::propfind::DavEntry> for RemoteEntry {
             fileid: dav.fileid,
             has_preview: dav.has_preview,
             is_shared: dav.is_shared,
+            locked_by: dav.locked_by.as_deref().map(intern),
         };
 
         RemoteEntry {
@@ -591,6 +631,7 @@ impl From<crate::webdav_ops::WriteError> for BackendWriteError {
                 BackendWriteError::QuotaExceeded
             }
             crate::webdav_ops::WriteError::Server(code, s) => BackendWriteError::Server(code, s),
+            crate::webdav_ops::WriteError::Withdrawn => BackendWriteError::Withdrawn,
         }
     }
 }

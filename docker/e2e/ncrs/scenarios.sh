@@ -1507,6 +1507,11 @@ PY
     mstray="$(ls "$SC_MOUNT/sched/lo" 2>/dev/null | grep '\.tmp$' | tr '\n' ' ')"
     [ -z "$stray" ] && [ -z "$mstray" ] && ok "no temp file was left behind on the backend or the mount" \
         || no "temp files left behind (backend: ${stray:-none}; mount: ${mstray:-none})"
+    # Every save was based on the one before it: none may 412 against our own last
+    # upload (the proxy checks preconditions as Nextcloud does) and become a copy.
+    clash="$(curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 1' "${URL}sched/lo/" | grep -o 'conflicted' | wc -l)"
+    [ "$clash" = 0 ] && ok "no conflicted copies from 25 back-to-back saves of one document" \
+        || no "$clash conflicted cop(ies) from our own back-to-back saves — a save was conditional on a version we had already replaced"
 fi
 fusermount3 -u "$SC_MOUNT" 2>/dev/null || umount "$SC_MOUNT" 2>/dev/null
 kill "$SC_DAEMON" "$SC_PID" 2>/dev/null
@@ -1955,6 +1960,580 @@ else
     kill "$PT_DENY" 2>/dev/null; wait "$PT_DENY" 2>/dev/null
     rm -rf "$PT_ROOT_MP" "$PT_DENY_HOME" /tmp/pt.bin
 fi
+
+echo "→ 34. LIBREOFFICE SAVE of a large document — the target must serve the NEW save while its upload and MOVE are pending"
+# LibreOffice keeps the document open O_RDWR, writes the whole new file to lu<random>.tmp in
+# the same folder, closes it and renames it over the document, then within a second or so
+# reopens, stats and reads the document back. ncrs queues the tmp's PUT on release and the
+# rename's MOVE behind it, and until that MOVE lands (seconds, for 33 MB) the target path
+# was served from the server's OLD version: opens and reads returned the pre-save bytes and
+# size, a folder refresh (PROPFIND, or the .~lock.<name># LibreOffice rewrites) put the
+# server's old etag/size/mtime back in the listing, and when the MOVE finally landed all of
+# them flipped to the new version under the editor ("the file has been changed since it was
+# opened", then "Write error" on the next save). Besides, the target's IPC status stayed
+# `uploading` for good: it moved from the tmp to the target on rename, but the PUT's
+# completion only marked the tmp path synced. A fourth daemon is pointed at chunkdav.py,
+# which holds every PUT/MOVE in the folder "slowsave" for SW_SLOW seconds so the checks below run
+# while the upload and the MOVE are still pending.
+SW_PORT=8094
+SW_LOG=/tmp/chunkdav-save.log
+SW_HOME=/tmp/ncrs-save
+SW_MOUNT=/mnt/ncrs-save
+SW_NLOG=/tmp/ncrs-save.log
+SW_SOCK="$SW_HOME/run/ncrs.sock"
+SW_SLOW=12   # each held PUT/MOVE; the checks below take ~7 s
+SW_NAME="slowsave/report.odt"
+: > "$SW_LOG"
+python3 /e2e/chunkdav.py "$SW_PORT" "$CD_HOST" "$SW_LOG" --slow-write "slowsave:$SW_SLOW" 2>/tmp/chunkdav-save.err &
+SW_PID=$!
+mkdir -p "$SW_MOUNT" "$SW_HOME/.config/ncrs" "$SW_HOME/run" "$SW_HOME/cache"
+chmod 700 "$SW_HOME/run"
+cat > "$SW_HOME/.config/ncrs/config.yaml" <<CFG
+url: "http://127.0.0.1:${SW_PORT}/remote.php/dav/files/${U}/"
+username: "${U}"
+password: "${P}"
+user: "${U}"
+mount_point: "${SW_MOUNT}"
+allow_insecure_http: true
+http3: false
+optimistic_listing: false
+auto_keep_cached_files: false
+CFG
+for _ in $(seq 1 20); do
+    curl -s -o /dev/null -u "$U:$P" -X PROPFIND -H 'Depth: 0' \
+        "http://127.0.0.1:${SW_PORT}/remote.php/dav/files/${U}/" && break
+    sleep 0.5
+done
+: > "$SW_NLOG"
+HOME="$SW_HOME" XDG_RUNTIME_DIR="$SW_HOME/run" XDG_CACHE_HOME="$SW_HOME/cache" XDG_CONFIG_HOME="$SW_HOME/.config" \
+    RUST_LOG="${RUST_LOG:-info}" ncrs --config "$SW_HOME/.config/ncrs/config.yaml" >>"$SW_NLOG" 2>&1 &
+SW_DAEMON=$!
+for _ in $(seq 1 60); do
+    mountpoint -q "$SW_MOUNT" && break
+    kill -0 "$SW_DAEMON" 2>/dev/null || break
+    sleep 1
+done
+sw_ipc() { printf '%s\n' "$1" | timeout 10 nc -U -N "$SW_SOCK" 2>/dev/null; }
+if ! mountpoint -q "$SW_MOUNT"; then
+    no "setup: the save-test mount never appeared"
+    tail -20 "$SW_NLOG" | sed 's/^/    /'
+else
+    # The folder is made through the mount (a server-made one lists no permissions and the
+    # rename guard refuses), the 33 MB document is seeded on the backend and read once so
+    # it is cached, which is the state LibreOffice finds it in.
+    mkdir -p "$SW_MOUNT/slowsave"
+    head -c 33528617 /dev/urandom > /tmp/save.v1
+    head -c 33529537 /dev/urandom > /tmp/save.v2
+    SW_V1="$(sha < /tmp/save.v1)"; SW_V2="$(sha < /tmp/save.v2)"
+    curl -s -u "$U:$P" -T /tmp/save.v1 "${URL}${SW_NAME}" -o /dev/null
+    got=""
+    for _ in $(seq 1 40); do
+        ls "$SW_MOUNT/slowsave" >/dev/null 2>&1
+        got="$(timeout -s KILL 60 sha256sum "$SW_MOUNT/$SW_NAME" 2>/dev/null | awk '{print $1}')"
+        [ "$got" = "$SW_V1" ] && break
+        sleep 1
+    done
+    [ "$got" = "$SW_V1" ] || no "setup: the seeded 33 MB document is not readable on the save-test mount"
+    sw_mtime() { stat -c %Y "$SW_MOUNT/$SW_NAME" 2>/dev/null || echo MISSING; }
+
+    # The save, as LibreOffice does it. The python helper keeps the target open O_RDWR,
+    # writes lu<random>.tmp, closes it, renames it over the target, then reads, stats
+    # and refreshes the folder (readdir + the .~lock.<name># file) while the MOVE waits.
+    # It prints "<tag> <sha> <size> <mtime>" lines.
+    python3 - "$SW_MOUNT/slowsave" report.odt /tmp/save.v2 > /tmp/save.out 2>&1 <<'PY'
+import hashlib, os, sys, time
+d, name, newfile = sys.argv[1:4]
+target = os.path.join(d, name)
+data = open(newfile, "rb").read()
+
+def seen(tag):
+    with open(target, "rb") as f:
+        got = f.read()
+    st = os.stat(target)
+    print(tag, hashlib.sha256(got).hexdigest(), st.st_size, int(st.st_mtime), flush=True)
+    # LibreOffice reopens the saved document O_RDWR and reads it back through that fd:
+    # a writable open stages its own copy, so it can differ from a read-only open.
+    fd = os.open(target, os.O_RDWR)
+    try:
+        got = b""
+        while chunk := os.pread(fd, 1 << 20, len(got)):
+            got += chunk
+    finally:
+        os.close(fd)
+    print(tag + "_RW", hashlib.sha256(got).hexdigest(), len(got), flush=True)
+
+held = os.open(target, os.O_RDWR)          # kept open for the whole save
+tmp = os.path.join(d, "lu12345abcde.tmp")
+with open(tmp, "wb") as f:
+    f.write(data)
+os.rename(tmp, target)
+st = os.stat(target)
+print("SAVED", "-", st.st_size, int(st.st_mtime), flush=True)
+# The fd held over the save is on the file the rename replaced: on a local disk fstat
+# still answers (nlink 0) and what is written through it goes nowhere.
+try:
+    hs = os.fstat(held)
+    print("HELD_FSTAT", "ok", hs.st_size, hs.st_nlink, flush=True)
+except OSError as e:
+    print("HELD_FSTAT", "errno", e.errno, flush=True)
+time.sleep(0.5)
+seen("AFTER_RENAME")
+lock = os.path.join(d, ".~lock.%s#" % name)
+for i in range(4):                         # folder refreshes while the upload is pending
+    with open(lock, "w") as f:
+        f.write(",user,host,%d;" % i)
+    os.listdir(d)
+    time.sleep(1.2)
+seen("AFTER_REFRESH")
+try:
+    os.pwrite(held, b"STALE WRITE THROUGH THE REPLACED FILE", 0)
+    print("HELD_WRITE ok", flush=True)
+except OSError as e:
+    print("HELD_WRITE errno", e.errno, flush=True)
+os.close(held)
+os.unlink(lock)
+PY
+    cat /tmp/save.out | sed 's/^/    /'
+    sw_old_now="$(dav_sha "$SW_NAME")"
+    if [ "$sw_old_now" = "$SW_V1" ]; then
+        echo "    (setup holds: the backend still has the old version while the checks ran)"
+    else
+        no "setup: the backend already had the new version, the checks ran after the MOVE landed"
+    fi
+    read -r _ _ _ sw_t_saved < <(grep '^SAVED' /tmp/save.out)
+    read -r _ sw_s1 sw_z1 _ < <(grep '^AFTER_RENAME ' /tmp/save.out)
+    read -r _ sw_s2 sw_z2 sw_m2 < <(grep '^AFTER_REFRESH ' /tmp/save.out)
+    read -r _ sw_rw1 _ < <(grep '^AFTER_RENAME_RW' /tmp/save.out)
+    read -r _ sw_rw2 _ < <(grep '^AFTER_REFRESH_RW' /tmp/save.out)
+    for sw_rw in "$sw_rw1" "$sw_rw2"; do
+        if [ "$sw_rw" = "$SW_V2" ]; then
+            ok "(a') reading the document back through a new O_RDWR fd returns the NEW content"
+        else
+            no "(a') a new O_RDWR fd reads $( [ "$sw_rw" = "$SW_V1" ] && echo 'the PRE-SAVE content' || echo "${sw_rw:-nothing}") — its staged copy came from the server's old version"
+        fi
+    done
+
+    if [ "$sw_s1" = "$SW_V2" ]; then
+        ok "(a) reading the document right after the save returns the NEW content"
+    else
+        no "(a) reading the document right after the save returned $( [ "$sw_s1" = "$SW_V1" ] && echo 'the PRE-SAVE content' || echo "${sw_s1:-nothing}") — LibreOffice reads back the old document"
+    fi
+    if [ "$sw_z1" = 33529537 ]; then
+        ok "(b) stat size right after the save is the new 33529537 bytes"
+    else
+        no "(b) stat size right after the save is ${sw_z1:-none}, not the new 33529537 (the old version is 33528617)"
+    fi
+    echo "    (c) mtime recorded right after the rename: $sw_t_saved ($(date -u -d "@$sw_t_saved" +%T 2>/dev/null))"
+    if [ "$sw_s2" = "$SW_V2" ] && [ "$sw_z2" = 33529537 ] && [ "$sw_m2" = "$sw_t_saved" ]; then
+        ok "(d) after folder refreshes (readdir + .~lock file) the document is still the new content, size and mtime"
+    else
+        no "(d) after folder refreshes the document reads as $( [ "$sw_s2" = "$SW_V1" ] && echo 'the PRE-SAVE content' || echo "${sw_s2:-nothing}"), size ${sw_z2:-none}, mtime ${sw_m2:-none} (saved: $sw_t_saved) — the refresh put the server's old entry back"
+    fi
+
+    # The upload and the MOVE finish; then the editor's earlier readings must still hold.
+    if wait_dav_sha "$SW_NAME" "$SW_V2" 120; then
+        grep -q "SLOWW MOVE .*slowsave/report.odt" "$SW_LOG" \
+            || no "setup: the proxy never held the rename's MOVE (did it go through the proxy?)"
+        sw_t_later=""
+        for _ in $(seq 1 15); do
+            ls "$SW_MOUNT/slowsave" >/dev/null 2>&1; sleep 1
+            sw_t_later="$(sw_mtime)"
+        done
+        if [ "$sw_t_later" = "$sw_t_saved" ]; then
+            ok "(e) the document's mtime did not move once the upload landed"
+        else
+            no "(e) the document's mtime moved from $(date -u -d "@$sw_t_saved" +%T) to $(date -u -d "@$sw_t_later" +%T 2>/dev/null || echo "$sw_t_later") after the upload landed — 'the file has been changed since it was opened'"
+        fi
+        read -r _ sw_hk sw_hz sw_hn < <(grep '^HELD_FSTAT' /tmp/save.out)
+        if [ "$sw_hk" = ok ] && [ "$sw_hn" = 0 ]; then
+            ok "(h) fstat on the fd held over the save answers with the replaced file (size $sw_hz, nlink 0)"
+        else
+            no "(h) fstat on the fd held over the save: $sw_hk $sw_hz $sw_hn (a local disk answers with nlink 0, not ENOENT)"
+        fi
+        read -r _ sw_hw _ < <(grep '^HELD_WRITE' /tmp/save.out)
+        [ "$sw_hw" = ok ] && ok "(h) a write through that fd is accepted, as on a local disk" \
+            || no "(h) a write through the fd held over the save failed: $(grep '^HELD_WRITE' /tmp/save.out)"
+        sleep 8
+        if [ "$(dav_sha "$SW_NAME")" = "$SW_V2" ]; then
+            ok "(i) a write through the replaced file's fd, closed after the save, never reached the document"
+        else
+            no "(i) the document on the backend changed after the save — the replaced file's fd committed over it"
+        fi
+        sw_st=""
+        for _ in $(seq 1 20); do
+            sw_st="$(sw_ipc "STATUS $SW_MOUNT/$SW_NAME")"
+            [ "$sw_st" != "uploading" ] && break
+            sleep 1
+        done
+        if [ -z "$sw_st" ]; then
+            echo "    (f) skipped: no answer from the IPC socket $SW_SOCK"
+        elif [ "$sw_st" != "uploading" ]; then
+            ok "(f) the document's IPC status is '$sw_st' once the backend has the save"
+        else
+            no "(f) the document's IPC status is still 'uploading' 20 s after the backend has the save"
+        fi
+    else
+        no "setup: the save never reached the backend (backend has $(curl -s -u "$U:$P" "${URL}${SW_NAME}" | wc -c) bytes)"
+    fi
+    sw_stray=""
+    for _ in $(seq 1 20); do
+        sw_stray="$(curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 1' "${URL}slowsave/" | grep -o 'lu[0-9a-z]*\.tmp' | sort -u | tr '\n' ' ')"
+        [ -z "$sw_stray" ] && break
+        sleep 1
+    done
+    [ -z "$sw_stray" ] && ok "(g) no lu*.tmp is left on the backend" \
+        || no "(g) temp file(s) left on the backend: $sw_stray"
+fi
+# Which way the daemon took the rename: re-pointing the upload, or a MOVE after it.
+grep -hE 'no MOVE needed|sending WebDAV MOVE|withdrawn before' "$SW_NLOG" 2>/dev/null | sed 's/^/    (daemon) /'
+fusermount3 -u "$SW_MOUNT" 2>/dev/null || umount "$SW_MOUNT" 2>/dev/null
+kill "$SW_DAEMON" "$SW_PID" 2>/dev/null
+wait "$SW_DAEMON" "$SW_PID" 2>/dev/null
+rm -f /tmp/save.v1 /tmp/save.v2 /tmp/save.out
+
+echo "→ 35. CONFLICTS — a save over a file someone changed on the server keeps both versions"
+# Someone else saves the document on the server after this mount served it; then the
+# user saves it here the LibreOffice way (temp file renamed over it). Before, that save
+# overwrote the other person's version unconditionally. Now it is conditional on the
+# version the mount served, and becomes a conflicted copy instead; the first attempt to
+# upload that copy fails (the proxy answers 503 once) and the save must stay queued, not
+# be deleted. Also: a handle reading a file the server replaces stops (ESTALE) instead of
+# splicing two versions, and a file locked on the server opens read-only. The proxy
+# checks If-Match / tagged If headers the way Nextcloud does.
+CF_PORT=8095
+CF_LOG=/tmp/chunkdav-clash.log
+CF_HOME=/tmp/ncrs-clash
+CF_MOUNT=/mnt/ncrs-clash
+CF_NLOG=/tmp/ncrs-clash.log
+: > "$CF_LOG"
+python3 /e2e/chunkdav.py "$CF_PORT" "$CD_HOST" "$CF_LOG" \
+    --fail-write "conflicted copy:503:1" --locked "clash/held-by-ana:ana:1" 2>/tmp/chunkdav-clash.err &
+CF_PID=$!
+mkdir -p "$CF_MOUNT" "$CF_HOME/.config/ncrs" "$CF_HOME/run" "$CF_HOME/cache"
+chmod 700 "$CF_HOME/run"
+cat > "$CF_HOME/.config/ncrs/config.yaml" <<CFG
+url: "http://127.0.0.1:${CF_PORT}/remote.php/dav/files/${U}/"
+username: "${U}"
+password: "${P}"
+user: "${U}"
+mount_point: "${CF_MOUNT}"
+allow_insecure_http: true
+http3: false
+optimistic_listing: false
+auto_keep_cached_files: false
+CFG
+for _ in $(seq 1 20); do
+    curl -s -o /dev/null -u "$U:$P" -X PROPFIND -H 'Depth: 0' \
+        "http://127.0.0.1:${CF_PORT}/remote.php/dav/files/${U}/" && break
+    sleep 0.5
+done
+: > "$CF_NLOG"
+HOME="$CF_HOME" XDG_RUNTIME_DIR="$CF_HOME/run" XDG_CACHE_HOME="$CF_HOME/cache" XDG_CONFIG_HOME="$CF_HOME/.config" \
+    RUST_LOG="${RUST_LOG:-info}" ncrs --config "$CF_HOME/.config/ncrs/config.yaml" >>"$CF_NLOG" 2>&1 &
+CF_DAEMON=$!
+for _ in $(seq 1 60); do
+    mountpoint -q "$CF_MOUNT" && break
+    kill -0 "$CF_DAEMON" 2>/dev/null || break
+    sleep 1
+done
+# The conflicted copies the backend has of clash/<stem>: "<name> <sha>" per line.
+cf_copies() {
+    python3 - "${URL}clash/" "$U:$P" "$1" <<'PY'
+import base64, hashlib, re, sys, urllib.parse, urllib.request
+base, auth, stem = sys.argv[1:4]
+hdr = {"Authorization": "Basic " + base64.b64encode(auth.encode()).decode()}
+req = urllib.request.Request(base, method="PROPFIND", headers=dict(hdr, Depth="1"))
+body = urllib.request.urlopen(req).read().decode()
+root = urllib.parse.urlsplit(base)
+for href in re.findall(r"<(?:\w+:)?href>([^<]*)</", body):
+    name = urllib.parse.unquote(href).rstrip("/").rsplit("/", 1)[-1]
+    if name.startswith(stem + " (conflicted copy"):
+        url = "%s://%s%s" % (root.scheme, root.netloc, urllib.parse.quote(urllib.parse.unquote(href)))
+        data = urllib.request.urlopen(urllib.request.Request(url, headers=hdr)).read()
+        print(name.replace(" ", "_"), hashlib.sha256(data).hexdigest())
+PY
+}
+# Reads <file> through the mount until it is <sha> (the mount has served that version).
+cf_read_until() {
+    for _ in $(seq 1 40); do
+        ls "$CF_MOUNT/clash" >/dev/null 2>&1
+        [ "$(timeout -s KILL 60 sha256sum "$CF_MOUNT/clash/$1" 2>/dev/null | awk '{print $1}')" = "$2" ] && return 0
+        sleep 1
+    done
+    return 1
+}
+# The LibreOffice save: write a temp file, close it, rename it over the document.
+cf_save() {
+    python3 - "$CF_MOUNT/clash" "$1" "$2" <<'PY'
+import os, sys
+d, name, src = sys.argv[1:4]
+tmp = os.path.join(d, "lu%d.tmp" % os.getpid())
+with open(tmp, "wb") as f:
+    f.write(open(src, "rb").read())
+os.rename(tmp, os.path.join(d, name))
+PY
+}
+if ! mountpoint -q "$CF_MOUNT"; then
+    no "setup: the conflict-test mount never appeared"
+    tail -20 "$CF_NLOG" | sed 's/^/    /'
+else
+    mkdir -p "$CF_MOUNT/clash"
+    # A 12 MB document goes up chunked: the rename re-points its unsent upload, whose
+    # assembly is then made conditional on the version the mount served.
+    for v in 1 2 3; do head -c 12582912 /dev/urandom > /tmp/clash.v$v; done
+    CF_V1="$(sha < /tmp/clash.v1)"; CF_V2="$(sha < /tmp/clash.v2)"; CF_V3="$(sha < /tmp/clash.v3)"
+    curl -s -u "$U:$P" -T /tmp/clash.v1 "${URL}clash/doc.odt" -o /dev/null
+    if ! cf_read_until doc.odt "$CF_V1"; then
+        no "setup: the seeded document is not readable on the conflict-test mount"
+    else
+        curl -s -u "$U:$P" -T /tmp/clash.v2 "${URL}clash/doc.odt" -o /dev/null   # someone else saves
+        cf_save doc.odt /tmp/clash.v3
+        cf_failed=""
+        for _ in $(seq 1 60); do
+            grep -q "FAILW .*doc (conflicted copy" "$CF_LOG" && { cf_failed=1; break; }
+            sleep 1
+        done
+        if [ -z "$cf_failed" ]; then
+            no "setup: the conflicted copy's upload was never attempted (proxy log: $(grep -c PRECOND "$CF_LOG") precondition failures)"
+        else
+            sleep 2
+            cf_journal="$(find "$CF_HOME/cache" -name mutation_journal.json 2>/dev/null | head -1)"
+            if [ -n "$cf_journal" ] && grep -q 'clash/doc.odt' "$cf_journal"; then
+                ok "(c) while its conflicted copy could not be uploaded, the save stayed queued"
+            else
+                no "(c) the save was dropped when its conflicted copy failed to upload — the only copy of the edit is gone"
+            fi
+        fi
+        cf_copy=""
+        for _ in $(seq 1 150); do
+            cf_copy="$(cf_copies doc | awk -v want="$CF_V3" '$2 == want {print $1}' | head -1)"
+            [ -n "$cf_copy" ] && break
+            sleep 1
+        done
+        [ -n "$cf_copy" ] && ok "(b) the save is on the server as a conflicted copy ($(printf '%s' "$cf_copy" | sed 's#.*/##'))" \
+            || no "(b) no conflicted copy holding the save (copies: $(cf_copies doc | wc -l))"
+        [ "$(dav_sha clash/doc.odt)" = "$CF_V2" ] && ok "(a) the other person's version of the document was not overwritten" \
+            || no "(a) the document on the server is $( [ "$(dav_sha clash/doc.odt)" = "$CF_V3" ] && echo 'our save' || echo 'neither version') — the other person's save was overwritten"
+    fi
+
+    # A small file: its upload may already be on the wire when the rename comes, so the
+    # rename may be a MOVE; either way the result must be the same.
+    printf 'notes v1\n' > /tmp/clash.n1; printf 'notes v2 (theirs)\n' > /tmp/clash.n2; printf 'notes v3 (ours)\n' > /tmp/clash.n3
+    curl -s -u "$U:$P" -T /tmp/clash.n1 "${URL}clash/notes.txt" -o /dev/null
+    if cf_read_until notes.txt "$(sha < /tmp/clash.n1)"; then
+        curl -s -u "$U:$P" -T /tmp/clash.n2 "${URL}clash/notes.txt" -o /dev/null
+        cf_save notes.txt /tmp/clash.n3
+        cf_copy=""
+        for _ in $(seq 1 60); do
+            cf_copy="$(cf_copies notes | awk -v want="$(sha < /tmp/clash.n3)" '$2 == want {print $1}' | head -1)"
+            [ -n "$cf_copy" ] && break
+            sleep 1
+        done
+        if [ -n "$cf_copy" ] && [ "$(dav_sha clash/notes.txt)" = "$(sha < /tmp/clash.n2)" ]; then
+            ok "(d) a small document saved over a changed one: theirs kept, ours a conflicted copy"
+        else
+            no "(d) small document: server has '$(curl -s -u "$U:$P" "${URL}clash/notes.txt")', conflicted copy: ${cf_copy:-none}"
+        fi
+    else
+        no "setup: the small document is not readable on the conflict-test mount"
+    fi
+    # The program then warns that the file changed (its mtime is the other person's now)
+    # and the user saves anyway: that save is based on the version the server has, so it
+    # overwrites it instead of making one more conflicted copy.
+    printf 'notes v4 (saved anyway)\n' > /tmp/clash.n4
+    cf_n_copies="$(cf_copies notes | wc -l)"
+    sleep 3
+    cf_save notes.txt /tmp/clash.n4
+    if wait_dav_sha clash/notes.txt "$(sha < /tmp/clash.n4)" 60 && [ "$(cf_copies notes | wc -l)" = "$cf_n_copies" ]; then
+        ok "(d2) saving again after the conflict ('save anyway') replaces their version, no new copy"
+    else
+        no "(d2) saving again after the conflict: server has '$(curl -s -u "$U:$P" "${URL}clash/notes.txt")', copies $cf_n_copies → $(cf_copies notes | wc -l)"
+    fi
+    grep -hE 'replaces version|no MOVE needed|sending WebDAV MOVE|conflicted copy|saved as' "$CF_NLOG" 2>/dev/null | sed 's/^/    (daemon) /' | head -12
+
+    # A reader of a file the server replaces must not get the new version's bytes in
+    # the middle of the old one's.
+    head -c 8388608 /dev/urandom > /tmp/clash.m1; head -c 8388608 /dev/urandom > /tmp/clash.m2
+    curl -s -u "$U:$P" -T /tmp/clash.m1 "${URL}clash/movie.bin" -o /dev/null
+    for _ in $(seq 1 40); do
+        ls "$CF_MOUNT/clash" >/dev/null 2>&1
+        [ -e "$CF_MOUNT/clash/movie.bin" ] && break
+        sleep 1
+    done
+    cf_pin="$(python3 - "$CF_MOUNT/clash/movie.bin" /tmp/clash.m1 /tmp/clash.m2 "${URL}clash/movie.bin" "$U:$P" <<'PY'
+import os, subprocess, sys
+path, v1, v2, url, auth = sys.argv[1:6]
+fd = os.open(path, os.O_RDONLY)
+os.pread(fd, 65536, 0)
+subprocess.run(["curl", "-s", "-o", "/dev/null", "-u", auth, "-T", v2, url], check=True)
+off = 7 << 20
+try:
+    got = os.pread(fd, 65536, off)
+except OSError as e:
+    print("ERRNO", e.errno)
+    sys.exit()
+old = open(v1, "rb").read()[off:off + 65536]
+new = open(v2, "rb").read()[off:off + 65536]
+print("OLD" if got == old else "NEW" if got == new else "OTHER")
+PY
+)"
+    case "$cf_pin" in
+        # ncrs answers ESTALE; a page-cache read reports a failed page fill as EIO.
+        "ERRNO 116"|"ERRNO 5") ok "(e) reading on after the server replaced the file fails (${cf_pin#ERRNO }) instead of mixing versions" ;;
+        OLD) ok "(e) reading on after the server replaced the file still returns the version it opened" ;;
+        *) no "(e) reading on after the server replaced the file returned: ${cf_pin:-nothing} (NEW = the other version's bytes in the old file)" ;;
+    esac
+
+    # Locked on the server by someone else (an app lock, as Nextcloud Office takes).
+    printf 'locked doc\n' > /tmp/clash.l1
+    curl -s -u "$U:$P" -T /tmp/clash.l1 "${URL}clash/held-by-ana.odt" -o /dev/null
+    for _ in $(seq 1 40); do
+        ls "$CF_MOUNT/clash" >/dev/null 2>&1
+        [ -e "$CF_MOUNT/clash/held-by-ana.odt" ] && break
+        sleep 1
+    done
+    cf_lock="$(python3 - "$CF_MOUNT/clash/held-by-ana.odt" <<'PY'
+import os, stat, sys
+p = sys.argv[1]
+mode = stat.S_IMODE(os.stat(p).st_mode)
+try:
+    os.close(os.open(p, os.O_RDWR))
+    w = "opened"
+except OSError as e:
+    w = "errno%d" % e.errno
+print(oct(mode), w, open(p).read().strip().replace(" ", "_"))
+PY
+)"
+    read -r cf_mode cf_w cf_body <<<"$cf_lock"
+    if [ "$cf_mode" = 0o444 ] && [ "$cf_w" = errno13 ] && [ "$cf_body" = locked_doc ]; then
+        ok "(f) a file locked on the server by someone else shows read-only, refuses writing (EACCES) and still reads"
+    else
+        no "(f) locked file: mode $cf_mode, O_RDWR open $cf_w, content $cf_body (want 0o444, errno13, locked_doc)"
+    fi
+    # The settings toggle (SERVER_LOCKS off) makes it writable again: the open is let
+    # through once the kernel's cached attributes (mode 0444) have expired.
+    cf_ipc="$(printf 'SERVER_LOCKS off\n' | timeout 10 nc -U -N "$CF_HOME/run/ncrs.sock" 2>/dev/null)"
+    cf_open=""
+    for _ in $(seq 1 45); do
+        cf_open="$(python3 -c 'import os,sys
+try:
+    os.close(os.open(sys.argv[1], os.O_RDWR)); print("opened")
+except OSError as e:
+    print("errno%d" % e.errno)' "$CF_MOUNT/clash/held-by-ana.odt")"
+        [ "$cf_open" = opened ] && break
+        sleep 1
+    done
+    [ "$cf_ipc" = ok ] && [ "$cf_open" = opened ] && ok "(g) with 'Respect Nextcloud file locks' off, the locked file opens for writing" \
+        || no "(g) SERVER_LOCKS off answered '${cf_ipc:-nothing}', the locked file's O_RDWR open: ${cf_open:-nothing}"
+fi
+fusermount3 -u "$CF_MOUNT" 2>/dev/null || umount "$CF_MOUNT" 2>/dev/null
+kill "$CF_DAEMON" "$CF_PID" 2>/dev/null
+wait "$CF_DAEMON" "$CF_PID" 2>/dev/null
+rm -f /tmp/clash.*
+
+echo "→ 36. STREAMED UPLOAD then REOPEN, and KEPT copies — no data lost, no second copy"
+# A big file streamed to the server is only readable there once its chunks are assembled;
+# opening it for writing before that (an edit right after a recording stops, an append)
+# used to start from the server's old version, or fail. Now the open waits for the
+# assembly. Also: with "keep locally modified files", the finished upload becomes the kept
+# copy by a rename of its staging file, not a copy.
+KP_PORT=8096
+KP_LOG=/tmp/chunkdav-keep.log
+KP_HOME=/tmp/ncrs-keep
+KP_MOUNT=/mnt/ncrs-keep
+KP_NLOG=/tmp/ncrs-keep.log
+: > "$KP_LOG"
+python3 /e2e/chunkdav.py "$KP_PORT" "$CD_HOST" "$KP_LOG" --slow-write "slowfinish:10" 2>/tmp/chunkdav-keep.err &
+KP_PID=$!
+mkdir -p "$KP_MOUNT" "$KP_HOME/.config/ncrs" "$KP_HOME/run" "$KP_HOME/cache"
+chmod 700 "$KP_HOME/run"
+cat > "$KP_HOME/.config/ncrs/config.yaml" <<CFG
+url: "http://127.0.0.1:${KP_PORT}/remote.php/dav/files/${U}/"
+username: "${U}"
+password: "${P}"
+user: "${U}"
+mount_point: "${KP_MOUNT}"
+allow_insecure_http: true
+http3: false
+optimistic_listing: false
+auto_keep_locally_modified_files: true
+auto_keep_cached_files: false
+stream_uploads: true
+stream_upload_threshold_mb: 20
+stream_disk_reserve_mb: 99999999
+CFG
+for _ in $(seq 1 20); do
+    curl -s -o /dev/null -u "$U:$P" -X PROPFIND -H 'Depth: 0' \
+        "http://127.0.0.1:${KP_PORT}/remote.php/dav/files/${U}/" && break
+    sleep 0.5
+done
+: > "$KP_NLOG"
+HOME="$KP_HOME" XDG_RUNTIME_DIR="$KP_HOME/run" XDG_CACHE_HOME="$KP_HOME/cache" XDG_CONFIG_HOME="$KP_HOME/.config" \
+    RUST_LOG="${RUST_LOG:-info}" ncrs --config "$KP_HOME/.config/ncrs/config.yaml" >>"$KP_NLOG" 2>&1 &
+KP_DAEMON=$!
+for _ in $(seq 1 60); do
+    mountpoint -q "$KP_MOUNT" && break
+    kill -0 "$KP_DAEMON" 2>/dev/null || break
+    sleep 1
+done
+if ! mountpoint -q "$KP_MOUNT"; then
+    no "setup: the streaming/keep mount never appeared"
+    tail -20 "$KP_NLOG" | sed 's/^/    /'
+else
+    mkdir -p "$KP_MOUNT/slowfinish" "$KP_MOUNT/keep"
+    # (a) a 48 MiB recording, written sequentially (streamed), then appended to at once.
+    head -c 50331648 /dev/urandom > /tmp/keep.rec
+    printf 'TRAILER APPENDED RIGHT AFTER CLOSE\n' > /tmp/keep.tail
+    cat /tmp/keep.rec /tmp/keep.tail > /tmp/keep.want
+    kp_r="$(python3 - "$KP_MOUNT/slowfinish/rec.mkv" /tmp/keep.rec /tmp/keep.tail <<'PY'
+import os, sys
+path, rec, tail = sys.argv[1:4]
+with open(rec, "rb") as src, open(path, "wb") as f:
+    while chunk := src.read(1 << 20):
+        f.write(chunk)
+try:
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    os.write(fd, open(tail, "rb").read())
+    os.close(fd)
+    print("appended")
+except OSError as e:
+    print("errno%d" % e.errno)
+PY
+)"
+    grep -q 'PUT ncrs-[^ ]*/0000000001' "$KP_LOG" \
+        || no "setup: the recording was not streamed (no chunk 1 in the proxy log)"
+    if [ "$kp_r" = appended ] && wait_dav_sha slowfinish/rec.mkv "$(sha < /tmp/keep.want)" 120; then
+        ok "(a) reopening a streamed file before its upload finished waited for it: the append landed after the whole recording"
+    else
+        no "(a) reopen + append right after a streamed write: open $kp_r, backend has $(curl -s -u "$U:$P" "${URL}slowfinish/rec.mkv" | wc -c) of $(stat -c %s /tmp/keep.want) bytes"
+    fi
+
+    # (b) a kept copy, made from the upload's own staging file.
+    head -c 3000000 /dev/urandom > /tmp/keep.doc
+    cp /tmp/keep.doc "$KP_MOUNT/keep/doc.bin"
+    if wait_dav_sha keep/doc.bin "$(sha < /tmp/keep.doc)" 60; then
+        kp_kept=""
+        for _ in $(seq 1 20); do
+            kp_kept="$(find "$KP_HOME/cache" -path '*kept*' -name doc.bin 2>/dev/null | head -1)"
+            [ -n "$kp_kept" ] && break
+            sleep 1
+        done
+        kp_left="$(find "$KP_HOME/cache" -name 'write_*' 2>/dev/null | wc -l)"
+        if [ -n "$kp_kept" ] && [ "$(sha < "$kp_kept")" = "$(sha < /tmp/keep.doc)" ] && [ "$kp_left" = 0 ]; then
+            ok "(b) the uploaded file is kept locally byte-exact, and no staging file is left behind"
+        else
+            no "(b) kept copy: ${kp_kept:-none}, staging files left: $kp_left"
+        fi
+        [ "$(sha < "$KP_MOUNT/keep/doc.bin")" = "$(sha < /tmp/keep.doc)" ] \
+            && ok "(c) the kept file reads back byte-exact" || no "(c) the kept file reads back wrong"
+    else
+        no "setup: the kept file never reached the backend"
+    fi
+fi
+fusermount3 -u "$KP_MOUNT" 2>/dev/null || umount "$KP_MOUNT" 2>/dev/null
+kill "$KP_DAEMON" "$KP_PID" 2>/dev/null
+wait "$KP_DAEMON" "$KP_PID" 2>/dev/null
+rm -f /tmp/keep.*
 
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
