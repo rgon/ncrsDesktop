@@ -123,7 +123,8 @@ if grep -E '^/usr/bin/ncrs[[:space:]]' <<<"$FILECAPS" | grep -q 'cap_'; then
 else
     pass "/usr/bin/ncrs carries no file capability"
 fi
-if grep -q 'setcap cap_' <<<"$SCRIPTS"; then
+# Skip comment lines: --scripts prints them, and %post mentions the old setcap.
+if grep -v '^[[:space:]]*#' <<<"$SCRIPTS" | grep -q 'setcap cap_'; then
     fail "scriptlets must not grant capabilities (the spec uses %caps)"
 else
     pass "scriptlets grant no capabilities"
