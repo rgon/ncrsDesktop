@@ -286,7 +286,10 @@
                 </div>
 
                 <div class="sv-toggle">
-                    <label class="sv-toggle-label" for="keep-modified">Keep locally modified files</label>
+                    <div>
+                        <label class="sv-toggle-label" for="keep-modified">Keep locally modified files</label>
+                        <p class="sv-hint">After a file you saved here is uploaded, its copy stays on this computer, so opening it again needs no download. It counts toward the cache size limit and is removed by auto-purge and "Purge local cache" like any cached file.</p>
+                    </div>
                     <input id="keep-modified" type="checkbox" class="sv-check" bind:checked={settings.auto_keep_locally_modified_files} />
                 </div>
 

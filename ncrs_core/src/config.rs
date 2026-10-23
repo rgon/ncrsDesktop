@@ -38,7 +38,10 @@ pub struct MountOptions {
     /// Ceiling on how many directory listings stay in memory (LRU past that).
     #[serde(default = "default_dir_cache_max_dirs")]
     pub dir_cache_max_dirs: usize,
-    #[serde(default)]
+    /// Keep the bytes of a file saved here as its local cached copy once uploaded, so
+    /// reopening it costs no download. It lives in the cache like any other copy: the
+    /// size limit, auto-purge and "purge local cache" clear it.
+    #[serde(default = "default_true")]
     pub auto_keep_locally_modified_files: bool,
     #[serde(default)]
     pub auto_keep_cached_files: bool,
@@ -241,7 +244,7 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
     let optimistic_listing = doc["optimistic_listing"].as_bool().unwrap_or(true);
     let dir_cache_max_stale_mins = doc["dir_cache_max_stale_mins"].as_i64().map(|v| v.max(0) as u64).unwrap_or_else(default_dir_cache_max_stale_mins);
     let dir_cache_max_dirs = doc["dir_cache_max_dirs"].as_i64().map(|v| v.max(0) as usize).unwrap_or_else(default_dir_cache_max_dirs);
-    let auto_keep_locally_modified_files = doc["auto_keep_locally_modified_files"].as_bool().unwrap_or(false);
+    let auto_keep_locally_modified_files = doc["auto_keep_locally_modified_files"].as_bool().unwrap_or(true);
     let auto_keep_cached_files = doc["auto_keep_cached_files"].as_bool().unwrap_or(false);
     let read_ahead_bytes = doc["read_ahead_bytes"].as_i64().map(|v| v as usize).unwrap_or(DEFAULT_READ_AHEAD);
     let cache_streamed_reads = doc["cache_streamed_reads"].as_bool().unwrap_or(false);
@@ -555,7 +558,7 @@ impl Default for ConfigSettings {
             optimistic_listing: true,
             dir_cache_max_stale_mins: default_dir_cache_max_stale_mins(),
             dir_cache_max_dirs: default_dir_cache_max_dirs(),
-            auto_keep_locally_modified_files: false,
+            auto_keep_locally_modified_files: true,
             auto_keep_cached_files: false,
             read_ahead_bytes: DEFAULT_READ_AHEAD,
             cache_max_size_bytes: default_cache_max_size(),
@@ -680,6 +683,9 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# next time it is opened. 0 removes the limit (the old unbounded behaviour,\n");
     content.push_str("# which on a large tree can cost hundreds of MB of RAM).\n");
     content.push_str(&format!("dir_cache_max_dirs: {}\n", settings.dir_cache_max_dirs));
+    content.push_str("# Keep a local copy of files you save here once they are uploaded, so reopening\n");
+    content.push_str("# them needs no download. It is ordinary cache: cache_max_size_bytes,\n");
+    content.push_str("# cache_auto_purge_days and \"purge local cache\" clear it.\n");
     content.push_str(&format!("auto_keep_locally_modified_files: {}\n", settings.auto_keep_locally_modified_files));
     content.push_str(&format!("auto_keep_cached_files: {}\n", settings.auto_keep_cached_files));
     content.push_str(&format!("read_ahead_bytes: {}\n", settings.read_ahead_bytes));
@@ -830,6 +836,13 @@ mod tests {
         assert_eq!(minimal_config("password: \"p\"\nwalker_listings_per_sec: 99999").walker_listings_per_sec, 1000);
         let s = config_settings_from_opts(&off);
         assert_eq!((s.walker_rate_limit, s.walker_listings_per_sec), (false, 25));
+    }
+
+    #[test]
+    fn saved_files_keep_a_local_copy_by_default() {
+        assert!(minimal_config("password: \"p\"").auto_keep_locally_modified_files);
+        assert!(ConfigSettings::default().auto_keep_locally_modified_files);
+        assert!(!minimal_config("password: \"p\"\nauto_keep_locally_modified_files: false").auto_keep_locally_modified_files);
     }
 
     #[test]

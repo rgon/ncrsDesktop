@@ -217,7 +217,7 @@ Additional metadata files in the root:
 - `journal.bin` -- offline mutation journal for pending uploads/deletes/renames
 
 Config options (in `~/.config/ncrs/config.yaml`):
-- `auto_keep_locally_modified_files: true` -- keep a local copy after uploading a file you edited
+- `auto_keep_locally_modified_files: true` -- keep a local cached copy after uploading a file you edited (default on; cleared by the cache size limit, auto-purge and "purge local cache")
 - `auto_keep_cached_files: true` -- promote read-cached files to kept automatically
 - `cache_max_size_bytes: 34359738368` -- max size for `cache/` directory (default 32 GB, 0 = unlimited). Oldest-accessed files are evicted first.
 - `cache_auto_purge_days: 10` -- auto-delete cached files not accessed in N days (default 10, 0 = disabled)

@@ -192,11 +192,15 @@ od_hex() { od -An -tx1 | tr -d ' \n'; }
 { printf 'NCRS-REAL-DATA--'; head -c 65520 /dev/urandom; } > /tmp/weird.bin
 WW="$(sha < /tmp/weird.bin)"
 REAL_HEX="$(head -c16 /tmp/weird.bin | od_hex)"
-cp /tmp/weird.bin "$MOUNT/weird.ncrstest"
-# Upload must complete; the file is not kept locally, so the next read re-fetches
-# from the backend unless it is intercepted.
-if wait_dav_sha weird.ncrstest "$WW" 90; then
-    ls "$MOUNT" >/dev/null 2>&1; sleep 2   # drop any local staging copy
+# Put on the server directly: a file saved through the mount keeps a local copy
+# (auto_keep_locally_modified_files), and cached files are read, never intercepted.
+curl -s -o /dev/null -u "$U:$P" -T /tmp/weird.bin "${URL}weird.ncrstest"
+for _ in $(seq 1 40); do
+    ls "$MOUNT" >/dev/null 2>&1
+    [ -e "$MOUNT/weird.ncrstest" ] && break
+    sleep 1
+done
+if wait_dav_sha weird.ncrstest "$WW" 90 && [ -e "$MOUNT/weird.ncrstest" ]; then
 
     # The probe is only answered for processes that have GLib's gio loaded
     # (desktop::sniff); a GLib app is simulated by preloading libgio into dd.
@@ -2431,12 +2435,13 @@ kill "$CF_DAEMON" "$CF_PID" 2>/dev/null
 wait "$CF_DAEMON" "$CF_PID" 2>/dev/null
 rm -f /tmp/clash.*
 
-echo "→ 36. STREAMED UPLOAD then REOPEN, and KEPT copies — no data lost, no second copy"
+echo "→ 36. STREAMED UPLOAD then REOPEN, and SAVED copies — no data lost, no second copy"
 # A big file streamed to the server is only readable there once its chunks are assembled;
 # opening it for writing before that (an edit right after a recording stops, an append)
 # used to start from the server's old version, or fail. Now the open waits for the
-# assembly. Also: with "keep locally modified files", the finished upload becomes the kept
-# copy by a rename of its staging file, not a copy.
+# assembly. Also: with "keep locally modified files" (on by default), the finished upload
+# becomes the file's cached copy by a rename of its staging file, not a copy, and
+# "purge local cache" removes it like any cached file.
 KP_PORT=8096
 KP_LOG=/tmp/chunkdav-keep.log
 KP_HOME=/tmp/ncrs-keep
@@ -2508,24 +2513,32 @@ PY
         no "(a) reopen + append right after a streamed write: open $kp_r, backend has $(curl -s -u "$U:$P" "${URL}slowfinish/rec.mkv" | wc -c) of $(stat -c %s /tmp/keep.want) bytes"
     fi
 
-    # (b) a kept copy, made from the upload's own staging file.
+    # (b) the saved file's local copy, made from the upload's own staging file.
     head -c 3000000 /dev/urandom > /tmp/keep.doc
     cp /tmp/keep.doc "$KP_MOUNT/keep/doc.bin"
     if wait_dav_sha keep/doc.bin "$(sha < /tmp/keep.doc)" 60; then
         kp_kept=""
         for _ in $(seq 1 20); do
-            kp_kept="$(find "$KP_HOME/cache" -path '*kept*' -name doc.bin 2>/dev/null | head -1)"
+            kp_kept="$(find "$KP_HOME/cache" -path '*/keep/doc.bin' 2>/dev/null | head -1)"
             [ -n "$kp_kept" ] && break
             sleep 1
         done
         kp_left="$(find "$KP_HOME/cache" -name 'write_*' 2>/dev/null | wc -l)"
         if [ -n "$kp_kept" ] && [ "$(sha < "$kp_kept")" = "$(sha < /tmp/keep.doc)" ] && [ "$kp_left" = 0 ]; then
-            ok "(b) the uploaded file is kept locally byte-exact, and no staging file is left behind"
+            ok "(b) the uploaded file stays cached locally byte-exact, and no staging file is left behind"
         else
             no "(b) kept copy: ${kp_kept:-none}, staging files left: $kp_left"
         fi
         [ "$(sha < "$KP_MOUNT/keep/doc.bin")" = "$(sha < /tmp/keep.doc)" ] \
-            && ok "(c) the kept file reads back byte-exact" || no "(c) the kept file reads back wrong"
+            && ok "(c) the saved file reads back byte-exact" || no "(c) the saved file reads back wrong"
+        kp_purge="$(printf 'PURGE_CACHE\n' | timeout 20 nc -U -N "$KP_HOME/run/ncrs.sock" 2>/dev/null)"
+        if [ -n "$kp_kept" ] && [ ! -e "$kp_kept" ]; then
+            ok "(d) 'purge local cache' removed the saved file's local copy ($kp_purge)"
+        else
+            no "(d) after PURGE_CACHE (answer: ${kp_purge:-none}) the saved copy is still at ${kp_kept:-?}"
+        fi
+        [ "$(sha < "$KP_MOUNT/keep/doc.bin")" = "$(sha < /tmp/keep.doc)" ] \
+            && ok "(e) after the purge the file still reads back byte-exact (from the server)" || no "(e) after the purge the file reads back wrong"
     else
         no "setup: the kept file never reached the backend"
     fi

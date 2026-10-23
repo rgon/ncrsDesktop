@@ -5652,14 +5652,21 @@ impl NextCloudFs {
                             j.rebase(&remote_path, sent_etag.as_deref(), new_etag.as_deref());
                             handed
                         };
+                        // The saved bytes stay as the file's local copy: in the cache, which its
+                        // size limit, age limit and "purge local cache" clear, or, for a file
+                        // pinned as kept, as its kept copy (which would otherwise go stale).
                         // Nothing reads the staging file once its entry is gone, so it becomes
-                        // the kept copy by a rename: no second copy of the file on disk. One a
-                        // MOVE still holds is copied instead. Either way it lands under a new
-                        // inode, so a passthrough reader of the previous kept copy keeps it.
+                        // that copy by a rename: no second copy of the file on disk. One a MOVE
+                        // still holds is copied instead. Either way it lands under a new inode,
+                        // so a passthrough reader of the previous copy keeps it.
                         let mut staging_gone = false;
-                        if auto_keep {
+                        let pinned = cache.safe_lock().file_cache.get(&remote_path).is_some_and(|e| e.kept);
+                        if auto_keep || pinned {
                             let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
-                            let keep_path = cache.safe_lock().kept_dir.join(rel);
+                            let keep_path = {
+                                let c = cache.safe_lock();
+                                if pinned { c.kept_dir.join(rel) } else { c.auto_cache_dir.join(rel) }
+                            };
                             if let Some(parent) = keep_path.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
@@ -5678,10 +5685,10 @@ impl NextCloudFs {
                                     local_path: keep_path,
                                     remote_modified: Some(saved_mtime),
                                     etag: result.new_change_token,
-                                    kept: true,
+                                    kept: pinned,
                                     size: upload_size,
                                 });
-                                smap.safe_write().insert(remote_path.clone(), FileStatus::Kept);
+                                smap.safe_write().insert(remote_path.clone(), if pinned { FileStatus::Kept } else { FileStatus::Cached });
                             } else {
                                 smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
                             }
