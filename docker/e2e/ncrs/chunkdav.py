@@ -29,10 +29,17 @@ With --locked MARKER:OWNER:TYPE, every file whose path contains MARKER is locked
 the "server": PROPFIND reports nc:lock for it, held by OWNER with lock-owner-type
 TYPE, and a PUT or MOVE onto it gets 423.
 
+WebDAV token locks (LOCK / UNLOCK) are kept here the way Nextcloud's files_lock keeps
+them: the timeout counts from when the lock was taken (a refresh replaces it), a PUT,
+MOVE or DELETE of a locked file without its token in the If header gets 423, a MOVE
+onto it drops the lock with the file it replaces, and PROPFIND reports it (nc:lock,
+lock-owner-type 2). Logged as LOCK / REFRESH / UNLOCK / LOCKED423.
+
 Usage: chunkdav.py <listen-port> <upstream-host> <log-file>
                    [--slow MARKER:SECONDS] [--slow-write MARKER:SECONDS]
                    [--fail-write MARKER:STATUS:COUNT] [--locked MARKER:OWNER:TYPE]
 """
+import base64
 import http.client
 import http.server
 import os
@@ -42,6 +49,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 
 PORT, UPSTREAM, LOG = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 SLOW_MARK, SLOW_SECS = None, 0.0
@@ -65,6 +73,7 @@ STORE = "/tmp/chunkdav-sessions"
 UPLOADS = "/remote.php/dav/uploads/"
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "host"}
 log_lock = threading.Lock()
+LOCKS = {}   # decoded path -> {"token", "created", "timeout", "owner", "user"}
 
 
 def log(line):
@@ -128,12 +137,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def precondition_failed(self, path):
         """Whether this request's If-Match / tagged If header names another version than
         the one `path` (the destination, for a MOVE) is now."""
-        if self.command == "MOVE":
-            m = re.search(r'\(\["([^"]*)"\]\)', self.headers.get("If", ""))
-            want = m.group(1) if m else None
-        else:
-            want = self.headers.get("If-Match")
-            want = want.replace("W/", "").strip('"') if want else None
+        m = re.search(r'\["([^"]*)"\]', self.headers.get("If", ""))
+        want = m.group(1) if m else self.headers.get("If-Match")
+        want = want.replace("W/", "").strip('"') if want else None
         if want is None:
             return False
         have = self.current_etag(path)
@@ -141,6 +147,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return False
         log("PRECOND %s %s wants %s, is %s" % (self.command, urllib.parse.unquote(path), want, have))
         return True
+
+    def live_lock(self, path):
+        lk = LOCKS.get(urllib.parse.unquote(path))
+        if lk and time.time() < lk["created"] + lk["timeout"]:
+            return lk
+        LOCKS.pop(urllib.parse.unquote(path), None)
+        return None
+
+    def lock_refused(self, path):
+        """A write of a token-locked file without that token."""
+        lk = self.live_lock(path)
+        if lk and lk["token"] not in self.headers.get("If", ""):
+            log("LOCKED423 %s %s" % (self.command, urllib.parse.unquote(path)))
+            return True
+        return False
+
+    def dav_lock(self, path, data):
+        key = urllib.parse.unquote(path)
+        secs = re.search(r"Second-(\d+)", self.headers.get("Timeout", ""))
+        secs = int(secs.group(1)) if secs else 0
+        lk = self.live_lock(path)
+        if lk and lk["token"] in self.headers.get("If", ""):
+            lk["timeout"] = secs            # files_lock: counted from when it was taken
+            log("REFRESH %s %d" % (key, secs))
+            return self.reply(200, [("Content-Type", "application/xml")], b"<?xml version=\"1.0\"?><d:prop xmlns:d=\"DAV:\"/>")
+        if lk:
+            return self.reply(423)
+        owner = re.search(rb"<(?:\w+:)?owner>(.*?)</(?:\w+:)?owner>", data, re.S)
+        token = "opaquelocktoken:%s" % uuid.uuid4()
+        user = base64.b64decode(self.headers.get("Authorization", "Basic ")[6:] or b"").split(b":")[0].decode()
+        LOCKS[key] = {"token": token, "created": time.time(), "timeout": secs,
+                      "owner": owner.group(1).decode() if owner else "", "user": user}
+        log("LOCK %s %d %s" % (key, secs, token))
+        return self.reply(200, [("Lock-Token", "<%s>" % token), ("Content-Type", "application/xml")],
+                          b"<?xml version=\"1.0\"?><d:prop xmlns:d=\"DAV:\"/>")
+
+    def dav_unlock(self, path):
+        key = urllib.parse.unquote(path)
+        lk = self.live_lock(path)
+        token = self.headers.get("Lock-Token", "").strip().strip("<>")
+        if lk and lk["token"] == token:
+            LOCKS.pop(key, None)
+            log("UNLOCK %s" % key)
+            return self.reply(204)
+        return self.reply(409)
 
     def handle_one(self):
         global FAIL_LEFT
@@ -165,6 +216,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if LOCK_MARK in target:
                 log("LOCKED %s %s" % (self.command, target))
                 return self.reply(423)
+        if self.command == "LOCK":
+            return self.dav_lock(path, data)
+        if self.command == "UNLOCK":
+            return self.dav_unlock(path)
+        if self.command in ("PUT", "DELETE", "MOVE") and not path.startswith(UPLOADS) and self.lock_refused(path):
+            return self.reply(423)
+        if self.command == "MOVE" and dest and self.lock_refused(dest):
+            return self.reply(423)
         if path.startswith(UPLOADS):
             return self.uploads(path[len(UPLOADS):], data)
         target = dest if self.command == "MOVE" else path
@@ -188,7 +247,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         status, rh, rd = self.upstream(self.command, self.path, headers, data)
         if self.command == "PUT" and status in (200, 201, 204):
             rh = self.stored_etag(path, rh)
-        if LOCK_MARK and self.command == "PROPFIND" and status == 207:
+        if self.command == "MOVE" and status in (200, 201, 204) and dest:
+            # The file the MOVE replaced took its lock with it (Nextcloud locks by file id).
+            LOCKS.pop(urllib.parse.unquote(dest), None)
+        if self.command == "DELETE" and status in (200, 204):
+            LOCKS.pop(urllib.parse.unquote(path), None)
+        if (LOCK_MARK or LOCKS) and self.command == "PROPFIND" and status == 207:
             rd = self.inject_locks(rd)
         self.reply(status, rh, rd)
 
@@ -200,12 +264,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  '<nc:lock-owner-displayname %s>%s</nc:lock-owner-displayname>'
                  '<nc:lock-owner-type %s>%s</nc:lock-owner-type>') % (ns, ns, LOCK_OWNER, ns, LOCK_OWNER, ns, LOCK_TYPE)
 
+        def token_props(lk):
+            return ('<nc:lock %s>1</nc:lock><nc:lock-owner %s>%s</nc:lock-owner>'
+                    '<nc:lock-owner-displayname %s>%s</nc:lock-owner-displayname>'
+                    '<nc:lock-owner-type %s>2</nc:lock-owner-type>') % (ns, ns, lk["user"], ns, lk["owner"], ns)
+
         def one(m):
             r = m.group(0)
             href = re.search(r"<(?:\w+:)?href>([^<]*)</", r)
-            if not href or LOCK_MARK not in urllib.parse.unquote(href.group(1)):
+            if not href:
                 return r
-            return re.sub(r"(<(?:\w+:)?prop\b[^>]*>)", lambda p: p.group(1) + props, r, count=1)
+            where = urllib.parse.unquote(href.group(1))
+            if LOCK_MARK and LOCK_MARK in where:
+                add = props
+            elif self.live_lock(href.group(1)):
+                add = token_props(self.live_lock(href.group(1)))
+            else:
+                return r
+            return re.sub(r"(<(?:\w+:)?prop\b[^>]*>)", lambda p: p.group(1) + add, r, count=1)
         return re.sub(r"<(\w+:)?response\b[^>]*>.*?</(\w+:)?response>", one, text, flags=re.S).encode("utf-8")
 
     def uploads(self, rel, data):
@@ -240,6 +316,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Nextcloud takes the file's mtime from the assembling MOVE.
                 headers["X-OC-Mtime"] = self.headers["X-OC-Mtime"]
             dest = urllib.parse.urlsplit(self.headers.get("Destination", "")).path
+            if self.lock_refused(dest):
+                return self.reply(423)
             if self.precondition_failed(dest):
                 return self.reply(412)
             status, rh, rd = self.upstream("PUT", dest, headers, bytes(whole))

@@ -386,6 +386,21 @@ impl CloudBackend for NextcloudBackend {
         .map_err(BackendWriteError::from)
     }
 
+    fn lock_file(&self, path: &Path, timeout: Duration, owner: &str) -> Result<String, BackendWriteError> {
+        webdav_ops::lock(&self.clients.get(), &self.base_url, &self.creds, path, timeout, owner)
+            .map_err(BackendWriteError::from)
+    }
+
+    fn refresh_lock(&self, path: &Path, token: &str, timeout: Duration) -> Result<(), BackendWriteError> {
+        webdav_ops::refresh_lock(&self.clients.get(), &self.base_url, &self.creds, path, token, timeout)
+            .map_err(BackendWriteError::from)
+    }
+
+    fn unlock_file(&self, path: &Path, token: &str) -> Result<(), BackendWriteError> {
+        webdav_ops::unlock(&self.clients.get(), &self.base_url, &self.creds, path, token)
+            .map_err(BackendWriteError::from)
+    }
+
     fn rename(&self, from: &Path, to: &Path, dest_etag: Option<&str>) -> Result<(), BackendWriteError> {
         webdav_ops::move_resource(
             &self.clients.get(),

@@ -107,6 +107,11 @@ pub struct MountOptions {
     /// cannot be opened for writing, instead of a save failing with 423 later.
     #[serde(default = "default_true")]
     pub honor_server_locks: bool,
+    /// While an editor has a document open here (its lock or swap file exists: LibreOffice,
+    /// Office, Vim, Kate), lock the document on the server so nobody else saves over it.
+    /// Only acts while `honor_server_locks` is on.
+    #[serde(default = "default_true")]
+    pub app_lock_files: bool,
 }
 
 pub fn default_walker_listings_per_sec() -> u32 {
@@ -271,8 +276,9 @@ pub fn configuration_parser(yaml_conf: &str) -> Result<MountOptions, String> {
         .unwrap_or_else(default_stream_upload_threshold_mb);
     let stream_disk_reserve_mb = doc["stream_disk_reserve_mb"].as_i64().map(|v| v.max(0) as u64).unwrap_or(0);
     let honor_server_locks = doc["honor_server_locks"].as_bool().unwrap_or(true);
+    let app_lock_files = doc["app_lock_files"].as_bool().unwrap_or(true);
 
-    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough, allow_insecure_http, walker_rate_limit, walker_listings_per_sec, stream_uploads, stream_upload_threshold_mb, stream_disk_reserve_mb, honor_server_locks })
+    Ok(MountOptions { url, username, password, bearer_token, auth_command, mount_point, log_user, aggressive_prefetch, http3, max_concurrent_requests, offline: false, optimistic_listing, dir_cache_max_stale_mins, dir_cache_max_dirs, auto_keep_locally_modified_files, auto_keep_cached_files, read_ahead_bytes, cache_streamed_reads, cache_max_size_bytes, cache_auto_purge_days, cache_cleanup_interval_secs, keep_paths, exclude_folders, cleanup_stale_gio_temps, stale_gio_temp_mins, fuse_passthrough, allow_insecure_http, walker_rate_limit, walker_listings_per_sec, stream_uploads, stream_upload_threshold_mb, stream_disk_reserve_mb, honor_server_locks, app_lock_files })
 }
 
 // ── Config file loading ───────────────────────────────────────────────────────
@@ -542,6 +548,8 @@ pub struct ConfigSettings {
     // Defaulted for the same forward-compat reason as dir_cache_max_dirs above.
     #[serde(default = "default_true")]
     pub honor_server_locks: bool,
+    #[serde(default = "default_true")]
+    pub app_lock_files: bool,
 }
 
 impl Default for ConfigSettings {
@@ -574,6 +582,7 @@ impl Default for ConfigSettings {
             stream_upload_threshold_mb: default_stream_upload_threshold_mb(),
             stream_disk_reserve_mb: 0,
             honor_server_locks: true,
+            app_lock_files: true,
         }
     }
 }
@@ -603,6 +612,7 @@ pub fn config_settings_from_opts(opts: &MountOptions) -> ConfigSettings {
         stream_upload_threshold_mb: opts.stream_upload_threshold_mb,
         stream_disk_reserve_mb: opts.stream_disk_reserve_mb,
         honor_server_locks: opts.honor_server_locks,
+        app_lock_files: opts.app_lock_files,
     }
 }
 
@@ -731,6 +741,11 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# be opened for writing. Off: it stays writable, and a save waits for the unlock.\n");
     content.push_str("# Applies immediately, no remount needed.\n");
     content.push_str(&format!("honor_server_locks: {}\n", settings.honor_server_locks));
+    content.push_str("# While an editor has a document open here (LibreOffice, Office, Vim or Kate,\n");
+    content.push_str("# seen by the lock or swap file it keeps next to it), lock the document on the\n");
+    content.push_str("# server so nobody else saves over it. The lock expires a minute after the\n");
+    content.push_str("# editor or ncrs stops. Needs honor_server_locks. Applies immediately.\n");
+    content.push_str(&format!("app_lock_files: {}\n", settings.app_lock_files));
 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {}", e))?;
@@ -852,6 +867,8 @@ mod tests {
         let off = minimal_config("password: \"p\"\nhonor_server_locks: false");
         assert!(!off.honor_server_locks);
         assert!(!config_settings_from_opts(&off).honor_server_locks);
+        assert!(minimal_config("password: \"p\"").app_lock_files);
+        assert!(!minimal_config("password: \"p\"\napp_lock_files: false").app_lock_files);
     }
 
     #[test]

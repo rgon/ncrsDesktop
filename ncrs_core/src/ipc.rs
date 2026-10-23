@@ -1458,6 +1458,14 @@ fn handle_client_loop(
                 "off" => { crate::set_honor_server_locks(false); "ok".to_string() }
                 _ => "error: usage SERVER_LOCKS on|off".to_string(),
             }
+        } else if let Some(arg) = trimmed.strip_prefix("APP_LOCKS ") {
+            // "APP_LOCKS on|off": whether an editor's lock file locks its document on the
+            // server. Off releases the locks held within a couple of seconds.
+            match arg.trim() {
+                "on" => { crate::set_app_lock_files(true); "ok".to_string() }
+                "off" => { crate::set_app_lock_files(false); "ok".to_string() }
+                _ => "error: usage APP_LOCKS on|off".to_string(),
+            }
         } else if let Some(args) = trimmed.strip_prefix("STREAM_UPLOADS ") {
             // "STREAM_UPLOADS on 100 [reserve MB]" / "STREAM_UPLOADS off 100 …": applies to
             // files opened next; a missing reserve keeps the current one (0 = automatic).

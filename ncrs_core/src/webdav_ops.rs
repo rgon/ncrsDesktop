@@ -61,6 +61,38 @@ fn dav_url(base_url: &str, username: &str, path: &Path) -> String {
     )
 }
 
+/// The tagged `If` list for `url`: the token of a lock this daemon holds on `path`
+/// (app_locks) and/or the etag it must still have. None when neither applies.
+fn tagged_if(url: &str, path: &Path, etag: Option<&str>) -> Option<String> {
+    let token = crate::app_locks::token_for(path);
+    if token.is_none() && etag.is_none() {
+        return None;
+    }
+    let mut conds = Vec::new();
+    if let Some(t) = token {
+        conds.push(format!("<{}>", t));
+    }
+    if let Some(e) = etag {
+        conds.push(format!("[\"{}\"]", e.trim_matches('"')));
+    }
+    Some(format!("<{}> ({})", url, conds.join(" ")))
+}
+
+/// The preconditions of a request that writes `path` at `url`: If-Match for its etag,
+/// or, when this daemon holds a lock on it, the tagged form that also carries the token
+/// (a locked file refuses writes without it, 423).
+fn with_conditions(req: reqwest::blocking::RequestBuilder, url: &str, path: &Path, etag: Option<&str>) -> reqwest::blocking::RequestBuilder {
+    if crate::app_locks::token_for(path).is_some() {
+        if let Some(cond) = tagged_if(url, path, etag) {
+            return req.header("If", cond);
+        }
+    }
+    match etag {
+        Some(e) => req.header("If-Match", format!("\"{}\"", e.trim_matches('"'))),
+        None => req,
+    }
+}
+
 /// `X-OC-Mtime` asks Nextcloud to store `mtime` as the file's modification time instead of
 /// the moment the upload landed, so the mtime the mount reported right after the save is
 /// still the one the server lists afterwards (LibreOffice warns "modified by others" when
@@ -87,9 +119,7 @@ pub fn put_file(
         .timeout(WRITE_TIMEOUT))
         .body(body), mtime);
 
-    if let Some(etag) = if_match_etag {
-        req = req.header("If-Match", format!("\"{}\"", etag.trim_matches('"')));
-    }
+    req = with_conditions(req, &url, path, if_match_etag);
 
     put_result(req.send().map_err(|e| WriteError::Network(e.to_string()))?)
 }
@@ -114,9 +144,7 @@ fn put_file_streamed(
         .put(&url)
         .timeout(timeout))
         .body(reqwest::blocking::Body::sized(file, file_size as u64)), mtime);
-    if let Some(etag) = if_match_etag {
-        req = req.header("If-Match", format!("\"{}\"", etag.trim_matches('"')));
-    }
+    req = with_conditions(req, &url, path, if_match_etag);
     put_result(req.send().map_err(|e| WriteError::Network(e.to_string()))?)
 }
 
@@ -177,9 +205,13 @@ pub fn delete(
     path: &Path,
 ) -> Result<(), WriteError> {
     let url = dav_url(base_url, creds.username(), path);
-    let resp = creds.apply(client
+    let mut req = creds.apply(client
         .delete(&url)
-        .timeout(WRITE_TIMEOUT))
+        .timeout(WRITE_TIMEOUT));
+    if let Some(cond) = tagged_if(&url, path, None) {
+        req = req.header("If", cond);
+    }
+    let resp = req
         .send()
         .map_err(|e| WriteError::Network(e.to_string()))?;
 
@@ -196,7 +228,7 @@ pub fn delete(
 
 /// MOVE `from` to `to`, overwriting it. With `dest_etag`, only while `to` is still that
 /// version (412 otherwise): the tagged If header names the destination, which a plain
-/// If-Match on a MOVE would not (see move_precondition).
+/// If-Match on a MOVE would not (see tagged_if).
 pub fn move_resource(
     client: &crate::http_clients::DavClient,
     base_url: &str,
@@ -212,8 +244,11 @@ pub fn move_resource(
         .timeout(WRITE_TIMEOUT))
         .header("Destination", &dst_url)
         .header("Overwrite", "T");
-    if let Some(etag) = dest_etag {
-        req = req.header("If", move_precondition(&dst_url, etag));
+    // Both ends: the source leaves and the destination is replaced, and either may be
+    // locked by this daemon (a lock moves with its file).
+    let conds: Vec<String> = [tagged_if(&src_url, from, None), tagged_if(&dst_url, to, dest_etag)].into_iter().flatten().collect();
+    if !conds.is_empty() {
+        req = req.header("If", conds.join(" "));
     }
     let resp = req.send()
         .map_err(|e| WriteError::Network(e.to_string()))?;
@@ -227,6 +262,91 @@ pub fn move_resource(
             status,
             resp.text().unwrap_or_default(),
         )),
+    }
+}
+
+/// Takes a WebDAV (token) lock on `path` for `timeout`, with `owner` as the text other
+/// people see. Returns the lock token. 423 when someone else holds a lock on it.
+pub fn lock(
+    client: &crate::http_clients::DavClient,
+    base_url: &str,
+    creds: &crate::auth::Credentials,
+    path: &Path,
+    timeout: Duration,
+    owner: &str,
+) -> Result<String, WriteError> {
+    let url = dav_url(base_url, creds.username(), path);
+    let owner = owner.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:lockinfo xmlns:d=\"DAV:\"><d:lockscope><d:exclusive/></d:lockscope>\
+         <d:locktype><d:write/></d:locktype><d:owner>{}</d:owner></d:lockinfo>",
+        owner,
+    );
+    let resp = creds.apply(client
+        .request(reqwest::Method::from_bytes(b"LOCK").unwrap(), &url)
+        .timeout(WRITE_TIMEOUT))
+        .header("Timeout", format!("Second-{}", timeout.as_secs()))
+        .header("Content-Type", "application/xml; charset=utf-8")
+        .body(body)
+        .send()
+        .map_err(|e| WriteError::Network(e.to_string()))?;
+    match resp.status().as_u16() {
+        200 | 201 => resp.headers().get("lock-token")
+            .and_then(|v| v.to_str().ok())
+            .map(|t| t.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| WriteError::Server(200, "LOCK answered without a Lock-Token".into())),
+        412 => Err(WriteError::Conflict),
+        423 => Err(WriteError::Locked),
+        status => Err(WriteError::Server(status, resp.text().unwrap_or_default())),
+    }
+}
+
+/// Refreshes the lock `token` on `path`. `timeout` is what files_lock counts from when
+/// the lock was taken (see app_locks::refresh_timeout). Conflict when the lock is gone.
+pub fn refresh_lock(
+    client: &crate::http_clients::DavClient,
+    base_url: &str,
+    creds: &crate::auth::Credentials,
+    path: &Path,
+    token: &str,
+    timeout: Duration,
+) -> Result<(), WriteError> {
+    let url = dav_url(base_url, creds.username(), path);
+    let resp = creds.apply(client
+        .request(reqwest::Method::from_bytes(b"LOCK").unwrap(), &url)
+        .timeout(WRITE_TIMEOUT))
+        .header("Timeout", format!("Second-{}", timeout.as_secs()))
+        .header("If", format!("<{}> (<{}>)", url, token))
+        .send()
+        .map_err(|e| WriteError::Network(e.to_string()))?;
+    match resp.status().as_u16() {
+        200 | 204 => Ok(()),
+        400 | 404 | 409 | 412 => Err(WriteError::Conflict),
+        423 => Err(WriteError::Locked),
+        status => Err(WriteError::Server(status, resp.text().unwrap_or_default())),
+    }
+}
+
+/// Releases the lock `token` on `path`. A lock that is already gone counts as released.
+pub fn unlock(
+    client: &crate::http_clients::DavClient,
+    base_url: &str,
+    creds: &crate::auth::Credentials,
+    path: &Path,
+    token: &str,
+) -> Result<(), WriteError> {
+    let url = dav_url(base_url, creds.username(), path);
+    let resp = creds.apply(client
+        .request(reqwest::Method::from_bytes(b"UNLOCK").unwrap(), &url)
+        .timeout(WRITE_TIMEOUT))
+        .header("Lock-Token", format!("<{}>", token))
+        .send()
+        .map_err(|e| WriteError::Network(e.to_string()))?;
+    match resp.status().as_u16() {
+        200 | 204 | 404 | 409 | 412 => Ok(()),
+        423 => Err(WriteError::Locked),
+        status => Err(WriteError::Server(status, resp.text().unwrap_or_default())),
     }
 }
 
@@ -296,10 +416,6 @@ pub fn put_chunk(
 /// Assembles a chunked-upload session into `path` via the collection's
 /// `.file` MOVE target, applying `if_match_etag` as an optimistic-concurrency
 /// guard exactly like a normal PUT's If-Match.
-/// `If` header making a chunked-upload MOVE conditional on the destination's etag.
-fn move_precondition(dest_url: &str, etag: &str) -> String {
-    format!("<{}> ([\"{}\"])", dest_url, etag.trim_matches('"'))
-}
 
 pub fn finish_chunked_upload(
     client: &crate::http_clients::DavClient,
@@ -318,10 +434,10 @@ pub fn finish_chunked_upload(
         .header("Destination", &dest_url)
         .header("Overwrite", "T"), mtime);
 
-    if let Some(etag) = if_match_etag {
-        // Nextcloud checks If-Match on this MOVE against the source (.file), so it 412s even
-        // with the right etag; a tagged If header targets the destination instead.
-        req = req.header("If", move_precondition(&dest_url, etag));
+    // Nextcloud checks If-Match on this MOVE against the source (.file), so it 412s even
+    // with the right etag; a tagged If header targets the destination instead.
+    if let Some(cond) = tagged_if(&dest_url, path, if_match_etag) {
+        req = req.header("If", cond);
     }
 
     let resp = req.send().map_err(|e| WriteError::Network(format!("chunked MOVE: {}", e)))?;
@@ -468,7 +584,7 @@ mod tests {
         // Verified against Nextcloud: If-Match on this MOVE is checked against the source
         // (.file) and always 412s; only this tagged form enforces the destination's etag.
         assert_eq!(
-            move_precondition("https://h/remote.php/dav/files/u/a b.txt", "\"abc123\""),
+            tagged_if("https://h/remote.php/dav/files/u/a b.txt", Path::new("/a b.txt"), Some("\"abc123\"")).unwrap(),
             "<https://h/remote.php/dav/files/u/a b.txt> ([\"abc123\"])",
         );
     }

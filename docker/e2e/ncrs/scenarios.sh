@@ -2548,6 +2548,182 @@ kill "$KP_DAEMON" "$KP_PID" 2>/dev/null
 wait "$KP_DAEMON" "$KP_PID" 2>/dev/null
 rm -f /tmp/keep.*
 
+echo "→ 37. EDITOR LOCK FILES lock the document on the server while it is open"
+# LibreOffice (.~lock.<name>#), Office (~$<name>), Vim (.<name>.swp) and Kate
+# (.<name>.kate-swp) leave a file next to a document while they have it open. ncrs turns
+# that into a Nextcloud token lock (60 s, refreshed every 20 s) so nobody else saves over
+# it, sends the token on its own saves, takes the lock again after a save replaced the
+# file, and releases it when the lock file goes, the editor dies or the daemon restarts.
+# The proxy keeps token locks the way files_lock does.
+AL_PORT=8097
+AL_LOG=/tmp/chunkdav-applock.log
+AL_HOME=/tmp/ncrs-applock
+AL_MOUNT=/mnt/ncrs-applock
+AL_NLOG=/tmp/ncrs-applock.log
+AL_SOCK="$AL_HOME/run/ncrs.sock"
+AL_PROXY="http://127.0.0.1:${AL_PORT}/remote.php/dav/files/${U}"
+: > "$AL_LOG"
+python3 /e2e/chunkdav.py "$AL_PORT" "$CD_HOST" "$AL_LOG" 2>/tmp/chunkdav-applock.err &
+AL_PID=$!
+mkdir -p "$AL_MOUNT" "$AL_HOME/.config/ncrs" "$AL_HOME/run" "$AL_HOME/cache"
+chmod 700 "$AL_HOME/run"
+cat > "$AL_HOME/.config/ncrs/config.yaml" <<CFG
+url: "http://127.0.0.1:${AL_PORT}/remote.php/dav/files/${U}/"
+username: "${U}"
+password: "${P}"
+user: "${U}"
+mount_point: "${AL_MOUNT}"
+allow_insecure_http: true
+http3: false
+optimistic_listing: false
+CFG
+for _ in $(seq 1 20); do
+    curl -s -o /dev/null -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${AL_PROXY}/" && break
+    sleep 0.5
+done
+al_start() {
+    : >> "$AL_NLOG"
+    HOME="$AL_HOME" XDG_RUNTIME_DIR="$AL_HOME/run" XDG_CACHE_HOME="$AL_HOME/cache" XDG_CONFIG_HOME="$AL_HOME/.config" \
+        RUST_LOG="${RUST_LOG:-info}" ncrs --config "$AL_HOME/.config/ncrs/config.yaml" >>"$AL_NLOG" 2>&1 &
+    AL_DAEMON=$!
+    for _ in $(seq 1 60); do
+        mountpoint -q "$AL_MOUNT" && return 0
+        kill -0 "$AL_DAEMON" 2>/dev/null || return 1
+        sleep 1
+    done
+    return 1
+}
+# Whether the proxy holds a lock on edit/<name> now.
+al_locked() {
+    curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 0' "${AL_PROXY}/edit/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1")" \
+        | grep -q '<nc:lock[^>]*>1</nc:lock>'
+}
+al_wait_locked() {   # <name> <yes|no> <seconds>
+    for _ in $(seq 1 "$3"); do
+        if al_locked "$1"; then [ "$2" = yes ] && return 0; else [ "$2" = no ] && return 0; fi
+        sleep 1
+    done
+    return 1
+}
+# An "editor": a process that makes <lock file> in edit/ and keeps running until killed.
+al_editor() {
+    python3 -c 'import os,sys,time
+open(sys.argv[1], "w").write("Ana,ana,laptop,24.10.2026 10:00,file:///home/ana;")
+print(os.getpid(), flush=True)
+time.sleep(3600)' "$AL_MOUNT/edit/$1" > "/tmp/applock.$2.pid" 2>/dev/null &
+    for _ in $(seq 1 20); do [ -s "/tmp/applock.$2.pid" ] && break; sleep 0.2; done
+}
+al_seed() {   # put edit/<name> on the server and wait until the mount shows it
+    printf '%s\n' "$2" > /tmp/applock.seed
+    curl -s -o /dev/null -u "$U:$P" -T /tmp/applock.seed "${URL}edit/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1")"
+    for _ in $(seq 1 40); do
+        ls "$AL_MOUNT/edit" >/dev/null 2>&1
+        [ -e "$AL_MOUNT/edit/$1" ] && return 0
+        sleep 1
+    done
+    return 1
+}
+if ! al_start; then
+    no "setup: the app-lock mount never appeared"
+    tail -20 "$AL_NLOG" | sed 's/^/    /'
+else
+    mkdir -p "$AL_MOUNT/edit"
+    al_seed doc.odt "doc v1" || no "setup: edit/doc.odt never showed on the mount"
+    cat "$AL_MOUNT/edit/doc.odt" >/dev/null
+
+    # (a)-(g) LibreOffice
+    al_editor '.~lock.doc.odt#' lo
+    al_wait_locked doc.odt yes 15 && ok "(a) LibreOffice's lock file locks the document on the server" \
+        || no "(a) no server lock on the document 15 s after LibreOffice's lock file was made"
+    printf 'theirs\n' > /tmp/applock.theirs
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -u "$U:$P" -T /tmp/applock.theirs "${AL_PROXY}/edit/doc.odt")" = 423 ] \
+        && ok "(b) someone else's save of the open document is refused (423)" \
+        || no "(b) another client could save over the document while it was open here"
+    al_rw="$(python3 -c 'import os,stat,sys
+p=sys.argv[1]
+try:
+    os.close(os.open(p, os.O_RDWR)); w="opened"
+except OSError as e:
+    w="errno%d" % e.errno
+print(oct(stat.S_IMODE(os.stat(p).st_mode)), w)' "$AL_MOUNT/edit/doc.odt")"
+    [ "$al_rw" = "0o644 opened" ] && ok "(c) our own lock does not make the document read-only here" \
+        || no "(c) the document is '$al_rw' here while we hold its lock (want 0o644 opened)"
+    printf 'doc v2 (our save)\n' > /tmp/applock.v2
+    python3 -c 'import os,sys
+d=sys.argv[1]; tmp=os.path.join(d,"lu1.tmp")
+open(tmp,"wb").write(open(sys.argv[2],"rb").read()); os.rename(tmp, os.path.join(d,"doc.odt"))' "$AL_MOUNT/edit" /tmp/applock.v2
+    wait_dav_sha edit/doc.odt "$(sha < /tmp/applock.v2)" 60 \
+        && ok "(d) our own save of the locked document goes through (it carries the lock token)" \
+        || no "(d) our save never reached the server ($(grep -c LOCKED423 "$AL_LOG") refused writes in the proxy log)"
+    sleep 3
+    al_wait_locked doc.odt yes 30 && ok "(e) the document is locked again after the save" \
+        || no "(e) the document stayed unlocked after our save"
+    al_t0=$(date +%s)
+    sleep 70
+    if al_locked doc.odt && grep -q "REFRESH .*edit/doc.odt" "$AL_LOG"; then
+        ok "(f) the lock is refreshed past its 60 s timeout while the document stays open"
+    else
+        no "(f) the lock lapsed while the document was open (refreshes: $(grep -c 'REFRESH .*edit/doc.odt' "$AL_LOG"))"
+    fi
+    rm -f "$AL_MOUNT/edit/.~lock.doc.odt#"
+    al_wait_locked doc.odt no 10 && ok "(g) closing the document (its lock file goes) releases the lock" \
+        || no "(g) the lock stayed after LibreOffice's lock file was deleted"
+    kill "$(cat /tmp/applock.lo.pid)" 2>/dev/null
+
+    # (h) Vim, crashing: the swap file stays, the lock must not
+    al_seed notes.txt "notes v1" || no "setup: edit/notes.txt never showed"
+    al_editor '.notes.txt.swp' vim
+    if al_wait_locked notes.txt yes 15; then
+        kill -9 "$(cat /tmp/applock.vim.pid)" 2>/dev/null
+        al_wait_locked notes.txt no 15 && ok "(h) Vim's swap file locks the file, and a crashed Vim's lock is released though its swap file stays" \
+            || no "(h) the lock of a crashed Vim was kept"
+    else
+        no "(h) Vim's swap file did not lock the file"
+    fi
+
+    # (i) Office's owner file names a long document by its last characters
+    al_seed "Report 2026.docx" "report" || no "setup: the Office document never showed"
+    al_editor '~$port 2026.docx' office
+    al_wait_locked "Report 2026.docx" yes 15 && ok "(i) Office's ~\$ owner file locks the document it stands for" \
+        || no "(i) Office's owner file did not lock 'Report 2026.docx'"
+    rm -f "$AL_MOUNT/edit/~\$port 2026.docx"; kill "$(cat /tmp/applock.office.pid)" 2>/dev/null
+
+    # (j) Kate, then a daemon crash and restart while Kate keeps running
+    al_seed k.txt "kate v1" || no "setup: edit/k.txt never showed"
+    al_editor '.k.txt.kate-swp' kate
+    if al_wait_locked k.txt yes 15; then
+        al_old="$(grep '^LOCK .*edit/k.txt' "$AL_LOG" | tail -1 | awk '{print $NF}')"
+        kill -9 "$AL_DAEMON" 2>/dev/null; wait "$AL_DAEMON" 2>/dev/null
+        fusermount3 -uz "$AL_MOUNT" 2>/dev/null || umount -l "$AL_MOUNT" 2>/dev/null
+        if al_start; then
+            sleep 8
+            al_new="$(grep '^LOCK .*edit/k.txt' "$AL_LOG" | tail -1 | awk '{print $NF}')"
+            if grep -q "^UNLOCK .*edit/k.txt" "$AL_LOG" && [ -n "$al_new" ] && [ "$al_new" != "$al_old" ] && al_locked k.txt; then
+                ok "(j) after a daemon restart the old lock is released and taken again for the editor still running"
+            else
+                no "(j) after a restart: unlock $(grep -c '^UNLOCK .*edit/k.txt' "$AL_LOG"), token ${al_old:-?} → ${al_new:-?}, locked now: $(al_locked k.txt && echo yes || echo no)"
+                grep -hE 'k.txt' "$AL_NLOG" | grep -iE 'lock|swp|gone' | tail -8 | sed 's/^/    (daemon) /'
+            fi
+        else
+            no "setup: the daemon did not come back after the restart"
+        fi
+    else
+        no "(j) Kate's swap file did not lock the file"
+    fi
+
+    # (k) turning the setting off releases what is held
+    al_off="$(printf 'APP_LOCKS off\n' | timeout 10 nc -U -N "$AL_SOCK" 2>/dev/null)"
+    al_wait_locked k.txt no 10 && [ "$al_off" = ok ] && ok "(k) turning 'lock documents while you edit them' off releases the locks" \
+        || no "(k) APP_LOCKS off answered '${al_off:-nothing}', k.txt still locked: $(al_locked k.txt && echo yes || echo no)"
+    kill "$(cat /tmp/applock.kate.pid)" 2>/dev/null
+    grep -hE 'locking it on the server|locked .* on the server|lock released|taking it again|still has .* open' "$AL_NLOG" 2>/dev/null | sed 's/^/    (daemon) /' | head -14
+fi
+for f in /tmp/applock.*.pid; do [ -s "$f" ] && kill -9 "$(cat "$f")" 2>/dev/null; done
+fusermount3 -u "$AL_MOUNT" 2>/dev/null || umount "$AL_MOUNT" 2>/dev/null
+kill "$AL_DAEMON" "$AL_PID" 2>/dev/null
+wait "$AL_DAEMON" "$AL_PID" 2>/dev/null
+rm -f /tmp/applock.*
+
 echo
 echo "e2e results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]

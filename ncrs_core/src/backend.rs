@@ -467,6 +467,23 @@ pub trait CloudBackend: Send + Sync + 'static {
     /// (BackendWriteError::Conflict otherwise).
     fn rename(&self, from: &Path, to: &Path, dest_etag: Option<&str>) -> Result<(), BackendWriteError>;
 
+    // -- Server locks (see app_locks) ------------------------------------------
+
+    /// Takes a lock on `path` that expires after `timeout` unless refreshed; returns its
+    /// token. Locked when someone else holds one.
+    fn lock_file(&self, _path: &Path, _timeout: Duration, _owner: &str) -> Result<String, BackendWriteError> {
+        Err(BackendWriteError::Unsupported)
+    }
+
+    /// Conflict when the lock is gone.
+    fn refresh_lock(&self, _path: &Path, _token: &str, _timeout: Duration) -> Result<(), BackendWriteError> {
+        Err(BackendWriteError::Unsupported)
+    }
+
+    fn unlock_file(&self, _path: &Path, _token: &str) -> Result<(), BackendWriteError> {
+        Err(BackendWriteError::Unsupported)
+    }
+
     // -- Bounded chunked-upload streaming --------------------------------------
     //
     // Lets a caller PUT a large file's chunks as they become available instead
