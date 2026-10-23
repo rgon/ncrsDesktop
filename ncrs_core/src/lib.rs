@@ -6698,7 +6698,10 @@ impl NextCloudFs {
         // file_cache_matches_remote() returns false when the file is not cached,
         // and true when offline (no remote etag to compare) so offline reads of a
         // kept copy are never forced into an unsatisfiable re-download.
-        let cache_fresh = self.cache.safe_lock().file_cache_matches_remote(&path);
+        // A queued upload of the path is newer than any cached copy (an edit saved offline):
+        // the copy must neither back a passthrough open nor be read as fresh.
+        let cache_fresh = self.cache.safe_lock().file_cache_matches_remote(&path)
+            && self.journal.safe_lock().pending_upload(&path).is_none();
 
         // Whether the staging file starts out holding the file's current content.
         let mut seeded = false;
