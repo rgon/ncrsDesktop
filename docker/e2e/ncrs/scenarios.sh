@@ -1231,35 +1231,123 @@ PY
             no "a 50 MiB streamed file with a large tail at close never reached the backend intact"
         fi
     fi
-    # With room on the disk (reserve 1 MiB) nothing streams: a 24 MiB file stays local
-    # until close, so a rewrite of offset 0 works and no chunk is sent while it is open.
+    # With room on the disk (reserve 1 MiB) a big file still uploads early, but every byte
+    # stays local until it is uploaded: nothing that goes wrong with the early upload may
+    # lose the file or fail a write. The proxy is restarted for these with three faults
+    # to arm: a MOVE onto "early-slow" held 8 s (an assembly still pending), a chunk-PUT
+    # blip armed through $CD_FAILC, and the session of a MOVE onto "early-gone" expired.
+    CD_FAILC=/tmp/chunkdav-failchunk
+    rm -f "$CD_FAILC"
+    fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
+    kill "$CD_DAEMON" 2>/dev/null; wait "$CD_DAEMON" 2>/dev/null
+    kill "$CD_PID" 2>/dev/null; wait "$CD_PID" 2>/dev/null
+    python3 /e2e/chunkdav.py "$CD_PORT" "$CD_HOST" "$CD_LOG" --slow-write "early-slow:8" \
+        --fail-chunk-file "$CD_FAILC" --expire-session "early-gone:1" 2>>/tmp/chunkdav.err &
+    CD_PID=$!
+    for _ in $(seq 1 20); do
+        curl -s -o /dev/null -u "$U:$P" -X PROPFIND -H 'Depth: 0' \
+            "http://127.0.0.1:${CD_PORT}/remote.php/dav/files/${U}/" && break
+        sleep 0.5
+    done
     if cd_restart 's/^stream_upload_threshold_mb: .*/stream_upload_threshold_mb: 10/; s/^stream_disk_reserve_mb: .*/stream_disk_reserve_mb: 1/'; then
-        python3 - "$CD_MOUNT/chunked/roomy.bin" /tmp/chunked.roomy.expect "$CD_LOG" "$(wc -l < "$CD_LOG")" <<'PY'
-import os, sys
-path, expect_path, log, mark = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-data = bytearray(os.urandom(24 * 1048576))
-fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        mkdir -p "$CD_MOUNT/chunked/early-slow" "$CD_MOUNT/chunked/early-gone"
+        # The writer for these checks: 34 MiB written sequentially (chunks 1 and 2 are
+        # handed to the uploader at 20 and 30 MiB; chunk 0, the head, stays local), with
+        # optional rewrites while it is open. Waits for chunk 1 to go up before closing,
+        # so the check proves the upload started early, then reads the middle back
+        # through a fresh fd right after close, while the upload may still be pending.
+        early_write() {  # <mount path> <expect file> <seek-back offset or -> [wait for chunk: 1|0]
+            python3 - "$1" "$2" "$3" "$CD_LOG" "$(wc -l < "$CD_LOG")" "${4:-1}" <<'PY'
+import os, sys, time
+path, expect_path, back, log, mark, wait = sys.argv[1:7]
+mark, MiB = int(mark), 1048576
+data = bytearray(os.urandom(34 * MiB + 555))
+bad = []
 try:
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
     for off in range(0, len(data), 65536):
         os.pwrite(fd, bytes(data[off:off + 65536]), off)
+    if wait == "1":
+        early = False
+        for _ in range(60):
+            if any(l.startswith("PUT ") and l.split()[1].endswith("/0000000001")
+                   for l in open(log).read().splitlines()[mark:]):
+                early = True
+                break
+            time.sleep(0.5)
+        if not early:
+            bad.append("no chunk went up while the file was open: not an early upload")
+    # The middle, already sent, still reads back through the writer's own fd.
+    if os.pread(fd, 65536, 15 * MiB) != bytes(data[15 * MiB:15 * MiB + 65536]):
+        bad.append("reading the already-sent middle while open returned other bytes")
+    if back != "-":
+        # A zip writer going back to a local header (sizes, CRC) in bytes already sent.
+        b = int(back)
+        data[b:b + 4096] = os.urandom(4096)
+        os.pwrite(fd, bytes(data[b:b + 4096]), b)
+    # And a header patch at offset 0, in the kept head.
     data[0:4096] = os.urandom(4096)
     os.pwrite(fd, bytes(data[0:4096]), 0)
+    os.close(fd)
+    # Right after close: the upload may still be on its way, the middle must read back.
+    with open(path, "rb") as f:
+        f.seek(15 * MiB)
+        if f.read(65536) != bytes(data[15 * MiB:15 * MiB + 65536]):
+            bad.append("reading the middle right after close returned other bytes")
 except OSError as e:
-    print("    write: %s" % e)
-    sys.exit(1)
-sent = [l for l in open(log).read().splitlines()[mark:] if l.startswith("PUT ")]
-os.close(fd)
+    bad.append("I/O error: %s" % e)
 open(expect_path, "wb").write(bytes(data))
-if sent:
-    print("    %d chunk(s) were sent while the file was still open" % len(sent))
-    sys.exit(2)
+for x in bad:
+    print("    " + x)
+sys.exit(1 if bad else 0)
 PY
+        }
+
+        # (a) A healthy early upload, assembled 8 s after close: chunks went up while it was
+        # open, and the middle reads back from the local copy until the assembly lands.
+        early_write "$CD_MOUNT/chunked/early-slow/mid.bin" /tmp/chunked.mid.expect -
+        mrc=$?
+        [ "$mrc" = 0 ] && ok "plenty of disk: chunks went up while the file was open, and its middle read back while open and right after close" \
+            || no "plenty of disk: early upload / read-back of the middle failed (rc=$mrc)"
+        wait_dav_sha chunked/early-slow/mid.bin "$(sha < /tmp/chunked.mid.expect 2>/dev/null)" 90 \
+            && ok "plenty of disk: the early-uploaded file reached the backend byte-exact" \
+            || no "plenty of disk: the early-uploaded file never reached the backend intact"
+
+        # (b) A zip-like seek back into a sent chunk (12 MiB, in chunk 1) plus an offset-0
+        # patch: the rewrite succeeds, the early upload is dropped and the file uploads whole.
+        early_write "$CD_MOUNT/chunked/roomy.bin" /tmp/chunked.roomy.expect $((12 * 1048576))
         rrc=$?
-        [ "$rrc" = 0 ] && ok "plenty of disk: a 24 MiB file was not streamed, and rewriting its offset 0 worked" \
-            || no "plenty of disk: the 24 MiB file was streamed or its rewrite failed (rc=$rrc)"
+        [ "$rrc" = 0 ] && ok "plenty of disk: chunks went up early, and rewriting a sent chunk and offset 0 got no write error" \
+            || no "plenty of disk: the rewrite of an early-uploaded file failed (rc=$rrc)"
         wait_dav_sha chunked/roomy.bin "$(sha < /tmp/chunked.roomy.expect 2>/dev/null)" 90 \
-            && ok "plenty of disk: the file reached the backend byte-exact after close" \
-            || no "plenty of disk: the file never reached the backend intact"
+            && ok "plenty of disk: the rewritten file reached the backend byte-exact (uploaded whole)" \
+            || no "plenty of disk: the rewritten file never reached the backend intact"
+        grep -q "roomy.bin .*dropping its early upload" "$CD_NLOG" \
+            || no "plenty of disk: the rewrite into a sent chunk did not drop the early upload — the check missed the fallback"
+
+        # (c) A network blip mid-stream: chunk PUTs fail with 503 past their retries. The
+        # writer sees no error and the file still lands whole.
+        printf '503 3\n' > "$CD_FAILC"
+        early_write "$CD_MOUNT/chunked/blip.bin" /tmp/chunked.blip.expect - 0
+        brc=$?
+        rm -f "$CD_FAILC"
+        [ "$brc" = 0 ] && ok "plenty of disk: failed chunk PUTs mid-stream gave the writer no error" \
+            || no "plenty of disk: a chunk-PUT blip mid-stream failed the writer (rc=$brc)"
+        grep -q "^FAILC " "$CD_LOG" || no "setup: no chunk PUT was failed — the blip check did not run"
+        wait_dav_sha chunked/blip.bin "$(sha < /tmp/chunked.blip.expect 2>/dev/null)" 90 \
+            && ok "plenty of disk: after the blip the file still reached the backend byte-exact" \
+            || no "plenty of disk: after a chunk-PUT blip the file never reached the backend intact (data loss)"
+
+        # (d) The session is gone at the assembly (Nextcloud's day-old upload cleanup): the
+        # staging file still holds every byte, so it is uploaded whole instead of dropped.
+        early_write "$CD_MOUNT/chunked/early-gone/gone.bin" /tmp/chunked.gone.expect -
+        grc=$?
+        [ "$grc" = 0 ] || no "plenty of disk: writing the file whose session expires failed (rc=$grc)"
+        wait_dav_sha chunked/early-gone/gone.bin "$(sha < /tmp/chunked.gone.expect 2>/dev/null)" 90 \
+            && ok "plenty of disk: an assembly that found its session gone (404) fell back to a whole-file upload, byte-exact" \
+            || no "plenty of disk: an expired upload session lost the file (backend has $(curl -s -u "$U:$P" "${URL}chunked/early-gone/gone.bin" | wc -c) bytes)"
+        grep -q "^EXPIRED .*early-gone/gone.bin" "$CD_LOG" || no "setup: the assembly's session was never expired — the 404 check did not run"
+        grep -E "write:.*(abort|cannot go on)" "$CD_NLOG" | grep -E "early-slow|roomy|blip|early-gone" | head -3 | sed 's/^/    unexpected: /'
     fi
 
     # With stream_uploads off, the whole file is staged locally, so a rewrite of offset 0
@@ -1303,7 +1391,8 @@ fusermount3 -u "$CD_MOUNT" 2>/dev/null || umount "$CD_MOUNT" 2>/dev/null
 kill "$CD_DAEMON" "$CD_PID" 2>/dev/null
 wait "$CD_DAEMON" "$CD_PID" 2>/dev/null
 rm -f /tmp/chunked.seq /tmp/chunked.lo.expect /tmp/chunked.hdr.expect /tmp/chunked.big /tmp/chunked.roomy.expect \
-    /tmp/chunked.trailer.expect /tmp/chunked.rw
+    /tmp/chunked.trailer.expect /tmp/chunked.rw /tmp/chunked.mid.expect /tmp/chunked.blip.expect /tmp/chunked.gone.expect \
+    /tmp/chunkdav-failchunk
 
 echo "→ 30. MODIFICATION TIME is the same after the upload as right after the save"
 # LibreOffice remembers a document's mtime right after saving it and, before the next save,

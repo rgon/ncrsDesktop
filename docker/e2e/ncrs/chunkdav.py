@@ -35,9 +35,20 @@ MOVE or DELETE of a locked file without its token in the If header gets 423, a M
 onto it drops the lock with the file it replaces, and PROPFIND reports it (nc:lock,
 lock-owner-type 2). Logged as LOCK / REFRESH / UNLOCK / LOCKED423.
 
+With --fail-chunk-file PATH, a network blip can be armed while the proxy runs: while
+PATH exists and holds "STATUS COUNT", the next COUNT chunk PUTs after a session's first
+chunk (index 1 on, so an early upload is hit and not a whole-file upload's chunk 0) get
+STATUS (logged as FAILC); the file is removed once COUNT is used up. A chunk PUT names
+no file, hence a file armed right before the write it is meant for.
+
+With --expire-session MARKER:COUNT, the first COUNT assembling MOVEs whose Destination
+contains MARKER find their session gone, as Nextcloud's cleanup of uploads unfinished
+for a day leaves it: the session is deleted and the MOVE gets 404 (logged as EXPIRED).
+
 Usage: chunkdav.py <listen-port> <upstream-host> <log-file>
                    [--slow MARKER:SECONDS] [--slow-write MARKER:SECONDS]
                    [--fail-write MARKER:STATUS:COUNT] [--locked MARKER:OWNER:TYPE]
+                   [--fail-chunk-file PATH] [--expire-session MARKER:COUNT]
 """
 import base64
 import http.client
@@ -56,7 +67,16 @@ SLOW_MARK, SLOW_SECS = None, 0.0
 WSLOW_MARK, WSLOW_SECS = None, 0.0
 FAIL_MARK, FAIL_STATUS, FAIL_LEFT = None, 0, 0
 LOCK_MARK, LOCK_OWNER, LOCK_TYPE = None, "", "0"
+FAIL_CHUNK_FILE = None
+EXPIRE_MARK, EXPIRE_LEFT = None, 0
 for flag, spec in zip(sys.argv[4::2], sys.argv[5::2]):
+    if flag == "--fail-chunk-file":
+        FAIL_CHUNK_FILE = spec
+        continue
+    if flag == "--expire-session":
+        EXPIRE_MARK, count = spec.rsplit(":", 1)
+        EXPIRE_LEFT = int(count)
+        continue
     if flag == "--fail-write":
         FAIL_MARK, status, count = spec.rsplit(":", 2)
         FAIL_STATUS, FAIL_LEFT = int(status), int(count)
@@ -284,8 +304,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return re.sub(r"(<(?:\w+:)?prop\b[^>]*>)", lambda p: p.group(1) + add, r, count=1)
         return re.sub(r"<(\w+:)?response\b[^>]*>.*?</(\w+:)?response>", one, text, flags=re.S).encode("utf-8")
 
+    def armed_chunk_failure(self, index):
+        """The status an armed --fail-chunk-file gives this chunk PUT, None if not armed."""
+        if not FAIL_CHUNK_FILE or int(index) < 1:
+            return None
+        with log_lock:
+            try:
+                status, count = open(FAIL_CHUNK_FILE).read().split()
+            except (OSError, ValueError):
+                return None
+            left = int(count) - 1
+            if left > 0:
+                with open(FAIL_CHUNK_FILE, "w") as f:
+                    f.write("%s %d\n" % (status, left))
+            else:
+                os.remove(FAIL_CHUNK_FILE)
+            return int(status)
+
     def uploads(self, rel, data):
         # rel = "<user>/<transfer-id>[/<chunk>|/.file]"
+        global EXPIRE_LEFT
         parts = [urllib.parse.unquote(p) for p in rel.strip("/").split("/")]
         if len(parts) < 2 or any(p in ("", ".", "..") for p in parts):
             return self.reply(400)
@@ -295,6 +333,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             os.makedirs(session, exist_ok=True)
             return self.reply(201)
         if self.command == "PUT" and len(parts) == 3 and re.fullmatch(r"\d+", parts[2]):
+            failed = self.armed_chunk_failure(parts[2])
+            if failed:
+                log("FAILC %s -> %d" % ("/".join(parts[1:]), failed))
+                return self.reply(failed)
             if not os.path.isdir(session):
                 return self.reply(404)
             with open(os.path.join(session, parts[2]), "wb") as f:
@@ -304,6 +346,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             shutil.rmtree(session, ignore_errors=True)
             return self.reply(204)
         if self.command == "MOVE" and len(parts) == 3 and parts[2] == ".file":
+            target = urllib.parse.unquote(urllib.parse.urlsplit(self.headers.get("Destination", "")).path)
+            with log_lock:
+                expire = EXPIRE_MARK is not None and EXPIRE_MARK in target and EXPIRE_LEFT > 0
+                if expire:
+                    EXPIRE_LEFT -= 1
+            if expire:
+                shutil.rmtree(session, ignore_errors=True)
+                log("EXPIRED %s -> %s" % (parts[1], target))
+                return self.reply(404)
             if not os.path.isdir(session):
                 return self.reply(404)
             whole = bytearray()
