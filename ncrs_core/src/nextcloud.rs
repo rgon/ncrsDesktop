@@ -348,6 +348,7 @@ impl CloudBackend for NextcloudBackend {
         path: &Path,
         if_match: Option<&str>,
         mtime: Option<std::time::SystemTime>,
+        total_len: u64,
     ) -> Result<PutResult, BackendWriteError> {
         webdav_ops::finish_chunked_upload(
             &self.clients.get(),
@@ -357,6 +358,7 @@ impl CloudBackend for NextcloudBackend {
             path,
             if_match,
             mtime,
+            total_len,
         )
         .map(PutResult::from)
         .map_err(BackendWriteError::from)

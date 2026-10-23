@@ -48,8 +48,10 @@ and programs block; nothing fails.
   drained hand-over also writes `handoff-handles.json` (dirty flags, streamed
   upload progress); the successor reads it once and deletes it. Without it,
   write handles are judged by their staging file's identity, and a handle that
-  was mid-way through a streamed upload comes back failed (EIO) rather than
-  guessed.
+  was mid-way through a disk-low streamed upload (sent chunks punched out) comes
+  back failed (EIO) rather than guessed. An early upload, whose staging file still
+  holds every byte, is not resumed either way: the handle comes back as a plain
+  staged write and the file is uploaded whole when it is closed.
 - **Passthrough backing ids** belong to the connection, not to a process, so
   files the previous daemon opened in passthrough mode keep reading directly
   from their cache copies. Their ids are part of the handle log; the

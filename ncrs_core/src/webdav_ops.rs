@@ -138,7 +138,7 @@ fn put_file_streamed(
     let file = std::fs::File::open(staging_path)
         .map_err(|e| WriteError::Network(format!("staging open: {}", e)))?;
     // The whole file rides one request, so the budget scales with its size (>= 512 KiB/s).
-    let timeout = WRITE_TIMEOUT + std::time::Duration::from_secs(file_size as u64 / (512 * 1024));
+    let timeout = sized_timeout(file_size as u64);
     let url = dav_url(base_url, creds.username(), path);
     let mut req = with_mtime(creds.apply(client
         .put(&url)
@@ -350,6 +350,13 @@ pub fn unlock(
     }
 }
 
+/// WRITE_TIMEOUT plus a second per 512 KiB of `size`: for a request whose work on the
+/// server grows with the file, a whole-file PUT or a chunked upload's assembly, which
+/// Nextcloud answers only once it has concatenated every chunk into the file.
+pub(crate) fn sized_timeout(size: u64) -> Duration {
+    WRITE_TIMEOUT + Duration::from_secs(size / (512 * 1024))
+}
+
 pub(crate) const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const CHUNK_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -425,12 +432,15 @@ pub fn finish_chunked_upload(
     path: &Path,
     if_match_etag: Option<&str>,
     mtime: Option<SystemTime>,
+    total_size: u64,
 ) -> Result<PutResult, WriteError> {
     let dest_url = dav_url(base_url, creds.username(), path);
     let assemble_url = format!("{}/.file", uploads_base);
+    // The server copies every chunk into the file before it answers: a fixed budget timed
+    // out a multi-GiB assembly that then landed anyway, and the retry found it gone.
     let mut req = with_mtime(creds.apply(client
         .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &assemble_url)
-        .timeout(WRITE_TIMEOUT))
+        .timeout(sized_timeout(total_size)))
         .header("Destination", &dest_url)
         .header("Overwrite", "T"), mtime);
 
@@ -490,7 +500,7 @@ pub fn put_file_chunked(
         }
     }
 
-    finish_chunked_upload(client, base_url, creds, &uploads_base, path, if_match_etag, mtime)
+    finish_chunked_upload(client, base_url, creds, &uploads_base, path, if_match_etag, mtime, body.len() as u64)
 }
 
 pub fn put_file_from_path(
@@ -560,7 +570,7 @@ pub fn put_file_from_path_settled(
         let _ = cleanup_chunked_upload(client, &uploads_base, creds);
         return Err(WriteError::Withdrawn);
     };
-    finish_chunked_upload(client, base_url, creds, &uploads_base, &path, if_match_etag.as_deref(), mtime)
+    finish_chunked_upload(client, base_url, creds, &uploads_base, &path, if_match_etag.as_deref(), mtime, file_size as u64)
 }
 
 fn cleanup_chunked_upload(
@@ -578,6 +588,14 @@ fn cleanup_chunked_upload(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn size_bound_requests_get_a_second_per_512_kib() {
+        assert_eq!(super::sized_timeout(0), super::WRITE_TIMEOUT);
+        assert_eq!(super::sized_timeout(512 * 1024 - 1), super::WRITE_TIMEOUT);
+        // A 4 GiB assembly gets over two hours, not the minute that timed it out.
+        assert_eq!(super::sized_timeout(4 << 30), super::WRITE_TIMEOUT + std::time::Duration::from_secs(8192));
+    }
 
     #[test]
     fn chunked_move_precondition_targets_the_destination() {

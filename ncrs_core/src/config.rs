@@ -85,21 +85,25 @@ pub struct MountOptions {
     pub walker_rate_limit: bool,
     #[serde(default = "default_walker_listings_per_sec")]
     pub walker_listings_per_sec: u32,
-    /// When the disk is low (see `stream_disk_reserve_mb`), send a new file to the
-    /// server in chunks while it is still being written, once it passes
-    /// `stream_upload_threshold_mb`, instead of staging all of it on local disk
-    /// first. Off means every write is staged in full: costs disk space, but a
-    /// program that goes back and rewrites early bytes of a big file (office
-    /// saves, zip writers) can never hit already-sent data.
+    /// Send a new file to the server in chunks while it is still being written, once
+    /// it passes `stream_upload_threshold_mb`, so most of it is uploaded by the time
+    /// it is closed. The whole file is still kept on local disk, so a program that
+    /// goes back and rewrites early bytes (office saves, zip writers) only costs the
+    /// early start: the file is then uploaded whole when closed. Only when the disk is
+    /// low (see `stream_disk_reserve_mb`) are sent chunks also freed from local disk,
+    /// so big copies still fit; there a rewrite of already-sent bytes is a write error.
+    /// Off means every file is uploaded only once it is closed.
     #[serde(default = "default_true")]
     pub stream_uploads: bool,
-    /// How far (MiB) a new file must be written before streaming starts. Below
-    /// it the whole file stays local, so writes anywhere in it work.
+    /// How far (MiB) a new file must be written before its upload starts. Chunks then
+    /// go up this far behind the writer, so rewrites within the last this-many MiB
+    /// never touch sent data.
     #[serde(default = "default_stream_upload_threshold_mb")]
     pub stream_upload_threshold_mb: u64,
-    /// Streaming only happens while free space on the cache's filesystem is below
-    /// this (MiB); with room to spare every file is staged in full, which works for
-    /// any write pattern. 0 means automatic: the larger of 2 GiB and 5% of the disk.
+    /// Sent chunks are freed from local disk only while free space on the cache's
+    /// filesystem is below this (MiB); with room to spare the whole file stays local,
+    /// which any write pattern survives. 0 means automatic: the larger of 2 GiB and 5%
+    /// of the disk.
     #[serde(default)]
     pub stream_disk_reserve_mb: u64,
     /// Honour Nextcloud's file locks (the files_lock app): a file someone else has
@@ -726,13 +730,14 @@ pub fn rewrite_config_settings(settings: &ConfigSettings) -> Result<(), String> 
     content.push_str("# the local cache are never slowed. Applies immediately, no remount needed.\n");
     content.push_str(&format!("walker_rate_limit: {}\n", settings.walker_rate_limit));
     content.push_str(&format!("walker_listings_per_sec: {}\n", settings.walker_listings_per_sec));
-    content.push_str("# When the disk is low, once a new file has been written past\n");
-    content.push_str("# stream_upload_threshold_mb (MiB), send it to the server in 10 MiB pieces while\n");
-    content.push_str("# it is still being written instead of saving all of it locally first. Saves disk\n");
-    content.push_str("# space on big copies; a program that later rewrites an already-sent part of the\n");
-    content.push_str("# file gets a write error. 'Low' is free space under stream_disk_reserve_mb\n");
-    content.push_str("# (MiB; 0 = automatic, the larger of 2 GiB and 5% of the disk).\n");
-    content.push_str("# Set false to always stage the whole file locally. Applies to files opened after the change.\n");
+    content.push_str("# Once a new file has been written past stream_upload_threshold_mb (MiB), send it\n");
+    content.push_str("# to the server in 10 MiB pieces while it is still being written, so big copies\n");
+    content.push_str("# finish uploading soon after they are closed. The whole file stays on local disk\n");
+    content.push_str("# too: a program that rewrites an already-sent part just has it uploaded whole on\n");
+    content.push_str("# close. Only when the disk is low are sent pieces freed locally, so big copies\n");
+    content.push_str("# still fit; there such a rewrite gets a write error. 'Low' is free space under\n");
+    content.push_str("# stream_disk_reserve_mb (MiB; 0 = automatic, the larger of 2 GiB and 5% of the disk).\n");
+    content.push_str("# Set false to upload files only once closed. Applies to files opened after the change.\n");
     content.push_str(&format!("stream_uploads: {}\n", settings.stream_uploads));
     content.push_str(&format!("stream_upload_threshold_mb: {}\n", settings.stream_upload_threshold_mb));
     content.push_str(&format!("stream_disk_reserve_mb: {}\n", settings.stream_disk_reserve_mb));

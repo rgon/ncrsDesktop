@@ -3255,7 +3255,7 @@ mod upload_order_tests {
         let wp = dir.join("write_1");
         std::fs::write(&wp, pattern(1_000)).unwrap();
         let mut of = writer_handle(7, true, Some(wp));
-        of.chunk_upload = Some(ChunkUploadState { uploads_base: "x".into(), next_index: 3, bytes_confirmed: 30_000, head: 0 });
+        of.chunk_upload = Some(ChunkUploadState::resumed("x".into(), 3, 30_000, 0, true));
         of.total_written = 31_000;
         let files = Mutex::new(HashMap::from([(1, of)]));
 
@@ -3390,7 +3390,7 @@ mod upload_order_tests {
         f.write_all_at(&head, 0).unwrap();
         f.write_all_at(&tail, 30_000).unwrap();
         let mut of = writer_handle(7, true, Some(wp.clone()));
-        of.chunk_upload = Some(ChunkUploadState { uploads_base: "x".into(), next_index: 3, bytes_confirmed: 30_000, head: 10_000 });
+        of.chunk_upload = Some(ChunkUploadState::resumed("x".into(), 3, 30_000, 10_000, true));
         let files = HashMap::from([(1, of)]);
 
         let (src, held) = staged_source(&files, 1, 7).unwrap();
@@ -3530,8 +3530,66 @@ mod upload_order_tests {
         assert!(stream_should_graduate(2 * chunk, None, 0));
         // Session open: one chunk sent leaves the tail under the threshold, so the next
         // chunk only goes once the writer has added another chunk's worth.
-        let s = ChunkUploadState { uploads_base: "x".into(), next_index: 2, bytes_confirmed: 2 * chunk, head: chunk };
+        let s = ChunkUploadState::resumed("x".into(), 2, 2 * chunk, chunk, true);
         assert!(!stream_should_graduate(threshold + chunk, Some(&s), threshold));
         assert!(!stream_should_graduate(threshold + 2 * chunk - 1, Some(&s), threshold));
         assert!(stream_should_graduate(threshold + 2 * chunk, Some(&s), threshold));
+        // What counts is what was handed to the uploader, sent or not: a chunk on its way
+        // does not make the next one due again.
+        s.pump.state.lock().unwrap().claimed = 3 * chunk;
+        assert!(!stream_should_graduate(threshold + 2 * chunk, Some(&s), threshold));
+        assert!(stream_should_graduate(threshold + 3 * chunk, Some(&s), threshold));
+    }
+
+    #[test]
+    fn an_early_upload_falls_back_where_a_disk_low_one_fails() {
+        let chunk = webdav_ops::CHUNK_SIZE as u64;
+        let (head, end) = (chunk, 20 * chunk);
+        let early = PumpState { next_index: 3, bytes_confirmed: 3 * chunk, claimed: 4 * chunk, ..PumpState::default() };
+        let low = PumpState { punching: true, ..early.clone() };
+        for (p, broken) in [(&early, StreamWrite::Abandon), (&low, StreamWrite::Fail)] {
+            // Appending, rewriting the unsent tail or the kept head carries on.
+            assert_eq!(stream_write_verdict(end, 4096, end, head, p, false), StreamWrite::Keep);
+            assert_eq!(stream_write_verdict(end - 4096, 4096, end, head, p, false), StreamWrite::Keep);
+            assert_eq!(stream_write_verdict(4 * chunk, 4096, end, head, p, false), StreamWrite::Keep);
+            assert_eq!(stream_write_verdict(0, 4096, end, head, p, false), StreamWrite::Keep);
+            // A zip writer going back to an entry's header in bytes already handed over (the
+            // chunk still on its way included), a header write running into them, or a
+            // write past the end can no longer be uploaded as the session has it.
+            assert_eq!(stream_write_verdict(2 * chunk, 4096, end, head, p, false), broken);
+            assert_eq!(stream_write_verdict(4 * chunk - 1, 4096, end, head, p, false), broken);
+            assert_eq!(stream_write_verdict(head - 100, 4096, end, head, p, false), broken);
+            assert_eq!(stream_write_verdict(end + 1, 4096, end, head, p, false), broken);
+            // Nor can a session whose chunk would not go up, or one closed under it.
+            let failed = PumpState { failed: Some("503".into()), ..p.clone() };
+            assert_eq!(stream_write_verdict(end, 4096, end, head, &failed, false), broken);
+            let closed = PumpState { closed: true, ..p.clone() };
+            assert_eq!(stream_write_verdict(end, 4096, end, head, &closed, false), broken);
+        }
+        // Offline, an early upload drops to the whole-file upload at once; a disk-low one
+        // has nothing to drop to and lets its next chunk decide.
+        assert_eq!(stream_write_verdict(end, 4096, end, head, &early, true), StreamWrite::Abandon);
+        assert_eq!(stream_write_verdict(end, 4096, end, head, &low, true), StreamWrite::Keep);
+    }
+
+    #[test]
+    fn an_early_upload_serves_every_byte_from_its_staging_file() {
+        let dir = staging_dir("early-read");
+        let wp = dir.join("write_1");
+        let data = pattern(40_000);
+        std::fs::write(&wp, &data).unwrap();
+        let mut of = writer_handle(7, true, Some(wp.clone()));
+        of.chunk_upload = Some(ChunkUploadState::resumed("x".into(), 3, 30_000, 10_000, false));
+        of.total_written = 40_000;
+        let files = HashMap::from([(1, of)]);
+
+        let (src, held) = staged_source(&files, 1, 7).unwrap();
+        assert_eq!(held, Held::ALL, "nothing was punched out");
+        assert_eq!(read_staged(&src, 15_000, 100).unwrap(), data[15_000..15_100], "the middle reads back");
+        // Once the disk got low and its sent chunks were freed, the middle is gone locally.
+        files[&1].chunk_upload.as_ref().unwrap().pump.state.lock().unwrap().punching = true;
+        let (_, held) = staged_source(&files, 1, 7).unwrap();
+        assert!(!held.covers(15_000, 100));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }

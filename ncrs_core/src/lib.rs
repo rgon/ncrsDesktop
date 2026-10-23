@@ -1118,7 +1118,12 @@ impl Held {
     const ALL: Held = Held { head: 0, from: 0 };
 
     fn of(session: Option<&ChunkUploadState>) -> Held {
-        session.map_or(Held::ALL, |c| Held { head: c.head, from: c.bytes_confirmed })
+        // An early upload keeps every byte: only a disk-low one punches its sent chunks out.
+        let p = session.map(|c| (c.head, c.progress()));
+        match p {
+            Some((head, p)) if p.punching => Held { head, from: p.bytes_confirmed },
+            _ => Held::ALL,
+        }
     }
 
     /// Whether `sz` bytes at `off` are all held: a read reaching into the sent bytes
@@ -1159,33 +1164,143 @@ struct ReadAheadBuf {
     target_len: u64,
 }
 
-// State for the bounded chunked-upload streaming path (see write()'s
-// stream_eligible handling): once a sequential write on a file with no
-// pre-existing content crosses the stream threshold (`stream_upload_threshold_mb`,
-// 100 MiB by default), the oldest CHUNK_SIZE chunk is pushed to Nextcloud each
-// time the unsent tail reaches the threshold again, instead of the whole file
-// landing on local disk first. The staging file keeps the file's own offsets: sent
-// chunks become holes (free_sent_chunk) and the unsent tail stays where it was, so
-// writes back into the tail are fine. The file's first chunk (`head`) is never sent
-// early: it stays in the staging file and goes up as chunk 0 at the finish, so a muxer
-// patching its header when it closes (ffmpeg's mp4 mdat size, OBS's mkv segment size
-// and seek head) writes into local bytes. Streamed chunks are numbered from 1, and
-// the server assembles them by name, so chunk 0 still lands first. There is
-// deliberately no journal entry for this: unlike the legacy staging path, a
-// crash or a write into already-sent bytes while a session is open cannot be resumed
-// or safely unwound (the already-uploaded prefix is punched out locally),
-// so those cases fail the handle outright rather than risk silent corruption
-// or data loss. A plain sequential copy — the case this exists for — never
-// hits either path.
+// State for uploading a large file while it is being written (see write()'s
+// stream_eligible handling): once a sequential write on a file with no pre-existing
+// content crosses the stream threshold (`stream_upload_threshold_mb`, 100 MiB by
+// default), the oldest CHUNK_SIZE chunk behind the writer is handed to a background
+// uploader (run_chunk_pump) each time the unsent tail reaches the threshold again, so
+// most of the file is on the server by the time it is closed and release() is left with
+// the rest and the assembly. The staging file keeps the file's own offsets, so writes
+// back into the unsent tail are fine. Two modes:
+//
+// - Early upload, whenever the disk has room: the staging file keeps every byte, and the
+//   session is only a head start. Anything that would make it disagree with the file (a
+//   write into bytes already handed to the uploader, a resize, going offline, a chunk that
+//   would not go up, a restart) abandons the session, and release() uploads the staging
+//   file whole like any other save. So does a session the server no longer has when the
+//   file is assembled (FinishChunked `whole`). Reads are served from the staging file.
+// - Disk low (stream_disk_low, on a filesystem that can punch holes): sent chunks are also
+//   punched out of the staging file (free_sent_chunk), so a file the disk cannot hold
+//   still copies. Nothing local is left to fall back on there, so the cases above fail
+//   the handle (EIO) instead, and write() waits for the uploader rather than let unsent
+//   bytes pile up on a full disk. A plain sequential copy never hits either path.
+//
+// The file's first chunk (`head`) is never sent early: it stays in the staging file and
+// goes up as chunk 0 at the finish, so a muxer patching its header when it closes
+// (ffmpeg's mp4 mdat size, OBS's mkv segment size and seek head) writes into local bytes.
+// Streamed chunks are numbered from 1, and the server assembles them by name, so chunk 0
+// still lands first.
 #[derive(Clone)]
 struct ChunkUploadState {
     uploads_base: String,
+    // The file's first bytes, kept local and sent as chunk 0 at the finish (STREAM_HEAD).
+    head: u64,
+    pump: Arc<ChunkPump>,
+}
+
+/// A streamed upload's progress, shared by the handle (write, release, reads) and its
+/// background uploader. Lock order: `open_files` before this, never the other way.
+#[derive(Default)]
+struct ChunkPump {
+    state: Mutex<PumpState>,
+    // Signalled whenever a chunk lands or fails, the uploader goes idle, or it is closed.
+    cv: Condvar,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PumpState {
+    // Index the next chunk goes up as.
     next_index: u64,
     // End of the sent bytes: everything in [head, bytes_confirmed) is on the server.
     bytes_confirmed: u64,
-    // The file's first bytes, kept local and sent as chunk 0 at the finish (STREAM_HEAD).
-    head: u64,
+    // End of the bytes handed to the uploader, sent or not. A write below it changes
+    // bytes the uploader may be reading right now, so it counts as a write into sent bytes.
+    claimed: u64,
+    // Sent chunks are punched out of the staging file (the disk is low).
+    punching: bool,
+    // An uploader job for this session is queued or running.
+    busy: bool,
+    // A chunk could not be sent: the session can no longer be finished.
+    failed: Option<String>,
+    // Taken over by release(), abandoned, or frozen for a hand-over: nothing more is sent
+    // or punched, and the progress stays what it was then.
+    closed: bool,
 }
+
+impl ChunkUploadState {
+    /// A session whose chunks up to `bytes_confirmed` are on the server.
+    fn resumed(uploads_base: String, next_index: u64, bytes_confirmed: u64, head: u64, punching: bool) -> Self {
+        let state = PumpState { next_index, bytes_confirmed, claimed: bytes_confirmed, punching, ..PumpState::default() };
+        ChunkUploadState { uploads_base, head, pump: Arc::new(ChunkPump { state: Mutex::new(state), cv: Condvar::new() }) }
+    }
+
+    fn progress(&self) -> PumpState {
+        self.pump.state.safe_lock().clone()
+    }
+
+    fn session(&self) -> backend::ChunkedUploadSession {
+        backend::ChunkedUploadSession { uploads_base: self.uploads_base.clone() }
+    }
+
+    /// Stops the uploader for good and returns the progress as it then stands: a chunk
+    /// still on its way no longer counts, whether it lands or not.
+    fn close(&self) -> PumpState {
+        let mut st = self.pump.state.safe_lock();
+        st.closed = true;
+        self.pump.cv.notify_all();
+        st.clone()
+    }
+
+    /// Waits until no uploader job is running: one still sending a chunk could otherwise
+    /// write that chunk on the server while the finish re-sends or assembles it.
+    fn wait_idle(&self) {
+        // Bounded all the same: a chunk PUT gives up within its retries' timeouts, and an
+        // uploader job that died without clearing `busy` must not hold a mutation worker.
+        const LIMIT: Duration = Duration::from_secs(20 * 60);
+        let st = self.pump.state.safe_lock();
+        let (st, waited) = self.pump.cv.wait_timeout_while(st, LIMIT, |s| s.busy).unwrap_or_else(|e| e.into_inner());
+        if waited.timed_out() {
+            log::warn!("streamed upload {}: its uploader is still busy after {:?} — finishing without it", self.uploads_base, LIMIT);
+        }
+        drop(st);
+    }
+
+    /// A disk-low upload that lost a chunk: the bytes it held are gone locally too.
+    fn lost(&self) -> bool {
+        let p = self.progress();
+        p.punching && (p.failed.is_some() || p.closed)
+    }
+}
+
+/// What a write of `len` bytes at `off` does to its handle's streamed upload.
+#[derive(Debug, PartialEq)]
+enum StreamWrite {
+    /// Into bytes not yet handed to the uploader, or into the kept head: carry on.
+    Keep,
+    /// The session can no longer be finished, but the staging file holds the whole file:
+    /// drop the session and upload the file whole at release.
+    Abandon,
+    /// The session can no longer be finished and its sent bytes are gone locally: EIO.
+    Fail,
+}
+
+fn stream_write_verdict(off: u64, len: u64, total_written: u64, head: u64, p: &PumpState, offline: bool) -> StreamWrite {
+    let in_head = off.saturating_add(len) <= head;
+    let in_tail = off >= p.claimed && off <= total_written;
+    // Offline, an early upload would only fail its next chunk: drop it now, while the
+    // staging file can still be uploaded whole. A disk-low one has no such fallback, so
+    // its next chunk decides (the flag is mount-wide, and another file's blip sets it).
+    let healthy = (in_head || in_tail) && p.failed.is_none() && !p.closed && !(offline && !p.punching);
+    match (healthy, p.punching) {
+        (true, _) => StreamWrite::Keep,
+        (false, false) => StreamWrite::Abandon,
+        (false, true) => StreamWrite::Fail,
+    }
+}
+
+/// How many bytes a disk-low upload lets the writer get ahead of the uploader, past the
+/// threshold's tail: one chunk on the wire and one waiting.
+const STREAM_MAX_UNSENT: u64 = 2 * webdav_ops::CHUNK_SIZE as u64;
 
 /// How much of a streamed file's start stays local until it is closed: one chunk, which
 /// holds the header any muxer rewrites at the end (see ChunkUploadState).
@@ -1280,19 +1395,99 @@ fn stream_disk_low() -> bool {
     low
 }
 
-/// Whether write()'s streaming fast path should PUT a chunk now: when the unsent tail
-/// reaches `threshold` (never less than one chunk). Its oldest chunk then goes out, so
-/// the tail slides along behind the writer at just under the threshold. A file smaller
-/// than that never meets already-sent data, and a larger one can still be rewritten in
-/// its last threshold-minus-a-chunk bytes (a zip entry's header, LibreOffice's block).
-/// One chunk per write also bounds how long write() holds a fuse worker and the file's queue.
-/// A file only starts streaming while the disk is low (stream_disk_low); once it does it
-/// keeps streaming until closed. Sent chunks are punched out of the staging file in place
-/// (free_sent_chunk), so the same holds on every filesystem. The head chunk is never
-/// sent early, so it does not count as unsent: the disk holds at most it plus the tail.
+/// Whether write()'s streaming fast path should hand a chunk to the uploader now: when
+/// the tail not yet handed over reaches `threshold` (never less than one chunk). Its
+/// oldest chunk then goes, so the tail slides along behind the writer at just under the
+/// threshold. A file smaller than that never meets already-sent data, and a larger one
+/// can still be rewritten in its last threshold-minus-a-chunk bytes (a zip entry's
+/// header, LibreOffice's block). One chunk per write keeps the uploader just behind.
+/// With room on the disk the staging file keeps every byte (an early upload); while it
+/// is low, sent chunks are punched out in place (free_sent_chunk), so the disk holds at
+/// most the head chunk, the tail and what the uploader has not sent yet.
 fn stream_should_graduate(total_written: u64, session: Option<&ChunkUploadState>, threshold: u64) -> bool {
-    let unsent = total_written.saturating_sub(session.map_or(STREAM_HEAD, |s| s.bytes_confirmed));
+    let unsent = total_written.saturating_sub(session.map_or(STREAM_HEAD, |s| s.progress().claimed));
     unsent >= threshold.max(webdav_ops::CHUNK_SIZE as u64)
+}
+
+/// Sends the oldest chunk handed to a streamed upload's uploader and not sent yet, on a
+/// `chunk` pool worker under a `throttle` slot, then queues itself for the next one: one
+/// chunk per job, so the files being written take turns on the pool's two workers. While
+/// the disk is low the chunk is punched out of the staging file once it is on the server.
+/// A chunk that will not go up even after retry_chunk_write's retries ends the session
+/// (`failed`); the handle then falls back or fails (see stream_write_verdict).
+fn run_chunk_pump(conn: Arc<ConnInfo>, cs: ChunkUploadState, wp: PathBuf) {
+    let (index, from) = {
+        let mut st = cs.pump.state.safe_lock();
+        if st.closed || st.failed.is_some() || st.bytes_confirmed >= st.claimed {
+            st.busy = false;
+            cs.pump.cv.notify_all();
+            return;
+        }
+        (st.next_index, st.bytes_confirmed)
+    };
+    let mut chunk = vec![0u8; webdav_ops::CHUNK_SIZE];
+    let sent = std::fs::File::open(&wp)
+        .and_then(|f| f.read_exact_at(&mut chunk, from))
+        .map_err(|e| format!("staging read: {}", e))
+        .and_then(|()| {
+            let _permit = conn.throttle.acquire();
+            retry_chunk_write("chunk upload", || conn.backend.put_chunk(&cs.session(), index, chunk.clone()))
+                .map_err(|e| e.to_string())
+        });
+    {
+        let mut st = cs.pump.state.safe_lock();
+        match sent {
+            Ok(()) if !st.closed => {
+                st.next_index += 1;
+                st.bytes_confirmed += webdav_ops::CHUNK_SIZE as u64;
+                if st.punching {
+                    // Under the session's lock, with the progress it publishes: a read
+                    // checks the held range against that same progress before and after
+                    // it reads (see read()), so it never returns bytes punched under it.
+                    let punched = std::fs::OpenOptions::new().write(true).open(&wp)
+                        .and_then(|f| free_sent_chunk(&f, from, webdav_ops::CHUNK_SIZE as u64));
+                    if let Err(e) = punched {
+                        log::warn!("chunk {} of {}: staging free failed: {}", index, wp.display(), e);
+                    }
+                }
+            }
+            Ok(()) => {}
+            Err(e) => {
+                log::warn!("chunk {} of {} failed: {}", index, cs.uploads_base, e);
+                st.failed = Some(e);
+            }
+        }
+        cs.pump.cv.notify_all();
+    }
+    kick_chunk_pump(&conn, &cs, &wp, true);
+}
+
+/// Starts the uploader for `cs` if it has a chunk to send and none is running. `held`
+/// says the caller is that uploader, finishing a chunk, and its `busy` mark is its own.
+/// A full pool leaves the chunk for the next kick, or for the finish at release (which
+/// sends everything from the last sent byte on); a disk-low write() sends it inline.
+fn kick_chunk_pump(conn: &Arc<ConnInfo>, cs: &ChunkUploadState, wp: &Path, held: bool) -> bool {
+    {
+        let mut st = cs.pump.state.safe_lock();
+        let idle = !st.busy || held;
+        if !idle {
+            return true;
+        }
+        if st.closed || st.failed.is_some() || st.bytes_confirmed >= st.claimed {
+            st.busy = false;
+            cs.pump.cv.notify_all();
+            return true;
+        }
+        st.busy = true;
+    }
+    let (c, s, w) = (conn.clone(), cs.clone(), wp.to_path_buf());
+    if bg::CHUNK.submit(move || run_chunk_pump(c, s, w)).is_ok() {
+        return true;
+    }
+    let mut st = cs.pump.state.safe_lock();
+    st.busy = false;
+    cs.pump.cv.notify_all();
+    false
 }
 
 struct OpenFile {
@@ -5362,76 +5557,123 @@ impl DirReply {
 }
 
 impl NextCloudFs {
-    /// Called from write() once it decided a chunk should go out (stream_should_graduate,
-    /// and the disk is low or the file already streams). Lazily opens the chunked-upload
-    /// session on the very first graduation, PUTs exactly one chunk, the oldest unsent
-    /// one after the kept head, and frees its space in the staging file. One per call: a backlog staged while
-    /// the disk had room drains one chunk per write, so no single write() holds its worker
-    /// and the file's queue for the whole upload (which would also starve the watchdog's
-    /// progress check). Must be called without `open_files` locked: this
-    /// performs network I/O, and that mutex guards every open handle in the
-    /// mount, not just this one.
-    ///
-    /// On failure, returns the most recent server-confirmed session state
-    /// alongside the error (rather than just discarding it) — including one
-    /// opened by *this* call, if the MKCOL succeeded but a subsequent chunk
-    /// PUT then failed. The caller must store it back into `of.chunk_upload`
-    /// even on the error path, otherwise a freshly-opened session the caller
-    /// never learns the `uploads_base` of leaks server-side: release()'s
-    /// abandoned-session cleanup can only abort a session it knows about.
-    fn graduate_chunk(
-        &self,
-        remote_path: &Path,
-        wp: &Path,
-        mut state: Option<ChunkUploadState>,
-    ) -> Result<ChunkUploadState, (String, Option<ChunkUploadState>)> {
-        {
-            if state.is_none() {
-                let session = retry_chunk_write("chunked-upload open", || {
-                    self.conn.backend.open_chunked_upload(remote_path)
-                }).map_err(|e| (e.to_string(), None))?;
-                // Daemon-restart survival: from here the staging file may stop holding every byte.
-                state_snapshot::stream_started(wp, &session.uploads_base);
-                // Chunk 0, the head, stays local until the finish: sending starts after it.
-                state = Some(ChunkUploadState {
-                    uploads_base: session.uploads_base,
-                    next_index: 1,
-                    bytes_confirmed: STREAM_HEAD,
-                    head: STREAM_HEAD,
-                });
+    /// Opens the chunked-upload session of handle `fh` once its unsent bytes reached the
+    /// stream threshold (stream_should_graduate). An early upload while the disk has room;
+    /// while it is low, and the staging filesystem can punch holes, one that frees its sent
+    /// chunks. Returns None, the handle staying a plain whole-file write, when the server
+    /// has no chunked uploads or the handle stopped streaming meanwhile. Called without
+    /// `open_files` locked: the MKCOL is network I/O.
+    fn start_stream(&self, fh: u64, path: &Path, wp: &Path) -> Option<ChunkUploadState> {
+        let punching = stream_disk_low() && punch_hole_supported();
+        let session = match retry_chunk_write("chunked-upload open", || self.conn.backend.open_chunked_upload(path)) {
+            Ok(s) => s,
+            Err(e) => {
+                // Nothing was sent, so the staging file holds every byte: keep it as a
+                // whole-file staging copy for release().
+                log::warn!("write: chunked upload unavailable for {} ({}) — staging the whole file instead", path.display(), e);
+                if let Some(of) = self.open_files.safe_lock().get_mut(&fh) {
+                    of.stream_eligible = false;
+                }
+                return None;
             }
-            // Snapshot the session as the server last confirmed it, before
-            // attempting this chunk — on failure below this is what the
-            // caller needs to be able to find and abort the session later.
-            let confirmed_state = state.clone();
-            let s = state.as_mut().expect("just ensured Some above");
+        };
+        if punching {
+            // Daemon-restart survival: from here the staging file may stop holding every byte.
+            state_snapshot::stream_started(wp, &session.uploads_base);
+            log::info!("write: disk is low — streaming {} to the server as it is written", path.display());
+        } else {
+            log::info!("write: uploading {} early, while it is written", path.display());
+        }
+        // Chunk 0, the head, stays local until the finish: sending starts after it.
+        let cs = ChunkUploadState::resumed(session.uploads_base, 1, STREAM_HEAD, STREAM_HEAD, punching);
+        let mut files = self.open_files.safe_lock();
+        match files.get_mut(&fh) {
+            Some(of) if of.stream_eligible && of.chunk_upload.is_none() => {
+                of.chunk_upload = Some(cs.clone());
+                Some(cs)
+            }
+            _ => {
+                drop(files);
+                self.abandon_stream(cs);
+                None
+            }
+        }
+    }
 
-            let sent_from = s.bytes_confirmed;
-            let mut chunk = vec![0u8; webdav_ops::CHUNK_SIZE];
-            let staging = std::fs::OpenOptions::new().read(true).write(true).open(wp)
-                .and_then(|f| f.read_exact_at(&mut chunk, sent_from).map(|()| f))
-                .map_err(|e| (format!("staging read: {}", e), confirmed_state.clone()))?;
+    /// Ends a streamed upload that will not be finished: stops its uploader and deletes the
+    /// session on the server, off the FUSE thread. A session the pool has no room for is
+    /// left to the server, which deletes unfinished uploads after a day.
+    fn abandon_stream(&self, cs: ChunkUploadState) {
+        cs.close();
+        let backend = self.conn.backend.clone();
+        let _ = bg::BACKGROUND.submit(move || backend.abort_chunked_upload(&cs.session()));
+    }
 
-            let session = backend::ChunkedUploadSession { uploads_base: s.uploads_base.clone() };
-            let index = s.next_index;
-            retry_chunk_write("chunk upload", || {
-                self.conn.backend.put_chunk(&session, index, chunk.clone())
-            }).map_err(|e| (e.to_string(), confirmed_state.clone()))?;
-            let s = state.as_mut().expect("just ensured Some above");
-            s.next_index += 1;
-            s.bytes_confirmed += webdav_ops::CHUNK_SIZE as u64;
+    /// Hands the next chunk of a streamed upload to its uploader. A disk-low one then holds
+    /// the writer until at most STREAM_MAX_UNSENT bytes are waiting to go up, since bytes
+    /// cannot be freed before they are sent; sends the chunk itself if the pool has no
+    /// room. Err once the session can no longer be finished: the handle must fail.
+    fn feed_stream(&self, cs: &ChunkUploadState, wp: &Path, claim: bool) -> Result<(), String> {
+        if claim {
+            let mut st = cs.pump.state.safe_lock();
+            st.claimed += webdav_ops::CHUNK_SIZE as u64;
+        }
+        let queued = kick_chunk_pump(&self.conn, cs, wp, false);
+        if !cs.progress().punching {
+            return Ok(());
+        }
+        if !queued {
+            // Marked busy as a pool job would be, so no other kick sends it alongside.
+            cs.pump.state.safe_lock().busy = true;
+            run_chunk_pump(self.conn.clone(), cs.clone(), wp.to_path_buf());
+        }
+        let mut st = cs.pump.state.safe_lock();
+        loop {
+            if let Some(e) = &st.failed {
+                return Err(e.clone());
+            }
+            if st.closed {
+                return Err("upload closed".into());
+            }
+            if st.claimed.saturating_sub(st.bytes_confirmed) <= STREAM_MAX_UNSENT {
+                return Ok(());
+            }
+            if !st.busy {
+                drop(st);
+                if !kick_chunk_pump(&self.conn, cs, wp, false) {
+                    cs.pump.state.safe_lock().busy = true;
+                    run_chunk_pump(self.conn.clone(), cs.clone(), wp.to_path_buf());
+                }
+                st = cs.pump.state.safe_lock();
+                continue;
+            }
+            st = cs.pump.cv.wait_timeout(st, Duration::from_secs(1)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
 
-            // Punched before write() publishes the new bytes_confirmed, which is safe: write()
-            // holds this file's inode exclusively in the request scheduler (fuse_dispatch),
-            // so no read of it runs until then.
-            free_sent_chunk(&staging, sent_from, webdav_ops::CHUNK_SIZE as u64)
-                .map_err(|e| (format!("staging free: {}", e), state.clone()))?;
-            Ok(state.expect("just ensured Some above"))
+    /// The disk got low while an early upload was under way: from now on its sent chunks
+    /// are punched out, those already sent at once, as a file that started streaming on a
+    /// low disk would have. Only while the session is healthy; past here it cannot fall
+    /// back on the staging file any more.
+    fn start_punching(&self, path: &Path, cs: &ChunkUploadState, wp: &Path) {
+        let mut st = cs.pump.state.safe_lock();
+        if st.punching || st.closed || st.failed.is_some() {
+            return;
+        }
+        state_snapshot::stream_started(wp, &cs.uploads_base);
+        log::info!("write: disk is low — freeing the {} bytes of {} already on the server", st.bytes_confirmed - cs.head, path.display());
+        st.punching = true;
+        let punched = std::fs::OpenOptions::new().write(true).open(wp)
+            .and_then(|f| free_sent_chunk(&f, cs.head, st.bytes_confirmed - cs.head));
+        if let Err(e) = punched {
+            log::warn!("write: freeing sent chunks of {} failed: {}", path.display(), e);
         }
     }
 
     /// Journals the end of a streamed upload and hands it to a worker, so a failed finish
-    /// is retried from the journal and release() never waits on the network.
+    /// is retried from the journal and release() never waits on the network. `p` is the
+    /// session's progress as release() closed it: a chunk still on its way when it did is
+    /// sent again with the rest, once that worker has seen it settle.
     fn commit_streamed(
         &self,
         remote_path: PathBuf,
@@ -5440,6 +5682,7 @@ impl NextCloudFs {
         opened_gen: u64,
         total_len: u64,
         cs: ChunkUploadState,
+        p: PumpState,
     ) -> Result<(), Errno> {
         log::info!(
             "[{}] COMMIT (streamed) {} size={} etag={:?}",
@@ -5463,16 +5706,18 @@ impl NextCloudFs {
                 dir.files = Arc::new(files);
             }
         }
+        let whole = !p.punching;
         let seq = self.journal.safe_lock().enqueue(mutation_journal::MutationOp::FinishChunked {
             remote_path: remote_path.clone(),
             uploads_base: cs.uploads_base.clone(),
-            next_index: cs.next_index,
-            bytes_confirmed: cs.bytes_confirmed,
+            next_index: p.next_index,
+            bytes_confirmed: p.bytes_confirmed,
             total_len,
             tail_path: tail_path.clone(),
             if_match_etag: original_etag.clone(),
             sparse: true,
             head: cs.head,
+            whole,
         });
         self.journal.safe_lock().supersede_uploads(&remote_path, seq);
         self.dirty.safe_lock().insert(remote_path.clone());
@@ -5502,10 +5747,13 @@ impl NextCloudFs {
                 return;
             }
             let etag = uploads.etag_for(&remote_path, opened_gen, original_etag);
+            // A chunk the uploader was still sending at release goes again below: not while
+            // its first PUT could still be writing it on the server.
+            cs.wait_idle();
             let _permit = conn.throttle.acquire();
             let result = mutation_journal::finish_chunked(
-                &*conn.backend, &cs.uploads_base, cs.next_index, cs.bytes_confirmed, total_len,
-                &tail_path, true, cs.head, &remote_path, etag.as_deref(),
+                &*conn.backend, &cs.uploads_base, p.next_index, p.bytes_confirmed, total_len,
+                &tail_path, true, cs.head, whole, &remote_path, etag.as_deref(),
             );
             cache.safe_lock().uploading.remove(&remote_path);
             match result {
@@ -5534,9 +5782,8 @@ impl NextCloudFs {
                 Err(backend::BackendWriteError::Conflict) => {
                     // Every chunk is already on the server: assemble ours as a conflicted copy.
                     let conflict_name = make_conflict_name(&remote_path);
-                    let session = backend::ChunkedUploadSession { uploads_base: cs.uploads_base.clone() };
-                    match conn.backend.finish_chunked_upload(&session, &conflict_name, None, None) {
-                        Ok(_) => {
+                    match mutation_journal::assemble_conflicted_copy(&*conn.backend, &cs.uploads_base, &conflict_name, total_len, &tail_path, whole) {
+                        Ok(()) => {
                             log::info!("conflicted copy assembled as {}", conflict_name.display());
                             push_error(&elog, remote_path.clone(), SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                             adopt_server_version(&conn, &uploads, &cache, &remote_path);
@@ -5574,10 +5821,13 @@ impl NextCloudFs {
                         backend::BackendWriteError::Server(code, _) => SyncErrorKind::ServerError(*code),
                         _ => SyncErrorKind::UploadFailed,
                     };
-                    push_error(&elog, remote_path.clone(), kind, format!("Streamed upload could not complete — please retry the copy: {}", e));
+                    let why = if whole { "Upload failed" } else { "Streamed upload could not complete — please retry the copy" };
+                    push_error(&elog, remote_path.clone(), kind, format!("{}: {}", why, e));
                     smap.safe_write().insert(remote_path.clone(), FileStatus::PendingSync);
-                    if matches!(e, backend::BackendWriteError::Server(404, _)) {
-                        // The session is gone; nothing left to retry from.
+                    if !whole && matches!(e, backend::BackendWriteError::Server(404, _)) {
+                        // The session is gone; nothing left to retry from. (With the whole
+                        // file staged, finish_chunked already sent it whole instead, and the
+                        // staging file stays for the journal's retries.)
                         conn.backend.abort_chunked_upload(&backend::ChunkedUploadSession { uploads_base: cs.uploads_base.clone() });
                         let _ = std::fs::remove_file(&tail_path);
                         journal.safe_lock().remove(seq);
@@ -5628,8 +5878,32 @@ impl NextCloudFs {
     fn commit_released(&self, fh: FileHandle, of: OpenFile) -> Result<(), Errno> {
         let OpenFile { remote_path, write_path, original_etag, chunk_upload, total_written, opened_gen, .. } = of;
         let Some(write_path) = write_path else { return Ok(()) };
-        if let Some(chunk_state) = chunk_upload {
-            return self.commit_streamed(remote_path, write_path, original_etag, opened_gen, total_written, chunk_state);
+        if let Some(cs) = chunk_upload {
+            let p = cs.close();
+            let offline = self.conn.is_offline.load(Ordering::Relaxed);
+            match (&p.failed, p.punching) {
+                (None, true) => return self.commit_streamed(remote_path, write_path, original_etag, opened_gen, total_written, cs, p),
+                (None, false) if !offline => return self.commit_streamed(remote_path, write_path, original_etag, opened_gen, total_written, cs, p),
+                (failed, false) => {
+                    // An early upload that cannot be finished from here (a chunk failed, or
+                    // we are offline): the staging file is the whole file, so it goes up as
+                    // any other save, journaled and retried until it does.
+                    log::warn!(
+                        "release: early upload of {} dropped ({}) — uploading it whole",
+                        remote_path.display(), failed.as_deref().unwrap_or("offline"),
+                    );
+                    self.abandon_stream(cs);
+                }
+                (Some(e), true) => {
+                    // Sent chunks are punched out and the rest cannot follow: nothing whole
+                    // is left anywhere to upload.
+                    log::error!("release: fh {} streamed upload of {} failed mid-copy ({}) — abandoning it, the copy must be retried", fh.0, remote_path.display(), e);
+                    push_error(&self.error_log, remote_path.clone(), SyncErrorKind::UploadFailed, format!("Streamed upload could not complete — please retry the copy: {}", e));
+                    self.abandon_stream(cs);
+                    let _ = std::fs::remove_file(&write_path);
+                    return Err(Errno::EIO);
+                }
+            }
         }
         let upload_size = match std::fs::metadata(&write_path) {
             Ok(m) => m.len(),
@@ -7158,6 +7432,16 @@ impl NextCloudFs {
             if let Some((staging, _)) = staged.filter(|(_, held)| held.covers(off, sz)) {
                 match read_staged(&staging, off, sz) {
                     Ok(buf) => {
+                        // A disk-low upload may have punched these bytes out while they
+                        // were being read (its uploader runs beside reads): only bytes it
+                        // still held afterwards are the file's.
+                        let still = staged_source(&self.open_files.safe_lock(), fh.0, ino.0)
+                            .is_some_and(|(_, held)| held.covers(off, sz));
+                        if !still && !sniff {
+                            warn_streamed_away(&path, off);
+                            reply.error(Errno::EIO);
+                            return;
+                        }
                         reply.data(&buf);
                         return;
                     }
@@ -7806,13 +8090,10 @@ impl NextCloudFs {
             }
             if let Some(cs) = of.chunk_upload {
                 log::warn!(
-                    "release: fh {} streamed upload of {} failed mid-copy ({}) — abandoning it, the copy must be retried",
-                    fh.0, of.remote_path.display(), cs.uploads_base,
+                    "release: fh {} streamed upload of {} {} ({}) — abandoning it",
+                    fh.0, of.remote_path.display(), if of.unlinked { "deleted while open" } else { "failed mid-copy, the copy must be retried" }, cs.uploads_base,
                 );
-                let backend = self.conn.backend.clone();
-                let _ = bg::BACKGROUND.submit(move || {
-                    backend.abort_chunked_upload(&backend::ChunkedUploadSession { uploads_base: cs.uploads_base });
-                });
+                self.abandon_stream(cs);
             }
             return;
         }
@@ -7927,15 +8208,23 @@ impl NextCloudFs {
                 let fh_raw = fh.0;
                 let mut files = self.open_files.safe_lock();
                 if let Some(of) = files.get_mut(&fh_raw) {
+                    // A resize of an early upload's file: the staging file holds every byte,
+                    // so drop the session and truncate it like any staged file below.
+                    if of.chunk_upload.as_ref().is_some_and(|cs| !cs.progress().punching) && new_size != of.total_written {
+                        log::info!("setattr: truncate on fh {} to {} — dropping its early upload, the file is uploaded whole when closed", fh_raw, new_size);
+                        if let Some(cs) = of.chunk_upload.take() {
+                            self.abandon_stream(cs);
+                        }
+                    }
                     if let Some(cs) = &of.chunk_upload {
-                        // A streamed upload is in progress: already-sent chunks are
+                        // A disk-low streamed upload is in progress: already-sent chunks are
                         // holes in the staging file now, so only a no-op truncate (to the
                         // length already accounted for) can be honored — anything
                         // else would need to shrink/extend bytes we no longer have.
                         if new_size != of.total_written {
                             log::error!(
                                 "setattr: truncate on fh {} to {} while a streamed upload is in progress ({} bytes already sent) — aborting handle",
-                                fh_raw, new_size, cs.bytes_confirmed,
+                                fh_raw, new_size, cs.progress().bytes_confirmed,
                             );
                             of.upload_failed = true;
                             reply.error(Errno::EIO);
@@ -8042,7 +8331,7 @@ impl NextCloudFs {
         // Decided under the open-files lock, which guards every handle in the mount, and
         // the staging file written with it released. Nothing else changes this handle in
         // between: the scheduler runs this inode's requests one at a time (fuse_dispatch).
-        let (wp, seed, fast_path) = {
+        let (wp, seed, fast_path, abandoned) = {
             let mut files = self.open_files.safe_lock();
             let of = match files.get_mut(&fh.0) {
                 Some(of) => of,
@@ -8063,61 +8352,62 @@ impl NextCloudFs {
                 cache_dir.join(format!("write_{}", fh.0))
             }).clone();
 
-            // Bounded chunked streaming: a freshly-written file, written purely
-            // sequentially from offset 0 while online, never keeps more than the
-            // stream threshold of unsent bytes on local disk — once the tail reaches
-            // it, its oldest CHUNK_SIZE chunk is pushed to Nextcloud's chunked-upload
-            // extension, one per write, instead
-            // of the whole file landing on disk before any upload starts. See
-            // ChunkUploadState's doc comment for why any deviation once a chunk has
-            // actually been sent fails the handle instead of trying to reconcile.
+            // Uploading while written: a freshly-written file, written purely sequentially
+            // from offset 0 while online, has its chunks handed to a background uploader
+            // once its unsent tail passes the stream threshold, so most of it is on the
+            // server by the time it is closed (see ChunkUploadState's doc comment).
             //
-            // `is_offline` only gates *starting* a fresh session (chunk_upload is
-            // still None): it is a mount-wide flag that unrelated traffic on any
-            // other file handle (a read, a PROPFIND) can flip momentarily, and once
-            // a session has a chunk sitting on the server there is no local-only
-            // fallback for it — bailing out here on every such blip would abort a
-            // perfectly healthy in-progress upload of file B just because file A's
-            // read hit a transient error at the same moment. Once streaming has
-            // actually begun, let the tail keep buffering locally and let the next
-            // real network call (graduate_chunk, which now retries transient
-            // failures) be the one to decide whether the server is actually gone.
-            //
-            // A write back into the unsent tail is placed there rather than failing the
-            // handle: LibreOffice rewrites the 4 KiB block it is in the middle of, so a large
+            // A write back into the unsent tail is placed there rather than ending the
+            // session: LibreOffice rewrites the 4 KiB block it is in the middle of, so a large
             // save always comes back a few KiB behind the end, and those bytes are still local.
             // So is a write into the kept head: a muxer's header fix-up when it finishes.
-            let blocked_by_offline =
-                of.chunk_upload.is_none() && self.conn.is_offline.load(Ordering::Relaxed);
-            let bytes_confirmed = of.chunk_upload.as_ref().map_or(0, |c| c.bytes_confirmed);
-            let in_tail = offset >= bytes_confirmed && offset <= of.total_written;
-            let in_head = of.chunk_upload.as_ref().is_some_and(|c| offset + data.len() as u64 <= c.head);
-            let fast = of.stream_eligible && (in_tail || in_head) && !blocked_by_offline;
+            // Anything else ends the session: an early upload falls back to uploading the
+            // whole staging file at release, a disk-low one fails the handle, since the bytes
+            // it sent are no longer local (stream_write_verdict).
+            //
+            // `is_offline` always stops a fresh session from starting. A disk-low one already
+            // under way carries on regardless: the flag is mount-wide, another handle's read
+            // can flip it for a moment, and that session has no local fallback to drop to.
+            let offline = self.conn.is_offline.load(Ordering::Relaxed);
+            let mut abandoned = None;
+            let fast = match &of.chunk_upload {
+                Some(cs) => match stream_write_verdict(offset, data.len() as u64, of.total_written, cs.head, &cs.progress(), offline) {
+                    StreamWrite::Keep => true,
+                    StreamWrite::Abandon => {
+                        log::info!(
+                            "write: {} at offset {} (end {}) can no longer be uploaded as written — dropping its early upload, the file is uploaded whole when closed",
+                            path.display(), offset, of.total_written,
+                        );
+                        abandoned = of.chunk_upload.take();
+                        false
+                    }
+                    StreamWrite::Fail => {
+                        // Chunks are on the server with nothing local to reconstruct them
+                        // from: a write into those sent bytes or past the end, or a chunk
+                        // that would not go up, cannot be reconciled here. Fail the write
+                        // rather than write into a punched-out range or lose the
+                        // already-uploaded prefix silently.
+                        log::error!(
+                            "write: streamed upload of {} cannot go on (offset={}, expected={}, failed={:?}) — aborting handle",
+                            path.display(), offset, of.total_written, cs.progress().failed,
+                        );
+                        of.upload_failed = true;
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                },
+                None => of.stream_eligible && offset <= of.total_written && !offline,
+            };
             if !fast {
-                if of.chunk_upload.is_some() {
-                    // At least one chunk is already sitting on the server with nothing
-                    // local to reconstruct it from — a write into those sent bytes or
-                    // past the end, a resize, or going offline mid-copy cannot be reconciled here. Fail the
-                    // write rather than write into a punched-out range or lose
-                    // the already-uploaded prefix silently. A plain sequential copy
-                    // never reaches this.
-                    log::error!(
-                        "write: non-sequential write on {} after chunked upload had begun (offset={}, expected={}) — aborting handle",
-                        path.display(), offset, of.total_written,
-                    );
-                    of.upload_failed = true;
-                    reply.error(Errno::EIO);
-                    return;
-                }
-                if of.stream_eligible {
-                    // First deviation before any chunk was ever sent — the tail file
-                    // already holds 100% of the content written so far, so there is
-                    // nothing to reconcile; just stop trying to stream this handle.
-                    of.stream_eligible = false;
-                }
+                // The staging file holds 100% of the content written so far, so there is
+                // nothing to reconcile; just stop trying to stream this handle.
+                of.stream_eligible = false;
             }
-            (wp, of.local.clone(), fast.then_some(offset == of.total_written))
+            (wp, of.local.clone(), fast.then_some(offset == of.total_written), abandoned)
         };
+        if let Some(cs) = abandoned {
+            self.abandon_stream(cs);
+        }
 
         if !wp.exists() {
             let seed_ok = if let Some(ref local) = seed {
@@ -8172,43 +8462,27 @@ impl NextCloudFs {
             (due, of.chunk_upload.clone())
         };
 
-        // Once a file streams it keeps streaming until closed: freeing its sent chunks
-        // gives back the space that made the disk low, and stopping then would only
-        // stage the rest and start over.
-        let had_session = existing_session.is_some();
-        let go = due && (had_session || (stream_disk_low() && punch_hole_supported()));
-        if go {
-            if !had_session {
-                log::info!("write: disk is low — streaming {} to the server as it is written", path.display());
+        // Once a file streams it keeps streaming until closed. One that started while
+        // the disk had room starts freeing its sent chunks when the disk gets low: that
+        // gives back the space that made it low.
+        let session = match existing_session {
+            Some(cs) => Some(cs),
+            None if due => self.start_stream(fh.0, &path, &wp),
+            None => None,
+        };
+        if let Some(cs) = session {
+            if due && !cs.progress().punching && stream_disk_low() && punch_hole_supported() {
+                self.start_punching(&path, &cs, &wp);
             }
-            match self.graduate_chunk(&path, &wp, existing_session) {
-                Ok(new_state) => {
-                    if let Some(of) = self.open_files.safe_lock().get_mut(&fh.0) {
-                        of.chunk_upload = Some(new_state);
-                    }
+            if let Err(e) = self.feed_stream(&cs, &wp, due) {
+                log::warn!("write: chunk upload failed for {}, aborting handle: {}", path.display(), e);
+                // The session stays on the handle so release() can still abort it
+                // instead of leaking it server-side.
+                if let Some(of) = self.open_files.safe_lock().get_mut(&fh.0) {
+                    of.upload_failed = true;
                 }
-                Err((e, None)) if !had_session => {
-                    // The session never opened (e.g. a server without chunked uploads
-                    // answers MKCOL with 404): nothing was sent, so the tail still holds
-                    // every byte. Keep it as a whole-file staging copy for release().
-                    log::warn!("write: chunked upload unavailable for {} ({}) — staging the whole file instead", path.display(), e);
-                    if let Some(of) = self.open_files.safe_lock().get_mut(&fh.0) {
-                        of.stream_eligible = false;
-                    }
-                }
-                Err((e, partial_state)) => {
-                    log::warn!("write: chunk upload failed for {}, aborting handle: {}", path.display(), e);
-                    // Persist whatever session state the server actually confirmed
-                    // (including a session opened by this very call) so release()'s
-                    // abandoned-session cleanup can still find and abort it instead
-                    // of leaking it server-side.
-                    if let Some(of) = self.open_files.safe_lock().get_mut(&fh.0) {
-                        of.chunk_upload = partial_state;
-                        of.upload_failed = true;
-                    }
-                    reply.error(Errno::EIO);
-                    return;
-                }
+                reply.error(Errno::EIO);
+                return;
             }
         }
         reply.written(data.len() as u32);
@@ -8224,7 +8498,7 @@ impl NextCloudFs {
         // could not resume its streamed upload) reports it here too, so close() does
         // not tell a program its data was saved.
         if state_snapshot::is_lost_fh(fh.0)
-            || self.open_files.safe_lock().get(&fh.0).is_some_and(|of| of.upload_failed)
+            || self.open_files.safe_lock().get(&fh.0).is_some_and(|of| of.upload_failed || of.chunk_upload.as_ref().is_some_and(|c| c.lost()))
         {
             reply.error(Errno::EIO);
             return;

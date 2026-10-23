@@ -295,7 +295,7 @@
                 <div class="sv-toggle">
                     <div>
                         <label class="sv-toggle-label" for="stream-uploads">Upload large files while they are being written</label>
-                        <p class="sv-hint">When this computer is low on disk space, files over {settings.stream_upload_threshold_mb} MB are sent to the server piece by piece as they are written, instead of being saved here first, so big copies still fit. Turn off if a program shows write errors when saving large files to the Nextcloud folder while the disk is nearly full.</p>
+                        <p class="sv-hint">Files over {settings.stream_upload_threshold_mb} MB start uploading piece by piece while they are still being written, so big copies are on the server soon after they finish. A full copy stays on this computer until the upload is done; only when it is low on disk space are the pieces already sent removed here, so big copies still fit. Turn off if a program shows write errors when saving large files to the Nextcloud folder while the disk is nearly full.</p>
                     </div>
                     <input id="stream-uploads" type="checkbox" class="sv-check" bind:checked={settings.stream_uploads} />
                 </div>

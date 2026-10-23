@@ -188,6 +188,10 @@ struct ChunkRec {
     bytes_confirmed: u64,
     #[serde(default)]
     head: u64,
+    /// An early upload: the staging file still holds every byte. Records written by older
+    /// versions were all streamed with sent chunks punched out.
+    #[serde(default)]
+    whole: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -723,11 +727,17 @@ pub(crate) fn write_handles_snapshot(cache_dir: &Path, open_files: &Mutex<HashMa
             dirty: of.dirty,
             total_written: of.total_written,
             stream_eligible: of.stream_eligible,
-            chunk: of.chunk_upload.as_ref().map(|c| ChunkRec {
-                uploads_base: c.uploads_base.clone(),
-                next_index: c.next_index,
-                bytes_confirmed: c.bytes_confirmed,
-                head: c.head,
+            chunk: of.chunk_upload.as_ref().map(|c| {
+                // A disk-low upload stops here, so a chunk still on its way can neither move
+                // the recorded progress on nor punch out bytes the successor counts as local.
+                let p = if c.progress().punching { c.close() } else { c.progress() };
+                ChunkRec {
+                    uploads_base: c.uploads_base.clone(),
+                    next_index: p.next_index,
+                    bytes_confirmed: p.bytes_confirmed,
+                    head: c.head,
+                    whole: !p.punching,
+                }
             }),
             upload_failed: of.upload_failed,
             unlinked: of.unlinked,
@@ -988,11 +998,15 @@ fn write_state(h: &RestoredHandle, staging_now: Option<StagingId>, stream: Optio
     let rec = &h.rec;
     let now = staging_now.ok_or_else(|| "its staging file is gone".to_string())?;
     if let Some(x) = &h.exact {
+        // An early upload is not resumed: its uploader and the chunk it was sending are
+        // gone with the previous daemon. The staging file holds the whole file, so the
+        // handle carries on as a plain staged write and is uploaded whole when released.
+        let early = x.chunk.as_ref().is_some_and(|c| c.whole);
         return Ok(WriteState {
             dirty: x.dirty,
             total_written: x.total_written,
-            stream_eligible: x.stream_eligible,
-            chunk: x.chunk.clone(),
+            stream_eligible: x.stream_eligible && !early,
+            chunk: x.chunk.clone().filter(|_| !early),
             upload_failed: x.upload_failed,
             unlinked: x.unlinked,
             created: x.created,
@@ -1019,7 +1033,7 @@ fn write_state(h: &RestoredHandle, staging_now: Option<StagingId>, stream: Optio
         Some(uploads_base) => Ok(WriteState {
             dirty: true,
             total_written: 0,
-            chunk: Some(ChunkRec { uploads_base: uploads_base.to_string(), next_index: 0, bytes_confirmed: 0, head: 0 }),
+            chunk: Some(ChunkRec { uploads_base: uploads_base.to_string(), next_index: 0, bytes_confirmed: 0, head: 0, whole: false }),
             upload_failed: true,
             ..base
         }),
@@ -1077,12 +1091,7 @@ fn rebuild(h: &RestoredHandle, stream: Option<&str>, gen: u64) -> Result<(OpenFi
     of.dirty = ws.dirty;
     of.total_written = ws.total_written;
     of.stream_eligible = ws.stream_eligible;
-    of.chunk_upload = ws.chunk.map(|c| ChunkUploadState {
-        uploads_base: c.uploads_base,
-        next_index: c.next_index,
-        bytes_confirmed: c.bytes_confirmed,
-        head: c.head,
-    });
+    of.chunk_upload = ws.chunk.map(|c| ChunkUploadState::resumed(c.uploads_base, c.next_index, c.bytes_confirmed, c.head, true));
     of.upload_failed = ws.upload_failed;
     of.unlinked = ws.unlinked;
     of.created = ws.created;
@@ -1100,6 +1109,17 @@ pub(crate) fn apply(fs: &NextCloudFs, r: &Restored, cache_dir: &Path, dev: ConnD
     let gen = fs.uploads.generation();
     let mut lost = HashMap::new();
     let mut uploading = Vec::new();
+    // Early uploads the restored handles drop (see write_state): their sessions go.
+    let early: Vec<String> = r.handles.values()
+        .filter_map(|h| h.exact.as_ref()?.chunk.as_ref().filter(|c| c.whole))
+        .map(|c| c.uploads_base.clone())
+        .collect();
+    for uploads_base in early {
+        let backend = fs.conn.backend.clone();
+        let _ = crate::bg::BACKGROUND.submit(move || {
+            backend.abort_chunked_upload(&crate::backend::ChunkedUploadSession { uploads_base });
+        });
+    }
     {
         let mut files = fs.open_files.safe_lock();
         let mut modes = fs.io_modes.safe_lock();
@@ -1352,7 +1372,7 @@ mod tests {
             dirty: true,
             total_written: 300,
             stream_eligible: true,
-            chunk: Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, head: 100 }),
+            chunk: Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, head: 100, whole: false }),
             upload_failed: false,
             unlinked: false,
             created: true,
@@ -1361,7 +1381,29 @@ mod tests {
         let ws = write_state(&h, Some(staging(100, 30)), Some("u")).unwrap();
         assert!(!ws.upload_failed);
         assert!(ws.stream_eligible);
-        assert_eq!(ws.chunk, Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, head: 100 }));
+        assert_eq!(ws.chunk, Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, head: 100, whole: false }));
+        assert_eq!(ws.total_written, 300);
+    }
+
+    #[test]
+    fn a_planned_restart_drops_an_early_upload_and_keeps_the_whole_staged_file() {
+        let mut h = write_handle(staging(0, 10));
+        h.exact = Some(HandleState {
+            fh: 5,
+            path: "/a".into(),
+            dirty: true,
+            total_written: 300,
+            stream_eligible: true,
+            chunk: Some(ChunkRec { uploads_base: "u".into(), next_index: 2, bytes_confirmed: 200, head: 100, whole: true }),
+            upload_failed: false,
+            unlinked: false,
+            created: true,
+            original_etag: None,
+        });
+        let ws = write_state(&h, Some(staging(300, 30)), None).unwrap();
+        assert!(!ws.upload_failed && ws.dirty);
+        assert_eq!(ws.chunk, None, "nothing to resume: the file is uploaded whole");
+        assert!(!ws.stream_eligible);
         assert_eq!(ws.total_written, 300);
     }
 

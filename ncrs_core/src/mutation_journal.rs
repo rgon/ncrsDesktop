@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const JOURNAL_FILE: &str = "mutation_journal.json";
 const CONFLICTS_FILE: &str = "conflicts.json";
@@ -62,6 +62,11 @@ pub enum MutationOp {
         /// Entries queued by older versions sent the head with the rest: 0.
         #[serde(default)]
         head: u64,
+        /// The staging file still holds every byte of the file (chunks went up early but
+        /// nothing was punched out): reads are served from it, and a session the server no
+        /// longer has is uploaded whole from it instead of being lost.
+        #[serde(default)]
+        whole: bool,
     },
 }
 
@@ -408,6 +413,9 @@ impl MutationJournal {
             match &e.op {
                 MutationOp::Put { remote_path, staging_path, .. } if names.contains(remote_path) => {
                     return Some(PendingUpload::Staged(staging_path.clone()));
+                }
+                MutationOp::FinishChunked { remote_path, tail_path, whole: true, .. } if names.contains(remote_path) => {
+                    return Some(PendingUpload::Staged(tail_path.clone()));
                 }
                 MutationOp::FinishChunked { remote_path, tail_path, bytes_confirmed, sparse, head, .. } if names.contains(remote_path) => {
                     return Some(PendingUpload::StreamTail { tail: tail_path.clone(), held_from: *bytes_confirmed, head: *head, sparse: *sparse });
@@ -843,11 +851,20 @@ pub(crate) fn replay_journal(
             } else {
                 None
             };
-            // A streamed tail is not the whole file, so it is not worth preserving.
-            if let MutationOp::FinishChunked { uploads_base, tail_path, .. } = &entry.op {
-                ctx.backend.abort_chunked_upload(&crate::backend::ChunkedUploadSession { uploads_base: uploads_base.clone() });
-                let _ = std::fs::remove_file(tail_path);
-            }
+            // A streamed tail is not the whole file, so it is not worth preserving; a
+            // staging file that still holds every byte is.
+            let recovered = match &entry.op {
+                MutationOp::FinishChunked { uploads_base, tail_path, whole, remote_path, .. } => {
+                    ctx.backend.abort_chunked_upload(&crate::backend::ChunkedUploadSession { uploads_base: uploads_base.clone() });
+                    if *whole {
+                        journal.safe_lock().recover_staging(tail_path, remote_path)
+                    } else {
+                        let _ = std::fs::remove_file(tail_path);
+                        None
+                    }
+                }
+                _ => recovered,
+            };
             let mut j = journal.safe_lock();
             let last_err = entry.last_error.as_deref().unwrap_or("unknown");
             let desc = match recovered {
@@ -900,7 +917,13 @@ pub(crate) fn replay_journal(
                     }
                 }
                 // A MOVE's copy only stood in for bytes the server already has under the source.
-                if let MutationOp::FinishChunked { tail_path: sp, .. } | MutationOp::Rename { staging: Some(sp), .. } = &entry.op {
+                if let MutationOp::FinishChunked { tail_path, remote_path, whole: true, .. } = &entry.op {
+                    if matches!(kind, ConflictKind::EditConflict { .. }) {
+                        let _ = std::fs::remove_file(tail_path);
+                    } else {
+                        journal.safe_lock().recover_staging(tail_path, remote_path);
+                    }
+                } else if let MutationOp::FinishChunked { tail_path: sp, .. } | MutationOp::Rename { staging: Some(sp), .. } = &entry.op {
                     let _ = std::fs::remove_file(sp);
                 }
                 let mut j = journal.safe_lock();
@@ -1151,11 +1174,11 @@ fn execute_op(
                 MoveOutcome::Failed(e) => ReplayResult::ServerError(e.to_string()),
             }
         }
-        MutationOp::FinishChunked { remote_path, uploads_base, next_index, bytes_confirmed, total_len, tail_path, if_match_etag, sparse, head } => {
+        MutationOp::FinishChunked { remote_path, uploads_base, next_index, bytes_confirmed, total_len, tail_path, if_match_etag, sparse, head, whole } => {
             let saved_mtime = crate::staged_mtime(tail_path).unwrap_or_else(SystemTime::now);
             let result = finish_chunked(
                 &*ctx.backend, uploads_base, *next_index, *bytes_confirmed, *total_len,
-                tail_path, *sparse, *head, remote_path, if_match_etag.as_deref(),
+                tail_path, *sparse, *head, *whole, remote_path, if_match_etag.as_deref(),
             );
             match result {
                 Ok(result) => {
@@ -1187,9 +1210,8 @@ fn execute_op(
                     // assemble ours as a conflicted copy instead.
                     log::warn!("JOURNAL replay: streamed upload {} conflict — assembling a conflicted copy", remote_path.display());
                     let conflict_name = crate::make_conflict_name(remote_path);
-                    let session = crate::backend::ChunkedUploadSession { uploads_base: uploads_base.clone() };
-                    match ctx.backend.finish_chunked_upload(&session, &conflict_name, None, None) {
-                        Ok(_) => {
+                    match assemble_conflicted_copy(&*ctx.backend, uploads_base, &conflict_name, *total_len, tail_path, *whole) {
+                        Ok(()) => {
                             crate::push_error(error_log, remote_path.clone(), crate::SyncErrorKind::Conflict, "Server version changed — conflicted copy created".into());
                             ReplayResult::Conflict(ConflictKind::EditConflict {
                                 local_path: remote_path.clone(),
@@ -1244,9 +1266,103 @@ fn each_tail_chunk<E>(
     Ok(())
 }
 
+/// Assembles a streamed upload's chunks as `conflict_name`, the conflicted copy of a file
+/// that changed on the server meanwhile; from a staging file that holds the whole file,
+/// uploaded whole when the session is gone.
+pub(crate) fn assemble_conflicted_copy(
+    backend: &dyn crate::backend::CloudBackend,
+    uploads_base: &str,
+    conflict_name: &Path,
+    total_len: u64,
+    tail_path: &Path,
+    whole: bool,
+) -> Result<(), crate::backend::BackendWriteError> {
+    let session = crate::backend::ChunkedUploadSession { uploads_base: uploads_base.to_string() };
+    match backend.finish_chunked_upload(&session, conflict_name, None, None, total_len) {
+        Err(e) if whole && session_gone(&e) => {
+            log::warn!("conflicted copy {}: upload session gone ({}) — uploading it whole", conflict_name.display(), e);
+            backend.put_file_settled(tail_path, &mut || Some((conflict_name.to_path_buf(), None))).map(|_| ())
+        }
+        r => r.map(|_| ()),
+    }
+}
+
+/// Whether a chunked-upload request failed because the server no longer has the session:
+/// its chunks expired (Nextcloud collects unfinished uploads after a day) or were assembled.
+fn session_gone(e: &crate::backend::BackendWriteError) -> bool {
+    matches!(e, crate::backend::BackendWriteError::Server(404 | 409, _))
+}
+
+/// Whether the file the server lists is this upload's assembly: the size it was given and
+/// the mtime it was stamped with (X-OC-Mtime, whole seconds), and no longer the version the
+/// assembly was conditioned on. A MOVE whose answer was lost (a timeout, a dropped
+/// connection) lands all the same, and its retry then finds the session gone (404) or the
+/// destination changed (412): this tells that apart from a real failure or conflict.
+fn is_our_assembly(
+    listed: &crate::backend::RemoteEntry,
+    total_len: u64,
+    mtime: Option<SystemTime>,
+    if_match: Option<&str>,
+) -> bool {
+    let secs = |t: SystemTime| t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
+    // Without an mtime of ours nothing tells this upload from another file of that size.
+    let Some(ours) = mtime.and_then(secs) else { return false };
+    !listed.is_dir
+        && listed.size == total_len
+        && listed.modified.and_then(secs) == Some(ours)
+        && (if_match.is_none() || listed.change_token.as_deref().map(|t| t.trim_matches('"')) != if_match.map(|t| t.trim_matches('"')))
+}
+
 /// Uploads the tail of a streamed upload as its last chunks and assembles the session.
-/// Re-running it is safe: a chunk PUT to the same index replaces the earlier one.
+/// Re-running it is safe: a chunk PUT to the same index replaces the earlier one. With
+/// `whole` (the staging file holds every byte), a session the server no longer has is
+/// replaced by an ordinary upload of the whole staging file.
 pub(crate) fn finish_chunked(
+    backend: &dyn crate::backend::CloudBackend,
+    uploads_base: &str,
+    next_index: u64,
+    bytes_confirmed: u64,
+    total_len: u64,
+    tail_path: &Path,
+    sparse: bool,
+    head: u64,
+    whole: bool,
+    remote_path: &Path,
+    if_match: Option<&str>,
+) -> Result<crate::backend::PutResult, crate::backend::BackendWriteError> {
+    let mtime = crate::staged_mtime(tail_path);
+    let result = send_chunked_finish(backend, uploads_base, next_index, bytes_confirmed, total_len, tail_path, sparse, head, remote_path, if_match, mtime);
+    match result {
+        Err(e) if matches!(e, crate::backend::BackendWriteError::Conflict | crate::backend::BackendWriteError::Server(404, _)) => {
+            // An earlier attempt (this call's, or a worker's before a replay) may have landed.
+            let listed = backend.list_dir(remote_path, Duration::from_secs(30)).ok().and_then(|(_, me, _)| me);
+            if let Some(listed) = listed.filter(|l| is_our_assembly(l, total_len, mtime, if_match)) {
+                log::info!("streamed upload {}: the server already has it ({}) — an earlier assembly landed", remote_path.display(), e);
+                return Ok(crate::backend::PutResult { new_change_token: listed.change_token });
+            }
+            if whole && session_gone(&e) {
+                return put_whole_instead(backend, tail_path, remote_path, if_match, &e);
+            }
+            Err(e)
+        }
+        Err(e) if whole && session_gone(&e) => put_whole_instead(backend, tail_path, remote_path, if_match, &e),
+        r => r,
+    }
+}
+
+fn put_whole_instead(
+    backend: &dyn crate::backend::CloudBackend,
+    tail_path: &Path,
+    remote_path: &Path,
+    if_match: Option<&str>,
+    why: &crate::backend::BackendWriteError,
+) -> Result<crate::backend::PutResult, crate::backend::BackendWriteError> {
+    log::warn!("streamed upload {}: upload session gone ({}) — uploading the whole file from its staging copy", remote_path.display(), why);
+    backend.put_file_settled(tail_path, &mut || Some((remote_path.to_path_buf(), if_match.map(str::to_string))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_chunked_finish(
     backend: &dyn crate::backend::CloudBackend,
     uploads_base: &str,
     next_index: u64,
@@ -1257,12 +1373,12 @@ pub(crate) fn finish_chunked(
     head: u64,
     remote_path: &Path,
     if_match: Option<&str>,
+    // Read before the final chunk: the tail's mtime is the save's, and it is the one the
+    // commit already reported for the file.
+    mtime: Option<SystemTime>,
 ) -> Result<crate::backend::PutResult, crate::backend::BackendWriteError> {
     use crate::backend::BackendWriteError;
     let session = crate::backend::ChunkedUploadSession { uploads_base: uploads_base.to_string() };
-    // Read before the final chunk: the tail's mtime is the save's, and it is the one the
-    // commit already reported for the file.
-    let mtime = crate::staged_mtime(tail_path);
     let tail_len = total_len.saturating_sub(bytes_confirmed);
     if tail_len > 0 {
         // Server(0, _): a local fault, never transient, so it is not retried forever.
@@ -1282,7 +1398,7 @@ pub(crate) fn finish_chunked(
             .map_err(|e| BackendWriteError::Server(0, format!("staging head {}: {}", tail_path.display(), e)))?;
         crate::retry_chunk_write("head chunk upload", || backend.put_chunk(&session, 0, body.clone()))?;
     }
-    crate::retry_chunk_write("chunked-upload finish", || backend.finish_chunked_upload(&session, remote_path, if_match, mtime))
+    crate::retry_chunk_write("chunked-upload finish", || backend.finish_chunked_upload(&session, remote_path, if_match, mtime, total_len))
 }
 
 #[cfg(test)]
@@ -1313,6 +1429,30 @@ mod tests {
         let err = each_tail_chunk(&tail, 0, 30, 10, |m| m, |_, _| Ok::<(), String>(())).unwrap_err();
         assert!(err.contains("refusing to assemble"), "{}", err);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lost_assembly_answer_is_recognised_by_size_and_mtime() {
+        let t = |s: u64| std::time::UNIX_EPOCH + Duration::from_secs(s);
+        let listed = |size: u64, secs: u64, etag: &str| crate::backend::RemoteEntry {
+            path: PathBuf::from("/big.bin"),
+            is_dir: false,
+            size,
+            modified: Some(t(secs)),
+            change_token: Some(etag.into()),
+            content_type: None,
+            ext: Default::default(),
+        };
+        // Our size and stamped mtime, and not the version the MOVE was conditioned on.
+        assert!(is_our_assembly(&listed(500, 1_000, "new"), 500, Some(t(1_000)), Some("old")));
+        assert!(is_our_assembly(&listed(500, 1_000, "new"), 500, Some(t(1_000)), None));
+        // Still the version it replaces: a real conflict or a MOVE that never ran.
+        assert!(!is_our_assembly(&listed(500, 1_000, "old"), 500, Some(t(1_000)), Some("\"old\"")));
+        // Someone else's file: another size or another mtime.
+        assert!(!is_our_assembly(&listed(499, 1_000, "new"), 500, Some(t(1_000)), Some("old")));
+        assert!(!is_our_assembly(&listed(500, 1_001, "new"), 500, Some(t(1_000)), Some("old")));
+        // Nothing of ours to compare with.
+        assert!(!is_our_assembly(&listed(500, 1_000, "new"), 500, None, None));
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -1746,6 +1886,7 @@ mod tests {
                 if_match_etag: Some("e1".into()),
                 sparse: false,
                 head: 0,
+                whole: false,
             })
         };
         let j = MutationJournal::load_or_create(&dir);
@@ -1774,6 +1915,7 @@ mod tests {
                 if_match_etag: None,
                 sparse,
                 head: if sparse { 10 } else { 0 },
+                whole: false,
             });
         }
         assert_eq!(
@@ -1781,6 +1923,21 @@ mod tests {
             Some(PendingUpload::StreamTail { tail: tail.clone(), held_from: 20, head: 10, sparse: true }),
             "the newest finish",
         );
+        // One whose staging file kept every byte is read like a whole-file save.
+        let full = dir.join("write_5");
+        j.enqueue(MutationOp::FinishChunked {
+            remote_path: PathBuf::from("/v.mkv"),
+            uploads_base: "u".into(),
+            next_index: 3,
+            bytes_confirmed: 20,
+            total_len: 30,
+            tail_path: full.clone(),
+            if_match_etag: None,
+            sparse: true,
+            head: 10,
+            whole: true,
+        });
+        assert_eq!(j.pending_upload(Path::new("/v.mkv")), Some(PendingUpload::Staged(full)));
         // A newer whole-file save of the same path wins over the streamed finish...
         let staged = dir.join("write_4");
         j.enqueue(MutationOp::Put { remote_path: PathBuf::from("/v.mkv"), staging_path: staged.clone(), if_match_etag: Some("e".into()) });
@@ -1808,6 +1965,7 @@ mod tests {
                 if_match_etag: None,
                 sparse: false,
                 head: 0,
+                whole: false,
             });
         }
         let j = MutationJournal::load_or_create(&dir);
@@ -1832,6 +1990,7 @@ mod tests {
             if_match_etag: None,
             sparse: false,
             head: 0,
+            whole: false,
         });
         j.enqueue(MutationOp::Rename { from: PathBuf::from("/d"), to: PathBuf::from("/e"), staging: None, if_match: None });
         assert_eq!(j.entries()[0].op.path(), Path::new("/e/tmp.bin"));

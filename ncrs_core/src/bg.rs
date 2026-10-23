@@ -340,7 +340,14 @@ pub const THUMB_WORKERS: usize = 2;
 pub static USER: Pool = Pool::new("user", USER_WORKERS, 4096);
 pub const USER_WORKERS: usize = 4;
 
-pub static POOLS: [&Pool; 13] = [&FUSE, &READDIR, &READ, &STREAM, &DNS, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER];
+/// Chunks of large files PUT while they are still being written (lib.rs `run_chunk_pump`).
+/// Two workers are the cap on such PUTs across the mount, so a few big copies cannot
+/// take every upload slot from ordinary saves. Each job sends one chunk and queues the
+/// next, so several files being written share the workers in turn.
+pub static CHUNK: Pool = Pool::new("chunk", CHUNK_WORKERS, 1024);
+pub const CHUNK_WORKERS: usize = 2;
+
+pub static POOLS: [&Pool; 14] = [&FUSE, &READDIR, &READ, &STREAM, &DNS, &LISTING, &BACKGROUND, &MUTATION, &NOTIFY, &IPC, &HOUSEKEEPING, &THUMB, &USER, &CHUNK];
 
 /// Named long-lived threads: the FUSE session, connectivity monitor, push
 /// watcher, IPC accept loop, savers, cleanup. Fixed in number.
@@ -413,7 +420,7 @@ pub const MAX_THREADS: usize = {
 pub const HTTP_SINGLETON_CLIENTS: usize = 7;
 pub const MAX_HTTP_CLIENT_THREADS: usize = HTTP_SINGLETON_CLIENTS + 2 * crate::http_clients::DOWNLOAD_CONNECTIONS;
 
-const POOL_SIZES: [usize; 13] = [
+const POOL_SIZES: [usize; 14] = [
     FUSE_WORKERS,
     READDIR_WORKERS,
     READ_WORKERS,
@@ -427,6 +434,7 @@ const POOL_SIZES: [usize; 13] = [
     HOUSEKEEPING_WORKERS,
     THUMB_WORKERS,
     USER_WORKERS,
+    CHUNK_WORKERS,
 ];
 
 /// A lifetime cap on how many threads a class may ever start.

@@ -2,7 +2,7 @@
 
 Every OS thread the daemon creates comes from [`ncrs_core/src/bg.rs`](../ncrs_core/src/bg.rs). It is either a worker of one of the fixed pools below or one of the named long-lived services. `std::thread::spawn` is banned everywhere else by `ncrs_core/clippy.toml`, and CI enforces this with `clippy -D clippy::disallowed_methods`. `std::thread::scope` stays allowed, because it joins its threads before returning.
 
-This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (192) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 57) + the main thread + reqwest's runtime threads (`MAX_HTTP_CLIENT_THREADS`, 23: 7 singletons plus one read client per download slot per transport — see `http_clients::DOWNLOAD_CONNECTIONS`), which is **297**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
+This makes the thread count a constant known at compile time, `bg::MAX_THREADS`. It equals the pool worker caps (194) + `MAX_SERVICES` (24) + the scoped fan-outs (`MAX_SCOPED_THREADS`, 57) + the main thread + reqwest's runtime threads (`MAX_HTTP_CLIENT_THREADS`, 23: 7 singletons plus one read client per download slot per transport — see `http_clients::DOWNLOAD_CONNECTIONS`), which is **299**. fuser adds its session thread (`fuser-0`) and one `fuser-bg` thread. Workers exist only while there is work, so an idle mount holds no pool threads. `HEALTH` over IPC and a once-a-minute `HEALTH` log line report the live numbers.
 
 Why this matters: 0.1.76 spawned a detached thread per FUSE request and per background revalidation, and took its concurrency permit *inside* the thread. During a `find /` over a server answering 500, 9,800 of those threads parked on a 10-slot throttle. The daemon reached 10,160 threads and ~900 load average (2026-09-24; see `docs/plans/2026-09-24-thread-leak-5xx-walker.md`).
 
@@ -18,12 +18,13 @@ graph LR
   FU -->|look-ahead, slot taken first| ST
   FU -->|submit_mutation — ticket taken first, FIFO, never refused| MU[[mutate ×16, q∞]]
   FU -->|notify_later| NO[[notify ×1, q8192]]
+  FU -->|early chunks of a large write| CH[[chunk ×2, q1024]]
   RD -->|cold listing: per-pid token bucket| WK{walkers}
   RD -->|miss / stale| LI[[list ×16, q2048]]
   RD -->|cached hit| BG[[bg ×4, q256: revalidate, purge, abort]]
   RD -->|dir has files| TH[[thumb ×2, q64]]
   LI & BG & TH -->|breaker open or path cooling down: skip| HB{backoff + breaker}
-  LI & BG & MU -->|Throttle: bounded waits| SRV[(server)]
+  LI & BG & MU & CH -->|Throttle: bounded waits| SRV[(server)]
   BG & LI & MU & RE -->|kernel cache invalidation| NO
   NO --> KC[(kernel inode cache)]
   IPC[ipc-accept] -->|refuse over 64| IC[[ipc ×64, q0]]
@@ -35,7 +36,7 @@ graph LR
 
 | Pool | Workers | Queue | Full → | Used for |
 |---|---|---|---|---|
-| `fuse` | 16 | 4096 (= requests in flight) | the dispatch thread waits for one to finish | every FUSE request body. `fuse_sched` queues each request on the inodes it touches (`fuse_dispatch.rs` lists the keys) and hands it here only once it is at the head of all of them: one at a time per inode in arrival order, consecutive reads together, other inodes in parallel. A body that waits on the network (a PROPFIND for an uncached lookup, a chunk upload in `write`) holds one worker and its own inodes, not the mount |
+| `fuse` | 16 | 4096 (= requests in flight) | the dispatch thread waits for one to finish | every FUSE request body. `fuse_sched` queues each request on the inodes it touches (`fuse_dispatch.rs` lists the keys) and hands it here only once it is at the head of all of them: one at a time per inode in arrival order, consecutive reads together, other inodes in parallel. A body that waits on the network (a PROPFIND for an uncached lookup, a disk-low `write` waiting for its chunks to go up) holds one worker and its own inodes, not the mount |
 | `readdir` | 24 | 512 | EAGAIN to the kernel | `readdir`/`readdirplus` workers; the reply travels in the job |
 | `read` | 32 | 2048 | EAGAIN | jobs that own a READ reply: opening a range stream to its first bytes, waits on read-ahead windows, the bounded whole-file fallback. Deep so bursts queue instead of bouncing (`cp` treats EAGAIN as fatal); a job dequeued after 30 s answers EAGAIN at once, so a backlog drains at dequeue speed |
 | `stream` | 8 (= `DOWNLOAD_CONNECTIONS`) | 8 | foreground: runs on in its `read` worker; look-ahead: dropped | read-ahead window bodies after their READ was answered, and look-ahead windows (whose slot is taken before submission, so they never wait for one here) |
@@ -48,6 +49,7 @@ graph LR
 | `housekeeping` | 3 | 16 | disarmed, retried later | dir-cache saver, journal replay, reconnect revalidation |
 | `thumb` | 2 | 64 | dropped | thumbnail prefetch batches; thumbguard's server-preview fetch |
 | `user` | 4 | 4096 | dropped | IPC-requested KEEP / PREFETCH |
+| `chunk` | 2 | 1024 | sent with the rest at close (disk low: inline in `write`) | early chunk PUTs of large files still being written, one chunk per job (`run_chunk_pump`); each takes a `Throttle` slot |
 
 ## Services (`bg::spawn_service`, at most 24 per process lifetime)
 
