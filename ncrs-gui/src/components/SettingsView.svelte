@@ -24,6 +24,7 @@
         stream_uploads: boolean;
         stream_upload_threshold_mb: number;
         stream_disk_reserve_mb: number;
+        honor_server_locks: boolean;
     }
 
     // One desktop profile, as reported by the service (`INTEGRATIONS`):
@@ -223,6 +224,20 @@
                         <p class="sv-hint sv-warn">No folder set — your files won't be mounted until you choose one.</p>
                     {/if}
                     <p class="sv-hint">Local path where your Nextcloud files appear. The directory is created automatically.</p>
+                </div>
+
+                <div class="sv-toggle">
+                    <div>
+                        <label class="sv-toggle-label" for="server-locks">Respect Nextcloud file locks</label>
+                        <p class="sv-hint">
+                            When someone else has a file locked on the server — open in Nextcloud
+                            Office, or locked from the web — it shows as read-only here and
+                            programs open it read-only, instead of your save failing later. Your
+                            own locks never stop you. Needs the Files lock app on the server;
+                            without it nothing is ever locked. Applies immediately when saved.
+                        </p>
+                    </div>
+                    <input id="server-locks" type="checkbox" class="sv-check" bind:checked={settings.honor_server_locks} />
                 </div>
             </section>
 

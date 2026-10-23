@@ -756,8 +756,8 @@ fn get_config_values() -> ncrs_core::config::ConfigSettings {
 #[tauri::command]
 fn save_config_values(values: ncrs_core::config::ConfigSettings) -> Result<(), String> {
     ncrs_core::config::rewrite_config_settings(&values)?;
-    // The walker limit and the streamed-upload settings apply live; everything else
-    // takes effect on remount.
+    // The walker limit, the streamed-upload settings and server locks apply live;
+    // everything else takes effect on remount.
     let limit = format!(
         "WALKER_LIMIT {} {}",
         if values.walker_rate_limit { "on" } else { "off" },
@@ -769,7 +769,8 @@ fn save_config_values(values: ncrs_core::config::ConfigSettings) -> Result<(), S
         values.stream_upload_threshold_mb,
         values.stream_disk_reserve_mb,
     );
-    for verb in [limit, stream] {
+    let locks = format!("SERVER_LOCKS {}", if values.honor_server_locks { "on" } else { "off" });
+    for verb in [limit, stream, locks] {
         if ipc_request(&[verb.as_str()]).is_none() {
             log::debug!("{} saved; no daemon to forward it to right now", verb);
         }
