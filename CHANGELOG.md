@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.90](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.89...ncrs-v0.1.90) (2026-10-23)
+
+
+### Features
+
+* **core:** register passthrough backing files through ncrs-passthrough and run the daemon without capabilities ([96e5d7e](https://github.com/rgon/ncrsDesktop/commit/96e5d7ecc86657940b5e0917c9671495c778d9d4))
+* **fuser:** let a backing broker perform the passthrough backing ioctls ([9729226](https://github.com/rgon/ncrsDesktop/commit/9729226bc250499448a286b690f53ca9192ecf6d))
+* **passthrough:** add ncrs-passthrough, a capability-holding helper that only registers and releases FUSE backing files ([001ad07](https://github.com/rgon/ncrsDesktop/commit/001ad07c0e0a92d89328faad77b3fe960c66eea8))
+
+
+### Bug Fixes
+
+* **core:** refuse control characters and parent segments in IPC paths, keep trailing spaces in path arguments, and strip control characters from server owner names ([351c743](https://github.com/rgon/ncrsDesktop/commit/351c7437213de305a5866b710f0ad85514a07f9f))
+* **deb:** grant cap_sys_admin to the passthrough helper only, strip it from /usr/bin/ncrs, and apply it when libcap2-bin arrives later ([373a636](https://github.com/rgon/ncrsDesktop/commit/373a636688107ac52b9bc19c1ca668b401e3c6e2))
+* **e2e:** build the ncrs-passthrough binary too, since --bin ncrs limited every package to that one binary ([758c53c](https://github.com/rgon/ncrsDesktop/commit/758c53c9cb2020d662759f98ece22324d62c17d3))
+* **rpm:** set cap_sys_admin on the passthrough helper with %caps instead of setcap on /usr/bin/ncrs in %post ([c59f6b6](https://github.com/rgon/ncrsDesktop/commit/c59f6b69c06f30f46fcb097e9d2f3ce47c3c9d40))
+
 ## [0.1.89](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.88...ncrs-v0.1.89) (2026-10-22)
 
 
