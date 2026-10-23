@@ -5735,6 +5735,7 @@ impl NextCloudFs {
         let journal = self.journal.clone();
         let smap = self.status.clone();
         let uploads = self.uploads.clone();
+        let auto_keep = self.auto_keep_locally_modified_files;
         let order = MUTATION_ORDER.safe_lock();
         let ticket = uploads.ticket_entry(&remote_path);
         submit_mutation(move || {
@@ -5760,6 +5761,7 @@ impl NextCloudFs {
                 Ok(result) => {
                     log::info!("PUT (streamed) {} → new etag {:?}", remote_path.display(), result.new_change_token);
                     uploads.record(&remote_path, result.new_change_token.clone());
+                    let new_etag = result.new_change_token.clone();
                     journal.safe_lock().rebase(&remote_path, etag.as_deref(), result.new_change_token.as_deref());
                     {
                         let mut c = cache.safe_lock();
@@ -5774,10 +5776,39 @@ impl NextCloudFs {
                             dir.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
                         }
                     }
-                    // The tail is only the end of the file, so it can never become a kept copy.
-                    smap.safe_write().insert(remote_path.clone(), FileStatus::Synced);
-                    let _ = std::fs::remove_file(&tail_path);
                     journal.safe_lock().remove(seq);
+                    // An early upload kept the whole file, which becomes its local copy like
+                    // a whole-file upload's (commit_released); a punched tail is only the end.
+                    let pinned = cache.safe_lock().file_cache.get(&remote_path).is_some_and(|e| e.kept);
+                    let mut kept_copy = false;
+                    if whole && (auto_keep || pinned) {
+                        let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
+                        let keep_path = {
+                            let c = cache.safe_lock();
+                            if pinned { c.kept_dir.join(rel) } else { c.auto_cache_dir.join(rel) }
+                        };
+                        if let Some(dir) = keep_path.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        if std::fs::rename(&tail_path, &keep_path).is_ok() {
+                            cache.safe_lock().file_cache.insert(remote_path.clone(), FileCacheEntry {
+                                local_path: keep_path,
+                                remote_modified: Some(saved_mtime),
+                                etag: new_etag,
+                                kept: pinned,
+                                size: total_len,
+                            });
+                            kept_copy = true;
+                        }
+                    }
+                    smap.safe_write().insert(remote_path.clone(), match (kept_copy, pinned) {
+                        (true, true) => FileStatus::Kept,
+                        (true, false) => FileStatus::Cached,
+                        _ => FileStatus::Synced,
+                    });
+                    if !kept_copy {
+                        let _ = std::fs::remove_file(&tail_path);
+                    }
                 }
                 Err(backend::BackendWriteError::Conflict) => {
                     // Every chunk is already on the server: assemble ours as a conflicted copy.
