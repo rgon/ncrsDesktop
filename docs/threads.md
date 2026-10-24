@@ -63,6 +63,7 @@ graph LR
 | `auto-keep` | `mount_ncfs` (one-shot) | done / shutdown |
 | `storage-stats` | `mount_ncfs` | shutdown |
 | `cache-cleanup` | `mount_ncfs` | shutdown |
+| `app-locks` | `mount_ncfs` (server locks for documents an editor has open: takes, refreshes every 20 s and releases them, see `app_locks.rs`) | shutdown, after releasing what it holds |
 | `health-log` | `mount_ncfs` | shutdown |
 | `ipc-state` | `ipc::start_ipc_server` | process exit |
 | `ipc-accept` | `ipc::start_ipc_server` | process exit |
