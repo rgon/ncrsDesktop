@@ -703,6 +703,12 @@ fn compact(cache: &Mutex<FsCache>) {
 pub(crate) fn write_handles_snapshot(cache_dir: &Path, open_files: &Mutex<HashMap<u64, OpenFile>>, drained: bool) -> io::Result<()> {
     let path = cache_dir.join(HANDLES_FILE);
     if !drained {
+        // Called off (or never taken): a session the snapshot froze carries on here.
+        for of in open_files.safe_lock().values() {
+            if let Some(c) = &of.chunk_upload {
+                c.thaw();
+            }
+        }
         return match std::fs::remove_file(&path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -730,7 +736,7 @@ pub(crate) fn write_handles_snapshot(cache_dir: &Path, open_files: &Mutex<HashMa
             chunk: of.chunk_upload.as_ref().map(|c| {
                 // A disk-low upload stops here, so a chunk still on its way can neither move
                 // the recorded progress on nor punch out bytes the successor counts as local.
-                let p = if c.progress().punching { c.close() } else { c.progress() };
+                let p = if c.progress().punching { c.freeze() } else { c.progress() };
                 ChunkRec {
                     uploads_base: c.uploads_base.clone(),
                     next_index: p.next_index,

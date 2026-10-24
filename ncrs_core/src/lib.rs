@@ -1225,6 +1225,8 @@ struct PumpState {
     // Taken over by release(), abandoned, or frozen for a hand-over: nothing more is sent
     // or punched, and the progress stays what it was then.
     closed: bool,
+    // Closed only for a hand-over, which may still be called off (thaw).
+    frozen: bool,
 }
 
 impl ChunkUploadState {
@@ -1249,6 +1251,27 @@ impl ChunkUploadState {
         st.closed = true;
         self.pump.cv.notify_all();
         st.clone()
+    }
+
+    /// Closes the session for a hand-over: the successor resumes it from this progress.
+    fn freeze(&self) -> PumpState {
+        let mut st = self.pump.state.safe_lock();
+        if !st.closed {
+            st.frozen = true;
+        }
+        st.closed = true;
+        self.pump.cv.notify_all();
+        st.clone()
+    }
+
+    /// The hand-over was called off: a session it froze carries on.
+    fn thaw(&self) {
+        let mut st = self.pump.state.safe_lock();
+        if st.frozen {
+            st.frozen = false;
+            st.closed = false;
+            self.pump.cv.notify_all();
+        }
     }
 
     /// Waits until no uploader job is running: one still sending a chunk could otherwise
@@ -1573,7 +1596,7 @@ struct OpenFile {
 
 /// How long opening a file for writing waits for its streamed upload to be assembled on
 /// the server before refusing (EBUSY): until then the server cannot hand its bytes back.
-const STREAMED_REOPEN_WAIT: Duration = Duration::from_secs(60);
+const STREAMED_REOPEN_WAIT: Duration = Duration::from_secs(15);
 
 /// Error a range read returns when the server's copy is no longer the version the
 /// handle was reading: answered ESTALE, never served.
@@ -5776,12 +5799,19 @@ impl NextCloudFs {
                             dir.at = Instant::now() - (DIR_CACHE_TTL + Duration::from_secs(1));
                         }
                     }
-                    journal.safe_lock().remove(seq);
+                    // A rename queued its MOVE while this was finishing: until that lands the
+                    // whole file kept here is the destination's only readable copy.
+                    let handed = {
+                        let mut j = journal.safe_lock();
+                        let handed = whole && j.hand_staging_to_rename(&remote_path, &tail_path);
+                        j.remove(seq);
+                        handed
+                    };
                     // An early upload kept the whole file, which becomes its local copy like
                     // a whole-file upload's (commit_released); a punched tail is only the end.
                     let pinned = cache.safe_lock().file_cache.get(&remote_path).is_some_and(|e| e.kept);
                     let mut kept_copy = false;
-                    if whole && (auto_keep || pinned) {
+                    if whole && !handed && (auto_keep || pinned) {
                         let rel = remote_path.strip_prefix("/").unwrap_or(&remote_path);
                         let keep_path = {
                             let c = cache.safe_lock();
@@ -5806,7 +5836,7 @@ impl NextCloudFs {
                         (true, false) => FileStatus::Cached,
                         _ => FileStatus::Synced,
                     });
-                    if !kept_copy {
+                    if !kept_copy && !handed {
                         let _ = std::fs::remove_file(&tail_path);
                     }
                 }
