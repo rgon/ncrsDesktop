@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.93](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.92...ncrs-v0.1.93) (2026-10-24)
+
+
+### Bug Fixes
+
+* **core:** let a disk-low streamed write go at disk speed while free space is above the reserve, pacing it to the upload only below it ([b981ecb](https://github.com/rgon/ncrsDesktop/commit/b981ecb6754eb68c378710eacecf71073b82c4d7))
+
 ## [0.1.92](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.91...ncrs-v0.1.92) (2026-10-24)
 
 
