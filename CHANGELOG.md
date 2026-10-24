@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.91](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.90...ncrs-v0.1.91) (2026-10-24)
+
+
+### Features
+
+* **core:** lock documents on the server while LibreOffice, Office, Vim or Kate has them open ([a3bc075](https://github.com/rgon/ncrsDesktop/commit/a3bc0750771dbe36ee9ab3122f4885ced33f12fa))
+* **core:** upload large files early while keeping the whole local copy, falling back to a whole-file upload ([61d5655](https://github.com/rgon/ncrsDesktop/commit/61d56557b1ce710d7c30da76dd650a47ecf77074))
+* **gui:** setting to lock documents on the server while you edit them ([9885873](https://github.com/rgon/ncrsDesktop/commit/98858730b23b3b3e148b1be22b4ff7581d862eb3))
+* **gui:** setting to respect Nextcloud file locks ([97e5430](https://github.com/rgon/ncrsDesktop/commit/97e5430d8655a448fc2b64040e8b0d424af3497e))
+* keep a cached local copy of saved files by default, cleared by purge and the cache limits ([d74fec5](https://github.com/rgon/ncrsDesktop/commit/d74fec5f32a6dbcc985297222aea9c43d8253215))
+
+
+### Bug Fixes
+
+* **core:** a finished early upload stays as the file's cached local copy ([56ac097](https://github.com/rgon/ncrsDesktop/commit/56ac0975759297193661acda2b5b5bb0408802a5))
+* **core:** an aborted restart resumes a low-disk upload, and a finished early upload hands its copy to a pending rename ([b5836c0](https://github.com/rgon/ncrsDesktop/commit/b5836c075c79a4c66567d1d1e58b459b8788cf6a))
+* **core:** an edit saved offline is read back instead of the older cached copy ([6851184](https://github.com/rgon/ncrsDesktop/commit/6851184b565de3190bfcbfed6db59d629da314cc))
+* **core:** keep a document's lock until our own save of it lands, and never mistake our lock for someone else's change ([7c08466](https://github.com/rgon/ncrsDesktop/commit/7c08466e2071378a99820a3092930140094eb37e))
+* **core:** saves follow renames and keep both versions on a server conflict instead of overwriting ([8cc6522](https://github.com/rgon/ncrsDesktop/commit/8cc6522ebbd2e46746082f40649770ebfba8ea61))
+
 ## [0.1.90](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.89...ncrs-v0.1.90) (2026-10-23)
 
 
