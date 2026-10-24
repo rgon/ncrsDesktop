@@ -1182,8 +1182,10 @@ struct ReadAheadBuf {
 // - Disk low (stream_disk_low, on a filesystem that can punch holes): sent chunks are also
 //   punched out of the staging file (free_sent_chunk), so a file the disk cannot hold
 //   still copies. Nothing local is left to fall back on there, so the cases above fail
-//   the handle (EIO) instead, and write() waits for the uploader rather than let unsent
-//   bytes pile up on a full disk. A plain sequential copy never hits either path.
+//   the handle (EIO) instead, and while free space is under the reserve write() waits for
+//   the uploader rather than let unsent bytes eat into it; once space is back (another
+//   file deleted) it goes at disk speed again. A plain sequential copy never hits either
+//   path.
 //
 // The file's first chunk (`head`) is never sent early: it stays in the staging file and
 // goes up as chunk 0 at the finish, so a muxer patching its header when it closes
@@ -1322,7 +1324,8 @@ fn stream_write_verdict(off: u64, len: u64, total_written: u64, head: u64, p: &P
 }
 
 /// How many bytes a disk-low upload lets the writer get ahead of the uploader, past the
-/// threshold's tail: one chunk on the wire and one waiting.
+/// threshold's tail, while free space is under the reserve (stream_disk_below_reserve):
+/// one chunk on the wire and one waiting. With space above it the writer is not held.
 const STREAM_MAX_UNSENT: u64 = 2 * webdav_ops::CHUNK_SIZE as u64;
 
 /// How much of a streamed file's start stays local until it is closed: one chunk, which
@@ -1416,6 +1419,16 @@ fn stream_disk_low() -> bool {
         .is_some_and(|(free, size)| free < stream_reserve_bytes(reserve_mb, size));
     *cached = Some((Instant::now(), low));
     low
+}
+
+/// Whether free space is under the reserve right now, so a disk-low writer must wait for
+/// sent chunks to be freed. Unlike stream_disk_low this is read fresh on every call: a
+/// fast disk eats into the reserve faster than its 2 s cache would notice. An unreadable
+/// filesystem counts as under it, i.e. the writer waits.
+fn stream_disk_below_reserve() -> bool {
+    let reserve_mb = STREAM_DISK_RESERVE_MB.load(Ordering::Relaxed);
+    STREAM_DISK_PATH.safe_lock().as_deref().and_then(disk_space)
+        .map_or(true, |(free, size)| free < stream_reserve_bytes(reserve_mb, size))
 }
 
 /// Whether write()'s streaming fast path should hand a chunk to the uploader now: when
@@ -5701,9 +5714,11 @@ impl NextCloudFs {
     }
 
     /// Hands the next chunk of a streamed upload to its uploader. A disk-low one then holds
-    /// the writer until at most STREAM_MAX_UNSENT bytes are waiting to go up, since bytes
-    /// cannot be freed before they are sent; sends the chunk itself if the pool has no
-    /// room. Err once the session can no longer be finished: the handle must fail.
+    /// the writer, while free space is under the reserve, until at most STREAM_MAX_UNSENT
+    /// bytes are waiting to go up, since bytes cannot be freed before they are sent; with
+    /// space above the reserve the writer goes at disk speed and the uploader catches up.
+    /// Sends the chunk itself if the pool has no room. Err once the session can no longer
+    /// be finished: the handle must fail.
     fn feed_stream(&self, cs: &ChunkUploadState, wp: &Path, claim: bool) -> Result<(), String> {
         if claim {
             let mut st = cs.pump.state.safe_lock();
@@ -5728,6 +5743,15 @@ impl NextCloudFs {
             }
             if st.claimed.saturating_sub(st.bytes_confirmed) <= STREAM_MAX_UNSENT {
                 return Ok(());
+            }
+            // statvfs with the pump lock dropped: the uploader takes it to report a chunk.
+            drop(st);
+            if !stream_disk_below_reserve() {
+                return Ok(());
+            }
+            st = cs.pump.state.safe_lock();
+            if st.failed.is_some() || st.closed || st.claimed.saturating_sub(st.bytes_confirmed) <= STREAM_MAX_UNSENT {
+                continue;
             }
             if !st.busy {
                 drop(st);
