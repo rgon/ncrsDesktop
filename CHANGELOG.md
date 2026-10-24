@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.92](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.91...ncrs-v0.1.92) (2026-10-24)
+
+
+### Bug Fixes
+
+* **core:** keep a document's server lock through LibreOffice's saves, which rewrite its lock file, so our own lock no longer turns them into conflicted copies ([a179c48](https://github.com/rgon/ncrsDesktop/commit/a179c4872497ebddefd5ecf55eb67b5d24bc1326))
+
 ## [0.1.91](https://github.com/rgon/ncrsDesktop/compare/ncrs-v0.1.90...ncrs-v0.1.91) (2026-10-24)
 
 
