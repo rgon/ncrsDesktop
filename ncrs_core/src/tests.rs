@@ -3067,6 +3067,18 @@ mod upload_order_tests {
     }
 
     #[test]
+    fn a_crawler_reading_many_files_does_not_grow_served_versions_for_good() {
+        use crate::ServedVersions;
+        let s = ServedVersions::default();
+        s.wrote(Path::new("/mine.odt"), "e0");
+        for i in 0..25_000 {
+            s.serve(Path::new(&format!("/scan/{i}.jpg")), "e");
+        }
+        assert!(s.0.lock().unwrap().len() <= 20_000);
+        assert!(s.is_ours(Path::new("/mine.odt"), "e0"), "what our own saves made is kept");
+    }
+
+    #[test]
     fn served_versions_follow_renames() {
         use crate::ServedVersions;
         let s = ServedVersions::default();

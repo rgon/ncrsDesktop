@@ -1662,9 +1662,18 @@ struct ServedVersion {
     ours: std::collections::VecDeque<String>,
 }
 
+/// Paths ServedVersions remembers. Every network read adds one, so a crawler reading tens
+/// of thousands of files must not grow it for good: past this, what only a read left is
+/// forgotten (a save over such a file is then based on its listed etag).
+const SERVED_VERSIONS_MAX: usize = 20_000;
+
 impl ServedVersions {
     fn serve(&self, path: &Path, etag: &str) {
-        self.0.safe_lock().entry(path.to_path_buf()).or_default().served = Some(etag.to_string());
+        let mut m = self.0.safe_lock();
+        if m.len() >= SERVED_VERSIONS_MAX && !m.contains_key(path) {
+            m.retain(|_, v| !v.ours.is_empty());
+        }
+        m.entry(path.to_path_buf()).or_default().served = Some(etag.to_string());
     }
 
     fn served(&self, path: &Path) -> Option<String> {
@@ -2625,24 +2634,28 @@ fn settle_live_upload(
     }
 }
 
-/// The etag `path` has on the server now, None when it is not there (or not a file).
-fn server_etag(conn: &ConnInfo, path: &Path) -> Option<String> {
+/// What a file is on the server now: its etag, size and mtime. None when it is not
+/// there (or not a file).
+fn server_state(conn: &ConnInfo, path: &Path) -> Option<(String, u64, Option<SystemTime>)> {
     match conn.backend.list_dir(path, Duration::from_secs(10)) {
-        Ok((_, Some(now), _)) if !now.is_dir => now.change_token,
+        Ok((_, Some(now), _)) if !now.is_dir => now.change_token.map(|t| (t, now.size, now.modified)),
         _ => None,
     }
 }
 
-/// A lock or unlock changes the file's etag on Nextcloud, though not its content. When
-/// the version this mount served was the one before it, the new etag is the same file:
-/// the next save is based on it, or our own lock would turn it into a conflicted copy.
-fn adopt_lock_etag(conn: &ConnInfo, cache: &Arc<Mutex<FsCache>>, served: &ServedVersions, path: &Path, before: Option<String>) {
-    let (Some(before), Some(after)) = (before, server_etag(conn, path)) else { return };
-    if before == after {
+/// A lock or unlock changes the file's etag on Nextcloud, though not its content. The new
+/// etag is then this mount's own version of the file: readers pinned to the old one take
+/// it (VersionPin), saves are based on it (rename-saves and handles opened before), so our
+/// own lock never reads as someone else's change. Only while size and mtime are the same:
+/// a save by someone else between `before` and the lock is not ours to adopt.
+fn adopt_lock_etag(conn: &ConnInfo, cache: &Arc<Mutex<FsCache>>, uploads: &UploadOrder, path: &Path, before: Option<(String, u64, Option<SystemTime>)>) {
+    let (Some((before, size, mtime)), Some((after, size2, mtime2))) = (before, server_state(conn, path)) else { return };
+    if before == after || size != size2 || mtime != mtime2 {
         return;
     }
-    if served.served(path).as_deref() == Some(before.as_str()) {
-        served.serve(path, &after);
+    let listed = cache.safe_lock().find_entry(path).and_then(|e| e.change_token.clone());
+    if uploads.served.served(path).as_deref() == Some(before.as_str()) || listed.as_deref() == Some(before.as_str()) {
+        uploads.record(path, Some(after.clone()));
     }
     let mut c = cache.safe_lock();
     if let Some(dir) = c.dir_cache.get_mut(path.parent().unwrap_or(Path::new("/"))) {
@@ -2654,16 +2667,32 @@ fn adopt_lock_etag(conn: &ConnInfo, cache: &Arc<Mutex<FsCache>>, served: &Served
     }
 }
 
-/// Stops tracking `doc`'s lock and releases it on the server.
-fn release_app_lock(conn: &ConnInfo, cache: &Arc<Mutex<FsCache>>, served: &ServedVersions, doc: &Path) {
+/// Whether a change to `doc` is still queued or on its way to the server: such a request
+/// carries the lock token, so the lock must outlive it (an UNLOCK first would make the
+/// server refuse our own save, 412).
+fn doc_writes_pending(cache: &Arc<Mutex<FsCache>>, journal: &mutation_journal::SharedJournal, doc: &Path) -> bool {
+    if cache.safe_lock().uploading.contains(doc) {
+        return true;
+    }
+    let j = journal.safe_lock();
+    j.pending_upload(doc).is_some()
+        || j.entries().iter().any(|e| matches!(&e.op, mutation_journal::MutationOp::Rename { from, to, .. } if from == doc || to == doc))
+}
+
+/// Stops tracking `doc`'s lock and releases it on the server, once no save of it is still
+/// pending; until then it stays (run_app_locks keeps refreshing it and tries again).
+fn release_app_lock(conn: &ConnInfo, cache: &Arc<Mutex<FsCache>>, journal: &mutation_journal::SharedJournal, uploads: &UploadOrder, doc: &Path) {
+    if doc_writes_pending(cache, journal, doc) {
+        return;
+    }
     let Some(held) = app_locks::untrack(doc) else { return };
     let Some(token) = held.token else { return };
-    let before = server_etag(conn, doc);
+    let before = server_state(conn, doc);
     match conn.backend.unlock_file(doc, &token) {
         Ok(()) => log::info!("{} closed {}: server lock released", held.app, doc.display()),
         Err(e) => log::warn!("releasing the server lock on {}: {} (it expires on its own)", doc.display(), e),
     }
-    adopt_lock_etag(conn, cache, served, doc, before);
+    adopt_lock_etag(conn, cache, uploads, doc, before);
 }
 
 /// Whether a tracked lock file is gone from the mount. A folder listing the cache no
@@ -2678,16 +2707,22 @@ fn lock_file_gone(cache: &Arc<Mutex<FsCache>>, journal: &mutation_journal::Share
         .is_some_and(|files| !files.iter().any(|e| e.path == lock_file))
 }
 
+/// How long one server lock is kept before it is taken anew: a refresh asks for the time
+/// held so far plus LOCK_TIMEOUT (files_lock counts from when it was taken), and that must
+/// not grow without end.
+const APP_LOCK_RENEW_AFTER: Duration = Duration::from_secs(30 * 60);
+
 /// Keeps the locks app_locks tracks: takes each one, refreshes it every REFRESH_EVERY,
 /// takes it again after a rename over the document dropped it, and releases it once its
 /// lock file is deleted, the application that made it exits, the feature is turned off,
-/// or the daemon stops. `previous` is what the last run held: released first, and taken
-/// again only for an application that is still running.
+/// or the daemon stops, and no save of the document is still pending. `previous` is what
+/// the last run held: released first, and taken again only for an application that is
+/// still running.
 fn run_app_locks(
     conn: Arc<ConnInfo>,
     cache: Arc<Mutex<FsCache>>,
     journal: mutation_journal::SharedJournal,
-    served: ServedVersions,
+    uploads: UploadOrder,
     previous: Vec<app_locks::Held>,
 ) {
     for h in previous {
@@ -2704,25 +2739,32 @@ fn run_app_locks(
         let active = honor_server_locks() && app_locks::enabled() && !stopping;
         let online = !conn.is_offline.load(Ordering::Relaxed);
         for h in app_locks::snapshot() {
+            let due = h.refreshed_at.is_none_or(|t| t.elapsed() >= app_locks::REFRESH_EVERY);
             // A cached listing can predate the lock file (one saved before a restart): it is
-            // gone only once the server agrees. Deleting it here releases the lock at once
-            // anyway (unlink), so this is the slow path.
-            let done = !active
-                || !app_locks::process_alive(h.pid, &h.comm)
-                || (lock_file_gone(&cache, &journal, &h.lock_file) && online
-                    && !matches!(conn.backend.list_dir(&h.lock_file, Duration::from_secs(10)), Ok((_, Some(_), _))));
-            if done {
-                if online || h.token.is_none() {
-                    release_app_lock(&conn, &cache, &served, &h.doc);
-                }
+            // gone only once the server says so, asked at most once per refresh. Deleting it
+            // here releases the lock at once anyway (unlink), so this is the slow path.
+            let file_gone = || {
+                due && online && lock_file_gone(&cache, &journal, &h.lock_file)
+                    && matches!(conn.backend.list_dir(&h.lock_file, Duration::from_secs(10)),
+                        Ok((_, None, _)) | Err(backend::BackendReadError::NotFound))
+            };
+            let done = !active || !app_locks::process_alive(h.pid, &h.comm) || file_gone();
+            if done && (online || h.token.is_none()) && !doc_writes_pending(&cache, &journal, &h.doc) {
+                release_app_lock(&conn, &cache, &journal, &uploads, &h.doc);
                 continue;
             }
-            let due = h.refreshed_at.is_none_or(|t| t.elapsed() >= app_locks::REFRESH_EVERY);
             if !online || !due {
                 continue;
             }
             let now = Instant::now();
             match (&h.token, h.locked_at) {
+                (Some(token), Some(at)) if now.saturating_duration_since(at) >= APP_LOCK_RENEW_AFTER => {
+                    // Taken anew, so the next refresh asks for a short timeout again.
+                    let before = server_state(&conn, &h.doc);
+                    let _ = conn.backend.unlock_file(&h.doc, token);
+                    adopt_lock_etag(&conn, &cache, &uploads, &h.doc, before);
+                    app_locks::set_token(&h.doc, None, now);
+                }
                 (Some(token), Some(at)) => match conn.backend.refresh_lock(&h.doc, token, app_locks::refresh_timeout(at, now)) {
                     Ok(()) => app_locks::mark_refreshed(&h.doc, now),
                     Err(backend::BackendWriteError::Conflict) => {
@@ -2731,16 +2773,17 @@ fn run_app_locks(
                     }
                     Err(e) => log::warn!("refreshing the server lock on {}: {}", h.doc.display(), e),
                 },
+                _ if done => {}
                 _ => {
                     // Taken once the document exists on the server (a new one is saved
                     // after its lock file is made); retried every REFRESH_EVERY meanwhile.
                     app_locks::mark_refreshed(&h.doc, now);
-                    let Some(before) = server_etag(&conn, &h.doc) else { continue };
+                    let Some(before) = server_state(&conn, &h.doc) else { continue };
                     match conn.backend.lock_file(&h.doc, app_locks::LOCK_TIMEOUT, &app_locks::owner_text(&h.app)) {
                         Ok(token) => {
                             log::info!("locked {} on the server for {}", h.doc.display(), h.app);
                             app_locks::set_token(&h.doc, Some(token), now);
-                            adopt_lock_etag(&conn, &cache, &served, &h.doc, Some(before));
+                            adopt_lock_etag(&conn, &cache, &uploads, &h.doc, Some(before));
                         }
                         Err(backend::BackendWriteError::Locked) => {
                             log::info!("{} is locked on the server by someone else; {} keeps it open read-write here", h.doc.display(), h.app);
@@ -9038,8 +9081,8 @@ impl NextCloudFs {
 
         // The editor closed the document: its server lock goes with the lock file.
         if let Some(doc) = app_locks::doc_of_lock_file(&remote_path) {
-            let (conn, cache, served) = (self.conn.clone(), self.cache.clone(), self.uploads.served.clone());
-            let _ = bg::BACKGROUND.submit(move || release_app_lock(&conn, &cache, &served, &doc));
+            let (conn, cache, journal, uploads) = (self.conn.clone(), self.cache.clone(), self.journal.clone(), self.uploads.clone());
+            let _ = bg::BACKGROUND.submit(move || release_app_lock(&conn, &cache, &journal, &uploads, &doc));
         }
 
         if !self.conn.is_offline.load(Ordering::Relaxed) {
@@ -11237,9 +11280,9 @@ pub fn mount_ncfs(options: MountOptions, error_log: Option<ErrorLog>, transfer_m
     // Server locks for documents an editor has open here (see app_locks).
     {
         let previous = app_locks::init(&filesystem.cache.safe_lock().cache_dir.clone());
-        let (conn, cache, served) = (filesystem.conn.clone(), filesystem.cache.clone(), filesystem.uploads.served.clone());
+        let (conn, cache, uploads) = (filesystem.conn.clone(), filesystem.cache.clone(), filesystem.uploads.clone());
         let journal = filesystem.journal.clone();
-        start_service("app-locks", move || run_app_locks(conn, cache, journal, served, previous));
+        start_service("app-locks", move || run_app_locks(conn, cache, journal, uploads, previous));
     }
 
     // Cache cleanup thread
