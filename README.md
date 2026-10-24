@@ -23,6 +23,7 @@ Designed to perform well in installations with a very large amount of shared fil
 | Dynamically cache files/keep part locally | ❌                | ❌ (No internet = no files) | ✅   |
 | No path conflicts | ❌ (may emit sync errors)               | ✅ | ✅ No dumb 'Some files could not be synced' |
 | Maps nextcloud permissions to filesystem permissions      | ❌                | ❌ (will error, but doesn't first display it to the user)                    | ✅   |
+| Office document locking (Nextcloud Office/Collabora ↔ local LibreOffice, no conflicted copies) | ⚠️ (since 3.10 it locks files opened in MS Office/LibreOffice, but users report locks not taking or not being released) | ❌ | ✅ locks a document on the server while LibreOffice, Office, Vim or Kate has it open, keeps the lock through saves, and shows files someone else has open in Collabora as read-only |
 | HPB Support/Sync speed         | ✅ NC HPB | ❌ | ✅ NC HPB |
 | QUIC/HTTP3 Support         | ❌ | ❌ | ✅ |
 | Syncing multiple OS paths -> different folders within Nextcloud     | ✅ | ❌ | ❌ (everything mounted under the Nextcloud path) |
