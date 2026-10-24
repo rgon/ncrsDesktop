@@ -33,7 +33,8 @@ WebDAV token locks (LOCK / UNLOCK) are kept here the way Nextcloud's files_lock 
 them: the timeout counts from when the lock was taken (a refresh replaces it), a PUT,
 MOVE or DELETE of a locked file without its token in the If header gets 423, a MOVE
 onto it drops the lock with the file it replaces, and PROPFIND reports it (nc:lock,
-lock-owner-type 2). Logged as LOCK / REFRESH / UNLOCK / LOCKED423.
+lock-owner-type 2). Taking or releasing one changes the file's etag, content and mtime
+unchanged, as Nextcloud's does. Logged as LOCK / REFRESH / UNLOCK / LOCKED423.
 
 With --fail-chunk-file PATH, a network blip can be armed while the proxy runs: while
 PATH exists and holds "STATUS COUNT", the next COUNT chunk PUTs after a session's first
@@ -94,6 +95,13 @@ UPLOADS = "/remote.php/dav/uploads/"
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "host"}
 log_lock = threading.Lock()
 LOCKS = {}   # decoded path -> {"token", "created", "timeout", "owner", "user"}
+BUMPS = {}   # decoded path -> how often a lock or unlock changed its etag since its last write
+
+
+def salted(key, tag):
+    """The etag `key` shows: the stored one, changed by every lock and unlock since."""
+    n = BUMPS.get(key)
+    return "%s-L%d" % (tag, n) if n and tag else tag
 
 
 def log(line):
@@ -145,7 +153,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if status == 404:
             return None
         tag = dict((k.lower(), v) for k, v in rh).get("etag", "")
-        return tag.replace("W/", "").strip('"')
+        return salted(urllib.parse.unquote(path), tag.replace("W/", "").strip('"'))
 
     def stored_etag(self, path, rh):
         """Nextcloud answers a PUT with the etag of the file as stored; rclone with the one
@@ -199,6 +207,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         user = base64.b64decode(self.headers.get("Authorization", "Basic ")[6:] or b"").split(b":")[0].decode()
         LOCKS[key] = {"token": token, "created": time.time(), "timeout": secs,
                       "owner": owner.group(1).decode() if owner else "", "user": user}
+        BUMPS[key] = BUMPS.get(key, 0) + 1
         log("LOCK %s %d %s" % (key, secs, token))
         return self.reply(200, [("Lock-Token", "<%s>" % token), ("Content-Type", "application/xml")],
                           b"<?xml version=\"1.0\"?><d:prop xmlns:d=\"DAV:\"/>")
@@ -209,6 +218,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         token = self.headers.get("Lock-Token", "").strip().strip("<>")
         if lk and lk["token"] == token:
             LOCKS.pop(key, None)
+            BUMPS[key] = BUMPS.get(key, 0) + 1
             log("UNLOCK %s" % key)
             return self.reply(204)
         return self.reply(409)
@@ -260,11 +270,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         headers["Host"] = UPSTREAM
         # reqwest sends header names in lower case; a MOVE whose Destination still
         # names this proxy is refused by the server (502, another host).
-        dest = [k for k in headers if k.lower() == "destination"]
-        if dest:
-            d = urllib.parse.urlsplit(headers.pop(dest[0]))
+        dest_key = [k for k in headers if k.lower() == "destination"]
+        if dest_key:
+            d = urllib.parse.urlsplit(headers.pop(dest_key[0]))
             headers["Destination"] = urllib.parse.urlunsplit(("http", UPSTREAM, d.path, d.query, ""))
         status, rh, rd = self.upstream(self.command, self.path, headers, data)
+        if self.command in ("PUT", "MOVE", "DELETE") and status in (200, 201, 204):
+            BUMPS.pop(urllib.parse.unquote(path), None)
+            if self.command == "MOVE" and dest:
+                BUMPS.pop(urllib.parse.unquote(dest), None)
+        if self.command in ("GET", "HEAD") and BUMPS:
+            key = urllib.parse.unquote(path)
+            rh = [(k, '"%s"' % salted(key, v.replace("W/", "").strip('"')) if k.lower() == "etag" else v) for k, v in rh]
         if self.command == "PUT" and status in (200, 201, 204):
             rh = self.stored_etag(path, rh)
         if self.command == "MOVE" and status in (200, 201, 204) and dest:
@@ -274,6 +291,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             LOCKS.pop(urllib.parse.unquote(path), None)
         if (LOCK_MARK or LOCKS) and self.command == "PROPFIND" and status == 207:
             rd = self.inject_locks(rd)
+        if BUMPS and self.command == "PROPFIND" and status == 207:
+            rd = self.salt_etags(rd)
         self.reply(status, rh, rd)
 
     def inject_locks(self, body):
@@ -303,6 +322,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return r
             return re.sub(r"(<(?:\w+:)?prop\b[^>]*>)", lambda p: p.group(1) + add, r, count=1)
         return re.sub(r"<(\w+:)?response\b[^>]*>.*?</(\w+:)?response>", one, text, flags=re.S).encode("utf-8")
+
+    def salt_etags(self, body):
+        def one(m):
+            r = m.group(0)
+            href = re.search(r"<(?:\w+:)?href>([^<]*)</", r)
+            key = urllib.parse.unquote(href.group(1)).rstrip("/") if href else None
+            if key not in BUMPS:
+                return r
+            return re.sub(r"(<(?:\w+:)?getetag>)\"?([^<\"]*)\"?(</)", lambda e: '%s"%s"%s' % (e.group(1), salted(key, e.group(2)), e.group(3)), r)
+        return re.sub(r"<(\w+:)?response\b[^>]*>.*?</(\w+:)?response>", one, body.decode("utf-8"), flags=re.S).encode("utf-8")
 
     def armed_chunk_failure(self, index):
         """The status an armed --fail-chunk-file gives this chunk PUT, None if not armed."""
@@ -374,6 +403,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             status, rh, rd = self.upstream("PUT", dest, headers, bytes(whole))
             if status in (200, 201, 204):
                 shutil.rmtree(session, ignore_errors=True)
+                BUMPS.pop(urllib.parse.unquote(dest), None)
             log("ASSEMBLED %s %d bytes -> %s (HTTP %d)" % (parts[1], len(whole), dest, status))
             if status in (200, 201, 204):
                 rh = self.stored_etag(dest, rh)

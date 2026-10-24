@@ -1637,7 +1637,7 @@ impl VersionPin {
                 p.etag = Some(got);
                 Ok(())
             }
-            Some(_) if !p.frozen && served.is_ours(path, &got) => {
+            Some(_) if !p.frozen && (served.is_ours(path, &got) || app_locks::vouched(path)) => {
                 p.etag = Some(got);
                 Ok(())
             }
@@ -2648,13 +2648,17 @@ fn server_state(conn: &ConnInfo, path: &Path) -> Option<(String, u64, Option<Sys
 /// it (VersionPin), saves are based on it (rename-saves and handles opened before), so our
 /// own lock never reads as someone else's change. Only while size and mtime are the same:
 /// a save by someone else between `before` and the lock is not ours to adopt.
-fn adopt_lock_etag(conn: &ConnInfo, cache: &Arc<Mutex<FsCache>>, uploads: &UploadOrder, path: &Path, before: Option<(String, u64, Option<SystemTime>)>) {
-    let (Some((before, size, mtime)), Some((after, size2, mtime2))) = (before, server_state(conn, path)) else { return };
-    if before == after || size != size2 || mtime != mtime2 {
-        return;
+fn adopt_lock_etag(conn: &ConnInfo, cache: &Arc<Mutex<FsCache>>, uploads: &UploadOrder, path: &Path, before: Option<(String, u64, Option<SystemTime>)>) -> bool {
+    let Some((before, size, mtime)) = before else { return false };
+    let known = knows_version(cache, uploads, path, &before);
+    let Some((after, size2, mtime2)) = server_state(conn, path) else { return false };
+    if before == after {
+        return known;
     }
-    let listed = cache.safe_lock().find_entry(path).and_then(|e| e.change_token.clone());
-    if uploads.served.served(path).as_deref() == Some(before.as_str()) || listed.as_deref() == Some(before.as_str()) {
+    if size != size2 || mtime != mtime2 {
+        return false;
+    }
+    if known {
         uploads.record(path, Some(after.clone()));
     }
     let mut c = cache.safe_lock();
@@ -2665,6 +2669,13 @@ fn adopt_lock_etag(conn: &ConnInfo, cache: &Arc<Mutex<FsCache>>, uploads: &Uploa
             dir.files = Arc::new(files);
         }
     }
+    known
+}
+
+/// Whether `etag` is the version of `path` this mount last handed out or listed.
+fn knows_version(cache: &Arc<Mutex<FsCache>>, uploads: &UploadOrder, path: &Path, etag: &str) -> bool {
+    let listed = cache.safe_lock().find_entry(path).and_then(|e| e.change_token.clone());
+    uploads.served.served(path).as_deref() == Some(etag) || listed.as_deref() == Some(etag)
 }
 
 /// Whether a change to `doc` is still queued or on its way to the server: such a request
@@ -2748,13 +2759,21 @@ fn run_app_locks(
                     && matches!(conn.backend.list_dir(&h.lock_file, Duration::from_secs(10)),
                         Ok((_, None, _)) | Err(backend::BackendReadError::NotFound))
             };
-            let done = !active || !app_locks::process_alive(h.pid, &h.comm) || file_gone();
+            let deleted = h.lock_file_gone_at.is_some_and(|t| t.elapsed() >= app_locks::LOCK_FILE_GRACE);
+            let done = !active || deleted || !app_locks::process_alive(h.pid, &h.comm) || file_gone();
             if done && (online || h.token.is_none()) && !doc_writes_pending(&cache, &journal, &h.doc) {
                 release_app_lock(&conn, &cache, &journal, &uploads, &h.doc);
                 continue;
             }
             if !online || !due {
                 continue;
+            }
+            // Taking a lock changes the file's etag: one sent while our own save of it is
+            // on its way would make that save a conflict (or a 423). It waits for the save.
+            if h.token.is_none() || h.locked_at.is_some_and(|at| at.elapsed() >= APP_LOCK_RENEW_AFTER) {
+                if doc_writes_pending(&cache, &journal, &h.doc) {
+                    continue;
+                }
             }
             let now = Instant::now();
             match (&h.token, h.locked_at) {
@@ -2779,16 +2798,22 @@ fn run_app_locks(
                     // after its lock file is made); retried every REFRESH_EVERY meanwhile.
                     app_locks::mark_refreshed(&h.doc, now);
                     let Some(before) = server_state(&conn, &h.doc) else { continue };
+                    app_locks::set_vouched(&h.doc, knows_version(&cache, &uploads, &h.doc, &before.0));
                     match conn.backend.lock_file(&h.doc, app_locks::LOCK_TIMEOUT, &app_locks::owner_text(&h.app)) {
                         Ok(token) => {
                             log::info!("locked {} on the server for {}", h.doc.display(), h.app);
                             app_locks::set_token(&h.doc, Some(token), now);
-                            adopt_lock_etag(&conn, &cache, &uploads, &h.doc, Some(before));
+                            let ours = adopt_lock_etag(&conn, &cache, &uploads, &h.doc, Some(before));
+                            app_locks::set_vouched(&h.doc, ours);
                         }
                         Err(backend::BackendWriteError::Locked) => {
+                            app_locks::refused(&h.doc);
                             log::info!("{} is locked on the server by someone else; {} keeps it open read-write here", h.doc.display(), h.app);
                         }
-                        Err(e) => log::warn!("locking {} on the server: {}", h.doc.display(), e),
+                        Err(e) => {
+                            app_locks::set_vouched(&h.doc, false);
+                            log::warn!("locking {} on the server: {}", h.doc.display(), e);
+                        }
                     }
                 }
             }
@@ -9079,11 +9104,9 @@ impl NextCloudFs {
             mutation_journal::MutationOp::Unlink { path: remote_path.clone() },
         );
 
-        // The editor closed the document: its server lock goes with the lock file.
-        if let Some(doc) = app_locks::doc_of_lock_file(&remote_path) {
-            let (conn, cache, journal, uploads) = (self.conn.clone(), self.cache.clone(), self.journal.clone(), self.uploads.clone());
-            let _ = bg::BACKGROUND.submit(move || release_app_lock(&conn, &cache, &journal, &uploads, &doc));
-        }
+        // The editor closed the document: its server lock goes with the lock file, once
+        // run_app_locks sees it has not come back (LibreOffice rewrites it on each save).
+        app_locks::lock_file_removed(&remote_path, Instant::now());
 
         if !self.conn.is_offline.load(Ordering::Relaxed) {
             let conn = self.conn.clone();

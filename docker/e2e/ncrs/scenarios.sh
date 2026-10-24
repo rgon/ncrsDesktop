@@ -2747,6 +2747,33 @@ open(tmp,"wb").write(open(sys.argv[2],"rb").read()); os.rename(tmp, os.path.join
     sleep 3
     al_wait_locked doc.odt yes 30 && ok "(e) the document is locked again after the save" \
         || no "(e) the document stayed unlocked after our save"
+    # LibreOffice saving again and again: its lock file is deleted and written anew
+    # around each save, a rename over the document. Each used to unlock and relock it,
+    # and the lock's etag change turned the next save into a conflicted copy.
+    python3 - "$AL_MOUNT/edit" > /tmp/applock.lo2.pid <<'PY' &
+import os, sys, time
+d = sys.argv[1]; lf = os.path.join(d, ".~lock.doc.odt#")
+print(os.getpid(), flush=True)
+for i in range(1, 4):
+    os.remove(lf)
+    tmp = os.path.join(d, "lu2%d.tmp" % i)
+    open(tmp, "w").write("doc v3.%d (LibreOffice save)\n" % i)
+    open(lf, "w").write("Ana,ana,laptop,24.10.2026 10:00,file:///home/ana;")
+    os.rename(tmp, os.path.join(d, "doc.odt"))
+    time.sleep(4)
+time.sleep(3600)
+PY
+    al_pre=$(grep -c 'PRECOND .*edit/doc.odt' "$AL_LOG")
+    if wait_dav_sha edit/doc.odt "$(printf 'doc v3.3 (LibreOffice save)\n' | sha)" 60; then
+        al_copies=$(curl -s -u "$U:$P" -X PROPFIND -H 'Depth: 1' "${URL}edit/" | grep -c 'conflicted copy')
+        [ "$al_copies" = 0 ] && [ "$(grep -c 'PRECOND .*edit/doc.odt' "$AL_LOG")" = "$al_pre" ] \
+            && ok "(e2) three LibreOffice saves (lock file rewritten each time) all land, with no conflicted copy" \
+            || no "(e2) LibreOffice's saves made $al_copies conflicted copies ($(grep -c 'PRECOND .*edit/doc.odt' "$AL_LOG") refused preconditions)"
+    else
+        no "(e2) LibreOffice's last save never reached the server ($(grep -c 'PRECOND .*edit/doc.odt' "$AL_LOG") refused preconditions)"
+        grep -E 'PRECOND|LOCK|UNLOCK' "$AL_LOG" | tail -12 | sed 's/^/    (proxy) /'
+    fi
+    al_wait_locked doc.odt yes 30 || no "(e2) the document was left unlocked after LibreOffice's saves"
     al_t0=$(date +%s)
     sleep 70
     if al_locked doc.odt && grep -q "REFRESH .*edit/doc.odt" "$AL_LOG"; then
@@ -2755,9 +2782,9 @@ open(tmp,"wb").write(open(sys.argv[2],"rb").read()); os.rename(tmp, os.path.join
         no "(f) the lock lapsed while the document was open (refreshes: $(grep -c 'REFRESH .*edit/doc.odt' "$AL_LOG"))"
     fi
     rm -f "$AL_MOUNT/edit/.~lock.doc.odt#"
-    al_wait_locked doc.odt no 10 && ok "(g) closing the document (its lock file goes) releases the lock" \
+    al_wait_locked doc.odt no 25 && ok "(g) closing the document (its lock file goes) releases the lock" \
         || no "(g) the lock stayed after LibreOffice's lock file was deleted"
-    kill "$(cat /tmp/applock.lo.pid)" 2>/dev/null
+    kill "$(cat /tmp/applock.lo.pid)" "$(cat /tmp/applock.lo2.pid)" 2>/dev/null
 
     # (h) Vim, crashing: the swap file stays, the lock must not
     al_seed notes.txt "notes v1" || no "setup: edit/notes.txt never showed"

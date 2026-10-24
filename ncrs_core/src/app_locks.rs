@@ -27,6 +27,10 @@ use crate::MutexExt;
 pub const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often a held lock is refreshed: three chances before it would expire.
 pub const REFRESH_EVERY: Duration = Duration::from_secs(20);
+/// How long a deleted lock file keeps its document locked. LibreOffice deletes and
+/// writes its lock file anew on every save: releasing at once would unlock and relock
+/// the document around each save (each changes its etag on the server).
+pub const LOCK_FILE_GRACE: Duration = Duration::from_secs(10);
 
 const STATE_FILE: &str = "app_locks.json";
 
@@ -86,6 +90,19 @@ pub struct Held {
     pub locked_at: Option<Instant>,
     #[serde(skip)]
     pub refreshed_at: Option<Instant>,
+    /// The lock was taken on the version this mount last had of the document, so while
+    /// it is held nobody else changes the file: our requests need only its token, not
+    /// the etag (which the lock itself, and taking it again, change).
+    #[serde(skip)]
+    pub vouched: bool,
+    /// When the lock file was deleted; the lock goes once LOCK_FILE_GRACE passes
+    /// without it coming back.
+    #[serde(skip)]
+    pub lock_file_gone_at: Option<Instant>,
+    /// We got the lock since tracking began, and nobody else took it since: a lock a
+    /// listing shows on the document is ours even while the token is being renewed.
+    #[serde(skip)]
+    pub ours: bool,
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -112,9 +129,41 @@ pub fn token_for(path: &Path) -> Option<String> {
 }
 
 /// Whether a server lock on `path` is this daemon's own, which must not make the file
-/// read-only here.
+/// read-only here: also between a save replacing the file (the server drops the lock
+/// with it) and the lock being taken again, when a listing can still show ours.
 pub fn holds(path: &Path) -> bool {
-    held().safe_lock().get(path).is_some_and(|h| h.token.is_some())
+    held().safe_lock().get(path).is_some_and(|h| h.token.is_some() || h.ours)
+}
+
+/// Someone else holds the lock on `doc`: theirs is honoured like any other.
+pub fn refused(doc: &Path) {
+    if let Some(e) = held().safe_lock().get_mut(doc) {
+        e.ours = false;
+        e.vouched = false;
+    }
+}
+
+/// What a request changing `path` sends: the lock token, and whether that alone is
+/// enough (the lock is vouched for, so no etag condition is needed).
+pub fn condition_for(path: &Path) -> (Option<String>, bool) {
+    match held().safe_lock().get(path) {
+        Some(h) if h.token.is_some() => (h.token.clone(), h.vouched),
+        _ => (None, false),
+    }
+}
+
+/// Whether every change to `path` on the server now is this daemon's own: a version
+/// read from it then is ours too.
+pub fn vouched(path: &Path) -> bool {
+    held().safe_lock().get(path).is_some_and(|h| h.vouched)
+}
+
+/// Marks the lock on `doc` as taken on a version this mount knew (or not). Set before
+/// the LOCK is sent, so a read racing the etag change it makes still accepts it.
+pub fn set_vouched(doc: &Path, on: bool) {
+    if let Some(e) = held().safe_lock().get_mut(doc) {
+        e.vouched = on;
+    }
 }
 
 pub fn snapshot() -> Vec<Held> {
@@ -127,11 +176,18 @@ pub fn track(doc: PathBuf, lock_file: PathBuf, app: &str, pid: u32) -> bool {
     let Some(tgid) = tgid_of(pid) else { return false };
     let comm = comm_of(tgid).unwrap_or_default();
     let mut h = held().safe_lock();
-    if h.contains_key(&doc) {
+    if let Some(e) = h.get_mut(&doc) {
+        // Written anew (LibreOffice does so on every save): the lock stays.
+        if e.lock_file_gone_at.take().is_some() {
+            e.lock_file = lock_file;
+            e.pid = tgid;
+            e.comm = comm;
+        }
         return false;
     }
     h.insert(doc.clone(), Held {
         doc, lock_file, app: app.to_string(), pid: tgid, comm, token: None, locked_at: None, refreshed_at: None,
+        vouched: false, lock_file_gone_at: None, ours: false,
     });
     drop(h);
     save();
@@ -143,9 +199,11 @@ pub fn set_token(doc: &Path, token: Option<String>, now: Instant) {
     if let Some(e) = held().safe_lock().get_mut(doc) {
         if token.is_some() && e.token != token {
             e.locked_at = Some(now);
+            e.ours = true;
         }
         if token.is_none() {
             e.locked_at = None;
+            e.vouched = false;
         }
         e.refreshed_at = token.as_ref().map(|_| now);
         e.token = token;
@@ -166,9 +224,12 @@ pub fn untrack(doc: &Path) -> Option<Held> {
     gone
 }
 
-/// The tracked document a lock file stands for, when `lock_file` is one.
-pub fn doc_of_lock_file(lock_file: &Path) -> Option<PathBuf> {
-    held().safe_lock().values().find(|h| h.lock_file == lock_file).map(|h| h.doc.clone())
+/// A tracked lock file was deleted: its document's lock goes after LOCK_FILE_GRACE,
+/// unless the lock file comes back first.
+pub fn lock_file_removed(lock_file: &Path, now: Instant) {
+    if let Some(h) = held().safe_lock().values_mut().find(|h| h.lock_file == lock_file) {
+        h.lock_file_gone_at = Some(now);
+    }
 }
 
 /// The `Timeout` to send when refreshing: files_lock counts it from when the lock was
@@ -216,6 +277,9 @@ pub fn readopt(mut h: Held) {
     h.token = None;
     h.locked_at = None;
     h.refreshed_at = None;
+    h.vouched = false;
+    h.lock_file_gone_at = None;
+    h.ours = false;
     held().safe_lock().insert(h.doc.clone(), h);
     save();
 }
@@ -254,6 +318,26 @@ mod tests {
         let (_, long) = document_for("~$port 2026.docx").unwrap();
         assert!(long.matches("Report 2026.docx"), "Office replaces the first two characters of a long name");
         assert!(!long.matches("XReport 2026.docx"));
+    }
+
+    #[test]
+    fn a_lock_file_written_anew_keeps_the_lock() {
+        let doc = PathBuf::from("/t/rewritten.odt");
+        let lf = PathBuf::from("/t/.~lock.rewritten.odt#");
+        assert!(track(doc.clone(), lf.clone(), "LibreOffice", std::process::id()));
+        set_token(&doc, Some("opaquelocktoken:1".into()), Instant::now());
+        set_vouched(&doc, true);
+        assert_eq!(condition_for(&doc), (Some("opaquelocktoken:1".into()), true));
+        lock_file_removed(&lf, Instant::now());
+        assert!(!track(doc.clone(), lf.clone(), "LibreOffice", std::process::id()), "the same document is not tracked twice");
+        let h = snapshot().into_iter().find(|h| h.doc == doc).unwrap();
+        assert!(h.lock_file_gone_at.is_none() && h.token.is_some(), "a save's lock-file rewrite must not release the lock");
+        set_token(&doc, None, Instant::now());
+        assert_eq!(condition_for(&doc), (None, false), "a dropped lock vouches for nothing");
+        assert!(holds(&doc), "until it is taken again, a listing showing the lock shows ours");
+        refused(&doc);
+        assert!(!holds(&doc), "someone else's lock is honoured");
+        untrack(&doc);
     }
 
     #[test]

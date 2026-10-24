@@ -64,7 +64,10 @@ fn dav_url(base_url: &str, username: &str, path: &Path) -> String {
 /// The tagged `If` list for `url`: the token of a lock this daemon holds on `path`
 /// (app_locks) and/or the etag it must still have. None when neither applies.
 fn tagged_if(url: &str, path: &Path, etag: Option<&str>) -> Option<String> {
-    let token = crate::app_locks::token_for(path);
+    // Under a vouched lock only this daemon changes the file, and the lock's own etag
+    // changes must not fail our saves: the token is the whole condition then.
+    let (token, vouched) = crate::app_locks::condition_for(path);
+    let etag = etag.filter(|_| !vouched);
     if token.is_none() && etag.is_none() {
         return None;
     }
